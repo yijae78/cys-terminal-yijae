@@ -68,6 +68,36 @@ Compress-Archive target\x86_64-pc-windows-msvc\release\cys.exe,cysd.exe `
 
 GUI 앱의 Windows Tauri 빌드는 잔여 — 현재 Windows는 CLI+데몬 중심 배포.
 
+### ★macOS에서 Windows 크로스빌드 (Windows 머신 없이 — 2026-06-15 실증)
+
+Windows 머신이 없어도 macOS에서 MSI까지 만들 수 있다. **windows-gnu 타깃**(wxs Source가
+가리키는 `x86_64-pc-windows-gnu`·`aarch64-pc-windows-gnullvm`)을 zig 링커로 크로스컴파일하고,
+WiX 대신 **msitools(wixl)**로 MSI를 만든다. (cys.wxs는 표준 WiX v3라 wixl이 그대로 읽는다.)
+
+```sh
+# 사전: rustup(homebrew rust와 별개) · cargo-zigbuild · zig · msitools(wixl)
+#   brew install zig msitools && cargo install cargo-zigbuild
+#   curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+rustup target add x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm
+
+# 바이너리 크로스컴파일 (GUI 없이 cys+cysd만)
+cargo zigbuild --release --target x86_64-pc-windows-gnu      --bin cys --bin cysd
+cargo zigbuild --release --target aarch64-pc-windows-gnullvm --bin cys --bin cysd
+
+# MSI (wixl — wxs Source 상대경로가 ../target/... 이므로 dist-win에서 실행)
+cd dist-win
+wixl -o cys-0.2.1-windows-x64.msi   cys-x64.wxs
+wixl -o cys-0.2.1-windows-arm64.msi cys.wxs
+cd ..
+# ZIP
+zip -j dist-win/cys-0.2.1-windows-x64.zip   target/x86_64-pc-windows-gnu/release/cys.exe target/x86_64-pc-windows-gnu/release/cysd.exe
+zip -j dist-win/cys-0.2.1-windows-arm64.zip target/aarch64-pc-windows-gnullvm/release/cys.exe target/aarch64-pc-windows-gnullvm/release/cysd.exe
+```
+
+⚠ **한계(정직)**: 크로스빌드 산출물은 PE 포맷·아키텍처는 검증되나(`file`로 PE32+ x86-64 /
+Aarch64 확인) **실제 Windows에서 실행 검증은 불가**하다. 광범위 배포 전 Windows 머신에서
+스모크테스트(설치→`cys status`) 권장.
+
 ## 3. GitHub 저장소 최초 설정 (1회)
 
 자동 업데이트의 endpoint가 GitHub Releases이므로 **공개 repo가 있어야** 작동합니다.
