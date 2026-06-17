@@ -49,6 +49,10 @@ pub const PACK: &[(&str, &str)] = &[
     ("agents.json", include_str!("../cysjavis-pack/agents.json")),
     ("acl.json", include_str!("../cysjavis-pack/acl.json")),
     (
+        "alerts-config.json",
+        include_str!("../cysjavis-pack/alerts-config.json"),
+    ),
+    (
         "schedule.json",
         include_str!("../cysjavis-pack/schedule.json"),
     ),

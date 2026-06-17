@@ -124,7 +124,19 @@ stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retentio
 > - **정직 범위**: duration p50·미사용 4주 diff는 현재 미수집(events.duration_ms NULL·4주 축적 필요) — 후속.
 >   slash 명령 UNION도 캡처 경로(UserPromptSubmit) 미구현 — Skill 툴 기반만.
 > - 검증: cargo 210/210(신규 `summarize_skills_calls_and_failrate`) · E2E 15/15(`docs/skills_e2e.py`) · UI 번들 OK.
-> - **다음 = E4**(세션 타임라인·전사 탭) 또는 E6(경보 — 반복실패/이상감지, E3 실패율 직결).
+>
+> **E6 경보·이상감지 완료**(로컬 커밋·미배포):
+> - 백엔드: `alerts.rs` `AlertConfig`(pack `alerts-config.json` 핫로드·부분설정·기본값)·`evaluate`(순수)·
+>   `snapshot`(rate=observed_usage + 7d 비용/토큰=usage_records + 7d 반복실패=events). 경보 3종:
+>   rate_limit(노드 쿼터 ≥90%·≥95% crit)·weekly_budget(비용/토큰 한도, 0=비활성)·repeated_failure(fail수·
+>   실패율·최소표본 동시충족·≥50% crit). `governance.rs` watchdog **check_alerts**(30초·에지 디바운스
+>   1800s·해소 시 재무장)→`alert.<kind>` "alert" 이벤트 발화. `control.alerts` RPC(동일 평가기=단일 진실원).
+> - 프런트: Control Center 헤더 **경보 배지**(개수·crit 점멸) + Live 뷰 상단 경보 스트립. Tauri `control_alerts`.
+> - **설계 갱신**: "cys send --to master push"는 governance 교리(★자동응답 금지 — 감지·격상만)에 맞춰
+>   **이벤트 발화 + UI 배지**로 정합화(master PTY 주입은 kill-switch 위험·기존 패턴 위배라 회피).
+> - **정직 범위**: 노드 토큰 급증 이상감지·스킬 ROI 패턴(commit→재edit)은 per-node 시계열 베이스라인 미보존 → 후속.
+> - 검증: cargo 213/213(신규 alerts 3종) · E2E 7/7(`docs/alerts_e2e.py` — 핫로드·예산·반복실패·심각도·재무장) · UI 번들 OK.
+> - **다음 = E4**(세션 타임라인·전사) 또는 E5(주간 다이제스트).
 
 ### E1 — 영속 분석 기반 (척추) 【선행·필수】
 - **백엔드**: `analytics.db` 스키마 생성(state.rs init) · `ingest.rs`(hook 이벤트→events/messages 적재) ·

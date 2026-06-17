@@ -2035,6 +2035,23 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             ))
         }
 
+        // ─── T7 E6: 현재 활성 경보 (Control Center 경보 배지 — watchdog 발화와 동일 평가기) ───
+        "control.alerts" => {
+            let now = crate::state::now_epoch();
+            let cfg = crate::alerts::AlertConfig::load();
+            let snap = crate::alerts::snapshot(daemon, now);
+            let active = crate::alerts::evaluate(&snap, &cfg);
+            let list: Vec<Value> = active.iter().map(|a| a.to_value()).collect();
+            Reply::Single(ok_response(
+                &id,
+                json!({
+                    "now": now,
+                    "count": list.len(),
+                    "alerts": list,
+                }),
+            ))
+        }
+
         // ─── T2-5 에이전트 메타 등록 (launch-agent가 호출 — 사망 감지·status 보드의 기반) ───
         "surface.set_meta" => {
             let Some(sid) = resolve_surface_id(&params) else {

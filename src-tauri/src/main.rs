@@ -137,6 +137,11 @@ async fn control_skills(window: Option<String>) -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn control_alerts() -> Result<Value, String> {
+    rpc("control.alerts", json!({})).await
+}
+
+#[tauri::command]
 async fn create_surface(
     cwd: Option<String>,
     title: Option<String>,
@@ -508,6 +513,7 @@ fn main() {
             list_surfaces,
             control_analytics,
             control_skills,
+            control_alerts,
             control_dashboard,
             create_surface,
             send_input,

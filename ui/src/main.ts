@@ -190,8 +190,29 @@ async function refreshControlCenter() {
   } catch {
     /* 데몬 일시 부재 — 다음 틱 재시도 */
   }
+  try {
+    renderAlerts((await invoke("control_alerts")) as any);
+  } catch {
+    /* graceful */
+  }
   if (ccTab === "eff") refreshEfficiency();
   if (ccTab === "skills") refreshSkills();
+}
+
+// E6 경보 — 헤더 배지(개수) + Live 뷰 상단 스트립. severity: warn(주황)/crit(빨강).
+function renderAlerts(a: any) {
+  const list: any[] = a?.alerts ?? [];
+  const crit = list.filter((x) => x.severity === "crit").length;
+  const badge = document.getElementById("cc-alertbadge")!;
+  badge.hidden = list.length === 0;
+  badge.textContent = list.length ? `⚠ ${list.length}` : "";
+  badge.className = "cc-alert-badge " + (crit > 0 ? "crit" : "warn");
+  document.getElementById("cc-alerts")!.innerHTML = list
+    .map(
+      (x) =>
+        `<div class="cc-alert-row ${x.severity === "crit" ? "crit" : "warn"}"><span class="cc-alert-icon">${x.severity === "crit" ? "🔴" : "🟠"}</span><span class="cc-alert-msg">${ccEsc(x.message ?? x.kind ?? "")}</span></div>`,
+    )
+    .join("");
 }
 
 async function refreshEfficiency() {

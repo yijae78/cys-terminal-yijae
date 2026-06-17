@@ -251,6 +251,18 @@ html, body {
 .cc-fail-badge.warn { background: rgba(245,158,11,.18); color: #f59e0b; }
 .cc-fail-badge.crit { background: rgba(239,68,68,.18); color: #ef4444; }
 .cc-agent-roles { font-size: 11px; color: #64748b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
+/* E6 경보 — 헤더 배지 + Live 스트립 */
+.cc-alert-badge { font-size: 11px; font-weight: 700; padding: 2px 9px; border-radius: 10px; letter-spacing: .03em; }
+.cc-alert-badge[hidden] { display: none; }
+.cc-alert-badge.warn { background: rgba(245,158,11,.18); color: #f59e0b; }
+.cc-alert-badge.crit { background: rgba(239,68,68,.2); color: #ef4444; animation: cc-blink 1.4s infinite; }
+.cc-alerts:empty { display: none; }
+.cc-alerts { display: flex; flex-direction: column; gap: 6px; }
+.cc-alert-row { display: flex; align-items: center; gap: 9px; padding: 9px 12px; border-radius: 10px; font-size: 13px;
+  border: 1px solid rgba(245,158,11,.35); background: rgba(245,158,11,.08); color: #fcd34d; }
+.cc-alert-row.crit { border-color: rgba(239,68,68,.45); background: rgba(239,68,68,.10); color: #fca5a5; }
+.cc-alert-icon { flex: none; }
+.cc-alert-msg { font-weight: 600; }
 .pane .pane-close { opacity: .5; cursor: pointer; }
 .pane .pane-close:hover { opacity: 1; color: var(--error); }
 .pane .pane-title { cursor: grab; }

@@ -24,6 +24,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut approval_debounce: HashMap<(u64, String), f64> = HashMap::new();
         let mut queue_depth_alerted: HashMap<u64, f64> = HashMap::new();
         let mut deadman_last_alert: f64 = 0.0;
+        let mut alert_fired: HashMap<String, f64> = HashMap::new();
         let mut tick_no: u64 = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await;
@@ -45,6 +46,10 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 if tick_no.is_multiple_of(3) {
                     check_todo(&daemon);
                     check_approvals(&daemon, &mut approval_debounce);
+                }
+                // T7 E6 경보(30초): rate·주간예산·반복실패 — analytics SQL 동반이라 저빈도
+                if tick_no.is_multiple_of(6) {
+                    check_alerts(&daemon, &mut alert_fired);
                 }
                 // 24/365 데몬 누수 차단: 위 검사들이 surface_id·cmdline 키로 insert만 하는
                 // 태스크-로컬 디바운스/카운터 맵을 살아있는 surface 집합·나이로 솎아낸다.
@@ -253,6 +258,30 @@ fn check_master_deadman(daemon: &Arc<Daemon>, last_alert: &mut f64) {
             .bus
             .publish("master.deadman", "alert", Some(sid), payload);
     }
+}
+
+/// T7 E6 경보: rate 한도·주간 예산·반복실패를 순수 평가기(alerts.rs)로 판정해 **에지 발화**한다.
+/// fired 맵에 없는 키만 발행(첫 교차)하고, 해소된 키는 retain으로 제거해 재무장한다(다음 교차 시
+/// 재발화). 지속 조건은 30분 디바운스로 재격상(master가 놓치지 않게). ★자동응답 금지 — 이벤트만.
+fn check_alerts(daemon: &Arc<Daemon>, fired: &mut HashMap<String, f64>) {
+    const REMIND_SECS: f64 = 1800.0;
+    let cfg = crate::alerts::AlertConfig::load();
+    let now = now_epoch();
+    let snap = crate::alerts::snapshot(daemon, now);
+    let active = crate::alerts::evaluate(&snap, &cfg);
+    let active_keys: std::collections::HashSet<String> =
+        active.iter().map(|a| a.key.clone()).collect();
+    for a in &active {
+        let due = fired.get(&a.key).is_none_or(|t| now - *t >= REMIND_SECS);
+        if due {
+            fired.insert(a.key.clone(), now);
+            daemon
+                .bus
+                .publish(&format!("alert.{}", a.kind), "alert", None, a.to_value());
+        }
+    }
+    // 해소된 경보 키 재무장(다음 교차 시 즉시 발화) — 태스크-로컬 맵 누수도 차단.
+    fired.retain(|k, _| active_keys.contains(k));
 }
 
 /// CYS_TODO_DIRS(PATH류 목록)를 플랫폼 규약대로 분해한다.
