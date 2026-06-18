@@ -303,6 +303,14 @@ pub(crate) fn context_threshold_pct() -> u8 {
     threshold_from(std::env::var("CYS_CONTEXT_THRESHOLD_PCT").ok())
 }
 
+/// 발화 임계 결정(순수) — role 오버라이드(1~100 유효) 우선, 아니면 env/60. 테스트 핀.
+pub(crate) fn pick_context_threshold(override_pct: Option<u64>, env_pct: u8) -> u8 {
+    match override_pct {
+        Some(v) if (1..=100).contains(&v) => v as u8,
+        _ => env_pct,
+    }
+}
+
 /// 순수 함수 — env 파싱 규칙의 회귀 핀 (테스트에서 env 전역 오염 없이 검증).
 fn threshold_from(raw: Option<String>) -> u8 {
     raw.and_then(|v| v.trim().parse::<u8>().ok())
@@ -322,7 +330,11 @@ pub(crate) fn maybe_fire_context_threshold(
     source: &str,
     agent: Option<&str>,
 ) {
-    let threshold = context_threshold_pct();
+    let role = surface.role.lock().unwrap().clone();
+    let threshold = pick_context_threshold(
+        cys::overrides::context_clear_pct(role.as_deref().unwrap_or("")),
+        context_threshold_pct(),
+    );
     if pct < threshold {
         surface.ctx_threshold_armed.store(true, Ordering::Relaxed);
         return;
@@ -331,7 +343,7 @@ pub(crate) fn maybe_fire_context_threshold(
         return;
     }
     let mut payload = json!({
-        "role": surface.role.lock().unwrap().clone(),
+        "role": role.clone(),
         "context_pct": pct,
         "threshold": threshold,
         "surface_ref": cys::surface_ref(surface.id),
@@ -3796,6 +3808,14 @@ mod tests {
         assert_eq!(threshold_from(Some("101".into())), 60, "100 초과 무효");
         assert_eq!(threshold_from(Some("abc".into())), 60);
         assert_eq!(threshold_from(Some("-5".into())), 60);
+    }
+
+    #[test]
+    fn pick_context_threshold_prefers_override() {
+        assert_eq!(pick_context_threshold(Some(75), 60), 75);
+        assert_eq!(pick_context_threshold(None, 60), 60);
+        assert_eq!(pick_context_threshold(Some(0), 60), 60, "범위 밖(0) → env 폴백");
+        assert_eq!(pick_context_threshold(Some(200), 60), 60, "범위 밖(>100) → env 폴백");
     }
 
     fn close_surface_rpc(daemon: &Arc<Daemon>, surface_id: u64, caller_pid: Option<u32>) -> Value {
