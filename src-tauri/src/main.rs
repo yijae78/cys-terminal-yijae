@@ -357,12 +357,27 @@ async fn feed_reply(request_id: String, decision: String) -> Result<(), String> 
 /// 이벤트명은 (소켓 slug, surface_id)로 데몬 간 충돌을 막고, 그 이름을 반환해 UI가 구독한다
 /// (백엔드 단일 진실 — UI 독립 재계산 금지, 검증 mustFix).
 #[tauri::command]
-async fn attach_surface(
+async fn attach_surface(socket: Option<String>, surface_id: u64) -> Result<Value, String> {
+    // 이벤트명만 반환 — 실제 스트림은 start_surface_stream이 시작한다. UI가 이 이름으로 listen을
+    // 먼저 등록한 뒤 start를 호출해야, 데몬이 attach 직후 보내는 초기 화면 snapshot(프롬프트)이
+    // listen 등록 전에 emit돼 유실되는 race(런치 시 첫 pane 빈 화면)를 차단한다.
+    let sock = resolve_socket(&socket);
+    let slug = sock_slug(&sock);
+    Ok(json!({
+        "output_event": format!("surface-output-{slug}-{surface_id}"),
+        "exited_event": format!("surface-exited-{slug}-{surface_id}"),
+    }))
+}
+
+/// 실제 PTY 스트림 시작 — 이전 핸들 abort + connect + surface.attach + 초기 화면 snapshot + live 스트림.
+/// UI는 attach_surface로 이벤트명을 받아 listen을 등록한 뒤 이 명령을 호출한다(snapshot 유실 방지).
+#[tauri::command]
+async fn start_surface_stream(
     app: AppHandle,
     state: State<'_, Attachments>,
     socket: Option<String>,
     surface_id: u64,
-) -> Result<Value, String> {
+) -> Result<(), String> {
     let sock = resolve_socket(&socket);
     let slug = sock_slug(&sock);
     let key = (slug.clone(), surface_id);
@@ -412,7 +427,7 @@ async fn attach_surface(
         let _ = app.emit(&ee, ());
     });
     state.0.lock().unwrap().insert(key, handle);
-    Ok(json!({"output_event": event_name, "exited_event": event_exited}))
+    Ok(())
 }
 
 /// 데몬 소켓이 준비될 때까지 connect를 폴링(수동 spawn 없음). `attempts`×100ms.
@@ -781,6 +796,7 @@ fn main() {
             resize_surface,
             close_surface,
             attach_surface,
+            start_surface_stream,
             feed_list,
             feed_reply,
             list_dir,

@@ -1104,6 +1104,9 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   const un2 = await listen(ev.exited_event, () => {
     term.write("\r\n\x1b[31m[surface exited]\x1b[0m\r\n");
   });
+  // listen 등록을 마친 뒤에 스트림을 시작해야 초기 화면 snapshot(프롬프트)이 유실되지 않는다
+  // (런치 시 첫 pane 빈 화면 버그 — snapshot이 listen 전에 emit되던 race 차단).
+  await invoke("start_surface_stream", { socket, surfaceId: sid });
 
   let resizeTimer: number | undefined;
   const observer = new ResizeObserver(() => {
