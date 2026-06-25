@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
-# PreToolUse hook (matcher Edit|Write|NotebookEdit|Bash): 역할-기반 능력 가드 (T4-4/T6-P3).
+# PreToolUse hook (matcher Edit|Write|NotebookEdit|MultiEdit|Bash): 역할-기반 능력 가드 (T4-4/T6-P3).
 # reviewer-*/planner surface의 에이전트-내부 변형 도구(Edit/Write/NotebookEdit, write-shell Bash)를
-# **툴 실행 전** 물리 차단(exit 2 = block)해 producer≠evaluator(리뷰어 산출물 자기수정 reward-hack)를
-# 코드로 봉쇄한다. master/CSO/worker는 통과(full-trust).
+# **툴 실행 전** deny(producer≠evaluator: 리뷰어 산출물 자기수정 reward-hack 차단)해 코드로 봉쇄한다.
+# master/CSO/worker는 통과(full-trust).
+#
+# ★두 hook 클래스 (cys-hook.sh:6 불변 narrowing — 위반이 아니라 정밀화):
+#   (a) OBSERVABILITY hook (cys-hook.sh) = **절대 차단 금지·항상 exit 0** — 텔레메트리가
+#       에이전트를 깨뜨려선 안 된다(관측은 무해 통과가 불변).
+#   (b) GATE hook (appbuild-gate.sh, role-capability-gate.sh) = **설계상 deny 가능**(deny-by-default
+#       act tier) — 이 클래스는 차단이 목적이다. cys-hook.sh:6의 "막지 않는다"는 (a) 관측 전용
+#       안전규칙이지 전면 금지가 아니다. role-capability-gate는 appbuild-gate에 이은 GATE의 2번째 사례다.
+#
+# ★차단 메커니즘: deny path는 modern Claude Code permission-decision JSON을
+#   stdout({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny",...}})으로
+#   내고 exit 0 한다(printf 고정 형태 — emit 경로에 jq/python 의존 없음). `exit 2`는 reviewer/planner
+#   인데 role 조회가 물리적으로 불가능할 때(python3 부재 등)의 hard fail-closed fallback으로만 남긴다.
+#   허용·무역할·읽기 경로는 stdout 무출력 + exit 0(defer).
 #
 # ★enforcement boundary (정직 — IMPL-GROUP-W3 honesty 계약):
 #   이 hook이 *에이전트-내부 도구*(Claude Code Edit/Write/Bash)의 실 물리 enforcer다.
@@ -182,6 +195,37 @@ def decide(tool, tool_input, role):
     return False, "non-mutation tool"
 
 
+def _json_escape(s):
+    """JSON 문자열 값 이스케이프(고정 형태 emit용 — 외부 의존 없음)."""
+    out = []
+    for ch in s:
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20:
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def emit_deny(reason):
+    """modern Claude Code permission-decision deny JSON을 stdout에 내고 exit 0.
+    printf 고정 형태(외부 jq/python 의존 없음 — reason만 보간·이스케이프)."""
+    sys.stdout.write(
+        '{"hookSpecificOutput":{"hookEventName":"PreToolUse",'
+        '"permissionDecision":"deny","permissionDecisionReason":"%s"}}\n'
+        % _json_escape(reason))
+    sys.exit(0)
+
+
 def main():
     raw = os.environ.get("CAPGATE_INPUT", "")
     role = os.environ.get("CYS_SURFACE_ROLE", "")
@@ -199,8 +243,9 @@ def main():
     tool_input = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
     block, reason = decide(tool, tool_input, role)
     if block:
-        print("role-capability-gate BLOCKED: %s [role=%s tool=%s]" % (reason, role, tool), file=sys.stderr)
-        sys.exit(2)
+        # 진단은 stderr(transcript), 차단 판정은 modern JSON permission-decision(stdout)+exit 0.
+        print("role-capability-gate DENY: %s [role=%s tool=%s]" % (reason, role, tool), file=sys.stderr)
+        emit_deny("%s surface는 producer 산출물 수정 금지 (producer != evaluator)" % (role or "reviewer"))
     sys.exit(0)
 
 
@@ -245,11 +290,42 @@ def self_test():
         b, r = decide(tool, ti, role)
         if b:
             fails.append("FALSE-POSITIVE(%s): role=%s %s %r" % (r, role, tool, ti))
+
+    # ★API 계약 검증: deny 경로는 permissionDecision==deny JSON을 내는가 / 허용 경로는 무출력인가.
+    def render_emit(role, reason_block):
+        """main()의 emit 형태를 재현(emit_deny가 stdout에 쓰는 정확한 문자열)."""
+        return ('{"hookSpecificOutput":{"hookEventName":"PreToolUse",'
+                '"permissionDecision":"deny","permissionDecisionReason":"%s"}}'
+                % _json_escape("%s surface는 producer 산출물 수정 금지 (producer != evaluator)"
+                               % (role or "reviewer")))
+    # reviewer mutation → JSON deny shape 파싱·필드 검증
+    sample_role = "reviewer-codex"
+    emitted = render_emit(sample_role, True)
+    try:
+        parsed = json.loads(emitted)
+        hso = parsed["hookSpecificOutput"]
+        if hso.get("hookEventName") != "PreToolUse":
+            fails.append("EMIT: hookEventName != PreToolUse")
+        if hso.get("permissionDecision") != "deny":
+            fails.append("EMIT: permissionDecision != deny")
+        if "producer != evaluator" not in hso.get("permissionDecisionReason", ""):
+            fails.append("EMIT: reason missing producer!=evaluator")
+        if sample_role not in hso.get("permissionDecisionReason", ""):
+            fails.append("EMIT: reason missing role")
+    except (ValueError, KeyError) as e:
+        fails.append("EMIT: deny JSON not valid/shaped: %s" % e)
+    # 허용 케이스는 deny JSON을 절대 내지 않는다(emit 미호출 = stdout 무출력) — decide()가 이미 보장.
+    for role, tool, ti in cases_allow:
+        b, _ = decide(tool, ti, role)
+        if b:
+            fails.append("EMIT-FALSE: allowed case would emit deny: role=%s %s" % (role, tool))
+
     if fails:
         print("\n".join(fails), file=sys.stderr)
         print("self-test: %d failure(s)" % len(fails), file=sys.stderr)
         sys.exit(1)
-    print("self-test OK: %d blocked · %d allowed · deny-by-default(reviewer)·fail-closed verified"
+    print("self-test OK: %d blocked · %d allowed · deny=permissionDecision JSON(exit0)·"
+          "allow=empty-stdout(exit0)·fail-closed(exit2) verified"
           % (len(cases_block), len(cases_allow)))
     sys.exit(0)
 

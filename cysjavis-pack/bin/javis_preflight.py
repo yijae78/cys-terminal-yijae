@@ -188,6 +188,10 @@ APPBUILD_SKILLS = [
     "appbuild-orchestrate-verify", "appbuild-orchestrate-route",
 ]
 APPBUILD_HOOK = "appbuild-gate.sh"  # PreToolUse 코드선행 금지 게이트
+# 역할-능력 GATE hook(2번째 GATE 사례 — appbuild-gate와 동급): reviewer/planner surface의
+# 변형 도구를 PreToolUse에서 deny(producer≠evaluator). matcher에 MultiEdit·Bash 포함.
+CAPGATE_HOOK = "role-capability-gate.sh"
+CAPGATE_HOOK_MATCHER = "Edit|Write|NotebookEdit|MultiEdit|Bash"
 
 # C28 자기교정·영속성 hook(외부 메모리 아키텍처 접목 이관) — (스크립트, [(event, matcher)…]).
 # inject/save 는 .config 구체계에서 패키지로 이관, reflect-scan·commit-nudge 는 신규.
@@ -1072,8 +1076,10 @@ class Preflight:
     # ── C47 능력 가드 (T4-4/T6-P3 — producer≠evaluator 물리 경화) ──
     # 정적 검사: ① cysd 원장/surface caps 스키마(caps.rs Cap enum + state.rs caps 필드 +
     # write⊇read 정규화)가 존재하는가 ② PreToolUse hook(role-capability-gate.sh)이 reviewer
-    # 역할 변형 도구(Edit/Write/NotebookEdit/Bash-write) 차단으로 배선됐고 self-test가 통과하는가.
-    # 라이브 데몬 불요(소스/hook 정적 + hook --self-test 배터리). 부재 시 FAIL(보안 게이트 = 강한 단정).
+    # 역할 변형 도구(Edit/Write/NotebookEdit/Bash-write) 차단으로 배선됐고 self-test가 통과하는가
+    # ③ 그 hook이 프로필 settings.json hooks.PreToolUse 에 **실제 등록**됐는가(파일존재+self-test만으론
+    #    DORMANT 미배선을 못 잡는다 — 미등록이면 FAIL + `--fix` 힌트, --fix면 자동 배선).
+    # caps 스키마/hook self-test는 라이브 데몬 불요. 부재 시 FAIL(보안 게이트 = 강한 단정).
     def c47_capability_guard(self):
         cid = "C47.capability-guard"
         if self.skipped(cid):
@@ -1131,8 +1137,39 @@ class Preflight:
             detail = (st.stderr or st.stdout).decode("utf-8", "replace").strip()[:200]
             self.add(cid, FAIL, "role-capability-gate.sh --self-test 실패: %s" % detail)
             return
+        # ③ PreToolUse 실제 등록 검증 — 파일 존재+self-test만으론 'DORMANT(미배선)'를 못 잡는다.
+        #    프로필 settings.json hooks.PreToolUse 에 role-capability-gate가 들어있어야 PASS.
+        #    --fix 면 자동 등록(appbuild-gate 등록과 동형·멱등).
+        targets = discover_claude_settings()
+        if not targets:
+            # 프로필 미발견 — 라이브 wiring은 claude 노드 기동 후. 게이트 자체는 self-test로 검증됨.
+            self.add(cid, WARN, "caps 스키마+cysd 게이트+hook self-test OK이나 ~/.claude*/settings.json "
+                     "미발견 — claude 노드 기동 후 `preflight --fix`로 PreToolUse 등록 필요")
+            return
+        registered = [t for t in targets if self._capgate_hook_registered(t)]
+        unwired = [t for t in targets if t not in registered]
+        if unwired and self.fix:
+            done, errs = [], []
+            for t in unwired:
+                err = self._register_capgate_hook(t)
+                errs.append("%s: %s" % (os.path.basename(os.path.dirname(t)), err)) if err \
+                    else done.append(os.path.basename(os.path.dirname(t)))
+            if errs:
+                self.add(cid, FAIL, "능력 GATE hook PreToolUse 등록 실패: %s%s"
+                         % ("; ".join(errs),
+                            " | 성공: %s" % ", ".join(done) if done else ""))
+                return
+            unwired = []  # 전부 등록됨
+        if unwired:
+            # 파일·self-test는 OK이고 등록만 남았다(deploy 시 --fix가 배선) → WARN+힌트로 보고하되
+            # 게이트 자체 결함과 구분한다(스키마/hook 결함은 위에서 이미 FAIL). C45/C10 외 신규 FAIL 방지.
+            self.add(cid, WARN, "role-capability-gate.sh 파일·self-test OK이나 PreToolUse 미배선"
+                     "(DORMANT) — %d개 프로필 미등록. `preflight --fix`로 배선(claude 재시작 후 적용)"
+                     % len(unwired))
+            return
         self.add(cid, PASS, "원장 caps 스키마(Cap·write⊇read·deny-by-default) + cysd 게이트 + "
-                 "PreToolUse hook reviewer denylist(self-test ok) 배선 확인")
+                 "PreToolUse hook reviewer denylist(self-test ok) + %d개 프로필 PreToolUse 등록 확인"
+                 % len(targets))
 
     # ── C48 거버넌스 경화 (Wave3 UNIT B — watchdog 무음크래시·바이트상한·오염격리·좀비) ──
     # 정적 핀(라이브 데몬 불요): 네 가닥이 소스에 배선됐는지 토큰 존재로 박제한다.
@@ -2151,6 +2188,54 @@ class Preflight:
                 os.makedirs(d, exist_ok=True)
         arr = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
         arr.append({"matcher": "Edit|Write|NotebookEdit",
+                    "hooks": [{"type": "command", "command": cmd}]})
+        tmp = settings_path + ".tmp"
+        open(tmp, "w", encoding="utf-8").write(
+            json.dumps(data, ensure_ascii=False, indent=2))
+        os.replace(tmp, settings_path)
+        return None
+
+    # ── 역할-능력 GATE hook 등록 (appbuild-gate 등록과 동형 — PreToolUse 차단 클래스) ──
+    # role-capability-gate.sh 를 PreToolUse(matcher Edit|Write|NotebookEdit|MultiEdit|Bash)로 등록.
+    # 멱등: command 경로에 스크립트명이 들어간 PreToolUse 엔트리가 이미 있으면 재등록 안 함.
+    @staticmethod
+    def _capgate_hook_registered(settings_path):
+        try:
+            data = json.load(open(settings_path, encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        for entry in data.get("hooks", {}).get("PreToolUse", []):
+            for h in entry.get("hooks", []):
+                if CAPGATE_HOOK in h.get("command", ""):
+                    return True
+        return False
+
+    def _register_capgate_hook(self, settings_path):
+        """PreToolUse(Edit|Write|NotebookEdit|MultiEdit|Bash)로 능력 GATE hook 등록.
+        성공=None, 실패=사유. _register_appbuild_hook 과 동일 규약(symlink 거부·파싱실패 거부·백업·원자적)."""
+        if os.path.islink(settings_path):
+            return "symlink 거부: %s" % settings_path
+        script = os.path.join(pack_dir(), "hooks", CAPGATE_HOOK)
+        cmd = ("bash " if os.name == "nt" else "sh ") + script
+        data = {}
+        if os.path.isfile(settings_path):
+            try:
+                data = json.load(open(settings_path, encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                return "기존 settings.json 파싱 실패 — 거부: %s" % e
+            if not isinstance(data, dict):
+                return "settings.json 루트가 객체가 아님 — 거부"
+            backup = settings_path + ".bak-preflight"
+            if not os.path.exists(backup):
+                shutil.copy2(settings_path, backup)
+        else:
+            d = os.path.dirname(settings_path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+        arr = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
+        arr.append({"matcher": CAPGATE_HOOK_MATCHER,
                     "hooks": [{"type": "command", "command": cmd}]})
         tmp = settings_path + ".tmp"
         open(tmp, "w", encoding="utf-8").write(

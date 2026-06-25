@@ -80,8 +80,11 @@ pub const PACK: &[(&str, &str)] = &[
         "hooks/appbuild-gate.sh",
         include_str!("../cysjavis-pack/hooks/appbuild-gate.sh"),
     ),
-    // Wave3 T4-4⊕T6-P3 capability gate — DORMANT(미배선): cys-hook.sh:6 '훅은 절대 막지 않는다'
-    // 불변과 충돌하는 blocking PreToolUse 패턴이라, 임베드만 하고 PreToolUse 배선은 owner 결정 보류.
+    // Wave3 T4-4⊕T6-P3 capability gate — WIRED(GATE-hook 클래스, appbuild-gate에 이은 2번째 사례).
+    // reviewer/planner surface의 변형 도구를 PreToolUse에서 deny(modern permission-decision JSON,
+    // exit 0)해 producer≠evaluator를 봉쇄. C47이 프로필 PreToolUse 실제 등록까지 검증하고
+    // `preflight --fix`가 배선한다. cys-hook.sh:6 '막지 않는다'는 OBSERVABILITY hook 전용 불변이라
+    // 이 GATE hook과 충돌하지 않는다(별개 클래스 — 차단이 목적).
     (
         "hooks/role-capability-gate.sh",
         include_str!("../cysjavis-pack/hooks/role-capability-gate.sh"),
