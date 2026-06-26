@@ -53,6 +53,46 @@ def v_schema(m):
             errs.append(f"tasks[{i}].to enum 위반: {t.get('to')}")
     return errs
 
+def _atomic_write(path, obj):
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+def catalog_upsert(catalog_path, dept):
+    """catalog 전용 .lock으로 직렬화 + 원자교체. mission_key=key 규약."""
+    lock = catalog_path + ".lock"
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        cat = load_json(catalog_path, {"version":1,"accounts":{},"departments":{}})
+        cat.setdefault("departments", {})[dept["key"]] = {
+            "display": dept["display"], "account": dept["account"],
+            "mission_key": dept["key"], "cwd": dept["cwd"]}
+        _atomic_write(catalog_path, cat)
+
+def write_mission(key, mission_md):
+    os.makedirs(MISSIONS, exist_ok=True)
+    with open(os.path.join(MISSIONS, f"{key}.md"), "w", encoding="utf-8") as f:
+        f.write(mission_md)
+
+def ensure_dirs(dept):
+    cwd = expand(dept["cwd"])
+    os.makedirs(cwd, exist_ok=True)
+    return cwd
+
+def backfill_mission_key(depts_path, key, mission_key):
+    """레거시 부서에 mission_key 소급(F6). cys-dept와 같은 .lock으로 직렬화, 다른 필드 무접촉."""
+    lock = depts_path + ".lock"
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        reg = load_json(depts_path, {"depts":{}})
+        for name, e in reg.get("depts", {}).items():
+            if e.get("cwd","").endswith(key) or e.get("mission_key")==mission_key:
+                if not e.get("mission_key"):
+                    e["mission_key"] = mission_key
+        _atomic_write(depts_path, reg)
+
 def v_refs(depts, tasks):
     keys = {d.get("key") for d in depts}
     return [f"tasks[{i}].dept '{t.get('dept')}' 미존재(참조 무결성)"
@@ -186,6 +226,19 @@ def self_test():
     chk("refs-bad", v_refs([good_dept],[{"dept":"no-such","to":"worker","task":"t","scope":"s","source_quote":"q"}])!=[], "붕뜬 task 미검출")
     chk("sha-ok", v_sha256("abc","abc")==[], "sha 일치 오탐")
     chk("sha-bad", v_sha256("abc","def")!=[], "sha 불일치 미검출")
+    # --- Task5: catalog_upsert (격리 tmp) ---
+    import tempfile as _tf
+    td = _tf.mkdtemp()
+    cpath = os.path.join(td, "catalog.json")
+    json.dump({"version":1,"accounts":{"cysinsight":"x","ysfuture":"y"},"departments":{}}, open(cpath,"w"))
+    catalog_upsert(cpath, {"key":"authoring","display":"저술콘텐츠부","account":"ysfuture",
+                           "cwd":"$HOME/Desktop/CYSjavis/저술콘텐츠부"})
+    catalog_upsert(cpath, {"key":"authoring","display":"저술콘텐츠부","account":"ysfuture",
+                           "cwd":"$HOME/Desktop/CYSjavis/저술콘텐츠부"})  # 멱등
+    c2 = json.load(open(cpath))
+    chk("cat-upsert", "authoring" in c2["departments"], "upsert 미반영")
+    chk("cat-idem", len(c2["departments"])==1, "멱등 위반(중복)")
+    chk("cat-mkey", c2["departments"]["authoring"]["mission_key"]=="authoring", "mission_key 미설정")
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False))
     return 1 if failures else 0
