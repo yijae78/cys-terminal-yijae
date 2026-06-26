@@ -203,6 +203,25 @@ def cmd_status(path=None):
     print(json.dumps({"status": "ok" if ok else "incomplete", "depts": rows}, ensure_ascii=False))
     return 0 if ok else 1
 
+def classify_dept(alive, intake):
+    if not alive: return "redeploy"   # 소켓 死 → 멱등 apply 재실행(cys-dept REUSE_DEAD 재spawn)
+    if not intake: return "hang"       # 소켓 alive·worker 미착수 → CSO 명시 개입 필요
+    return "ok"
+
+def correct_intake(name, e, m):
+    """2단 생존창 후 분기 교정. redeploy=apply 재실행, hang=read-screen 진단+재각성 권고(CSO)."""
+    time.sleep(8)  # 2단 생존창(뜨자마자 죽는 데몬 거짓양성 차단)
+    st = dept_status(e["socket"])
+    alive = st is not None
+    intake = intake_ok((st or {}).get("surfaces", []))
+    kind = classify_dept(alive, intake)
+    if kind == "ok": return ("ok", name)
+    if kind == "redeploy":
+        rc, _ = create_dept(e.get("mission_key") or name)  # REUSE_DEAD 경로 재spawn
+        return ("redeployed", name)
+    # hang: 자동 down→create 금지(데이터 위험) — CSO 개입 지시 반환
+    return ("hang_needs_cso", name)
+
 def apply_plan(m):
     """부수효과 없는 실행계획. 순서: dept당 catalog→mission→ensure→create→backfill, 그 후 tasks."""
     plan = []
@@ -341,6 +360,10 @@ def self_test():
     chk("intake-worker", intake_ok(with_worker)==True, "워커 착수인데 FAIL")
     dead_worker = only_master + [{"role":"worker","agent":"claude","agent_alive":False,"idle_secs":9999,"line_count":0,"status":None}]
     chk("intake-dead", intake_ok(dead_worker)==False, "죽은 워커를 착수로 오판")
+    # --- Task8: classify_dept (데몬死 vs hang) ---
+    chk("cls-dead", classify_dept(alive=False, intake=False)=="redeploy", "데몬死 분류 오류")
+    chk("cls-hang", classify_dept(alive=True, intake=False)=="hang", "hang 분류 오류")
+    chk("cls-ok", classify_dept(alive=True, intake=True)=="ok", "정상 분류 오류")
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False))
     return 1 if failures else 0
