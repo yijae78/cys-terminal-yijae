@@ -4040,6 +4040,91 @@ enum ReinjectDecision {
     Defer,
 }
 
+/// run_pack_reinject 집계 보고. injected/skipped/deferred/failed 카운트에 더해, busy로 보류된
+/// 노드(surface_id, role) 목록을 함께 실어 pending 영속(다음 pack-update 재시도 가시화)에 쓴다.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReinjectReport {
+    injected: usize,
+    skipped: usize,
+    deferred: usize,
+    failed: usize,
+    /// Defer로 판정된 라이브 노드들 — pending 파일에 (surface_id, role)로 영속한다.
+    deferred_nodes: Vec<(u64, String)>,
+}
+
+/// deferred reinject 대상 영속 경로 — pack_state_base(=~/.cys) 아래 .pack-reinject-pending.json.
+fn reinject_pending_path(base: &std::path::Path) -> std::path::PathBuf {
+    base.join(".pack-reinject-pending.json")
+}
+
+/// deferred(busy) 노드를 pending 파일에 영속하거나(>0), 더 이상 없으면 stale pending을 제거한다(0).
+/// {pack_version, deferred:[{surface_id, role}]} 형식. 디스크 반영·reinject 성공 여부와 독립한
+/// 가시화/재시도 힌트라 best-effort(critical 아님)다. 다음 pack-update는 토폴로지 마커를 새로 읽어
+/// deferred 노드를 자연히 재평가(재주입)하므로, 이 파일은 외부 재시도·관측용 SOT다.
+fn persist_reinject_pending(
+    base: &std::path::Path,
+    pack_version: &str,
+    deferred_nodes: &[(u64, String)],
+) -> std::io::Result<()> {
+    let path = reinject_pending_path(base);
+    if deferred_nodes.is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    } else {
+        let nodes: Vec<serde_json::Value> = deferred_nodes
+            .iter()
+            .map(|(sid, role)| json!({"surface_id": sid, "role": role}))
+            .collect();
+        let doc = json!({"pack_version": pack_version, "deferred": nodes});
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap_or_default())
+    }
+}
+
+/// pending 파일(.pack-reinject-pending.json)을 읽어 (pack_version, [(surface_id, role)])로 파싱한다.
+/// 파일 부재 → Ok(None). 손상(JSON 파싱 불가·pack_version 부재) → Ok(None)(best-effort: 손상 pending은
+/// 무시하고 다음 pack-update가 새로 기록). LOW#1 능동 소비 경로의 reader (persist_reinject_pending의 역).
+fn read_reinject_pending(
+    base: &std::path::Path,
+) -> std::io::Result<Option<(String, Vec<(u64, String)>)>> {
+    let path = reinject_pending_path(base);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else { return Ok(None) };
+    let ver = doc["pack_version"].as_str().unwrap_or_default().to_string();
+    if ver.is_empty() {
+        return Ok(None);
+    }
+    let nodes = doc["deferred"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|n| {
+                    let sid = n["surface_id"].as_u64()?;
+                    let role = n["role"].as_str()?.to_string();
+                    Some((sid, role))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(Some((ver, nodes)))
+}
+
+/// reinject 집계 → pack-update 종료코드. failed>0이면 EXIT_REINJECT_DEGRADED(디스크는 반영됐으나
+/// 라이브 일부 미각성 — 성공 침묵 포장 금지), 아니면 0(deferred만 있어도 디스크 반영은 성공이라 0).
+fn reinject_exit_code(failed: usize) -> i32 {
+    if failed > 0 {
+        cys::pack::EXIT_REINJECT_DEGRADED
+    } else {
+        0
+    }
+}
+
 /// reinject 결정(§7-② 순서 고정): ⓐ해시 선검사(SkipUnchanged) → ⓒ버전 dedup(SkipDedup) →
 /// ⓑidle 게이트(Defer) → Inject. 스킵(terminal)을 보류(Defer)보다 먼저 판정해, 주입할 게
 /// 없는 노드를 헛되이 deferral 시키지 않는다.
@@ -4235,7 +4320,8 @@ struct PackUpdateOutcome {
 /// `--from` 핵심 경로(검증+버전게이트+apply). 테스트 가능: keyring/now/running/accepted_path를
 /// 주입받고 라이브 데몬·embed 상수에 의존하지 않는다(do_apply=false면 검증·게이트만).
 /// 순서(§2-②): 소스읽기→staging 압축해제→서명검증(P2 fail-closed)→파일 sha256 대조→버전 3축
-/// 게이트→apply-lock+install_from_iter→record_accepted.
+/// 게이트→apply-lock+apply_pack_transactional(backup journal→install_from_iter→record_accepted[필수]
+/// →.pack-version commit marker→저널 삭제; 실패 시 rollback·부분적용 0).
 fn pack_update_from_dir(
     from_dir: &std::path::Path,
     staging: &std::path::Path,
@@ -4301,31 +4387,24 @@ fn pack_update_from_dir(
     let mut written = 0;
     let mut kept = 0;
     if gate == VersionGate::Apply && do_apply {
-        // 반영: apply-lock 배타 → install_from_iter(staged iter, force=false) → record_accepted.
+        // 반영: apply-lock 배타 → apply_pack_transactional(backup journal → install_from_iter →
+        // record_accepted[필수] → .pack-version=마지막 hard commit marker → 저널 삭제). 어느 단계든
+        // 실패 시 rollback(pre-state 복원·부분적용 0)·Err. record_accepted는 best-effort가 아니라
+        // commit 필수 단계로 격상돼 실패 시 이 rollback 경로로 떨어진다(R2CODE HIGH #1·MED #2).
         let tree = collect_tree(staging)?;
         let pv = manifest.pack_version.clone();
+        let manifest_acc = manifest.clone();
+        let acc_path = accepted_path.to_path_buf();
         let res = with_apply_lock(lock_path, move || {
             let items: Vec<(&str, &str)> =
                 tree.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
-            cys::pack::install_from_iter(items, false, &pv)
+            cys::pack::apply_pack_transactional(&items, &pv, || {
+                cys::packsig::record_accepted(&acc_path, &manifest_acc)
+            })
         })?;
         let (w, k) = res?;
         written = w;
         kept = k;
-        // ★apply→record→reinject 비원자성 디커플(R2 LOW). 여기 도달 시 디스크 팩·.pack-version은
-        // 이미 새 버전으로 반영됐다. record_accepted(replay 단조 기준선 기록)가 실패할 때 ?로 중단하면
-        // run_pack_update가 1을 반환하고 run_pack_reinject에 도달하지 못한다 — 그런데 디스크는 이미
-        // 새 버전이라 재시도 시 version_gates가 remote==disk→UpToDate(no-op)로 판정해 reinject가
-        // 영영 실행되지 않고 라이브 노드가 해당 버전에 미각성으로 영구 잔류한다. 그래서 실패 시
-        // 중단하지 않고 경고만 남긴 뒤 outcome(gate=Apply)을 반환해 reinject로 진행시킨다(reinject는
-        // pack_reinject 마커로 멱등). 기준선 미갱신의 부작용은 같은 팩의 replay 허용뿐인데, 이미
-        // 디스크에 반영된 동일 정당 팩이라 보안 강등이 없고 다음 성공 pack-update가 기준선을 재기록한다.
-        if let Err(e) = cys::packsig::record_accepted(accepted_path, &manifest) {
-            eprintln!(
-                "[pack-update] ⚠ accepted 기록 실패(replay 기준선 미갱신): {e} — \
-                 디스크 팩은 이미 반영됨, reinject 계속 진행(멱등). 다음 pack-update가 기준선 재기록."
-            );
-        }
     }
 
     Ok(PackUpdateOutcome {
@@ -4361,7 +4440,7 @@ fn adapter_ready(agent: &Option<String>, idle: bool, idle_secs: u64, scrollback_
 /// 살아있는 노드에 무중단 reinject(§7-②) — control.dashboard(state)·system.topology(마커)를 읽어
 /// reinject_decision으로 판정, Inject만 디렉티브 주입 후 reinject.mark RPC로 기록(P3).
 /// ★라이브 데몬 필요 — 실주입 검증은 P7. 여기선 결정 로직 배선만(베스트에포트).
-fn run_pack_reinject(new_version: &str) -> Result<(usize, usize, usize, usize), String> {
+fn run_pack_reinject(new_version: &str) -> Result<ReinjectReport, String> {
     // 마커(role → ReinjectMarker)는 system.topology.saved가 노출(P3가 pack_reinject 영속).
     let topo = request("system.topology", json!({}))?;
     let mut markers: std::collections::HashMap<String, ReinjectMarker> = std::collections::HashMap::new();
@@ -4383,6 +4462,7 @@ fn run_pack_reinject(new_version: &str) -> Result<(usize, usize, usize, usize), 
     let dash = request("control.dashboard", json!({}))?;
     let fleet = dash["fleet"].as_array().cloned().unwrap_or_default();
     let (mut injected, mut skipped, mut deferred, mut failed) = (0usize, 0usize, 0usize, 0usize);
+    let mut deferred_nodes: Vec<(u64, String)> = Vec::new();
     for node in &fleet {
         let Some(sid) = node["surface_id"].as_u64() else { continue };
         let Some(role) = node["role"].as_str() else { continue };
@@ -4429,19 +4509,171 @@ fn run_pack_reinject(new_version: &str) -> Result<(usize, usize, usize, usize), 
                 injected += 1;
             }
             ReinjectDecision::SkipUnchanged | ReinjectDecision::SkipDedup => skipped += 1,
-            ReinjectDecision::Defer => deferred += 1,
+            ReinjectDecision::Defer => {
+                deferred += 1;
+                deferred_nodes.push((sid, role.to_string()));
+            }
         }
     }
-    Ok((injected, skipped, deferred, failed))
+    Ok(ReinjectReport { injected, skipped, deferred, failed, deferred_nodes })
+}
+
+/// LOW#1 pending 소비 핵심 — 라이브 토폴로지(markers)·플릿(fleet)·주입을 인자/클로저로 받아
+/// 데몬 비의존 단위테스트가 가능하다. 각 pending 노드를 run_pack_reinject와 동일한 신호로
+/// reinject_decision 재평가한다: Inject→주입+마크 성공 시 해소 / Skip*(이미 최신)→해소 /
+/// 노드 부재(닫힘)·합성 실패(비표준 역할)→해소(무한 잔존 방지) / Defer(여전히 busy)·주입·마크
+/// 실패→pending 잔존. 잔존 0이면 파일 삭제, 아니면 잔존 노드로 재기록(pack_version 보존).
+/// pending_ver를 새 버전으로 쓰므로(현재 디스크 팩 == 보류 당시 버전), version gate와 독립이다.
+/// 반환=(resolved, kept).
+#[allow(clippy::too_many_arguments)]
+fn consume_reinject_pending_core(
+    base: &std::path::Path,
+    pending_ver: &str,
+    pending_nodes: &[(u64, String)],
+    markers: &std::collections::HashMap<String, ReinjectMarker>,
+    fleet: &[serde_json::Value],
+    compose: impl Fn(&str) -> Result<String, String>,
+    read_tail: impl Fn(u64) -> String,
+    inject: impl Fn(u64, &str) -> Result<(), String>,
+    mark: impl Fn(u64, &str, &str) -> Result<(), String>,
+) -> std::io::Result<(usize, usize)> {
+    let mut kept: Vec<(u64, String)> = Vec::new();
+    let mut resolved = 0usize;
+    for (sid, role) in pending_nodes {
+        // 라이브 플릿에서 해당 surface 조회 — 부재(닫힘)면 재시도 대상 자체가 없으므로 해소 처리.
+        let Some(node) = fleet.iter().find(|n| n["surface_id"].as_u64() == Some(*sid)) else {
+            resolved += 1;
+            continue;
+        };
+        let agent = node["agent"].as_str().map(|s| s.to_string());
+        let idle = node["state"].as_str() == Some("idle");
+        let idle_secs = node["idle_secs"].as_u64().unwrap_or(0);
+        // 자기보고 게이트(§7-② step2) — null(미보고)은 보수적으로 비idle.
+        let self_idle = match node["agent_status"].as_str() {
+            Some(st) => st != "working",
+            None => false,
+        };
+        // 디렉티브 합성 실패(비표준 역할)는 영영 주입 불가 → 해소(stale 잔존 방지).
+        let Ok(directive) = compose(role) else {
+            resolved += 1;
+            continue;
+        };
+        let new_hash = sha256_hex(&directive);
+        let ready = adapter_ready(&agent, idle, idle_secs, &read_tail(*sid));
+        match reinject_decision(markers.get(role.as_str()), pending_ver, &new_hash, idle, self_idle, ready)
+        {
+            ReinjectDecision::Inject => {
+                // per-node 에러 격리 — 한 노드의 실패가 나머지 재시도를 막지 않게 잔존 처리 후 계속.
+                if inject(*sid, &directive).is_err() {
+                    kept.push((*sid, role.clone()));
+                    continue;
+                }
+                if mark(*sid, pending_ver, &new_hash).is_err() {
+                    kept.push((*sid, role.clone()));
+                    continue;
+                }
+                resolved += 1;
+            }
+            ReinjectDecision::SkipUnchanged | ReinjectDecision::SkipDedup => resolved += 1,
+            ReinjectDecision::Defer => kept.push((*sid, role.clone())),
+        }
+    }
+    persist_reinject_pending(base, pending_ver, &kept)?;
+    Ok((resolved, kept.len()))
+}
+
+/// LOW#1 능동 소비 진입점 — run_pack_update 착수 시 1회 호출. 디스크 pending이 있으면 지금 idle인
+/// 보류 노드에 reinject를 재시도한다(write-only였던 pending을 능동 소비). pending 부재/빈 목록 →
+/// no-op(데몬 접속 없이 즉시 반환). 데몬 미가동 → Err(호출자가 로깅·계속, pending 보존 = graceful).
+fn consume_reinject_pending(base: &std::path::Path) -> Result<(usize, usize), String> {
+    let Some((ver, nodes)) = read_reinject_pending(base).map_err(|e| e.to_string())? else {
+        return Ok((0, 0));
+    };
+    if nodes.is_empty() {
+        // 빈 deferred만 남은 stale 파일 → 정리(데몬 접속 불요).
+        let _ = std::fs::remove_file(reinject_pending_path(base));
+        return Ok((0, 0));
+    }
+    // 라이브 토폴로지(마커)·플릿(상태) — 데몬 필요. 미가동이면 ?로 Err 전파(graceful 스킵·pending 보존).
+    let topo = request("system.topology", json!({}))?;
+    let mut markers: std::collections::HashMap<String, ReinjectMarker> =
+        std::collections::HashMap::new();
+    if let Some(saved) = topo["saved"].as_array() {
+        for e in saved {
+            if let (Some(role), Some(pr)) = (e["role"].as_str(), e.get("pack_reinject")) {
+                if let (Some(pv), Some(dh)) =
+                    (pr["pack_version"].as_str(), pr["directive_hash"].as_str())
+                {
+                    markers.insert(
+                        role.to_string(),
+                        ReinjectMarker {
+                            pack_version: pv.to_string(),
+                            directive_hash: dh.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    let dash = request("control.dashboard", json!({}))?;
+    let fleet = dash["fleet"].as_array().cloned().unwrap_or_default();
+    consume_reinject_pending_core(
+        base,
+        &ver,
+        &nodes,
+        &markers,
+        &fleet,
+        compose_directive,
+        |sid| {
+            request("surface.read_text", json!({"surface_id": sid}))
+                .ok()
+                .and_then(|r| r["text"].as_str().map(|s| s.to_string()))
+                .unwrap_or_default()
+        },
+        inject_text,
+        |sid, ver, hash| {
+            request(
+                "reinject.mark",
+                json!({"surface_id": sid, "pack_version": ver, "directive_hash": hash}),
+            )
+            .map(|_| ())
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// `cys pack-update` 진입점(§2-② 전체 흐름). --from(핵심)·--manifest-url(부차).
 fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: bool) -> i32 {
-    let result = (|| -> Result<(), String> {
+    // 성공 경로는 종료코드(i32)를 싣는다: 0=완전 성공, EXIT_REINJECT_DEGRADED=디스크는 반영됐으나
+    // 라이브 노드 reinject 실패(성공 침묵 포장 금지). 에러 경로(Err)는 외부에서 1로 매핑.
+    let result = (|| -> Result<i32, String> {
         let base = pack_state_base();
         let staging = base.join(".pack-staging");
         let lock_path = base.join(".pack-apply.lock");
         let accepted_path = base.join(".pack-accepted.json");
+
+        // 착수 시 crash recovery(§7-⑤): 직전 pack-update가 apply 도중 죽어 orphan 저널이 남았으면
+        // 먼저 자가치유한다(미커밋=rollback / 커밋완료=정리). dry-run·UpToDate 경로도 거치도록
+        // 소스 해석 전에, apply-lock 보유 하에 1회 수행한다.
+        with_apply_lock(&lock_path, cys::pack::recover_pack_journal)??;
+
+        // LOW#1: 착수 시 1회 — 직전 pack-update가 busy로 보류(deferred)한 노드를 능동 재시도한다.
+        // version gate 판정 전·독립(디스크 팩이 이미 그 버전이라 UpToDate여도 동작): 보류 당시 busy였던
+        // 노드가 지금 idle이면 reinject를 완료하고 pending에서 제거한다. dry-run은 부작용 없음 계약이라
+        // 생략. 데몬 미가동이면 graceful 스킵(Err 로깅·pending 보존).
+        if !dry_run {
+            match consume_reinject_pending(&base) {
+                Ok((resolved, kept)) if resolved > 0 || kept > 0 => {
+                    println!(
+                        "[pack-update] pending reinject 소비: {resolved} 해소, {kept} 잔존."
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[pack-update] pending reinject 소비 스킵(데몬 점검 필요): {e}")
+                }
+            }
+        }
 
         // 소스 해석: --from(로컬 디렉터리) 우선. --manifest-url은 staging에 fetch(부차).
         let from_dir: std::path::PathBuf = match (from, manifest_url) {
@@ -4470,7 +4702,7 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                     "[pack-update] 이미 최신 — 반영 0 (remote {} ≤ 디스크). no-op.",
                     outcome.pack_version
                 );
-                return Ok(());
+                return Ok(0);
             }
             VersionGate::BinaryTooOld => {
                 eprintln!(
@@ -4488,7 +4720,7 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                 "[pack-update] dry-run: 검증·게이트 통과(팩 {} 반영 가능) — 디스크 반영·reinject 생략.",
                 outcome.pack_version
             );
-            return Ok(());
+            return Ok(0);
         }
 
         println!(
@@ -4497,16 +4729,58 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
         );
 
         // 6) 살아있는 노드 reinject(§7-②) — 베스트에포트(데몬 미가동 시 경고만).
+        //    디스크 반영은 이미 성공(commit). reinject 결과는 별도 신호로 전파한다:
+        //    failed>0 → 종료코드 EXIT_REINJECT_DEGRADED + 경고(성공 침묵 포장 금지),
+        //    deferred>0 → pending 영속(다음 pack-update/노드 idle 시 재시도) + 경고.
         match run_pack_reinject(&outcome.pack_version) {
-            Ok((inj, skip, defer, fail)) => println!(
-                "[pack-update] reinject: {inj} injected, {skip} skipped, {defer} deferred, {fail} failed."
-            ),
-            Err(e) => eprintln!("[pack-update] reinject 스킵(데몬 점검 필요): {e}"),
+            Ok(rep) => {
+                println!(
+                    "[pack-update] reinject: {} injected, {} skipped, {} deferred, {} failed.",
+                    rep.injected, rep.skipped, rep.deferred, rep.failed
+                );
+                // 구조화 출력(Tauri 브리지가 failed/deferred를 파싱해 update-warning emit).
+                println!(
+                    "{} pack_version={} injected={} skipped={} deferred={} failed={}",
+                    cys::pack::REINJECT_RESULT_PREFIX,
+                    outcome.pack_version,
+                    rep.injected,
+                    rep.skipped,
+                    rep.deferred,
+                    rep.failed
+                );
+                // deferred(busy) 노드 pending 영속 / 없으면 stale 제거(가시화·재시도 SOT).
+                if let Err(e) =
+                    persist_reinject_pending(&base, &outcome.pack_version, &rep.deferred_nodes)
+                {
+                    eprintln!("[pack-update] ⚠ deferred pending 영속 실패: {e}");
+                }
+                if rep.deferred > 0 {
+                    eprintln!(
+                        "[pack-update] ⚠ {} 노드 busy → reinject 보류(pending 영속: {}). \
+                         다음 pack-update 또는 노드 idle 시 재시도됩니다.",
+                        rep.deferred,
+                        reinject_pending_path(&base).display()
+                    );
+                }
+                if rep.failed > 0 {
+                    eprintln!(
+                        "[pack-update] ⚠ {} 노드 reinject 실패 — 디스크 팩은 {} 로 갱신됐으나 해당 \
+                         노드는 미각성(이전 지침으로 동작). 디스크 반영은 성공이라 롤백하지 않음. \
+                         다음 pack-update에서 재시도됩니다(성공으로 침묵 포장하지 않음).",
+                        rep.failed, outcome.pack_version
+                    );
+                }
+                Ok(reinject_exit_code(rep.failed))
+            }
+            // 데몬 미가동 등으로 reinject 자체를 못 함 — 디스크 반영은 성공(무중단 정책상 0).
+            Err(e) => {
+                eprintln!("[pack-update] reinject 스킵(데몬 점검 필요): {e}");
+                Ok(0)
+            }
         }
-        Ok(())
     })();
     match result {
-        Ok(()) => 0,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e}");
             1
@@ -4841,6 +5115,201 @@ mod tests {
             reinject_decision(None, "1.0.0", "HASH_X", true, false, true),
             ReinjectDecision::Defer
         );
+    }
+
+    /// reinject 집계 → pack-update 종료코드: failed>0이면 degraded(성공 침묵 포장 금지),
+    /// failed==0이면 0(deferred만 있어도 디스크 반영은 성공이라 0). #3 핵심 신호 계약.
+    #[test]
+    fn reinject_failed_signals_degraded_exit() {
+        assert_eq!(reinject_exit_code(0), 0, "실패 0 → 성공(0)");
+        assert_eq!(
+            reinject_exit_code(1),
+            cys::pack::EXIT_REINJECT_DEGRADED,
+            "실패>0 → degraded 종료코드(성공으로 침묵 포장 금지)"
+        );
+        assert_eq!(reinject_exit_code(5), cys::pack::EXIT_REINJECT_DEGRADED);
+        // 0(완전 성공)·1(일반 실패)과 구분되는 신호여야 호출자가 디스크 반영+미각성을 분간한다.
+        assert_ne!(cys::pack::EXIT_REINJECT_DEGRADED, 0);
+        assert_ne!(cys::pack::EXIT_REINJECT_DEGRADED, 1);
+    }
+
+    /// deferred(busy) 노드 pending 영속: deferred>0 → {pack_version, deferred:[{surface_id, role}]}
+    /// 기록, deferred==0 → stale pending 제거(없으면 no-op). #3 deferred 가시화·재시도 계약.
+    #[test]
+    fn reinject_pending_persists_and_clears() {
+        let base = std::env::temp_dir().join(format!("cys-reinject-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = reinject_pending_path(&base);
+
+        // deferred 없으면 기존 파일 없을 때 no-op(에러 아님).
+        assert!(!path.exists());
+        persist_reinject_pending(&base, "2.0.0", &[]).unwrap();
+        assert!(!path.exists(), "deferred 0·기존 부재 → 파일 생성 안 함");
+
+        // deferred>0 → pending 영속(버전·노드 목록 보존).
+        let deferred = vec![(7u64, "worker".to_string()), (9u64, "cso".to_string())];
+        persist_reinject_pending(&base, "2.0.0", &deferred).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["pack_version"], "2.0.0");
+        let nodes = doc["deferred"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0]["surface_id"], 7);
+        assert_eq!(nodes[0]["role"], "worker");
+        assert_eq!(nodes[1]["surface_id"], 9);
+        assert_eq!(nodes[1]["role"], "cso");
+
+        // 이후 deferred 0 → stale pending 제거(다음 실행이 해소됐음을 반영).
+        persist_reinject_pending(&base, "2.1.0", &[]).unwrap();
+        assert!(!path.exists(), "deferred 해소 → stale pending 제거");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// LOW#1 능동 소비: pending에 보류된 2노드 중 지금 idle인 노드는 재주입(inject+mark)·해소하고,
+    /// 여전히 busy(자기보고 working)인 노드는 pending에 잔존시킨다. 잔존 노드만 재기록되는지 확인.
+    #[test]
+    fn pending_consume_retries_idle_keeps_busy() {
+        let base = std::env::temp_dir().join(format!("cys-pending-c1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = reinject_pending_path(&base);
+
+        // 보류된 2노드 영속(둘 다 직전 pack-update에서 busy였다).
+        persist_reinject_pending(
+            &base,
+            "2.0.0",
+            &[(7u64, "worker".to_string()), (9u64, "cso".to_string())],
+        )
+        .unwrap();
+        let (ver, nodes) = read_reinject_pending(&base).unwrap().unwrap();
+        assert_eq!(ver, "2.0.0");
+        assert_eq!(nodes.len(), 2);
+
+        // 라이브 플릿: surface 7=idle·ready(agent 부재→idle+quiet fallback), surface 9=working.
+        let fleet = vec![
+            json!({"surface_id":7, "role":"worker", "state":"idle", "idle_secs":30, "agent_status":"idle"}),
+            json!({"surface_id":9, "role":"cso", "state":"idle", "idle_secs":30, "agent_status":"working"}),
+        ];
+        let markers = std::collections::HashMap::new(); // 마커 부재(첫 주입) → 3신호 AND면 Inject.
+
+        let injected = std::cell::Cell::new(0u32);
+        let marked = std::cell::Cell::new(0u32);
+        let (resolved, kept) = consume_reinject_pending_core(
+            &base,
+            &ver,
+            &nodes,
+            &markers,
+            &fleet,
+            |_role| Ok("DIRECTIVE-BODY".to_string()),
+            |_sid| String::new(), // tail 빈값 — ready_marker 부재 어댑터는 idle+quiet fallback.
+            |_sid, _t| {
+                injected.set(injected.get() + 1);
+                Ok(())
+            },
+            |_sid, _v, _h| {
+                marked.set(marked.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved, 1, "idle 노드 1개 해소");
+        assert_eq!(kept, 1, "busy 노드 1개 잔존");
+        assert_eq!(injected.get(), 1, "idle 노드만 주입");
+        assert_eq!(marked.get(), 1, "주입 성공 노드만 마크");
+        // pending은 busy 노드(surface 9)만 남아 재기록.
+        assert!(path.exists(), "잔존 노드 있음 → pending 유지");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let remaining = doc["deferred"].as_array().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["surface_id"], 9);
+        assert_eq!(remaining[0]["role"], "cso");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// LOW#1: 보류 노드가 전부 해소되면(모두 idle 주입 성공) pending 파일을 삭제한다.
+    #[test]
+    fn pending_consume_clears_file_when_all_resolved() {
+        let base = std::env::temp_dir().join(format!("cys-pending-c2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let path = reinject_pending_path(&base);
+
+        persist_reinject_pending(&base, "2.0.0", &[(7u64, "worker".to_string())]).unwrap();
+        let (ver, nodes) = read_reinject_pending(&base).unwrap().unwrap();
+        let fleet = vec![
+            json!({"surface_id":7, "role":"worker", "state":"idle", "idle_secs":30, "agent_status":"idle"}),
+        ];
+        let markers = std::collections::HashMap::new();
+        let (resolved, kept) = consume_reinject_pending_core(
+            &base,
+            &ver,
+            &nodes,
+            &markers,
+            &fleet,
+            |_role| Ok("DIRECTIVE-BODY".to_string()),
+            |_sid| String::new(),
+            |_sid, _t| Ok(()),
+            |_sid, _v, _h| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(resolved, 1);
+        assert_eq!(kept, 0);
+        assert!(!path.exists(), "전부 해소 → pending 삭제");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// LOW#1: pending 파일이 없으면 consume_reinject_pending은 데몬 접속 없이 즉시 no-op(0,0).
+    #[test]
+    fn pending_consume_noop_when_absent() {
+        let base = std::env::temp_dir().join(format!("cys-pending-c3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(!reinject_pending_path(&base).exists());
+        // 데몬 접속 없이 즉시 반환(요청 함수 호출 없음).
+        let r = consume_reinject_pending(&base).unwrap();
+        assert_eq!(r, (0, 0));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// LOW#1: pending이 있는데 데몬 미가동이면 graceful — Err 반환·pending 보존(소실 없음).
+    #[test]
+    fn pending_consume_graceful_when_daemon_absent() {
+        let _g = PACK_UPDATE_ENV_LOCK.lock().unwrap();
+        // 존재하지 않는 소켓으로 강제 + autostart 차단 → request 결정론적 실패(실데몬 비접촉).
+        let saved_sock = std::env::var(cys::ENV_SOCKET).ok();
+        let saved_noauto = std::env::var("CYS_NO_AUTOSTART").ok();
+        let base = std::env::temp_dir().join(format!("cys-pending-c4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::env::set_var(cys::ENV_SOCKET, base.join("nonexistent.sock"));
+        std::env::set_var("CYS_NO_AUTOSTART", "1");
+
+        let path = reinject_pending_path(&base);
+        persist_reinject_pending(&base, "2.0.0", &[(7u64, "worker".to_string())]).unwrap();
+        assert!(path.exists());
+
+        let res = consume_reinject_pending(&base);
+
+        // env 복원(assert 전).
+        match saved_sock {
+            Some(v) => std::env::set_var(cys::ENV_SOCKET, v),
+            None => std::env::remove_var(cys::ENV_SOCKET),
+        }
+        match saved_noauto {
+            Some(v) => std::env::set_var("CYS_NO_AUTOSTART", v),
+            None => std::env::remove_var("CYS_NO_AUTOSTART"),
+        }
+        let preserved = path.exists();
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(res.is_err(), "데몬 미가동 → Err(graceful 스킵 신호)");
+        assert!(preserved, "데몬 부재 시 pending 보존(소실 금지)");
     }
 
     /// ★오프라인 통합: 서명된 테스트 팩을 --from 코어로 적용 → .pack-version·파일·accepted 반영.

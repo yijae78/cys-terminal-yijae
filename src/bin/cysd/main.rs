@@ -54,6 +54,14 @@ fn scrub_claude_session_env() {
 #[tokio::main]
 async fn main() {
     scrub_claude_session_env();
+    // crash recovery(§7-⑤): 직전 pack-update가 apply 도중 죽어 남긴 orphan 저널을 install(false)
+    // **이전에** 자가치유한다(미커밋=rollback / 커밋완료=정리). 순서가 중요 — install(false)가
+    // 부분반영 트리 위에서 돌면 안 되므로 반드시 선행한다.
+    match cys::pack::recover_pack_journal() {
+        Ok(true) => eprintln!("[cysd] pack-update orphan journal recovered (self-heal)"),
+        Ok(false) => {}
+        Err(e) => eprintln!("[cysd] pack journal recovery skipped: {e}"),
+    }
     // 온보딩②: 신규 머신 첫 기동 시 pack 자동 설치 (보존 모드 — 기존 사용자 파일 불가침).
     // launch-agent·디렉티브·acl이 "init-pack을 아는 사람"에게만 동작하는 것을 없앤다.
     match cys::pack::install(false) {

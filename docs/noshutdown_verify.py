@@ -10,12 +10,25 @@
   | 팩 반영   | 파일              | <pack_dir>/.pack-version      | 새 버전으로 범프     |
 
 ★불합격(hard fail): daemon_pid 변동 = 데몬 재시작 = 무중단 위반 = FAIL.
-  (cys-app pid는 OS 프로세스 — 라이브 Tauri 앱이 있을 때만 의미. 여기선 cysd·세션 생존을 본다.)
+  --app-pid 를 주면 cys-app(Tauri) OS 프로세스 pid·기동시각 동일성(재시작 0)도 검증한다.
 
-라이브 데몬이 없거나 서명된 테스트 팩(--from)이 없으면 **graceful skip**(로직은 완성, exit 0).
+★노드 각성 검증: pack-update 후 `system.topology`의 surface별 `pack_reinject` 마커가
+  새 pack_version으로 갱신됐는지 확인한다(부분/낡은 각성 = FAIL). 디렉티브 해시 불변 시
+  reinject는 스킵되므로(설계 §7-② step1) 마커 변동 없음은 정상으로 본다.
+
+출력·exit code는 SKIP/PASS/FAIL을 명확히 구분한다:
+  - PASS  → exit 0   (모든 검사 통과)
+  - FAIL  → exit 1   (검사 1건 이상 실패 = 무중단/각성 위반)
+  - SKIP  → exit 77  (라이브 데몬/테스트 팩 부재 — 평시 graceful skip, pass와 구분)
+
+릴리스/승인용 hard gate 모드:
+  --require-live  → 라이브 cysd 부재 = skip 아니라 FAIL(non-zero).
+  --require-pack  → 테스트 팩(--from) 부재/불완전 = skip 아니라 FAIL(non-zero).
 
 실행:
   python3 docs/noshutdown_verify.py --from /path/to/testpack   # pack.tar.gz+manifest+.minisig
+  python3 docs/noshutdown_verify.py --from ... --require-live --require-pack   # 릴리스 게이트
+  python3 docs/noshutdown_verify.py --from ... --app-pid 12345                 # Tauri 앱 동일성도
   CYS_SOCKET=... CYS_PACK_DIR=... python3 docs/noshutdown_verify.py --from ...
 """
 import argparse
@@ -135,12 +148,66 @@ def version_bumped(before, after):
     return bool(after) and after != before
 
 
+SKIP_EXIT = 77  # skip을 pass(0)·fail(1)과 명확히 구분하는 종료코드.
+
+
+def proc_alive(pid):
+    """pid 프로세스 생존 여부 — signal 0(존재 검사, 미전달)."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # 존재하나 시그널 권한 없음 = 살아있음.
+    except OSError:
+        return False
+
+
+def proc_starttime(pid):
+    """프로세스 기동시각(ps lstart) — 동일 pid 재사용(재시작) 판별용. 실패 시 빈 문자열."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def topology_markers(sock_path):
+    """system.topology의 saved 엔트리에서 {키: pack_version} reinject 마커 맵 추출.
+
+    키 = session_id 우선(없으면 role) — surface별 마커를 안정 식별. RPC 미지원/오류 시 None.
+    """
+    try:
+        topo = rpc(sock_path, "system.topology", {})
+    except (DaemonUnavailable, RuntimeError, OSError):
+        return None
+    markers = {}
+    for e in topo.get("saved", []) or []:
+        if not isinstance(e, dict):
+            continue
+        pr = e.get("pack_reinject")
+        if isinstance(pr, dict) and pr.get("pack_version"):
+            key = e.get("session_id") or e.get("role") or repr(sorted(e.items()))
+            markers[key] = pr.get("pack_version")
+    return markers
+
+
 def main():
     ap = argparse.ArgumentParser(description="무중단 팩 업데이트 실측 E2E")
     ap.add_argument("--from", dest="from_dir",
                     help="테스트 팩 디렉터리(pack.tar.gz + pack-manifest.json + pack-manifest.json.minisig)")
     ap.add_argument("--socket", default=default_socket(), help="cysd Unix 소켓 경로")
     ap.add_argument("--pack-dir", default=default_pack_dir(), help="설치 팩 디렉터리(.pack-version 위치)")
+    ap.add_argument("--require-live", action="store_true",
+                    help="라이브 cysd 부재 시 skip이 아니라 FAIL(릴리스/승인 게이트)")
+    ap.add_argument("--require-pack", action="store_true",
+                    help="테스트 팩(--from) 부재/불완전 시 skip이 아니라 FAIL(릴리스/승인 게이트)")
+    ap.add_argument("--app-pid", type=int, default=None,
+                    help="cys-app(Tauri) OS 프로세스 pid — 주면 pack-update 전후 동일성(재시작 0) 검증")
     args = ap.parse_args()
 
     fails = []
@@ -151,22 +218,44 @@ def main():
         if not cond:
             fails.append(name)
 
-    # 게이트 0: 라이브 데몬 — 없으면 graceful skip(로직 완성·exit 0).
+    # 게이트 0: 라이브 데몬 — 평시 graceful skip(exit 77), --require-live면 FAIL(exit 1).
     try:
         rpc(args.socket, "system.ping", {})
     except (DaemonUnavailable, OSError) as e:
-        print(f"[SKIP] 라이브 cysd 없음({args.socket}): {e} — 무중단 실측 생략(로직은 완성).")
-        return 0
+        msg = f"라이브 cysd 없음({args.socket}): {e}"
+        if args.require_live:
+            print(f"[FAIL] {msg} — --require-live 게이트(skip 불가).")
+            return 1
+        print(f"[SKIP] {msg} — 무중단 실측 생략(로직은 완성).")
+        return SKIP_EXIT
 
-    # 게이트 0': 서명된 테스트 팩 — 없으면 graceful skip.
+    # 게이트 0': 서명된 테스트 팩 — 평시 graceful skip(exit 77), --require-pack면 FAIL(exit 1).
+    def pack_gate_skip(reason):
+        if args.require_pack:
+            print(f"[FAIL] {reason} — --require-pack 게이트(skip 불가).")
+            return 1
+        print(f"[SKIP] {reason} 실측 생략(로직은 완성).")
+        return SKIP_EXIT
+
     if not args.from_dir:
-        print("[SKIP] --from 미지정 — 서명된 테스트 팩이 있어야 실측 가능(로직은 완성).")
-        return 0
+        return pack_gate_skip("--from 미지정 — 서명된 테스트 팩이 있어야 실측 가능.")
     needed = ["pack.tar.gz", "pack-manifest.json", "pack-manifest.json.minisig"]
     missing = [f for f in needed if not os.path.isfile(os.path.join(args.from_dir, f))]
     if missing:
-        print(f"[SKIP] 테스트 팩 불완전({args.from_dir}) — 누락 {missing}. 실측 생략(로직은 완성).")
-        return 0
+        return pack_gate_skip(f"테스트 팩 불완전({args.from_dir}) — 누락 {missing}.")
+
+    # cys-app(Tauri) 기동시각 — pack-update가 OS 앱 프로세스를 재시작하지 않음을 보장(재시작 0).
+    app_before = None
+    if args.app_pid is not None:
+        if not proc_alive(args.app_pid):
+            check(f"cys-app(pid {args.app_pid}) 반영 전 생존", False,
+                  "프로세스 부재 — --app-pid 확인")
+        else:
+            app_before = proc_starttime(args.app_pid)
+            print(f"[snap-before] app_pid={args.app_pid} starttime={app_before!r}")
+
+    # ★노드 각성 — 반영 전 reinject 마커 베이스라인(session_id→pack_version).
+    markers_before = topology_markers(args.socket) or {}
 
     # 반영 전 스냅샷.
     before = snapshot(args.socket, args.pack_dir)
@@ -208,10 +297,34 @@ def main():
           version_bumped(before["pack_version"], after["pack_version"]),
           f"{before['pack_version']!r} → {after['pack_version']!r} (범프 안 됨)")
 
+    # ★cys-app(Tauri) 동일성 — 재시작 0(같은 프로세스 인스턴스 유지).
+    if app_before is not None:
+        app_after = proc_starttime(args.app_pid)
+        check(f"cys-app(pid {args.app_pid}) 생존 — 재시작 0",
+              proc_alive(args.app_pid) and app_after == app_before,
+              f"기동시각 {app_before!r} → {app_after!r} (변동 = 앱 재시작 = 무중단 위반)")
+
+    # ★노드 각성 검증 — pack_reinject 마커가 새 pack_version으로 갱신됐는지.
+    markers_after = topology_markers(args.socket)
+    if markers_after is None:
+        print("[awaken] system.topology 미응답 — 각성 마커 확인 생략(RPC 미노출 가능).")
+    else:
+        new_ver = after["pack_version"]
+        changed = {k: v for k, v in markers_after.items() if markers_before.get(k) != v}
+        awakened = [k for k, v in changed.items() if v == new_ver]
+        stale = {k: v for k, v in changed.items() if v != new_ver}
+        print(f"[awaken] reinject 마커: 새 버전({new_ver!r}) 각성 {len(awakened)}개, "
+              f"마커 변동 없음 {len(markers_after) - len(changed)}개 "
+              f"(디렉티브 해시 불변 시 reinject 스킵 — 설계 §7-② step1).")
+        # 마커가 '변했다면' 반드시 새 버전이어야 한다(부분/낡은 각성 = FAIL).
+        check("노드 각성 — 변경된 reinject 마커는 새 pack_version",
+              not stale,
+              f"낡은/오류 마커: {stale} (기대 {new_ver!r})")
+
     if fails:
-        print(f"\n❌ FAIL {len(fails)}건: {fails}")
+        print(f"\n[FAIL] {len(fails)}건: {fails}")
         return 1
-    print("\n✅ 무중단 검증 통과 — cysd·세션 전부 생존, 팩만 갱신(재시작 0).")
+    print("\n[PASS] 무중단 검증 통과 — cysd·세션·앱 생존, 팩만 갱신(재시작 0), 노드 각성 정합.")
     return 0
 
 

@@ -1158,22 +1158,74 @@ async fn install_pack_update(
         .await
         .map_err(|e| format!("pack-update join 실패: {e}"))?
         .map_err(|e| format!("cys pack-update 실행 실패 ({}): {e}", cys.display()))?;
-    if !out.status.success() {
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    // 종료코드 구분: EXIT_REINJECT_DEGRADED = 디스크 팩은 반영됐으나 라이브 노드 reinject 실패
+    // (일부 미각성) — 디스크는 성공이므로 pack-updated를 emit하되 update-warning을 함께 띄운다.
+    // 그 외 비0 = 실제 실패(디스크 미반영) → 구 캐시 유지가 안전하므로 update-error만.
+    let degraded = out.status.code() == Some(cys::pack::EXIT_REINJECT_DEGRADED);
+    if !out.status.success() && !degraded {
         // ★실패 — "pack-updated"는 emit하지 않는다(구 캐시 유지가 stale 갱신보다 안전). update-error만.
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         let _ = app.emit(
             "update-error",
             json!({"phase": "pack-update", "message": stderr.clone()}),
         );
         return Err(format!("pack-update 실패: {stderr}"));
     }
-    // ★성공 종료 후에만 — 디스크 .pack-version을 읽어 새 팩 버전으로 브로드캐스트(§2-②/§7-③).
+    // ★디스크 반영 성공(success 또는 degraded) — .pack-version을 읽어 새 팩 버전으로 브로드캐스트(§2-②/§7-③).
     //   read_board_catalog가 pack_dir의 정적 파일을 읽는 것과 동일 SOT(pack_dir).
     let pack_version = std::fs::read_to_string(cys::pack::pack_dir().join(".pack-version"))
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    let _ = app.emit("pack-updated", json!({"pack_version": pack_version}));
+    // 사이드카 구조화 출력에서 reinject failed/deferred 집계 — 라이브 미각성을 사용자에게 경고.
+    let (failed, deferred) = parse_reinject_counts(&stdout);
+    if failed > 0 || deferred > 0 {
+        // ★성공으로만 포장 금지 — 디스크는 갱신됐으나 라이브 노드 일부 미각성/보류를 경고한다.
+        //   (app.restart는 여전히 미호출 — 무중단 불변식 유지.)
+        let _ = app.emit(
+            "update-warning",
+            json!({
+                "phase": "pack-update",
+                "pack_version": pack_version,
+                "reinject_failed": failed,
+                "reinject_deferred": deferred,
+                "message": format!(
+                    "디스크 팩은 {pack_version} 로 갱신됐으나 reinject {failed} 실패·{deferred} 보류 — \
+                     일부 노드 미각성(라이브 무중단 유지, 재시작 안 함). 다음 pack-update에서 재시도됩니다."
+                ),
+            }),
+        );
+    }
+    let _ = app.emit(
+        "pack-updated",
+        json!({
+            "pack_version": pack_version,
+            "reinject_failed": failed,
+            "reinject_deferred": deferred,
+        }),
+    );
     Ok(pack_version)
+}
+
+/// 사이드카(cys pack-update) stdout에서 `PACK_UPDATE_RESULT … failed=N deferred=N` 토큰을 파싱해
+/// (failed, deferred)를 돌려준다. 토큰 부재(구버전 사이드카·reinject 스킵 등)면 (0,0) — 보수적.
+/// 사람용 메시지와 독립한 안정 토큰(REINJECT_RESULT_PREFIX)만 신뢰한다.
+fn parse_reinject_counts(stdout: &str) -> (u64, u64) {
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(cys::pack::REINJECT_RESULT_PREFIX) {
+            let (mut failed, mut deferred) = (0u64, 0u64);
+            for tok in rest.split_whitespace() {
+                if let Some(v) = tok.strip_prefix("failed=") {
+                    failed = v.parse().unwrap_or(0);
+                } else if let Some(v) = tok.strip_prefix("deferred=") {
+                    deferred = v.parse().unwrap_or(0);
+                }
+            }
+            return (failed, deferred);
+        }
+    }
+    (0, 0)
 }
 
 /// `ledger.list` 응답에서 scoped 프로세스 pid만 추린다.
@@ -1332,6 +1384,31 @@ mod tests {
         assert!(url_host_allowed("https://evil.com#.github.com/").is_err(), "fragment 사칭 차단");
         assert!(url_host_allowed("https://evil.com?.github.com").is_err(), "query 사칭 차단");
         assert!(url_host_allowed("https://evil.com?x=.github.com").is_err(), "query 파라미터 사칭 차단");
+    }
+
+    // #3: 사이드카 stdout의 PACK_UPDATE_RESULT 토큰에서 reinject failed/deferred를 파싱해
+    // update-warning 발화 판단에 쓴다. 토큰 부재(구버전·reinject 스킵)는 (0,0)으로 보수적 처리.
+    #[test]
+    fn parse_reinject_counts_reads_structured_token() {
+        let out = "[pack-update] 팩 2.0.0 반영 완료 (3 written, 1 preserved). 노드 reinject 점검…\n\
+                   [pack-update] reinject: 2 injected, 1 skipped, 3 deferred, 4 failed.\n\
+                   PACK_UPDATE_RESULT pack_version=2.0.0 injected=2 skipped=1 deferred=3 failed=4\n";
+        assert_eq!(parse_reinject_counts(out), (4, 3), "failed=4 deferred=3 파싱");
+
+        // 토큰 부재 → (0,0) 보수적(경고 미발화).
+        assert_eq!(parse_reinject_counts("아무 의미 없는 출력\n"), (0, 0));
+        assert_eq!(parse_reinject_counts(""), (0, 0));
+
+        // failed=0 deferred=0 → (0,0)(완전 성공, 경고 없음).
+        assert_eq!(
+            parse_reinject_counts("PACK_UPDATE_RESULT pack_version=2.0.0 injected=5 skipped=0 deferred=0 failed=0"),
+            (0, 0)
+        );
+        // deferred만 있는 경우(busy 노드) — 경고 발화 대상.
+        assert_eq!(
+            parse_reinject_counts("PACK_UPDATE_RESULT pack_version=1.2.3 injected=0 skipped=0 deferred=2 failed=0"),
+            (0, 2)
+        );
     }
 
     // 회귀: windows 업데이트 핸드오프가 데몬을 taskkill /F로 하드킬하면 cysd의

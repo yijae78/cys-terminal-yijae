@@ -6,6 +6,15 @@ pub const ENV_PACK_DIR: &str = "CYS_PACK_DIR";
 /// cys 전용 CLAUDE_CONFIG_DIR 오버라이드(주로 테스트 격리용). 미설정 시 pack_dir 형제(~/.cys/claude).
 pub const ENV_CONFIG_DIR: &str = "CYS_CONFIG_DIR";
 
+/// pack-update 종료코드: 디스크 팩은 반영됐으나 라이브 노드 reinject에 실패가 있어 일부 노드가
+/// 미각성 상태(이전 지침으로 동작)임을 의미한다. 디스크 반영 자체는 성공이라 롤백하지 않되,
+/// 성공으로 침묵 포장하지 않도록 0/일반실패(1)와 구분되는 신호다. Tauri install_pack_update
+/// 브리지가 이 코드를 보고 pack-updated(디스크 갱신)+update-warning(라이브 미각성)을 함께 emit한다.
+pub const EXIT_REINJECT_DEGRADED: i32 = 3;
+/// run_pack_update가 reinject 집계를 stdout에 구조화 출력할 때 쓰는 줄 접두사. 호출자(Tauri
+/// 브리지)가 failed/deferred를 정확히 파싱하도록 사람용 메시지와 별개의 안정 토큰으로 둔다.
+pub const REINJECT_RESULT_PREFIX: &str = "PACK_UPDATE_RESULT";
+
 /// (상대경로, 내용) — init-jarvis 가 설치한다.
 pub const PACK: &[(&str, &str)] = &[
     ("README.md", include_str!("../cysjavis-pack/README.md")),
@@ -537,6 +546,7 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
         PACK.iter().chain(PACK_SKILLS.iter()).map(|(r, c)| (*r, *c)),
         force,
         env!("CARGO_PKG_VERSION"),
+        true, // embed/cysd 경로는 .pack-version을 종전대로 직접 기록(외부 동작 불변).
     )
 }
 
@@ -545,10 +555,15 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
 /// embed PACK iter(기존 경로)와 staged-tree iter(무중단 채널)가 같은 로직을 공유한다(중복 0·회귀 0).
 /// 다운그레이드 가드 비교 기준은 `target_version`(env! 직접 참조 제거 — staged 입력은 자기 버전을 넘김).
 /// force=false: 사용자 수정 파일 불가침 + 비수정 파일은 입력 신버전으로 자동 갱신. 반환: (written, kept).
+/// `write_version_marker`: true면 종전대로 마지막에 `.pack-version`을 best-effort 기록(embed/cysd
+/// 경로 — 외부 동작 불변). false면 기록하지 않는다 — 무중단 pack-update 트랜잭션
+/// (apply_pack_transactional)이 record_accepted **이후** `.pack-version`을 마지막 hard commit
+/// marker로 직접(검사 포함) 기록하기 위함(R2CODE HIGH #1).
 pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     items: I,
     force: bool,
     target_version: &str,
+    write_version_marker: bool,
 ) -> Result<(usize, usize), String> {
     // items를 한 번 Vec로 고정 — 쓰기 루프·prune embedded-set·exec bit 루프 세 곳이 같은 집합을 본다.
     let items: Vec<(&str, &str)> = items.into_iter().collect();
@@ -672,7 +687,11 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         let _ = write_atomic(&manifest_path, json.as_bytes());
     }
     // 팩 버전 기록 — 다음 install의 다운그레이드 판정 기준(target_version으로 갱신).
-    let _ = write_atomic(&dir.join(PACK_VERSION_FILE), target_version.as_bytes());
+    // ★pack-update 트랜잭션(write_version_marker=false)은 여기서 쓰지 않는다 — record_accepted
+    // 성공 후 apply_pack_transactional이 마지막 hard commit marker로 직접(검사) 기록한다.
+    if write_version_marker {
+        let _ = write_atomic(&dir.join(PACK_VERSION_FILE), target_version.as_bytes());
+    }
     // cys 전용 CLAUDE_CONFIG_DIR 격리 셋업(박사님 2026-06-15) — 사용자 ~/.claude 오염으로부터
     // cys 마스터를 분리한다. best-effort·보존 모드라 깨끗한 환경에서도 회귀 0.
     setup_isolated_config_dir();
@@ -693,6 +712,206 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             }
         }
     }
+    Ok((written, kept))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 무중단 pack-update 적용 트랜잭션(§7-⑤ 옵션 b — 박사님 결정 ⑤ 확정: 심링크 마이그레이션 안 함).
+// backup journal + rollback + `.pack-version` = 마지막 hard commit marker로 전체 팩 적용에
+// all-or-nothing(부분적용 0)을 부여한다. ★install()/cysd 자동설치·init-pack 경로는 이 트랜잭션을
+// 거치지 않는다(install_from_iter를 write_version_marker=true로 직접 호출 — 외부 동작 불변).
+// pack-update만 apply_pack_transactional로 감싼다. R2CODE HIGH #1 해소.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PACK_JOURNAL_DIR: &str = ".pack-journal";
+
+/// 백업 저널 디렉터리(~/.cys/.pack-journal) — pack_dir 형제(staging·lock·accepted와 동일 루트).
+pub fn pack_journal_dir() -> PathBuf {
+    pack_dir()
+        .parent()
+        .map(|p| p.join(PACK_JOURNAL_DIR))
+        .unwrap_or_else(|| PathBuf::from(PACK_JOURNAL_DIR))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct JournalEntry {
+    rel: String,
+    /// apply 전 파일이 존재했는가. false면 rollback 시 (신규 생성분) 삭제.
+    existed: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct JournalIndex {
+    /// 이번 트랜잭션의 목표 pack_version(= 커밋 성공 시 `.pack-version`에 기록되는 값).
+    /// recovery는 디스크 `.pack-version`이 이 값과 같은지로 커밋 완료를 판정한다.
+    target_version: String,
+    entries: Vec<JournalEntry>,
+}
+
+/// apply 전 backup journal 작성: backup_set의 각 파일 기존 bytes를 저널에 복사(+fsync)하고
+/// 인덱스(목표 버전·existed 플래그)를 기록(+fsync)한다. 잔존 저널은 먼저 비운다.
+fn write_journal(
+    target_version: &str,
+    backup_set: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let jdir = pack_journal_dir();
+    let _ = std::fs::remove_dir_all(&jdir);
+    let files_dir = jdir.join("files");
+    std::fs::create_dir_all(&files_dir)
+        .map_err(|e| format!("journal files dir 생성 실패 {}: {e}", files_dir.display()))?;
+    let dir = pack_dir();
+    let mut entries = Vec::new();
+    for rel in backup_set {
+        let src = dir.join(rel);
+        if src.is_file() {
+            let bytes = std::fs::read(&src)
+                .map_err(|e| format!("journal 백업 읽기 실패 {}: {e}", src.display()))?;
+            let dst = files_dir.join(rel);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("journal 백업 dir 실패 {}: {e}", parent.display()))?;
+            }
+            write_atomic(&dst, &bytes)
+                .map_err(|e| format!("journal 백업 쓰기 실패 {}: {e}", dst.display()))?;
+            entries.push(JournalEntry { rel: rel.clone(), existed: true });
+        } else {
+            entries.push(JournalEntry { rel: rel.clone(), existed: false });
+        }
+    }
+    let index = JournalIndex {
+        target_version: target_version.to_string(),
+        entries,
+    };
+    let json =
+        serde_json::to_vec_pretty(&index).map_err(|e| format!("journal 인덱스 직렬화 실패: {e}"))?;
+    // 인덱스는 마지막에(원자) — 인덱스 부재 = '백업 미완 = 미커밋'(원본 미변경)을 의미.
+    write_atomic(&jdir.join("index.json"), &json)
+        .map_err(|e| format!("journal 인덱스 쓰기 실패: {e}"))?;
+    Ok(())
+}
+
+/// 저널에서 pre-state로 복원: existed=true는 백업 bytes를 원위치 atomic 복원, existed=false는
+/// (신규 생성분) 삭제. `.pack-version`은 저널에 없으므로 손대지 않는다(미커밋 = old 유지). 복원
+/// 후 저널 삭제. ★커밋 마커(.pack-version==target)가 아닐 때만 호출(recover_pack_journal이 판정).
+pub fn rollback_journal() -> Result<(), String> {
+    let jdir = pack_journal_dir();
+    let index_path = jdir.join("index.json");
+    let s = std::fs::read_to_string(&index_path)
+        .map_err(|e| format!("journal 인덱스 읽기 실패 {}: {e}", index_path.display()))?;
+    let index: JournalIndex =
+        serde_json::from_str(&s).map_err(|e| format!("journal 인덱스 파싱 실패: {e}"))?;
+    let dir = pack_dir();
+    let files_dir = jdir.join("files");
+    for entry in &index.entries {
+        let target = dir.join(&entry.rel);
+        if entry.existed {
+            let backup = files_dir.join(&entry.rel);
+            let bytes = std::fs::read(&backup)
+                .map_err(|e| format!("journal 백업 복원 읽기 실패 {}: {e}", backup.display()))?;
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            write_atomic(&target, &bytes)
+                .map_err(|e| format!("journal 복원 쓰기 실패 {}: {e}", target.display()))?;
+        } else {
+            match std::fs::remove_file(&target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(format!("journal 신규파일 삭제 실패 {}: {e}", target.display()))
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&jdir);
+    Ok(())
+}
+
+/// crash recovery(§7-⑤): orphan 저널을 발견하면 `.pack-version`(= hard commit marker)을 저널의
+/// 목표 버전과 대조한다. 같으면 커밋은 성공했고 저널 정리 중 crash였으므로 저널만 삭제(롤백 금지).
+/// 다르면 미커밋(부분적용)이므로 rollback으로 pre-state 자가치유. 인덱스 부재(백업 도중 crash)는
+/// 원본 미변경이므로 잔존 저널만 폐기. 저널 완전 부재면 no-op. 반환: 복구를 수행했으면 true.
+/// ★pack-update 착수 시·cysd 기동 시(install(false) 전)에 호출해 부분적용을 선치유한다.
+pub fn recover_pack_journal() -> Result<bool, String> {
+    let jdir = pack_journal_dir();
+    let index_path = jdir.join("index.json");
+    if !index_path.is_file() {
+        // 인덱스 없는 잔존 디렉터리 = 백업 미완(원본 미변경) → 통째 폐기.
+        if jdir.exists() {
+            let _ = std::fs::remove_dir_all(&jdir);
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    let s = std::fs::read_to_string(&index_path)
+        .map_err(|e| format!("journal 인덱스 읽기 실패 {}: {e}", index_path.display()))?;
+    let index: JournalIndex =
+        serde_json::from_str(&s).map_err(|e| format!("journal 인덱스 파싱 실패(손상): {e}"))?;
+    let disk_version = std::fs::read_to_string(pack_dir().join(PACK_VERSION_FILE))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if !disk_version.is_empty() && disk_version == index.target_version {
+        // 커밋 성공(.pack-version == target) → 저널 정리만(롤백 금지).
+        let _ = std::fs::remove_dir_all(&jdir);
+    } else {
+        // 미커밋 → 롤백(pre-state 복원 + 저널 삭제).
+        rollback_journal()?;
+    }
+    Ok(true)
+}
+
+/// 무중단 pack-update 적용 트랜잭션(§7-⑤ 옵션 b). 호출 전제: apply-lock 보유(writer 배타).
+/// 순서: ⓪orphan 저널 자가치유 → ①backup journal(변경·삭제 대상 전체 기존 bytes fsync) →
+/// ②install_from_iter(파일 반영, `.pack-version` 미기록) → ③commit_extra(record_accepted 등 필수
+/// 단계) → ④`.pack-version` = 마지막 hard commit marker(write_atomic + 결과 검사) → ⑤저널 삭제.
+/// 어느 단계든 실패 시 rollback(pre-state 복원)·`.pack-version` 미기록·Err 반환(부분적용 0).
+pub fn apply_pack_transactional<F>(
+    items: &[(&str, &str)],
+    target_version: &str,
+    commit_extra: F,
+) -> Result<(usize, usize), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    // ⓪ 직전 crash로 남은 orphan 저널 자가치유(새 트랜잭션 전 pre-state 확정).
+    recover_pack_journal()?;
+    let dir = pack_dir();
+    // ① backup set = 새 manifest.files(=items) ∪ 현재 install-manifest 키(prune·overwrite 대상)
+    //    ∪ .install-manifest.json 자체. install_from_iter가 생성·덮어쓰기·삭제할 수 있는 전부.
+    let mut backup_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (rel, _) in items {
+        backup_set.insert((*rel).to_string());
+    }
+    if let Ok(s) = std::fs::read_to_string(dir.join(INSTALL_MANIFEST)) {
+        if let Ok(m) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s) {
+            for k in m.keys() {
+                backup_set.insert(k.clone());
+            }
+        }
+    }
+    backup_set.insert(INSTALL_MANIFEST.to_string());
+    write_journal(target_version, &backup_set)?;
+    // ② 파일 반영 — .pack-version은 여기서 쓰지 않는다(④에서 commit marker로).
+    let (written, kept) =
+        match install_from_iter(items.iter().copied(), false, target_version, false) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = rollback_journal();
+                return Err(format!("파일 반영 실패(rollback 완료): {e}"));
+            }
+        };
+    // ③ 필수 commit 단계(record_accepted 등) — 실패 시 rollback(best-effort 흡수 금지·R2CODE #2).
+    if let Err(e) = commit_extra() {
+        let _ = rollback_journal();
+        return Err(format!("commit 단계 실패(rollback 완료): {e}"));
+    }
+    // ④ .pack-version = 마지막 hard commit marker(결과 검사 — best-effort 금지).
+    if let Err(e) = write_atomic(&dir.join(PACK_VERSION_FILE), target_version.as_bytes()) {
+        let _ = rollback_journal();
+        return Err(format!(".pack-version 커밋 실패(rollback 완료): {e}"));
+    }
+    // ⑤ 커밋 성공 → 저널 삭제.
+    let _ = std::fs::remove_dir_all(pack_journal_dir());
     Ok((written, kept))
 }
 
@@ -1156,6 +1375,7 @@ mod tests {
             PACK.iter().chain(PACK_SKILLS.iter()).map(|(r, c)| (*r, *c)),
             false,
             env!("CARGO_PKG_VERSION"),
+            true,
         );
         let fp_b = fingerprint_dir(&td_b);
 
@@ -1241,5 +1461,217 @@ mod tests {
         assert!(leftovers.is_empty(), "temp 파일 잔존: {leftovers:?}");
 
         let _ = std::fs::remove_dir_all(&td);
+    }
+
+    // ── pack-update 적용 트랜잭션(§7-⑤ 옵션 b — R2CODE HIGH #1/MED #2) ────────────────
+    // 모든 트랜잭션 테스트는 PACK_ENV_LOCK으로 직렬화한다(ENV_PACK_DIR 프로세스 전역 + 저널은
+    // pack_dir 형제라 격리 base/pack 구조로 저널을 base 안에 가둔다).
+
+    /// pre-state(.pack-version·soul.md·.install-manifest)를 base/pack에 깔고 env를 세팅한다.
+    /// 반환: (base, pd). 정리는 호출처가 remove_dir_all(base).
+    fn txn_prestate(tag: &str, files: &[(&str, &str)], version: &str) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("cys-journal-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::env::set_var(ENV_PACK_DIR, &pd);
+        std::env::set_var(ENV_CONFIG_DIR, base.join("cfg"));
+        std::fs::write(pd.join(PACK_VERSION_FILE), version).unwrap();
+        let mut manifest = serde_json::Map::new();
+        for (rel, content) in files {
+            let p = pd.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+            manifest.insert((*rel).to_string(), serde_json::json!(content_hash(content)));
+        }
+        std::fs::write(
+            pd.join(INSTALL_MANIFEST),
+            serde_json::Value::Object(manifest).to_string(),
+        )
+        .unwrap();
+        (base, pd)
+    }
+
+    fn restore_env(saved: Option<String>, saved_cfg: Option<String>) {
+        match saved {
+            Some(v) => std::env::set_var(ENV_PACK_DIR, v),
+            None => std::env::remove_var(ENV_PACK_DIR),
+        }
+        match saved_cfg {
+            Some(v) => std::env::set_var(ENV_CONFIG_DIR, v),
+            None => std::env::remove_var(ENV_CONFIG_DIR),
+        }
+    }
+
+    /// 정상 경로: 파일 반영·prune·record_accepted(closure)·.pack-version commit marker 기록 후
+    /// 저널이 삭제된다.
+    #[test]
+    fn apply_transactional_commit_then_journal_removed() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let (base, pd) = txn_prestate(
+            "commit",
+            &[("soul.md", "OLD-SOUL"), ("stale.txt", "STALE")],
+            "1.0.0",
+        );
+
+        // soul.md 갱신 + new.txt 추가, stale.txt는 items 부재 → prune.
+        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL"), ("new.txt", "NEW")];
+        let committed = std::cell::Cell::new(false);
+        let res = apply_pack_transactional(&items, "2.0.0", || {
+            committed.set(true);
+            Ok(())
+        });
+
+        let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
+        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let newf = std::fs::read_to_string(pd.join("new.txt")).unwrap();
+        let stale_exists = pd.join("stale.txt").exists();
+        let journal_exists = pack_journal_dir().exists();
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let (w, _k) = res.expect("commit 실패");
+        assert!(committed.get(), "commit_extra(record_accepted) 미호출");
+        assert_eq!(pv.trim(), "2.0.0", ".pack-version commit marker 미기록");
+        assert_eq!(soul, "NEW-SOUL", "soul.md 갱신 안됨");
+        assert_eq!(newf, "NEW", "new.txt 추가 안됨");
+        assert!(!stale_exists, "stale.txt prune 안됨");
+        assert!(!journal_exists, "commit 성공 후 저널 미삭제");
+        assert!(w >= 2, "written={w}");
+    }
+
+    /// ★핵심(codex missing): apply 도중 N번째 쓰기에서 실패를 주입(디렉터리 충돌: 파일 'collide'
+    /// 직후 'collide/child' 쓰기가 create_dir_all 실패)하면 트리가 pre-state와 동일(전부 rollback)
+    /// 이고 .pack-version 불변임을 증명한다(부분적용 0).
+    #[test]
+    fn mid_apply_fault_rolls_back_to_prestate() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let (base, pd) = txn_prestate("fault", &[("soul.md", "OLD-SOUL")], "1.0.0");
+        let pre_fp = fingerprint_dir(&pd);
+
+        // soul.md 갱신(1번째 성공) → collide 파일(2번째 성공) → collide/child(3번째: 부모가
+        // 파일이라 create_dir_all 실패) = mid-apply fault.
+        let items: Vec<(&str, &str)> =
+            vec![("soul.md", "NEW"), ("collide", "X"), ("collide/child", "Y")];
+        let res = apply_pack_transactional(&items, "2.0.0", || Ok(()));
+
+        let post_fp = fingerprint_dir(&pd);
+        let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
+        let journal_exists = pack_journal_dir().exists();
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(res.is_err(), "mid-apply fault인데 성공 반환");
+        assert_eq!(pv.trim(), "1.0.0", ".pack-version 불변이어야(미커밋)");
+        assert!(!journal_exists, "rollback 후 저널 잔존");
+        assert_eq!(pre_fp, post_fp, "rollback이 pre-state로 복원 못함(부분적용 잔존)");
+    }
+
+    /// record_accepted(commit_extra) 실패 시 이미 쓰여진 파일·prune이 전부 rollback되고
+    /// .pack-version이 기록되지 않는다(best-effort 흡수 금지 — R2CODE #2).
+    #[test]
+    fn commit_extra_failure_rolls_back() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let (base, pd) = txn_prestate(
+            "recordfail",
+            &[("soul.md", "OLD-SOUL"), ("stale.txt", "STALE")],
+            "1.0.0",
+        );
+        let pre_fp = fingerprint_dir(&pd);
+
+        // 파일 반영·prune은 성공하지만 record_accepted가 실패 → 전체 rollback.
+        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL"), ("new.txt", "NEW")];
+        let res = apply_pack_transactional(&items, "2.0.0", || Err("record_accepted boom".into()));
+
+        let post_fp = fingerprint_dir(&pd);
+        let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
+        let journal_exists = pack_journal_dir().exists();
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(res.is_err(), "record_accepted 실패인데 성공 반환(best-effort 흡수)");
+        assert_eq!(pv.trim(), "1.0.0", ".pack-version 기록되면 안됨");
+        assert!(!journal_exists, "rollback 후 저널 잔존");
+        assert_eq!(
+            pre_fp, post_fp,
+            "record 실패 rollback이 soul.md/new.txt/stale.txt prune까지 복원 못함"
+        );
+    }
+
+    /// orphan 저널 recovery: 디스크 .pack-version != 저널 target(미커밋)이면 rollback으로
+    /// pre-state 자가치유. crash로 남은 부분적용(soul.md=PARTIAL·new.txt 생성)을 되돌린다.
+    #[test]
+    fn orphan_journal_recovery_rolls_back() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        // crash 후 디스크: .pack-version 옛 1.0.0(미커밋) + soul.md 부분반영 + new.txt 신규생성.
+        let (base, pd) = txn_prestate("orphan-rb", &[("soul.md", "PARTIAL-NEW")], "1.0.0");
+        std::fs::write(pd.join("new.txt"), "ORPHAN-NEW").unwrap();
+        // 저널 수작업 조립: target 2.0.0, soul.md(existed) backup=OLD-SOUL, new.txt(신규) existed=false.
+        let jdir = pack_journal_dir();
+        let files_dir = jdir.join("files");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        std::fs::write(files_dir.join("soul.md"), "OLD-SOUL").unwrap();
+        let index = serde_json::json!({
+            "target_version": "2.0.0",
+            "entries": [
+                {"rel": "soul.md", "existed": true},
+                {"rel": "new.txt", "existed": false}
+            ]
+        });
+        std::fs::write(jdir.join("index.json"), index.to_string()).unwrap();
+
+        let recovered = recover_pack_journal();
+
+        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let new_exists = pd.join("new.txt").exists();
+        let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
+        let journal_exists = pack_journal_dir().exists();
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(recovered.expect("recover 실패"), true, "orphan 미발견");
+        assert_eq!(soul, "OLD-SOUL", "soul.md rollback 안됨");
+        assert!(!new_exists, "신규생성 new.txt 삭제 안됨");
+        assert_eq!(pv.trim(), "1.0.0", ".pack-version 변경됨(미커밋인데)");
+        assert!(!journal_exists, "recovery 후 저널 잔존");
+    }
+
+    /// orphan 저널 recovery: 디스크 .pack-version == 저널 target(커밋 성공·정리 중 crash)이면
+    /// rollback 없이 저널만 삭제(커밋된 새 내용을 되돌리지 않는다).
+    #[test]
+    fn orphan_journal_committed_only_cleaned() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        // 커밋 성공: .pack-version=2.0.0, soul.md=NEW-SOUL(새 내용).
+        let (base, pd) = txn_prestate("orphan-commit", &[("soul.md", "NEW-SOUL")], "2.0.0");
+        let jdir = pack_journal_dir();
+        let files_dir = jdir.join("files");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        std::fs::write(files_dir.join("soul.md"), "OLD-SOUL").unwrap(); // 커밋 전 백업본
+        let index = serde_json::json!({
+            "target_version": "2.0.0",
+            "entries": [{"rel": "soul.md", "existed": true}]
+        });
+        std::fs::write(jdir.join("index.json"), index.to_string()).unwrap();
+
+        let recovered = recover_pack_journal();
+
+        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let journal_exists = pack_journal_dir().exists();
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(recovered.expect("recover 실패"), true, "orphan 미발견");
+        assert_eq!(soul, "NEW-SOUL", "커밋된 내용을 잘못 rollback함");
+        assert!(!journal_exists, "정리 후 저널 잔존");
     }
 }
