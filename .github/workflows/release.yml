@@ -98,6 +98,18 @@ jobs:
         with:
           key: pack-artifacts
 
+      # ★콘텐츠 스캔 발행 hard-gate (지점①/2 — 바이너리 빌드 전). git-추적 cysjavis-pack 전 트리가
+      # build.rs로 cys 바이너리에 자동 임베드되므로, gitignore가 못 잡는 콘텐츠 누출(개인 홈경로·
+      # 이메일·키토큰)을 바이너리 link 전에 fail-closed로 차단한다. 비0이면 잡 실패(발행 차단).
+      - name: Scan pack content (pre-build hard-gate)
+        run: bash scripts/scan-pack-secrets.sh
+
+      # ★cargo clean 선행 — rust-cache가 복원한 스테일 OUT_DIR/pack_all.rs(이전 cysjavis-pack 트리로
+      # 생성된 임베드 테이블)가 재사용돼 manifest SOT를 오염시키는 회귀를 차단한다. 캐시 복원 직후에
+      # target을 비워 build.rs 코드젠을 강제 재실행시킨다(스테일 생성표 무효화).
+      - name: cargo clean (스테일 생성표 무효화)
+        run: cargo clean
+
       # cys 바이너리(순수 Rust·Tauri 불요)를 러너에서 빌드 → pack-manifest emit에 사용.
       - name: Build cys
         run: cargo build --release --bin cys
@@ -116,6 +128,52 @@ jobs:
             --expires-at "$EXPIRES_AT" \
             > pack-manifest.json
           echo "── pack-manifest.json (head) ──"; head -c 600 pack-manifest.json; echo
+
+      # ★역방향 커버리지 게이트(디스크 고아 차단). 동일성 게이트(forward: manifest⊆disk)의 역방향 —
+      # git-추적 cysjavis-pack/ 트리에서 build.rs가 임베드했어야 할 파일이 manifest에 누락(디스크 고아)
+      # 됐는지 검출한다. ★SOT = `cys pack-manifest` 출력(임베드 권위 테이블) — 제외규칙을 python으로
+      # 재구현해 임베드 집합을 독립 재유도하지 않는다. python은 (tracked − manifest) 잔차만 분류한다:
+      # 잔차의 각 항목이 build.rs:41-44가 배제하는 알려진 카테고리(경로 컴포넌트가 '.'로 시작·tests·
+      # __pycache__)면 정당한 제외, 아니면 디스크 고아 → exit 1. build.rs 제외규칙이 바뀌어 새 카테고리가
+      # 생기면 잔차가 미설명으로 남아 게이트가 시끄럽게 실패(silent drift 차단).
+      - name: Reverse coverage gate (disk orphan detection)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, subprocess, sys
+
+          man = json.load(open("pack-manifest.json"))
+          embedded = set(man["files"])          # SOT: build.rs가 실제 임베드한 파일(권위 테이블)
+          if not embedded:
+              print("::error::manifest.files 비어있음 — 역커버리지 불가", file=sys.stderr); sys.exit(1)
+
+          out = subprocess.run(
+              ["git", "ls-files", "cysjavis-pack"],
+              capture_output=True, text=True, check=True,
+          ).stdout
+          tracked = set()
+          for line in out.splitlines():
+              line = line.strip()
+              if line.startswith("cysjavis-pack/"):
+                  tracked.add(line[len("cysjavis-pack/"):])
+          if not tracked:
+              print("::error::git ls-files cysjavis-pack 비어있음 — 인덱스 부재?", file=sys.stderr); sys.exit(1)
+
+          # build.rs:41-44 제외 카테고리(잔차 분류용 allowlist — 임베드 집합 재유도 아님).
+          def is_excluded(rel):
+              return any(c.startswith(".") or c == "tests" or c == "__pycache__"
+                         for c in rel.split("/"))
+
+          gap = tracked - embedded               # 추적되었으나 manifest에 없는 파일
+          orphans = sorted(g for g in gap if not is_excluded(g))
+          if orphans:
+              print("::error::디스크 고아(git-추적이나 임베드 누락 — build.rs가 실었어야 함):", file=sys.stderr)
+              for o in orphans:
+                  print(f"::error::  {o}", file=sys.stderr)
+              sys.exit(1)
+          print(f"[역커버리지] tracked={len(tracked)} embedded={len(embedded)} "
+                f"gap={len(gap)}(전부 제외규칙으로 설명) orphan=0 — 통과")
+          PY
 
       # ★embed-vs-standalone 동일성 게이트 + 결정론 pack.tar.gz 생성(§5-1).
       # ① manifest.files(임베드 권위) ⇔ cysjavis-pack/ 온디스크 트리 sha256 전수 일치(드리프트 차단).
@@ -183,6 +241,12 @@ jobs:
                       sys.exit(1)
           print(f"[gate③] tar⇔manifest⇔embed 3자 폐포 {len(files)}개 일치 — 동일성 게이트 통과")
           PY
+
+      # ★콘텐츠 스캔 발행 hard-gate (지점②/2 — pack.tar.gz 생성 후 발행 전). 결정론 tar로 묶은 직후·
+      # 서명·업로드 전에 한 번 더 fail-closed로 콘텐츠 누출을 차단한다(빌드 전 지점①과 이중 게이트 —
+      # 빌드~tar 사이 어떤 변형도 발행 전 재검). 비0이면 잡 실패(발행 차단).
+      - name: Scan pack content (pre-publish hard-gate)
+        run: bash scripts/scan-pack-secrets.sh
 
       # pack-manifest.json을 minisign 서명(★서명 대상=manifest 단 하나·기존 TAURI_SIGNING_PRIVATE_KEY
       # 재사용). tauri signer는 base64 래핑 .sig를 내므로 base64 디코드해 표준 minisign 텍스트
