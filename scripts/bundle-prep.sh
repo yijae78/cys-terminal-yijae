@@ -52,6 +52,11 @@ mkdir -p src-tauri/resources
 "$PY" - <<'PY'
 import gzip, hashlib, io, json, os, sys, tarfile
 
+# Windows 콘솔 기본 인코딩(cp1252)에서 한국어 print가 UnicodeEncodeError로 죽는 것 방지
+# (macOS/Linux는 이미 utf-8이라 no-op). tar 내용(바이트)엔 무관 — 사람용 메시지 인코딩만 교정.
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
+
 ROOT = "cysjavis-pack"
 man = json.load(open("src-tauri/resources/pack-manifest.json"))
 files = man["files"]

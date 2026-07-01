@@ -37,6 +37,8 @@ jobs:
 
       - name: Build Windows x64 (Tauri → NSIS setup.exe)
         shell: bash
+        env:
+          PYTHONUTF8: '1'   # Windows Python 기본 cp1252 stdout에서 한국어 print 크래시 방지(belt-and-suspenders)
         run: |
           bunx @tauri-apps/cli@2 build
 
