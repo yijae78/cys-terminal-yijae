@@ -83,13 +83,23 @@ jobs:
           $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $inst) { throw "설치 후 cysd.exe 를 LOCALAPPDATA 아래에서 못 찾음" }
           $dir = $inst.Directory.FullName
+          $rt = Join-Path $dir 'runtime'
           Write-Host "install dir: $dir"
-          $bash = Join-Path $dir 'runtime\git\usr\bin\bash.exe'
-          $py   = Join-Path $dir 'runtime\python\python3.exe'
-          if (-not (Test-Path $bash)) { throw "동봉 bash 없음: $bash" }
-          if (-not (Test-Path $py))   { throw "동봉 python3 없음: $py" }
-          & $bash --version
-          & $py --version
-          & $py -c "import sqlite3, ssl, json, hashlib, urllib.request, ast; print('embeddable stdlib OK (sqlite3+ssl+json+hashlib+urllib+ast)')"
+          Write-Host "== runtime top-level =="; if (Test-Path $rt) { Get-ChildItem $rt | Select-Object -ExpandProperty Name } else { throw "runtime 폴더 없음: $rt" }
+          # cysd PATH 주입이 기대하는 정확 경로(구조 보존 시): runtime\git\usr\bin\bash.exe · runtime\python\python3.exe
+          $bash = Get-ChildItem -Path $rt -Recurse -Filter bash.exe -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match 'git\\usr\\bin\\bash\.exe$' } | Select-Object -First 1
+          if (-not $bash) { $bash = Get-ChildItem -Path $rt -Recurse -Filter bash.exe -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          $py = Get-ChildItem -Path $rt -Recurse -Filter python3.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          Write-Host "bash: $($bash.FullName)"
+          Write-Host "python3: $($py.FullName)"
+          if (-not $bash) { throw "동봉 bash.exe 를 runtime 아래에서 못 찾음" }
+          if (-not $py)   { throw "동봉 python3.exe 를 runtime 아래에서 못 찾음" }
+          # cysd 하드코딩 경로와 실제 구조 일치 확인(불일치 시 명시 실패 → cysd PATH 주입도 교정 필요).
+          if ($bash.FullName -notmatch 'runtime\\git\\usr\\bin\\bash\.exe$') { throw "bash 경로가 cysd 기대(runtime\git\usr\bin)와 불일치: $($bash.FullName)" }
+          if ($py.FullName   -notmatch 'runtime\\python\\python3\.exe$')     { throw "python3 경로가 cysd 기대(runtime\python)와 불일치: $($py.FullName)" }
+          & $bash.FullName --version
+          & $py.FullName --version
+          & $py.FullName -c "import sqlite3, ssl, json, hashlib, urllib.request, ast; print('embeddable stdlib OK (sqlite3+ssl+json+hashlib+urllib+ast)')"
           if ($LASTEXITCODE -ne 0) { throw "동봉 python3 stdlib import 실패" }
-          Write-Host "OK: 자기완결 런타임 설치·실행 검증 통과"
+          Write-Host "OK: 자기완결 런타임 설치·실행·경로일치 검증 통과"
