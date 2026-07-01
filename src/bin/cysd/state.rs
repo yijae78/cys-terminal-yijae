@@ -764,9 +764,32 @@ impl Daemon {
         {
             let sep = if cfg!(windows) { ';' } else { ':' };
             let cur = std::env::var("PATH").unwrap_or_default();
-            let bin_str = bin_dir.to_string_lossy().into_owned();
-            if !cur.split(sep).any(|p| p == bin_str) {
-                builder.env("PATH", format!("{bin_str}{sep}{cur}"));
+            // 선두 주입 후보 ① 데몬 폴더(동봉 cys CLI가 pane에서 늘 보이게).
+            let mut prefixes: Vec<String> = Vec::new();
+            prefixes.push(bin_dir.to_string_lossy().into_owned());
+            // ② Windows 자기완결 설치 시 <install>\runtime\ 에 동봉된 python(+python3 심)·bash(+coreutils)·git.
+            //    팩의 .sh 훅/.py 빈이 순정 Windows(Git·Python 미설치)에서도 구동되게 PATH 선두에 얹는다
+            //    ("설치≠작동" 해소). 런타임 미동봉(엔진만 빌드)이면 dir 부재로 자동 skip → 기존 동작 무변경.
+            #[cfg(windows)]
+            {
+                let rt = bin_dir.join("runtime");
+                for d in [
+                    rt.join("python"),
+                    rt.join("git").join("cmd"),
+                    rt.join("git").join("usr").join("bin"),
+                ] {
+                    if d.is_dir() {
+                        prefixes.push(d.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            let add: Vec<String> = prefixes
+                .into_iter()
+                .filter(|p| !cur.split(sep).any(|e| e == p.as_str()))
+                .collect();
+            if !add.is_empty() {
+                let head = add.join(&sep.to_string());
+                builder.env("PATH", format!("{head}{sep}{cur}"));
             }
         }
         builder.env(cys::ENV_SOCKET, self.socket_path.to_string_lossy().as_ref());

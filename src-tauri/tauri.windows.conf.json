@@ -3,6 +3,11 @@
   "bundle": {
     "createUpdaterArtifacts": false,
     "targets": ["nsis"],
+    "resources": {
+      "resources/pack.tar.gz": "./",
+      "resources/pack-manifest.json": "./",
+      "runtime/**/*": "runtime/"
+    },
     "windows": {
       "webviewInstallMode": { "type": "downloadBootstrapper" },
       "nsis": { "installMode": "currentUser" }
