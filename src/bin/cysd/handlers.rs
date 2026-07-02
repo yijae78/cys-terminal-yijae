@@ -612,13 +612,25 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
             }
-            match daemon.create_surface(
+            // RC-3(B′): pane env 주입 — Windows launch-agent가 해소된 CLAUDE_CONFIG_DIR 등을 넘긴다
+            // (순수 cmd send와 짝). params["env"] 객체(문자열 값만)를 (k,v) 벡터로. 부재 시 빈 벡터.
+            let env_pairs: Vec<(String, String)> = params
+                .get("env")
+                .and_then(|e| e.as_object())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match daemon.create_surface_with_env(
                 param_str(&params, "cwd"),
                 param_str(&params, "cmd"),
                 param_str(&params, "title"),
                 param_str(&params, "role"),
                 rows,
                 cols,
+                &env_pairs,
             ) {
                 Ok(s) => {
                     // (E-e) 멱등 캐시 기록 — 다음 동일 key 재시도가 이 surface를 재반환.

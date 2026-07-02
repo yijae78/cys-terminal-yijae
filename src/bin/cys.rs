@@ -2675,6 +2675,75 @@ fn screen_shows_launch_failure(flat: &str) -> bool {
 }
 
 /// 살아있는 surface 위에서: 에이전트 기동 → 준비 폴링 → 지침 주입 → 메타 등록.
+/// RC-3(B′): agents.json env 값의 셸 확장을 Rust에서 해소한다(Windows용 — unix는 셸이 직접 전개).
+/// 지원 패턴: `${VAR:-default}`(현 agents.json 패턴)·`$HOME`·선두 `~`. HOME은 Windows에서
+/// dirs::home_dir()(USERPROFILE 기반)로 해소 — env::var("HOME")이 Windows 미설정인 함정 회피(RC-7 동형).
+fn resolve_env_value(v: &str) -> String {
+    fn home() -> String {
+        dirs::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+    let mut s = v.to_string();
+    // ${VAR:-default} 한 겹 해소 (default 내부의 $HOME도 재귀 전개)
+    if let (Some(a), Some(b)) = (s.find("${"), s.find('}')) {
+        if a < b {
+            let inner = &s[a + 2..b];
+            let resolved = if let Some((name, default)) = inner.split_once(":-") {
+                std::env::var(name)
+                    .ok()
+                    .filter(|x| !x.is_empty())
+                    .unwrap_or_else(|| resolve_env_value(default))
+            } else {
+                std::env::var(inner).unwrap_or_default()
+            };
+            s.replace_range(a..=b, &resolved);
+        }
+    }
+    s = s.replace("$HOME", &home());
+    if let Some(rest) = s.strip_prefix("~/") {
+        s = format!("{}/{}", home(), rest);
+    }
+    s
+}
+
+/// spec["env"] 맵 → 정렬된 (key, value) 벡터(결정론). 없으면 빈 벡터(레거시 cmd·env 없는 에이전트).
+fn agent_env_pairs(spec: &Value) -> Vec<(String, String)> {
+    spec.get("env")
+        .and_then(|e| e.as_object())
+        .map(|m| {
+            let mut v: Vec<(String, String)> = m
+                .iter()
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect();
+            v.sort();
+            v
+        })
+        .unwrap_or_default()
+}
+
+/// RC-3(B′): OS-aware 기동 렌더 — (pane에 send할 문자열, surface.create가 주입할 env).
+/// unix: `KEY="val" ... cmd` 인라인 재조립(셸이 ${:-}·$HOME 전개 — **기존 단일문자열과 byte-identical**),
+///       env 주입 없음(셸 전개가 진실원). → mac 무회귀(master D5 조건).
+/// windows: 순수 cmd만 send(powershell이 POSIX env-assign 미해석 회귀 차단) + 해소된 env를 주입 맵으로 반환
+///          (surface.create → builder.env). CLAUDE_CONFIG_DIR 등이 pane env에 직접 실린다.
+fn render_launch(cmd: &str, env: &[(String, String)]) -> (String, Vec<(String, String)>) {
+    if cfg!(windows) {
+        let inject = env
+            .iter()
+            .map(|(k, v)| (k.clone(), resolve_env_value(v)))
+            .collect();
+        (cmd.to_string(), inject)
+    } else {
+        let mut s = String::new();
+        for (k, v) in env {
+            s.push_str(&format!("{k}=\"{v}\" "));
+        }
+        s.push_str(cmd);
+        (s, Vec::new())
+    }
+}
+
 /// launch-agent(새 surface)와 node-recover(기존 surface 재기동)가 공유한다.
 fn boot_agent_on_surface(
     sid: u64,
@@ -2719,9 +2788,13 @@ fn boot_agent_on_surface(
     };
 
     // 1) 에이전트 기동 (authoritative: launch-agent의 모든 시스템 주입은 타이핑 가드 면제)
+    // RC-3(B′): OS-aware 렌더 — unix는 `KEY="val" cmd` 인라인(기존 byte-identical·셸 전개),
+    // windows는 순수 cmd(env는 surface.create가 pane env로 주입). send_env는 여기선 미사용
+    // (주입은 run_launch_agent_opts의 surface.create에서 이미 수행) — send 문자열만 취한다.
+    let (send, _send_env) = render_launch(&cmd, &agent_env_pairs(spec));
     request(
         "surface.send_text",
-        json!({"surface_id": sid, "text": cmd, "quiet": true, "authoritative": true}),
+        json!({"surface_id": sid, "text": send, "quiet": true, "authoritative": true}),
     )?;
     request(
         "surface.send_key",
@@ -2962,10 +3035,18 @@ fn run_launch_agent_opts(
                 .map(|c| c as u32)
                 .fold(0u64, |a, c| a.wrapping_mul(31).wrapping_add(c as u64))
         );
+        // RC-3(B′): Windows는 해소된 env(CLAUDE_CONFIG_DIR 등)를 surface.create로 넘겨 데몬이
+        // PTY spawn 시 builder.env로 주입한다(순수 cmd send와 짝). unix는 빈 맵 — 셸 인라인 전개가
+        // 진실원(무회귀). render_launch와 동일 규약이라 두 경로 결정론 일치.
+        let (_, inject_env) = render_launch("", &agent_env_pairs(&spec));
+        let env_obj: serde_json::Map<String, Value> = inject_env
+            .into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect();
         let r = request(
             "surface.create",
             json!({"cwd": cwd, "title": workflow_title(role, agent, &cwd), "role": role,
-                   "rows": 40, "cols": 140, "idempotency_key": idem}),
+                   "rows": 40, "cols": 140, "idempotency_key": idem, "env": env_obj}),
         )?;
         let sid = r["surface_id"].as_u64().ok_or("create returned no id")?;
         created = Some(sid);
@@ -6040,6 +6121,64 @@ mod tests {
             // Claude Code가 Windows에서 `.sh` 해석에 찾는 인터프리터와 일치
             assert!(cmd.starts_with("bash "), "windows must use bash: {cmd:?}");
         }
+    }
+
+    #[test]
+    fn render_launch_os_aware_unix_byte_identical() {
+        // RC-3(B′) 회귀 핀(master D5 조건): unix 렌더는 기존 agents.json 단일문자열과 byte-identical.
+        let cmd = "claude --dangerously-skip-permissions";
+        let env = vec![(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}".to_string(),
+        )];
+        let (send, inject) = render_launch(cmd, &env);
+        #[cfg(not(windows))]
+        {
+            // 기존(RC-3 前) claude.cmd 단일문자열과 정확히 동일 — 셸이 ${:-}·$HOME 전개(무회귀)
+            assert_eq!(
+                send,
+                "CLAUDE_CONFIG_DIR=\"${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}\" claude --dangerously-skip-permissions"
+            );
+            assert!(inject.is_empty(), "unix는 env 주입 없음(셸 전개가 진실원)");
+        }
+        #[cfg(windows)]
+        {
+            // Windows: 순수 cmd만 send(POSIX env-assign 문자열 소멸) + env는 해소되어 주입 맵으로
+            assert_eq!(send, "claude --dangerously-skip-permissions");
+            assert_eq!(inject.len(), 1);
+            assert_eq!(inject[0].0, "CLAUDE_CONFIG_DIR");
+            assert!(!inject[0].1.contains("${"), "주입 값은 해소됨: {:?}", inject[0].1);
+            assert!(!inject[0].1.contains("$HOME"), "HOME 전개됨: {:?}", inject[0].1);
+        }
+    }
+
+    #[test]
+    fn render_launch_no_env_agent_unchanged() {
+        // env 없는 에이전트(gemini/codex·레거시): 양 OS 모두 cmd 그대로, 주입 없음.
+        let (send, inject) = render_launch("~/.local/bin/agy --dangerously-skip-permissions", &[]);
+        assert_eq!(send, "~/.local/bin/agy --dangerously-skip-permissions");
+        assert!(inject.is_empty());
+    }
+
+    #[test]
+    fn resolve_env_value_expands_default_branch() {
+        // ${VAR:-default}: VAR 설정 시 그 값, 미설정 시 default($HOME 전개).
+        std::env::remove_var("CYS_TEST_ACCT_X");
+        let r = resolve_env_value("${CYS_TEST_ACCT_X:-$HOME/.cys/claude}");
+        assert!(r.ends_with("/.cys/claude"), "default+HOME 전개: {r}");
+        assert!(!r.contains("${") && !r.contains("$HOME"), "잔여 미전개 없음: {r}");
+        std::env::set_var("CYS_TEST_ACCT_X", "/acct/dir");
+        assert_eq!(resolve_env_value("${CYS_TEST_ACCT_X:-$HOME/.cys/claude}"), "/acct/dir");
+        std::env::remove_var("CYS_TEST_ACCT_X");
+    }
+
+    #[test]
+    fn agent_env_pairs_reads_map_or_empty() {
+        let spec = serde_json::json!({"cmd": "claude", "env": {"CLAUDE_CONFIG_DIR": "x", "A": "b"}});
+        let pairs = agent_env_pairs(&spec);
+        assert_eq!(pairs, vec![("A".into(), "b".into()), ("CLAUDE_CONFIG_DIR".into(), "x".into())]); // 정렬
+        let no_env = serde_json::json!({"cmd": "agy"});
+        assert!(agent_env_pairs(&no_env).is_empty());
     }
 
     #[test]

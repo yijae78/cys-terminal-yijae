@@ -733,6 +733,9 @@ impl Daemon {
     }
 
     /// Spawn a new PTY surface running the user's shell (or an explicit command).
+    // RC-3(B′): env 없는 호환 래퍼(테스트 다수가 사용). 프로덕션 create 경로는 handlers가
+    // create_surface_with_env를 직접 호출 → non-test 빌드에선 미사용이라 dead_code 허용.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn create_surface(
         self: &Arc<Self>,
         cwd: Option<String>,
@@ -741,6 +744,23 @@ impl Daemon {
         role: Option<String>,
         rows: u16,
         cols: u16,
+    ) -> Result<Arc<Surface>, String> {
+        self.create_surface_with_env(cwd, cmd, title, role, rows, cols, &[])
+    }
+
+    /// create_surface + PTY env 주입(RC-3 B′). `env`의 (k,v)를 builder.env로 실어 pane에 직접 전달한다
+    /// (Windows launch-agent가 해소한 CLAUDE_CONFIG_DIR 등 — 순수 cmd send와 짝). unix는 빈 슬라이스라
+    /// 무동작(셸 인라인 전개가 진실원). CYS_PACK_DIR·CYS_ACCOUNT_DIR 등 기존 주입과 동형.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_surface_with_env(
+        self: &Arc<Self>,
+        cwd: Option<String>,
+        cmd: Option<String>,
+        title: Option<String>,
+        role: Option<String>,
+        rows: u16,
+        cols: u16,
+        env: &[(String, String)],
     ) -> Result<Arc<Surface>, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let pty = native_pty_system();
@@ -839,6 +859,11 @@ impl Daemon {
         builder.env(cys::ENV_SURFACE_REF, cys::surface_ref(id));
         if let Some(r) = &role {
             builder.env(cys::ENV_ROLE, r);
+        }
+        // RC-3(B′): 호출자 지정 env(Windows launch-agent가 해소한 CLAUDE_CONFIG_DIR 등)를 마지막에
+        // 주입 — 순수 cmd로 기동되는 claude가 pane env에서 직접 읽는다. unix는 빈 슬라이스(무동작).
+        for (k, v) in env {
+            builder.env(k, v);
         }
 
         let child = pair
