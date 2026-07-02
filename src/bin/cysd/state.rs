@@ -1597,6 +1597,23 @@ mod tests {
     }
 
     #[test]
+    fn rc15_dept_logdir_slug_matches_rc13_state_dir() {
+        // D7 조건(정합 강제): cys-dept dept_logdir(RC-15)의 Windows 폴더명과 state_dir(RC-13) 슬러그가
+        // **동일 규약**이어야 로그(cysd.log)+상태(transcripts.db·feed.jsonl)가 한 폴더로 모인다.
+        // dept_logdir(Windows) = %LOCALAPPDATA%\cys\cys-dept-<name> (cys-dept bash·스모크 검증).
+        // state_dir(Windows)   = %LOCALAPPDATA%\cys\<pipe_slug(\\.\pipe\cys-dept-<name>)>.
+        // 일치 조건: pipe_slug(dept pipe) == "cys-dept-<name>". (2곳 slug 규약 갈라짐 방지 핀.)
+        for name in ["dept-3", "dept-future", "dept-1"] {
+            let pipe = format!(r"\\.\pipe\cys-dept-{name}");
+            assert_eq!(
+                pipe_slug(std::path::Path::new(&pipe)),
+                format!("cys-dept-{name}"),
+                "RC-15 dept_logdir 폴더명 ≠ RC-13 state_dir 슬러그 — 로그/state 폴더 분산 격리결함"
+            );
+        }
+    }
+
+    #[test]
     fn pipe_slug_dept_differs_from_base_for_isolation() {
         // 핵심 불변식: 부서 슬러그 ≠ 기본("cys") → state_dir가 서로 다른 디렉토리 파생(격리 보장).
         let base = pipe_slug(std::path::Path::new(r"\\.\pipe\cys"));

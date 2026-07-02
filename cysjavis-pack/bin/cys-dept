@@ -34,6 +34,18 @@ dept_sock(){
 }
 dept_pack(){ echo "$HOME/.cys/pack-dept-$1"; }
 
+# RC-15(D7): 부서 로그·상태 디렉토리 — Windows named pipe 소켓(\\.\pipe\...)은 dirname/디렉토리 개념이
+# 없어(RC-4 파생) mkdir·로그 경로가 깨진다. 실 디렉토리로 분리:
+#   Windows = %LOCALAPPDATA%\cys\cys-dept-<name> — ★RC-13 state_dir 슬러그와 **동일 규약**(pipe_slug
+#     `\\.\pipe\cys-dept-<name>`→`cys-dept-<name>`)이라 로그+transcripts.db+feed.jsonl가 한 폴더로 모임.
+#   unix = 소켓 부모(기존 dirname($sock)=~/.local/state/cys-dept-<name>·무회귀).
+dept_logdir(){
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) echo "${LOCALAPPDATA:-$HOME/AppData/Local}/cys/cys-dept-$1" ;;
+    *) dirname "$(dept_sock "$1")" ;;
+  esac
+}
+
 # RC-6: OS중립 graceful kill — unix=SIGTERM→대기→SIGKILL, Windows(MSYS/Git-Bash)=taskkill(트리·강제).
 # Windows 프로세스는 unix 시그널을 안 받으므로 kill/kill -9가 무효 → taskkill //PID //T //F로 분기
 # (MSYS는 `/PID`를 경로로 변환하므로 `//PID` 형식 사용).
@@ -304,13 +316,13 @@ case "$cmd" in
   launch)
     name="${2:?usage: cys-dept launch <name>}"
     sock="$(dept_sock "$name")"; pack="$(dept_pack "$name")"
-    mkdir -p "$(dirname "$sock")" "$pack/directives"
+    mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
     reg_upsert "$name" "$sock" "$pack"
     if ready "$sock"; then
       echo "[cys-dept] $name 이미 가동 중 — 재사용"
     else
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" nohup "$CYSD" >"$(dirname "$sock")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       disown
       # 기동 실패 시 reg_upsert 롤백 — 유령 부서(데몬 없는 레지스트리 항목) 잔류 방지
       ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패"; exit 1; }
@@ -382,12 +394,12 @@ PY
     [ -n "$base" ] || { echo "[cys-dept] allocate: 기본계정 base 빈값($acct) — fail-closed" >&2; exit 5; }
     acctdir="${base%/}-$name"; mkdir -p "$acctdir"
     [ -d "$acctdir" ] || { echo "[cys-dept] allocate: account fork dir 생성 실패: $acctdir — fail-closed" >&2; exit 5; }
-    mkdir -p "$(dirname "$sock")" "$pack/directives"
+    mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 중 — 재사용" >&2
     else
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR(fork dir)와 함께 spawn (create와 동형).
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" nohup "$CYSD" >"$(dirname "$sock")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       disown
       ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; exit 1; }
     fi
@@ -517,12 +529,12 @@ PY
     esac
     # ── ensure-up: 데몬 기동 + 시드 + 격리 + 부서장 (NEW · REUSE-사망 공통) ──
     if [ "$verb" = "NEW" ]; then trap 'reg_remove "$name" 2>/dev/null || true' EXIT; fi  # NEW만 실패 시 예약회수(REUSE는 기존 보존)
-    mkdir -p "$(dirname "$sock")" "$pack/directives"
+    mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 — 재사용" >&2
     else
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR 와 함께 spawn(patch2 있으면 자식 전파·없으면 F1 시드가 보장)
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" nohup "$CYSD" >"$(dirname "$sock")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       disown
       ready "$sock" || { if [ "$verb" = "NEW" ]; then reg_remove "$name"; fi; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; exit 1; }
     fi
