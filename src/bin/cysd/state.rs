@@ -545,7 +545,13 @@ pub fn now_epoch() -> f64 {
 /// §3.2 표면정책 — 자기승인 차단이 켜져 있는가.
 /// `~/.cys/policy.json`의 `deny_self_approve`(bool)를 읽는다. 파일이 없거나 파싱 실패하거나
 /// 키가 없으면 **기본값 true**(fail-safe — 정책 부재 시 더 안전한 쪽으로 차단). 명시적으로
-/// `{"deny_self_approve": false}`로만 끌 수 있다. (서명 검증은 이번 범위 밖 — 파일 존재·파싱까지.)
+/// `{"deny_self_approve": false}`로만 끌 수 있다.
+///
+/// M11 한계 명문화(정직): 이 정책 파일은 **미서명·로컬 파일**이며 데몬과 **동일 신뢰경계** 안의
+/// 에이전트(자율 master 포함)가 쓸 수 있다 — 즉 자기승인 차단을 스스로 `false`로 꺼서 우회할 수
+/// 있다. 따라서 §3.2의 강제는 "미서명 로컬 정책의 fail-safe 기본값"까지이지, 신뢰경계 내 악의/오작동
+/// 에이전트에 대한 암호학적 방어가 아니다. 서명 검증(박사님 토큰) 편입은 별도 트랙(크기 큼) — 이번엔
+/// 한계만 정직히 고지한다. 정본 반영 = DESIGN-ko.md §3.2.
 pub fn deny_self_approve_policy() -> bool {
     let path = cys::home_dir().join(".cys").join("policy.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
