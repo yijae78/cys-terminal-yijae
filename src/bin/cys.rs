@@ -8029,6 +8029,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn doctor_fix_then_rediag_ok() {
+        // L5 보호 해제 — 방금 만든 staging(<60s)이 진행중 보호에 걸려 정리 안 되는 것을 방지(정리 검증).
+        std::env::set_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "0");
         let base = std::env::temp_dir().join(format!("cys-doc-fix-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -8049,5 +8051,6 @@ mod tests {
         assert_eq!(by("staging-residue"), DiagStatus::Ok, "잔재 정리됨");
         assert_eq!(by("hook"), DiagStatus::Ok, "hook 재등록됨");
         let _ = std::fs::remove_dir_all(&base);
+        std::env::remove_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS");
     }
 }
