@@ -30,7 +30,7 @@ import sys
 import time
 import uuid
 
-ROOT = os.environ.get("JAVIS_ROOT", "/Users/cys/Desktop/CYSjavis")
+ROOT = os.environ.get("JAVIS_ROOT") or os.getcwd()  # 개인경로 하드코딩 금지(pack scan gate) — env 또는 CWD(워크스페이스 루트에서 호출)
 WK_DIR = os.path.join(ROOT, "_round", "wakeups")
 PENDING_DIR = os.path.join(WK_DIR, "pending")
 LEDGER = os.path.join(WK_DIR, "queue.jsonl")

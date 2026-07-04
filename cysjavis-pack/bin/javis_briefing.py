@@ -30,7 +30,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import javis_event  # noqa: E402  (동일 폴더 계약 구현 재사용 — parse/speak)
 
-ROOT = os.environ.get("JAVIS_ROOT", "/Users/cys/Desktop/CYSjavis")
+ROOT = os.environ.get("JAVIS_ROOT") or os.getcwd()  # 개인경로 하드코딩 금지(pack scan gate) — env 또는 CWD(워크스페이스 루트에서 호출)
 BRIEF_DIR = os.path.join(ROOT, "_round", "briefing")
 RATE_PATH = os.path.join(BRIEF_DIR, "rate.json")
 LEDGER = os.path.join(BRIEF_DIR, "ledger.jsonl")
