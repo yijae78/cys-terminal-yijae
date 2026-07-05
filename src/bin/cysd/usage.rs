@@ -1021,17 +1021,9 @@ pub fn pct(tokens: u64, window: u64) -> Option<u8> {
 }
 
 /// Claude Code projects/ 디렉터리명 munge — 실측: '/'와 특수문자가 '-'로 치환된다.
-/// ASCII 영숫자·'-'만 보존하는 보수 구현 (휴리스틱 폴백 전용 — 1순위는 hook 등록).
+/// 단일 소스는 cys 라이브러리(resume 사전검증 게이트와 공유) — 여기선 위임만 한다(로직 중복 금지).
 pub fn claude_project_component(cwd: &str) -> String {
-    cwd.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
+    cys::claude_project_component(cwd)
 }
 
 // ───────────────────────── T5 Phase 2-B: agy(Antigravity) 쿼터 ─────────────────────────

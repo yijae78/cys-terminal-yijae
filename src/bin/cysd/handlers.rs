@@ -652,6 +652,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .collect()
                 })
                 .unwrap_or_default();
+            // (W1) restore가 원 계정 dir을 넘기면 재해소 대신 그대로 고정한다(데몬 env 변동 시 오염 방지).
+            // 부재 시 데몬이 자기 env로 결정론 해소해 기록한다(신규 기동). 응답에 기록값을 되돌려준다.
+            let cfg_override = param_str(&params, "claude_config_dir");
             match daemon.create_surface_with_env(
                 param_str(&params, "cwd"),
                 param_str(&params, "cmd"),
@@ -660,6 +663,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 rows,
                 cols,
                 &env_pairs,
+                cfg_override,
             ) {
                 Ok(s) => {
                     // (E-e) 멱등 캐시 기록 — 다음 동일 key 재시도가 이 surface를 재반환.
@@ -672,7 +676,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                     Reply::Single(ok_response(
                         &id,
-                        json!({"surface_id": s.id, "surface_ref": surface_ref(s.id), "pid": s.pid}),
+                        json!({"surface_id": s.id, "surface_ref": surface_ref(s.id), "pid": s.pid,
+                               // (W1) 데몬이 기록한 권위 config_dir 반환 — 호출자(launch/restore)가
+                               // resume 사전검증 게이트·restore 인라인 오버라이드의 결정론 소스로 쓴다.
+                               "claude_config_dir": s.claude_config_dir.lock().unwrap().clone()}),
                     ))
                 }
                 Err(e) => Reply::Single(err_response(&id, "spawn_failed", &e)),
@@ -728,6 +735,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "exited": s.exited.load(Ordering::Relaxed),
                         "created_at": s.created_at,
                         "env_injected": s.env_injected, // RC-3 잔여(T2.1): node-recover 안전판정용
+                        "claude_config_dir": s.claude_config_dir.lock().unwrap().clone(), // (W1) node-recover resume 게이트용
                         "agent": agent,
                         "agent_alive": agent_alive,
                         "usage": s.observed_usage.lock().unwrap().clone()

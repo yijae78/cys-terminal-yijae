@@ -152,6 +152,31 @@ pub fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// (W1) claude CLAUDE_CONFIG_DIR 결정론 해소 — agents.json의 `${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}`와
+/// 동일 규칙을 **현재 프로세스 env**로 전개한다. pane 셸(=데몬 자식)이 실제로 해소하는 값과 일치하려면
+/// 실제 전개 주체인 **데몬 프로세스에서 호출**하는 것이 권위다(state.rs의 CYS_ACCOUNT_DIR 전파와 정합).
+/// discover 스캔(usage.rs)이 ~/.cys/claude를 원리적으로 못 보므로, config_dir 권위는 이 결정론 해소뿐이다.
+pub fn resolve_claude_config_dir() -> String {
+    std::env::var("CYS_ACCOUNT_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| home_dir().join(".cys").join("claude").to_string_lossy().into_owned())
+}
+
+/// Claude Code projects/ 디렉터리명 munge — 실측: '/'와 특수문자가 '-'로 치환된다.
+/// ASCII 영숫자·'-'만 보존하는 보수 구현. resume 사전검증 게이트(cys.rs)와 usage 휴리스틱이 공유한다.
+pub fn claude_project_component(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 /// 부서 데몬 소켓/파이프 경로(RC-4 · 공용 — GUI(src-tauri)·cys fleet가 공유, 규약 단일화).
 /// Windows: named pipe `\\.\pipe\cys-dept-<name>`(기본 데몬 `\\.\pipe\cys`와 대칭 · RC-13 state_dir
 /// 슬러그 `cys-dept-<name>`과 정합). unix: `~/.local/state/cys-dept-<name>/cys.sock`(cys-dept 규약).
@@ -509,5 +534,41 @@ mod tests {
         std::env::set_var(javis, "via_javis");
         assert_eq!(env_compat(only), Some("via_javis".to_string()));
         std::env::remove_var(javis);
+    }
+
+    #[test]
+    fn claude_project_component_munges_path() {
+        // 실측 munge 규칙: '/'와 특수문자 → '-', 영숫자·'-' 보존.
+        assert_eq!(
+            claude_project_component("/Users/alice/Desktop/ProjX"),
+            "-Users-alice-Desktop-ProjX"
+        );
+        assert_eq!(claude_project_component("/tmp/a.b_c"), "-tmp-a-b-c");
+    }
+
+    #[test]
+    fn resolve_claude_config_dir_is_deterministic_env_not_scan() {
+        // (W1-2 핵심) config_dir 권위는 결정론 env 해소뿐 — discover 스캔(~/.claude*)을 원리적으로
+        // 참조하지 않는다. CYS_ACCOUNT_DIR 설정 시 그 값 그대로, 미설정 시 $HOME/.cys/claude.
+        let prev = std::env::var("CYS_ACCOUNT_DIR").ok();
+        // (a) 명시 계정 dir → 그 절대경로 그대로 (foreign ~/.claude-* 존재 여부와 무관 = 스캔 안 함)
+        std::env::set_var("CYS_ACCOUNT_DIR", "/tmp/zz-acct/.cys/claude");
+        assert_eq!(resolve_claude_config_dir(), "/tmp/zz-acct/.cys/claude");
+        // (b) 빈 문자열 = 미설정 취급 → 기본 $HOME/.cys/claude
+        std::env::set_var("CYS_ACCOUNT_DIR", "");
+        let def = resolve_claude_config_dir();
+        assert!(def.ends_with("/.cys/claude"), "기본 해소: {def}");
+        assert!(
+            def.starts_with(&home_dir().to_string_lossy().into_owned()),
+            "HOME 기반: {def}"
+        );
+        // (c) 미설정도 동일 기본
+        std::env::remove_var("CYS_ACCOUNT_DIR");
+        assert_eq!(resolve_claude_config_dir(), def);
+        // 원복
+        match prev {
+            Some(v) => std::env::set_var("CYS_ACCOUNT_DIR", v),
+            None => std::env::remove_var("CYS_ACCOUNT_DIR"),
+        }
     }
 }

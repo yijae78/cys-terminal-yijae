@@ -90,6 +90,12 @@ pub struct Surface {
     /// (4) resume 핀용 agent transcript session_id — analytics.rs의 회계 session_id와 무관(별개 개념).
     /// usage 수집기가 transcript 발견 시 1회 stash(is_none 가드)·topology에 영속해 정확한 세션 재개.
     pub agent_session_id: Mutex<Option<String>>,
+    /// (W1) 이 pane의 claude 자식이 실제로 받는 CLAUDE_CONFIG_DIR — 생성 시 결정론 해소해 고정한다
+    /// (데몬 env의 CYS_ACCOUNT_DIR 또는 $HOME/.cys/claude, cys::resolve_claude_config_dir). topology에
+    /// 영속되고 restore가 이 값을 launch 문자열에 인라인 오버라이드해, 데몬 env가 바뀌어도 원 계정 dir로
+    /// 정확히 재개한다. discover 스캔은 ~/.cys/claude를 못 보므로 config_dir 권위는 오직 이 결정론 기록이다.
+    /// restore로 재생성될 땐 topology 원값을 그대로 주입(재해소 금지 — 데몬 env 변동 시 오염 방지).
+    pub claude_config_dir: Mutex<Option<String>>,
     /// ⑪ pack-reinject 추적 마커 — 마지막 주입 pack_version·directive_hash. 단일 write path는
     /// `reinject.mark` RPC(주입 성공 직후 컨트롤러만 호출). topology 영속·restore 복원으로
     /// 재기동을 견딘다. None=미주입(첫 pack-update에서 1회 주입). agent_session_id와 동일 위치 init.
@@ -1036,7 +1042,7 @@ impl Daemon {
         rows: u16,
         cols: u16,
     ) -> Result<Arc<Surface>, String> {
-        self.create_surface_with_env(cwd, cmd, title, role, rows, cols, &[])
+        self.create_surface_with_env(cwd, cmd, title, role, rows, cols, &[], None)
     }
 
     /// create_surface + PTY env 주입(RC-3 B′). `env`의 (k,v)를 builder.env로 실어 pane에 직접 전달한다
@@ -1052,6 +1058,7 @@ impl Daemon {
         rows: u16,
         cols: u16,
         env: &[(String, String)],
+        claude_config_dir_override: Option<String>,
     ) -> Result<Arc<Surface>, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let pty = native_pty_system();
@@ -1217,6 +1224,12 @@ impl Daemon {
             observed_usage: Mutex::new(None),
             registered_transcript: Mutex::new(None),
             agent_session_id: Mutex::new(None),
+            // (W1) restore가 넘긴 원값이 있으면 그대로 고정(재해소 금지 — 데몬 env 변동 시 오염 방지),
+            // 없으면(신규 기동) 이 데몬 프로세스 env로 결정론 해소(pane 셸이 실제 해소할 값과 일치).
+            claude_config_dir: Mutex::new(Some(
+                claude_config_dir_override
+                    .unwrap_or_else(cys::resolve_claude_config_dir),
+            )),
             pack_reinject: Mutex::new(None),
             ctx_threshold_armed: AtomicBool::new(true),
             // 능력 가드: 생성 시 역할에서 도출(reviewer-*=read/search, full=worker/master/cso,
@@ -1997,15 +2010,75 @@ mod tests {
             .create_surface_with_env(
                 None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80,
                 &[("CLAUDE_CONFIG_DIR".to_string(), "/x/.cys/claude".to_string())],
+                None,
             )
             .unwrap();
         assert!(s1.env_injected, "env 주입 surface는 env_injected=true여야 node-recover 허용");
         let s2 = daemon
             .create_surface_with_env(
-                None, Some("sleep 30".into()), None, Some("worker-2".into()), 24, 80, &[],
+                None, Some("sleep 30".into()), None, Some("worker-2".into()), 24, 80, &[], None,
             )
             .unwrap();
         assert!(!s2.env_injected, "env 미주입 surface는 env_injected=false → Windows node-recover fail-closed");
+    }
+
+    /// (W1-6 a·d) 계정 config_dir 영속 라운드트립 + 구 topology 하위호환.
+    #[test]
+    fn w1_topology_persists_config_dir_and_old_compat() {
+        let sock = isolated_sock("w1-topo");
+        let daemon = Daemon::new(sock.clone());
+        let recorded = "/home/x/acct/.cys/claude";
+        // restore 경로 모사: override를 넘기면 재해소 없이 그 원값을 그대로 고정한다.
+        let s = daemon
+            .create_surface_with_env(
+                Some("/home/x/wf".into()),
+                Some("sleep 30".into()),
+                None,
+                Some("worker-1".into()),
+                24,
+                80,
+                &[],
+                Some(recorded.to_string()),
+            )
+            .unwrap();
+        assert_eq!(
+            s.claude_config_dir.lock().unwrap().clone(),
+            Some(recorded.to_string()),
+            "restore override는 데몬 env 재해소 없이 원값 고정"
+        );
+        // 영속 → 재로드 라운드트립: 기록된 config_dir이 topology에 살아 있어야 restore가 인라인할 수 있다.
+        crate::governance::persist_topology(&daemon);
+        let entries = crate::governance::load_topology(&daemon);
+        let found = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["role"].as_str() == Some("worker-1"))
+            .expect("worker-1 entry 영속");
+        assert_eq!(
+            found["claude_config_dir"].as_str(),
+            Some(recorded),
+            "config_dir 영속·재로드"
+        );
+
+        // (d) 구 topology 호환: claude_config_dir 필드 없는 topology.json 직접 기록 → 로드 시 엔트리는
+        //     살아있고 config_dir=None(부재) → restore가 override None으로 템플릿 기본에 하위호환.
+        let dir = state_dir(&sock);
+        let old = r#"{"updated_at":1.0,"entries":[{"role":"worker-9","agent":"claude","cwd":"/x"}]}"#;
+        std::fs::write(dir.join("topology.json"), old).unwrap();
+        let loaded = crate::governance::load_topology(&daemon);
+        let e9 = loaded
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["role"].as_str() == Some("worker-9"))
+            .expect("구 topology 엔트리 로드");
+        assert!(
+            e9.get("claude_config_dir")
+                .and_then(|v| v.as_str())
+                .is_none(),
+            "구 topology엔 필드 부재 → None(restore 템플릿 기본 하위호환)"
+        );
     }
 
     #[test]

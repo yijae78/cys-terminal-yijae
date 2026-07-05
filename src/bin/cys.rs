@@ -3842,6 +3842,65 @@ fn render_launch(cmd: &str, env: &[(String, String)]) -> (String, Vec<(String, S
     }
 }
 
+/// (W1-5) resume 인자 해소 + claude 사전검증 게이트. `{session_id}` 정확 핀은 실제
+/// `<config_dir>/projects/<munge cwd>/<id>.jsonl`이 실재할 때만 부착하고, 미실재면 None을 반환해
+/// resume 자체를 생략한다(--continue 대체 금지 — 다른 대화 오염 방지). session_id 부재는 fallback,
+/// placeholder 없는 arg·타 agent(codex 등)는 무변경. 파일시스템만 접근하는 순수 함수라 단위 테스트 가능.
+fn resolve_resume_suffix(
+    agent: &str,
+    arg: &str,
+    session_id: Option<&str>,
+    config_dir: Option<&str>,
+    cwd: Option<&str>,
+    fallback: &str,
+) -> Option<String> {
+    if !arg.contains("{session_id}") {
+        return Some(arg.to_string());
+    }
+    let Some(id) = session_id else {
+        return Some(fallback.to_string());
+    };
+    if agent != "claude" {
+        // 타 agent는 세션 파일 레이아웃을 검증할 수 없다 → 기존 정책 그대로(핀 부착).
+        return Some(arg.replace("{session_id}", id));
+    }
+    let cfg = config_dir
+        .map(String::from)
+        .unwrap_or_else(cys::resolve_claude_config_dir);
+    let comp = cys::claude_project_component(cwd.unwrap_or(""));
+    let jsonl = format!("{cfg}/projects/{comp}/{id}.jsonl");
+    if std::path::Path::new(&jsonl).exists() {
+        Some(arg.replace("{session_id}", id))
+    } else {
+        eprintln!(
+            "[launch-agent] resume 생략: 세션 파일 미실재 ({jsonl}) — 새 세션으로 기동(다른 대화 오염 방지)"
+        );
+        None
+    }
+}
+
+/// (W1-4) restore 시 agents.json env 템플릿(`${CYS_ACCOUNT_DIR:-...}`) 대신 topology에 기록된 원
+/// config_dir을 launch 문자열에 리터럴 인라인 오버라이드한다 — 데몬 env가 바뀌어도 원 계정 dir로 정확히
+/// 재개. 신규 기동(restore=false)·config_dir 부재는 무변경(mac 무회귀·byte-identical 유지). spec env에
+/// CLAUDE_CONFIG_DIR 키가 있을 때만 치환하므로 codex 등 타 agent엔 무영향(claude 한정).
+fn apply_config_dir_override(
+    env_pairs: &mut [(String, String)],
+    restore: bool,
+    config_dir: Option<&str>,
+) {
+    if !restore {
+        return;
+    }
+    let Some(cfg) = config_dir else {
+        return;
+    };
+    for (k, v) in env_pairs.iter_mut() {
+        if k == "CLAUDE_CONFIG_DIR" {
+            *v = cfg.to_string();
+        }
+    }
+}
+
 /// launch-agent(새 surface)와 node-recover(기존 surface 재기동)가 공유한다.
 fn boot_agent_on_surface(
     sid: u64,
@@ -3851,26 +3910,22 @@ fn boot_agent_on_surface(
     resume: bool,
     session_id: Option<&str>,
     restore: bool,
+    // (W1) 이 pane의 cwd(resume 사전검증 munge용)와 데몬이 기록·반환한 권위 config_dir.
+    // config_dir=None이면 게이트가 cys::resolve_claude_config_dir()로 best-effort 해소한다.
+    cwd: Option<&str>,
+    config_dir: Option<&str>,
 ) -> Result<(), String> {
     let mut cmd = spec["cmd"].as_str().ok_or("agent cmd missing")?.to_string();
     if resume {
         if let Some(arg) = spec["resume_arg"].as_str() {
             // T2-6 resume 어댑터: 대화 기억 복원 플래그 (예: claude --continue).
-            // (4b) {session_id} placeholder 치환: id가 있으면 정확한 세션 핀, 없으면 fallback arg
-            // (claude=--continue, codex=resume --last). placeholder 없는 arg는 그대로(하위호환).
-            let resolved = if arg.contains("{session_id}") {
-                match session_id {
-                    Some(id) => arg.replace("{session_id}", id),
-                    None => spec["resume_arg_fallback"]
-                        .as_str()
-                        .unwrap_or("--continue")
-                        .to_string(),
-                }
-            } else {
-                arg.to_string()
-            };
-            cmd.push(' ');
-            cmd.push_str(&resolved);
+            let fallback = spec["resume_arg_fallback"].as_str().unwrap_or("--continue");
+            if let Some(resolved) =
+                resolve_resume_suffix(agent, arg, session_id, config_dir, cwd, fallback)
+            {
+                cmd.push(' ');
+                cmd.push_str(&resolved);
+            }
         }
     }
     let delay = spec["inject_delay_secs"].as_u64().unwrap_or(12);
@@ -3890,7 +3945,9 @@ fn boot_agent_on_surface(
     // RC-3(B′): OS-aware 렌더 — unix는 `KEY="val" cmd` 인라인(기존 byte-identical·셸 전개),
     // windows는 순수 cmd(env는 surface.create가 pane env로 주입). send_env는 여기선 미사용
     // (주입은 run_launch_agent_opts의 surface.create에서 이미 수행) — send 문자열만 취한다.
-    let (send, _send_env) = render_launch(&cmd, &agent_env_pairs(spec));
+    let mut env_pairs = agent_env_pairs(spec);
+    apply_config_dir_override(&mut env_pairs, restore, config_dir);
+    let (send, _send_env) = render_launch(&cmd, &env_pairs);
     request(
         "surface.send_text",
         json!({"surface_id": sid, "text": send, "quiet": true, "authoritative": true}),
@@ -4093,7 +4150,7 @@ fn run_todo_path() -> i32 {
 }
 
 fn run_launch_agent(role: &str, agent: &str, cwd: Option<String>) -> i32 {
-    run_launch_agent_opts(role, agent, cwd, false, None, false)
+    run_launch_agent_opts(role, agent, cwd, false, None, false, None)
 }
 
 /// 절대지침(앵커1-b): 탭(타이틀) = 워크플로우 폴더명 — "{role}-{agent} · {폴더}".
@@ -4112,6 +4169,7 @@ fn workflow_title(role: &str, agent: &str, cwd: &Option<String>) -> String {
         .unwrap_or_else(|| format!("{role}-{agent}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_launch_agent_opts(
     role: &str,
     agent: &str,
@@ -4119,6 +4177,8 @@ fn run_launch_agent_opts(
     resume: bool,
     session_id: Option<String>,
     restore: bool,
+    // (W1) restore가 topology에 기록된 원 계정 config_dir을 넘긴다(재해소 금지). 신규 기동은 None.
+    config_dir_override: Option<String>,
 ) -> i32 {
     // 절대지침(앵커1-b): 워커는 워크플로우 폴더에서 산다 — cwd 미지정이면 호출 폴더가
     // 워크플로우 폴더다 (데몬 기본값 home에 맡기지 않는다. 명시 --cwd는 그대로 우선).
@@ -4157,12 +4217,26 @@ fn run_launch_agent_opts(
         let r = request(
             "surface.create",
             json!({"cwd": cwd, "title": workflow_title(role, agent, &cwd), "role": role,
-                   "rows": 40, "cols": 140, "idempotency_key": idem, "env": env_obj}),
+                   "rows": 40, "cols": 140, "idempotency_key": idem, "env": env_obj,
+                   // (W1) restore 원값 전달(부재=신규는 데몬이 자기 env로 결정론 해소·기록).
+                   "claude_config_dir": config_dir_override}),
         )?;
         let sid = r["surface_id"].as_u64().ok_or("create returned no id")?;
         created = Some(sid);
         eprintln!("[launch-agent] {} created (role={role})", surface_ref(sid));
-        boot_agent_on_surface(sid, role, agent, &spec, resume, session_id.as_deref(), restore)?;
+        // (W1) 데몬이 기록·반환한 권위 config_dir을 resume 게이트·restore 인라인의 결정론 소스로 쓴다.
+        let recorded_cfg = r["claude_config_dir"].as_str().map(String::from);
+        boot_agent_on_surface(
+            sid,
+            role,
+            agent,
+            &spec,
+            resume,
+            session_id.as_deref(),
+            restore,
+            cwd.as_deref(),
+            recorded_cfg.as_deref(),
+        )?;
         println!("{}", surface_ref(sid));
         Ok(())
     })();
@@ -5089,7 +5163,20 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
         std::thread::sleep(std::time::Duration::from_millis(200));
         // (4b) topology에 영속된 session_id가 있으면 정확한 세션 재개(없으면 fallback)
         let sess = entry["session_id"].as_str().map(String::from);
-        boot_agent_on_surface(sid, &role_name, &agent, &spec, true, sess.as_deref(), false)?;
+        // (W1) 같은 pane 재기동(restore=false → 인라인 없음)이나 resume 게이트엔 기록된 config_dir·cwd를 쓴다.
+        let rec_cwd = entry["cwd"].as_str().map(String::from);
+        let rec_cfg = entry["claude_config_dir"].as_str().map(String::from);
+        boot_agent_on_surface(
+            sid,
+            &role_name,
+            &agent,
+            &spec,
+            true,
+            sess.as_deref(),
+            false,
+            rec_cwd.as_deref(),
+            rec_cfg.as_deref(),
+        )?;
         inject_text(sid, "[RECOVER] 너는 방금 재기동되었다. _round/SESSION_STATE.md와 자기 TODO 파일을 읽어 작업 기억을 복원한 뒤 master에게 복귀를 1줄 push로 보고하라. 작업 재개는 master 지시를 따른다.")?;
         println!("recovered surface:{sid} ({agent})");
         Ok(())
@@ -5142,7 +5229,9 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
             println!("· {role}: {agent} 재기동…");
             // (4b) saved entry의 session_id를 꺼내 정확한 세션 재개(없으면 fallback)
             let sess = entry["session_id"].as_str().map(String::from);
-            if run_launch_agent_opts(role, agent, target_cwd, !no_resume, sess, true) == 0 {
+            // (W1) topology에 기록된 원 계정 config_dir을 넘긴다(구 topology=None → 기존 템플릿 동작).
+            let cfg = entry["claude_config_dir"].as_str().map(String::from);
+            if run_launch_agent_opts(role, agent, target_cwd, !no_resume, sess, true, cfg) == 0 {
                 ok += 1;
                 if let Ok(r) = request("system.resolve_role", json!({"role": role})) {
                     if let Some(sid) = r["surface_id"].as_u64() {
@@ -8190,5 +8279,112 @@ mod tests {
         assert_eq!(by("hook"), DiagStatus::Ok, "hook 재등록됨");
         let _ = std::fs::remove_dir_all(&base);
         std::env::remove_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS");
+    }
+
+    // ───────────────────────── W1: 계정 dir 영속 + resume 재현 ─────────────────────────
+
+    /// (W1-6c·a) resume 사전검증 게이트가 **전달된 config_dir**만 결정론 소스로 삼는지 —
+    /// discover 스캔 밖(~/.cys/claude 모사) 경로 + 같은 munge cwd의 foreign 프로필 공존 환경.
+    #[test]
+    fn w1_resume_gate_uses_recorded_config_dir_not_foreign_profile() {
+        let base = std::env::temp_dir().join(format!("cys-w1-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // 워커의 실제 cwd — 이 값이 munge되어 projects/<comp>가 된다.
+        let cwd = "/home/x/Desktop/CYSjavis-wf";
+        let comp = cys::claude_project_component(cwd);
+        let sid = "ses-abc-123";
+        // (권위) discover 스캔이 못 보는 ~/.cys/claude 모사 경로.
+        let recorded = base.join("acct").join(".cys").join("claude");
+        // (foreign) 같은 munge cwd를 가진 남의 프로필 — 여기에도 같은 sid .jsonl이 존재하지만
+        //           게이트는 recorded만 봐야 한다(오채택 시 남의 대화로 재개 = 오염).
+        let foreign = base.join("home").join(".claude-other");
+        for root in [&recorded, &foreign] {
+            let proj = root.join("projects").join(&comp);
+            std::fs::create_dir_all(&proj).unwrap();
+        }
+        let recorded_str = recorded.to_string_lossy().into_owned();
+        let foreign_str = foreign.to_string_lossy().into_owned();
+        let arg = "--resume {session_id}";
+
+        // (1) recorded에 세션 파일 부재 + foreign에만 존재 → 게이트는 resume 생략(None).
+        //     "foreign에 있으니 붙이자"는 오채택을 하지 않는다(결정론 소스=recorded).
+        std::fs::write(
+            foreign.join("projects").join(&comp).join(format!("{sid}.jsonl")),
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_resume_suffix("claude", arg, Some(sid), Some(&recorded_str), Some(cwd), "--continue"),
+            None,
+            "recorded에 세션 파일 없으면 foreign 존재와 무관하게 resume 생략(--continue 대체 금지)"
+        );
+
+        // (2) recorded에 세션 파일 실재 → 정확 핀 부착.
+        std::fs::write(
+            recorded.join("projects").join(&comp).join(format!("{sid}.jsonl")),
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_resume_suffix("claude", arg, Some(sid), Some(&recorded_str), Some(cwd), "--continue"),
+            Some(format!("--resume {sid}")),
+            "recorded에 세션 파일 실재 시 정확 핀 부착"
+        );
+
+        // (3) config_dir을 foreign으로 넘기면 (recorded와 무관) foreign 파일로 판정 — 소스가 인자임을 박제.
+        assert_eq!(
+            resolve_resume_suffix("claude", arg, Some(sid), Some(&foreign_str), Some(cwd), "--continue"),
+            Some(format!("--resume {sid}")),
+            "게이트 소스는 전달된 config_dir 하나뿐"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (W1-6c) 게이트 경계: 타 agent·session_id 부재·placeholder 없는 arg는 무변경.
+    #[test]
+    fn w1_resume_gate_boundaries() {
+        let arg = "--resume {session_id}";
+        // 타 agent(codex)는 파일 검증 불가 → 파일 없어도 정책 그대로 핀 부착.
+        assert_eq!(
+            resolve_resume_suffix("codex", arg, Some("s1"), Some("/nonexistent"), Some("/x"), "resume --last"),
+            Some("--resume s1".to_string())
+        );
+        // session_id 부재 → fallback.
+        assert_eq!(
+            resolve_resume_suffix("claude", arg, None, Some("/nonexistent"), Some("/x"), "--continue"),
+            Some("--continue".to_string())
+        );
+        // placeholder 없는 arg는 그대로(하위호환).
+        assert_eq!(
+            resolve_resume_suffix("claude", "--continue", Some("s1"), Some("/nonexistent"), Some("/x"), "--continue"),
+            Some("--continue".to_string())
+        );
+    }
+
+    /// (W1-6b) restore 인라인 오버라이드: 기록된 원 config_dir이 launch 문자열에 리터럴로 실려야 한다.
+    /// 신규 기동(restore=false)은 템플릿 유지(byte-identical), codex 등(키 부재)은 무영향.
+    #[test]
+    fn w1_restore_inlines_recorded_config_dir() {
+        let template = "${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}";
+        let recorded = "/home/x/acct/.cys/claude";
+
+        // restore=true + 기록값 → 템플릿이 리터럴로 치환됨.
+        let mut env = vec![("CLAUDE_CONFIG_DIR".to_string(), template.to_string())];
+        apply_config_dir_override(&mut env, true, Some(recorded));
+        let (send, _) = render_launch("claude --dangerously-skip-permissions", &env);
+        assert!(send.contains(&format!("CLAUDE_CONFIG_DIR=\"{recorded}\"")), "리터럴 인라인: {send}");
+        assert!(!send.contains(template), "템플릿이 남으면 안 됨: {send}");
+
+        // restore=false → 무변경(템플릿 유지, 신규 기동 byte-identical).
+        let mut env2 = vec![("CLAUDE_CONFIG_DIR".to_string(), template.to_string())];
+        apply_config_dir_override(&mut env2, false, Some(recorded));
+        assert_eq!(env2[0].1, template, "신규 기동은 템플릿 유지");
+
+        // codex 등 CLAUDE_CONFIG_DIR 키 부재 → 무영향(엉뚱한 env 주입 안 함).
+        let mut env3 = vec![("OTHER".to_string(), "v".to_string())];
+        apply_config_dir_override(&mut env3, true, Some(recorded));
+        assert_eq!(env3.len(), 1, "새 키 추가 금지");
+        assert_eq!(env3[0], ("OTHER".to_string(), "v".to_string()));
     }
 }

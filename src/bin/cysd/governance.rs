@@ -711,6 +711,10 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
                        "agent_bin": meta.map(|(_, b)| b),
                        "cwd": s.cwd, "title": s.title.lock().unwrap().clone(),
                        "session_id": s.agent_session_id.lock().unwrap().clone(),
+                       // (W1) 원 계정 config_dir 영속 — restore가 이 값을 launch 문자열에 인라인해
+                       // 데몬 env 변동에도 원 대화(.jsonl)로 정확히 재개한다. 구 topology(필드 없음)는
+                       // 로드 시 None → 기존 동작(템플릿 전개)으로 하위호환.
+                       "claude_config_dir": s.claude_config_dir.lock().unwrap().clone(),
                        "pack_reinject": s.pack_reinject.lock().unwrap().clone()})
             })
         })
