@@ -2040,7 +2040,7 @@ function startGroupDrag(e0: MouseEvent, srcId: number) {
 
 // ---------- 정렬: 역할(role) 기반 고정 배치 ----------
 // 현재 워크스페이스의 살아있는 surface를 역할별 표준 자리로 재배치한다:
-//   · 왼쪽 끝 컬럼  = master(위) / cso(아래), 세로 4:1
+//   · 왼쪽 끝 컬럼  = master(위) / cso(아래), 세로 3:1
 //   · 가운데        = worker·미분류 surface를 같은 폭 컬럼으로 균등 분배(좌→우 순서 보존)
 //   · 오른쪽 끝 컬럼 = reviewer-gemini(agy, 위) / reviewer-codex(codex, 아래), 세로 1:1
 // 트리 위상만 새로 짜고 attachDividerDrag는 건드리지 않으므로 수동 크기 조절은 그대로 보존된다
@@ -2069,8 +2069,8 @@ function roleLayout(sids: number[], roleOf: Map<number, string | null>): Node {
   const pane = (sid: number): Node => ({ type: "pane", sid });
 
   const columns: Node[] = [];
-  // 왼쪽 끝: master(위) / cso(아래) = 4:1 (누락 시 있는 쪽이 컬럼 전체)
-  if (master != null && cso != null) columns.push({ type: "split", dir: "col", ratio: 4 / 5, a: pane(master), b: pane(cso) });
+  // 왼쪽 끝: master(위) / cso(아래) = 3:1 (누락 시 있는 쪽이 컬럼 전체)
+  if (master != null && cso != null) columns.push({ type: "split", dir: "col", ratio: 3 / 4, a: pane(master), b: pane(cso) });
   else if (master != null) columns.push(pane(master));
   else if (cso != null) columns.push(pane(cso));
   // 가운데: worker·미분류 균등 컬럼
@@ -2679,23 +2679,12 @@ async function newSurface(cwd: string | null = null, socket?: string): Promise<n
   return r.surface_id;
 }
 
-// 같은 ws의 첫 surface가 지금 있는 경로 — 새 surface의 시작 경로로 쓴다 (이후 이동은 사용자 몫)
-async function firstPaneCwd(): Promise<string | null> {
-  const first = collectSids(current().tree)[0];
-  if (first == null) return null;
-  try {
-    const r = (await invoke("list_surfaces", { socket: current()?.socket })) as {
-      surfaces: { surface_id: number; live_cwd: string | null }[];
-    };
-    return r.surfaces.find((s) => s.surface_id === first)?.live_cwd ?? null;
-  } catch {
-    return null;
-  }
-}
+// 새 pane 시작 경로 = 홈 디렉터리 (cwd=null → 데몬 기본값 home_dir — 오너 결정 2026-07-06:
+// 피닉스 복원 후에도 새 워크스페이스·pane은 항상 홈에서 시작. 첫 pane 경로 상속 폐기)
 
 async function actionNew() {
   if (current()?.pending) return; // 부서 데몬 준비 중(빈 socket placeholder) — surface 생성 금지(기본 데몬 고아 차단)
-  const sid = await newSurface(await firstPaneCwd(), current().socket);
+  const sid = await newSurface(null, current().socket);
   const ws = current();
   ws.tree = ws.tree
     ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid } }
@@ -2712,7 +2701,7 @@ async function actionSplit(dir: "row" | "col") {
     return actionNew();
   }
   const target = focusedSid;
-  const sid = await newSurface(await firstPaneCwd(), ws.socket);
+  const sid = await newSurface(null, ws.socket);
   if (!ws.tree || !collectSids(ws.tree).includes(target)) {
     // await 사이에 대상이 닫힌 경우 — 루트에 덧붙여 고아를 만들지 않는다
     ws.tree = ws.tree

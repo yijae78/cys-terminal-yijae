@@ -17,7 +17,10 @@
   9. 최종 deep verify         — 실패 시 자동 롤백:
        ★staging rollback: 동일 FS(/Applications)의 .rollback-staging 공간에 ditto 복원 후 서명/해시를 사전 검증.
        성공 시에만 기존 타깃을 existed 제거 후 원자 교체.
-  10. 데몬 재시작             — system.identify 정확 PID로 종료 및 respawn 폴링. 실패 시 hard fail.
+  10. 데몬 재시작             — ★--execute 성공 시 자동 실행(2026-07-06 오너 지시 — 수동 kill·재가동 폐기):
+       drain(저장 신호·best-effort) → system.identify 정확 PID로 종료 및 respawn 폴링. 실패 시 hard fail.
+       구 데몬 종료 후 launchd KeepAlive가 새 번들의 cysd를 respawn하고, 새 cysd의 auto-restore
+       (phoenix)가 노드를 복원한다. 단독 재시작은 기존대로 --restart.
 """
 import hashlib
 import json
@@ -303,6 +306,14 @@ def daemon_identify(timeout=2.0):
     except Exception:
         return None
 
+# ── drain: 재시작 前 살아있는 노드에 저장 신호 (best-effort·자체 watchdog 12s) ──
+def drain_nodes():
+    cys_cli = f"{BREW}/cys"
+    if not os.path.isfile(cys_cli):
+        cys_cli = f"{APP_MACOS}/cys"
+    r = run([cys_cli, "drain"])
+    print(f"  ✓ drain(저장 신호·best-effort): rc={r.returncode} {r.stdout.strip()}")
+
 # ── 데몬 재시작 (실패 시 restart hard fail) ─────────────────────────────
 def restart_daemon(inv):
     res = {"ts": int(time.time())}
@@ -400,6 +411,16 @@ def main():
         print(f"❌ 배포 실패: {e}")
         rollback(inv)
         sys.exit(1)
+    # ★스텝 10(2026-07-06 오너 지시): 배포 성공 확정 후 구 데몬 자동 교체 — drain(저장 신호)
+    # → 구 데몬 SIGTERM → 신 데몬 socket-ready 폴링. 파일 교체는 이미 완료·검증됐으므로
+    # 재시작 실패는 롤백하지 않고 hard fail로 알린다(restart_daemon 내 die).
+    # 구 데몬이 아예 없으면 교체할 대상이 없다 — 건너뛴다(다음 기동이 새 바이너리·기존 성공 배포 불변).
+    if daemon_identify() is None:
+        print("  ✓ 실행 중인 데몬 없음 — 재시작 생략(다음 기동이 새 cysd)")
+        return
+    drain_nodes()
+    restart_daemon(inv)
+    print("✅ 데몬 교체 완료 — 구 데몬 종료·신 데몬 socket-ready 확인")
 
 if __name__ == "__main__":
     # ★안전장치: --execute(배포) 또는 --restart(데몬 재시작) 없이는 실행 거부.
