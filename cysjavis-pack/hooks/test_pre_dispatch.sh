@@ -19,7 +19,7 @@
 set -u
 
 REAL_HOOKS=${REAL_HOOKS:-$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)}
-REAL_GUARD=${REAL_GUARD:-/Users/cys/dev/cys-arp/_round/autopilot/guard.sh}
+REAL_GUARD=${REAL_GUARD:-$HOME/dev/cys-arp/_round/autopilot/guard.sh}
 
 for f in "$REAL_HOOKS/pre-dispatch.sh" "$REAL_HOOKS/cys-hook.sh" "$REAL_HOOKS/appbuild-gate.sh" "$REAL_HOOKS/grill-gate.sh"; do
   [ -f "$f" ] || { echo "FATAL: 서브훅 없음 $f"; exit 1; }
