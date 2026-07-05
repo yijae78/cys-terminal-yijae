@@ -719,9 +719,18 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
             })
         })
         .collect();
+    // ★W2a 묘비 영속: 의도적으로 닫힌 역할을 topology.json에 함께 써 콜드부트를 넘겨 생존시킨다.
+    // auto-restore·phoenix가 이 집합을 desired_roster로 병합해 좀비 부활을 원천 차단한다.
+    let tombstones: Vec<String> = {
+        let mut v: Vec<String> = daemon.tombstones.lock().unwrap().iter().cloned().collect();
+        v.sort();
+        v
+    };
     let dir = crate::state::state_dir(&daemon.socket_path);
-    let content = serde_json::to_string_pretty(&json!({"updated_at": now_epoch(), "entries": entries}))
-        .unwrap_or_default();
+    let content = serde_json::to_string_pretty(
+        &json!({"updated_at": now_epoch(), "entries": entries, "tombstones": tombstones}),
+    )
+    .unwrap_or_default();
     // ★원자 쓰기 — SIGTERM/크래시가 쓰기 도중 끼어도 topology.json은 옛 완본 또는 새 완본만
     // 남는다. 비원자 write면 torn write가 깨진 JSON을 남기고 load_topology가 빈 배열로 폴백해
     // 전 노드 resume 핀(=전 세션 컨텍스트)이 증발한다. 패턴: reference_atomic-sidecar-json-write.
@@ -763,6 +772,22 @@ pub fn load_topology(daemon: &Arc<Daemon>) -> serde_json::Value {
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .map(|v| v["entries"].clone())
         .unwrap_or_else(|| json!([]))
+}
+
+/// ★W2a: topology.json에서 묘비 집합을 직접 읽는다(데몬 기동 시 in-메모리 tombstones seed용).
+/// 구 topology(tombstones 필드 부재)·부재·손상은 전부 빈 집합으로 폴백(기존 동작 하위호환).
+pub fn load_tombstones_from_disk(socket_path: &std::path::Path) -> std::collections::HashSet<String> {
+    let dir = crate::state::state_dir(socket_path);
+    std::fs::read_to_string(dir.join("topology.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["tombstones"].as_array().cloned())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn check_load(daemon: &Daemon, last_alert: &mut f64) {
@@ -1209,9 +1234,14 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64) -> Result<(), String> {
         let mut roles = daemon.roles.lock().unwrap();
         let srole = surface.role.lock().unwrap();
         let mut master_released = false;
+        // ★W2a: surface.close = 의도적 닫기. 이 surface가 실제로 보유한 역할(roles 맵이 이 id를
+        // 가리킬 때만 — 이미 다른 surface로 재배정된 역할은 그쪽이 살아있으므로 묘비 대상 아님)을
+        // 묘비에 올려 auto-restore의 좀비 부활을 차단한다. 실제 삽입은 락 해제 후(tombstones는 리프 락).
+        let mut tombstone_role: Option<String> = None;
         if let Some(role) = srole.as_ref() {
             if roles.get(role) == Some(&id) {
                 roles.remove(role);
+                tombstone_role = Some(role.clone());
                 // 벡터-9 방어심화: master 보유 surface가 종료되면 master_claimed_at을 비운다
                 // (master 부재 → approval.sign 동결, 다음 정당 승계 시 쿨다운 재시작).
                 if role == "master" {
@@ -1224,6 +1254,9 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64) -> Result<(), String> {
         // master_claimed_at 갱신은 surfaces·roles 락 해제 후(단일 락만 보유 → 락 순서 무변경).
         if master_released {
             *daemon.master_claimed_at.lock().unwrap() = None;
+        }
+        if let Some(role) = tombstone_role {
+            daemon.tombstones.lock().unwrap().insert(role);
         }
         surface
     };

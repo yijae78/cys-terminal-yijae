@@ -428,6 +428,13 @@ pub struct Daemon {
     pub ledger: Mutex<HashMap<u32, LedgerEntry>>,
     /// 역할 레지스트리: role → surface_id (launch-agent가 등록, --to <role> 주소 해석에 사용)
     pub roles: Mutex<HashMap<String, u64>>,
+    /// ★불사의 예외(W2a): 의도적으로 닫힌(surface.close 경유) 역할의 묘비 집합.
+    /// close_surface가 role 보유 surface를 닫을 때 추가하고, 역할이 명시적으로 재기동
+    /// (launch-agent/claim_role로 role 등록)되면 제거한다("살아있는 역할=묘비 아님" 불변식).
+    /// topology.json에 영속돼 콜드부트를 넘어 생존하며, auto-restore·phoenix가 이 집합의
+    /// 역할을 절대 재스폰하지 않는다(사고사만 부활, 의도삭제는 좀비 차단). 데몬 기동 시
+    /// topology.json에서 로드한다(구 topology=필드 부재→빈 집합=기존 동작 하위호환).
+    pub tombstones: Mutex<std::collections::HashSet<String>>,
     /// 적대검증 벡터-9 방어심화: master role이 현재 보유 surface로 (재)claim된 epoch초.
     /// master surface가 죽는 윈도우에 다른 노드가 claim_role("master")로 합법 승계 → 즉시
     /// approval.sign으로 위험명령을 정당 서명할 수 있다. 이 값으로 갓 승계한 master의 서명을
@@ -831,6 +838,8 @@ impl Daemon {
             create_idem: Mutex::new(HashMap::new()),
             ledger: Mutex::new(HashMap::new()),
             roles: Mutex::new(HashMap::new()),
+            // ★W2a 콜드부트 생존: topology.json에 영속된 묘비를 기동 시 로드(구 topology=빈 집합).
+            tombstones: Mutex::new(crate::governance::load_tombstones_from_disk(&socket_path)),
             // 벡터-9 방어심화: 기동 시 master 미승계 → None (첫 claim_role("master")에서 기록).
             master_claimed_at: Mutex::new(None),
             feed_items: Mutex::new(restored),
@@ -1238,6 +1247,8 @@ impl Daemon {
             osc_carry: Mutex::new(Vec::new()),
         });
 
+        // ★W2a: 이 create가 실제 등록한(dedup 후) 역할 — 아래에서 묘비 해제에 쓴다.
+        let mut registered_role: Option<String> = None;
         {
             // surfaces 등록 '이후'에 역할 공개 — resolve_role 직후 get_surface가
             // 실패해 스케줄러가 역할 부재로 오판하는 창을 닫는다.
@@ -1260,8 +1271,15 @@ impl Daemon {
                     id,
                 );
                 *surface.role.lock().unwrap() = Some(final_role.clone());
-                roles.insert(final_role, id);
+                roles.insert(final_role.clone(), id);
+                registered_role = Some(final_role);
             }
+        }
+        // ★W2a 해제 불변식: 역할이 명시적으로 (재)기동됐다 = 부활 의도. 묘비에서 제거해
+        // 이후 이 역할의 비정상 종료는 다시 정상 부활 대상이 되게 한다("살아있는 역할=묘비 아님").
+        // tombstones는 리프 락 — surfaces/roles 락 해제 후 획득(락 순서 무변경).
+        if let Some(rr) = registered_role {
+            self.tombstones.lock().unwrap().remove(&rr);
         }
         if role.is_some() {
             crate::governance::persist_topology(self);

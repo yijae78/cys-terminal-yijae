@@ -1327,6 +1327,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     json!({"from_sid": master_before, "to_sid": master_after, "now": now}),
                 );
             }
+            // ★W2a 해제 불변식: claim_role = 명시적 역할 (재)등록 = 부활 의도. 묘비에서 제거해
+            // 이후 이 역할의 비정상 종료는 다시 정상 부활 대상이 되게 한다. tombstones는 리프 락.
+            daemon.tombstones.lock().unwrap().remove(&claimed_role);
             daemon.bus.publish(
                 "role.claimed",
                 "system",
@@ -3000,7 +3003,18 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     })
                 })
                 .collect();
-            Reply::Single(ok_response(&id, json!({"saved": saved, "live": live})))
+            // ★W2a: 묘비 집합을 동봉 — raw `cys restore`(run_restore)가 의도 삭제 역할을 재스폰하지
+            // 않도록 심층방어(phoenix 경유가 원칙이나 raw 경로도 좀비 부활을 막는다).
+            let tombstones: Vec<String> = {
+                let mut v: Vec<String> =
+                    daemon.tombstones.lock().unwrap().iter().cloned().collect();
+                v.sort();
+                v
+            };
+            Reply::Single(ok_response(
+                &id,
+                json!({"saved": saved, "live": live, "tombstones": tombstones}),
+            ))
         }
 
         // ─── T3-14 완료 대기: 데몬측 블로킹 regex 감시 (plain-line 마커 규약 전제) ───
@@ -5747,5 +5761,117 @@ mod tests {
         assert_eq!(r4["ok"], json!(true), "발행 pid 미상인데 자기승인 판정이 걸림: {r4}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────── ★W2a 좀비 차단(의도삭제=묘비) 회귀 가드 ───────────
+
+    /// close_surface(surface.close 경유 = 의도적 닫기)가 role 보유 surface를 닫으면 묘비를
+    /// 기록하고 topology.json에 영속한다 → 콜드부트가 로드해 좀비 부활을 차단한다.
+    #[test]
+    fn w2a_intentional_close_records_tombstone_and_persists() {
+        let daemon = isolated_daemon();
+        let master = make_surface(&daemon, Some("master"));
+        assert!(daemon.tombstones.lock().unwrap().is_empty(), "초기 묘비는 비어야");
+
+        crate::governance::close_surface(&daemon, master).expect("close");
+
+        assert!(
+            daemon.tombstones.lock().unwrap().contains("master"),
+            "의도적 close가 master를 묘비에 올리지 않았다(좀비 부활 위험)"
+        );
+        // topology.json 영속 + 콜드부트 로드 라운드트립(구현이 in-메모리 seed에 쓰는 그 경로).
+        let disk = crate::governance::load_tombstones_from_disk(&daemon.socket_path);
+        assert!(
+            disk.contains("master"),
+            "묘비가 topology.json에 영속되지 않아 재부팅 후 소실된다"
+        );
+    }
+
+    /// ★해제 불변식: 묘비된 역할이 명시적으로 재기동(create 경로 role 등록)되면 묘비가 풀리고,
+    /// 이후 비정상 종료는 다시 정상 부활 대상이 된다("살아있는 역할=묘비 아님").
+    #[test]
+    fn w2a_relaunch_clears_tombstone_via_create() {
+        let daemon = isolated_daemon();
+        let w = make_surface(&daemon, Some("worker"));
+        // 첫 worker는 dedup_worker_role에서 n=1 → "worker"로 등록됨.
+        crate::governance::close_surface(&daemon, w).expect("close");
+        assert!(
+            daemon.tombstones.lock().unwrap().contains("worker"),
+            "worker 묘비 미기록"
+        );
+        // 명시적 재기동(같은 역할) → 묘비 해제(닫힌 슬롯 재사용으로 다시 "worker").
+        let _w2 = make_surface(&daemon, Some("worker"));
+        assert!(
+            !daemon.tombstones.lock().unwrap().contains("worker"),
+            "재기동했는데 묘비가 안 풀렸다 — 부활 대상에서 영구 배제되는 결함"
+        );
+    }
+
+    /// ★해제 불변식(claim_role 경로): 사후 역할 등록도 부활 의도 → 묘비 해제.
+    #[test]
+    fn w2a_claim_role_clears_tombstone() {
+        let daemon = isolated_daemon();
+        let cso = make_surface(&daemon, Some("cso"));
+        crate::governance::close_surface(&daemon, cso).expect("close");
+        assert!(daemon.tombstones.lock().unwrap().contains("cso"));
+        // 역할 없는 pane을 하나 세우고 claim_role("cso")로 사후 등록.
+        let bare = make_surface(&daemon, None);
+        bind_caller(&daemon, 993_401_u32, bare);
+        let req = Request {
+            id: json!(1),
+            method: "system.claim_role".into(),
+            params: json!({"role": "cso", "surface_id": bare}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(993_401_u32)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "claim_role 실패: {resp}");
+        assert!(
+            !daemon.tombstones.lock().unwrap().contains("cso"),
+            "claim_role 재등록으로 묘비가 풀려야 한다"
+        );
+    }
+
+    /// ★불변식 방어: 역할이 이미 다른 살아있는 surface로 재배정된 뒤 옛 surface를 닫아도
+    /// 묘비를 올리지 않는다(살아있는 역할을 죽었다고 오인해 부활 차단하는 역결함 방지).
+    #[test]
+    fn w2a_close_stale_surface_does_not_tombstone_live_role() {
+        let daemon = isolated_daemon();
+        let a = make_surface(&daemon, Some("reviewer-codex"));
+        // 같은 non-worker 역할을 다시 등록 → latest-wins로 B가 소유(roles["reviewer-codex"]=B).
+        let _b = make_surface(&daemon, Some("reviewer-codex"));
+        assert_ne!(
+            daemon.roles.lock().unwrap().get("reviewer-codex").copied(),
+            Some(a),
+            "재등록 후 역할은 B가 소유해야"
+        );
+        // 옛 surface A를 닫음 — roles 맵은 A를 안 가리키므로 묘비 대상 아님.
+        crate::governance::close_surface(&daemon, a).expect("close");
+        assert!(
+            !daemon.tombstones.lock().unwrap().contains("reviewer-codex"),
+            "살아있는(B 소유) 역할이 옛 surface close로 묘비에 올랐다 — 부활 오차단"
+        );
+    }
+
+    /// system.topology RPC가 묘비를 노출해 raw `cys restore` 심층방어(run_restore skip)의
+    /// 데이터 소스가 된다.
+    #[test]
+    fn w2a_topology_rpc_exposes_tombstones() {
+        let daemon = isolated_daemon();
+        let m = make_surface(&daemon, Some("master"));
+        crate::governance::close_surface(&daemon, m).expect("close");
+        let req = Request {
+            id: json!(1),
+            method: "system.topology".into(),
+            params: json!({}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        let tombs = resp["result"]["tombstones"].as_array().expect("tombstones array");
+        assert!(
+            tombs.iter().any(|t| t.as_str() == Some("master")),
+            "system.topology가 묘비를 노출하지 않는다: {resp}"
+        );
     }
 }

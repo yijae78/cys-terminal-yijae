@@ -239,6 +239,11 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
     // (master·worker·gemini·codex 노드는 모두 오너 UID로 도는 단일 사용자 구조)
     let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
 
+    // ★W2 콜드부트 자동 복원: 소켓 바인드·수신 준비가 끝난 '이후'에만 1회 발화한다(자식
+    // phoenix가 이 데몬 소켓으로 즉시 RPC할 수 있어야 하므로 바인드 성공이 선행 조건).
+    // raw `cys restore`가 아니라 phoenix를 태워 desired_roster·묘비·회로차단기·저널을 경유한다.
+    spawn_auto_restore();
+
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
@@ -250,6 +255,74 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
                 });
             }
             Err(e) => eprintln!("accept error: {e}"),
+        }
+    }
+}
+
+/// ★W2 콜드부트 자동 복원 판정(순수 함수 — 부수효과 없음, 단위 테스트 가능).
+/// opt-out(CYS_NO_AUTORESTORE) 또는 phoenix 미설치면 스폰하지 않는다.
+#[derive(Debug, PartialEq)]
+enum AutoRestore {
+    /// CYS_NO_AUTORESTORE=1 — 사용자가 콜드부트 복원을 껐다.
+    OptedOut,
+    /// phoenix 스크립트 부재(구 배포·미설치) — 조용히 skip(로그 1줄).
+    PhoenixMissing(std::path::PathBuf),
+    /// 스폰 대상: `python3 <phoenix> restore --auto`.
+    Ready {
+        program: String,
+        args: Vec<String>,
+    },
+}
+
+fn decide_auto_restore(pack_dir: &std::path::Path, opted_out: bool) -> AutoRestore {
+    if opted_out {
+        return AutoRestore::OptedOut;
+    }
+    let phoenix = pack_dir.join("bin").join("javis_phoenix.py");
+    if !phoenix.exists() {
+        return AutoRestore::PhoenixMissing(phoenix);
+    }
+    AutoRestore::Ready {
+        program: "python3".to_string(),
+        args: vec![
+            phoenix.to_string_lossy().into_owned(),
+            "restore".to_string(),
+            "--auto".to_string(),
+        ],
+    }
+}
+
+/// 콜드부트 auto-restore를 detached 스폰한다(env에 CYS_NO_AUTOSTART=1 — 자식 CLI가 라이벌
+/// 데몬을 autostart하는 재귀를 차단). 대기 스레드가 자식을 reap해 좀비 잔존을 막는다.
+fn spawn_auto_restore() {
+    let opted_out = cys::env_compat("CYS_NO_AUTORESTORE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    match decide_auto_restore(&cys::pack::pack_dir(), opted_out) {
+        AutoRestore::OptedOut => {
+            eprintln!("[cysd] auto-restore skipped (CYS_NO_AUTORESTORE=1)");
+        }
+        AutoRestore::PhoenixMissing(p) => {
+            eprintln!(
+                "[cysd] auto-restore skipped (phoenix not installed: {})",
+                p.display()
+            );
+        }
+        AutoRestore::Ready { program, args } => {
+            std::thread::spawn(move || {
+                let status = std::process::Command::new(&program)
+                    .args(&args)
+                    .env("CYS_NO_AUTOSTART", "1")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                match status {
+                    Ok(s) => eprintln!("[cysd] auto-restore finished (exit={:?})", s.code()),
+                    Err(e) => eprintln!("[cysd] auto-restore spawn failed: {e}"),
+                }
+            });
+            eprintln!("[cysd] auto-restore triggered (phoenix restore --auto)");
         }
     }
 }
@@ -1237,5 +1310,54 @@ mod pipe_security_tests {
             "accept-error backoff must be non-zero, else connect() Err re-tries on the same \
              broken pipe instance with no yield → 100% CPU spin: {backoff:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod auto_restore_tests {
+    use super::{decide_auto_restore, AutoRestore};
+
+    /// opt-out(CYS_NO_AUTORESTORE=1)이면 phoenix가 있어도 스폰하지 않는다.
+    #[test]
+    fn opted_out_never_spawns() {
+        let dir = std::env::temp_dir().join(format!("cys-ar-optout-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("javis_phoenix.py"), "#!/usr/bin/env python3\n").unwrap();
+        assert_eq!(decide_auto_restore(&dir, true), AutoRestore::OptedOut);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// phoenix 미설치(구 배포)면 조용히 skip — 데몬은 정상 기동한다.
+    #[test]
+    fn missing_phoenix_skips() {
+        let dir = std::env::temp_dir().join(format!("cys-ar-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        match decide_auto_restore(&dir, false) {
+            AutoRestore::PhoenixMissing(p) => {
+                assert!(p.ends_with("bin/javis_phoenix.py"), "부재 경로: {}", p.display())
+            }
+            other => panic!("expected PhoenixMissing, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// phoenix 설치 시 `python3 <phoenix> restore --auto` 스폰 스펙을 낸다(--auto 필수).
+    #[test]
+    fn present_phoenix_builds_auto_restore_command() {
+        let dir = std::env::temp_dir().join(format!("cys-ar-ready-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let ph = bin.join("javis_phoenix.py");
+        std::fs::write(&ph, "#!/usr/bin/env python3\n").unwrap();
+        match decide_auto_restore(&dir, false) {
+            AutoRestore::Ready { program, args } => {
+                assert_eq!(program, "python3");
+                assert_eq!(args[0], ph.to_string_lossy());
+                assert_eq!(&args[1..], &["restore".to_string(), "--auto".to_string()]);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -41,6 +41,16 @@ dept_sock(){
 }
 dept_pack(){ echo "$HOME/.cys/pack-dept-$1"; }
 
+# ★W2a-4 의도삭제 → phoenix dept 묘비: 부서 전체 폐기(down/down-sock=의도적 teardown)를 phoenix
+# 보호집합(base dept_roster)에 명시적 폐역으로 기록해, 부활 보고가 폐기된 부서를 '부활 필요'로
+# 오보하지 않게 한다. best-effort — phoenix 부재·실패가 teardown을 절대 깨지 않는다(|| true·무출력).
+dept_tombstone(){
+  [ -n "${1:-}" ] || return 0
+  ph="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_phoenix.py"
+  [ -f "$ph" ] || return 0
+  python3 "$ph" tombstone "$1" --dept >/dev/null 2>&1 || true
+}
+
 # RC-15(D7): 부서 로그·상태 디렉토리 — Windows named pipe 소켓(\\.\pipe\...)은 dirname/디렉토리 개념이
 # 없어(RC-4 파생) mkdir·로그 경로가 깨진다. 실 디렉토리로 분리:
 #   Windows = %LOCALAPPDATA%\cys\cys-dept-<name> — ★RC-13 state_dir 슬러그와 **동일 규약**(pipe_slug
@@ -592,6 +602,7 @@ PY
     fi
     rm -f "$sock" "$sock.lock" 2>/dev/null || true
     reg_remove "$name"
+    dept_tombstone "$name"
     [ "$(reg_count)" = "0" ] && ceo_demote || true
     echo "[cys-dept] $name 종료·정리 완료. 부서 수=$(reg_count)"
     ;;
@@ -612,6 +623,7 @@ PY
     fi
     rm -f "$sock" "$sock.lock" 2>/dev/null || true
     [ -n "$name" ] && reg_remove "$name" || true
+    [ -n "$name" ] && dept_tombstone "$name" || true
     [ "$(reg_count)" = "0" ] && ceo_demote || true
     echo "[cys-dept] socket teardown 완료(name=${name:-미등록}). 부서 수=$(reg_count)"
     ;;

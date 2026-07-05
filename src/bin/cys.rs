@@ -5202,6 +5202,16 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
             .filter_map(|e| e["role"].as_str().map(String::from))
             .collect();
         let saved = topo["saved"].as_array().cloned().unwrap_or_default();
+        // ★W2a 심층방어: 의도적으로 닫힌(surface.close 경유) 역할의 묘비 — raw restore도 절대 재스폰하지
+        // 않는다(1급 원칙: 사고사만 부활, 의도삭제는 좀비 차단). phoenix가 desired_roster로 병합하는
+        // 것과 별개로, 이 경로가 직접 호출돼도 좀비를 살리지 않도록 한 겹 더 막는다.
+        let tombstones: std::collections::HashSet<String> = topo["tombstones"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|e| e.as_str().map(String::from))
+            .collect();
         if saved.is_empty() {
             println!("(토폴로지 스냅샷 없음 — launch-agent로 역할을 기동하면 자동 기록된다)");
             return Ok((0, 0));
@@ -5211,6 +5221,11 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
             let Some(role) = entry["role"].as_str() else {
                 continue;
             };
+            // ★W2a: 묘비 역할은 include_master 여부와 무관하게 건너뛴다(의도삭제>강제부활).
+            if tombstones.contains(role) {
+                println!("· {role}: 의도적 삭제(묘비) — 부활 안 함 (좀비 차단)");
+                continue;
+            }
             if role == "master" && !include_master {
                 println!("· {role}: 제외 (restore 실행자가 보통 master — --include-master로 포함)");
                 continue;
@@ -5247,7 +5262,15 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                                 json!({"surface_id": sid, "pack_version": pv, "directive_hash": dh}),
                             );
                         }
-                        let _ = inject_text(sid, "[RESTORE] 조직 복원 절차다. _round/SESSION_STATE.md와 자기 TODO를 읽고 상태를 복원하라. ★작업 재개는 하지 말고 master의 지시를 기다려라.");
+                        // ★W2 복원 디렉티브 분기: 워커·리뷰어는 master 지시를 기다리지만, master는
+                        // 지시할 상위가 없다 — RECOVERY 프로토콜로 스스로 상태를 복원하고 미해결
+                        // 게이트부터 자율 재개한다(콜드부트 auto-restore가 master를 포함하는 경로).
+                        let directive = if role == "master" {
+                            "[RESTORE] 조직 복원 절차다(master). _round/RECOVERY.md → SESSION_STATE.md → 자기 TODO → memory → git 순으로 읽고, 노드 재기동·surface 재매핑·directive 각성 후 미해결 게이트부터 자율 재개하라."
+                        } else {
+                            "[RESTORE] 조직 복원 절차다. _round/SESSION_STATE.md와 자기 TODO를 읽고 상태를 복원하라. ★작업 재개는 하지 말고 master의 지시를 기다려라."
+                        };
+                        let _ = inject_text(sid, directive);
                     }
                 }
             } else {

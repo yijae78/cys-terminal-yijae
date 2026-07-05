@@ -330,6 +330,13 @@ def observe_and_persist_roster(socket):
     ★침식 전에 호출되면 전 역할이 박제된다 — 이후 topology가 줄어도 desired는 보존된다."""
     roster, tombstones = load_desired_roster(socket)
     topo = read_topology(socket)
+    # ★W2a 좀비 차단: 데몬 소유 topology.json의 tombstones(surface.close 경유 의도삭제)를 desired
+    #   tombstones로 병합한다. 데몬이 유일 작성자(이중 작성자 금지 — phoenix는 desired_roster.json에만,
+    #   데몬은 topology.json에만 쓴다). 병합된 역할은 아래 pop 루프로 roster에서 제외 → entries/need/
+    #   fresh-fallback 대상에서 자동 배제(기존 소비 로직 그대로 활용). 구 topology(필드 부재)=무병합.
+    for t in topo.get("tombstones", []):
+        if isinstance(t, str):
+            tombstones.add(t)
     # 우선순위: 기존 desired < 세대 스냅샷 < 현재 topology (최신 관측이 메타를 갱신)
     for role, e in _snapshot_roster_entries(socket).items():
         roster[role] = e
@@ -673,12 +680,45 @@ def stage_g2_ack(socket, role, surface, stub):
 
 # ------------------------------------------------------------------ restore 상태머신
 
+def _acquire_restore_lease(socket):
+    """★W2 restore lease: 단일 restore-in-progress 파일락 — 콜드부트 auto-restore와 deploy
+    오케스트레이션이 동시에 restore를 돌려 같은 역할을 이중 스폰하는 TOCTOU를 차단한다.
+    반환 (ok, handle): ok=False 는 '다른 restore가 진행 중 → 중복 skip'. ok=True 면 진행하되
+    handle(열린 파일객체)를 함수 끝까지 살려 락을 유지해야 한다(fail-open 시 handle=None).
+    unix=fcntl.flock(LOCK_EX|NB) · Windows/기타=best-effort(핸들 보유만·flock 부재는 fail-open)."""
+    try:
+        lease_path = os.path.join(phoenix_home(socket), "restore.lease")
+        f = open(lease_path, "w")
+    except Exception:
+        return True, None  # 락 파일 생성 실패 = 게이트 없이 진행(가용성 우선 fail-open)
+    if not IS_WINDOWS:
+        try:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            f.close()
+            return False, None  # 다른 restore 보유 중 — 중복 인지 skip
+        except Exception:
+            pass  # fcntl 미가용 등 → fail-open(핸들 보유)
+    return True, f
+
+
 def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=None,
                 include_master=False, stub_sids=None, print_result=True):
     """부활 저널 상태머신 본체(재사용 가능한 함수). cmd_restore(CLI)와 cmd_deploy(restore 단계)가 이 하나를
     공유한다 — P2 재사용 제1원칙(신규 부활 엔진을 만들지 않는다·코드 복제 금지). print_result=False 면 결과
     dict 만 반환하고 stdout 에 출력하지 않는다(deploy 가 단일 JSON 레코드로 감싸 출력할 때 사용)."""
     global _ACTIVE_EPOCH
+    # ★W2 restore lease: 동시 restore(콜드부트 auto vs deploy) 이중 스폰 차단. 먼저 획득해
+    # breaker·spawn 전체를 직렬화한다. 다른 restore 진행 중이면 즉시 중복 skip(무해).
+    _lease_ok, _lease_handle = _acquire_restore_lease(socket)
+    if not _lease_ok:
+        out = {"phoenix_restore": "LEASE_HELD",
+               "note": "다른 restore가 진행 중 — 이중 스폰 방지 위해 이번 호출은 skip(멱등)."}
+        log("★restore lease 보유 중(다른 restore 진행) — 중복 skip.")
+        if print_result:
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
     # ★Phase 6: 이 부팅 세대(재시작마다 변경)를 취득 — 저널 완료 마킹의 유효성 기준.
     _ACTIVE_EPOCH = get_boot_epoch(socket)
     # M5: 이번 시도 기록 + 차단기 판정
@@ -954,10 +994,14 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
 
 def cmd_restore(args):
     """CLI 래퍼 — argparse 값을 run_restore 로 전달(본체는 run_restore·deploy 와 공유)."""
+    # ★W2 --auto(콜드부트): master 포함 강제. master가 묘비면 observe_and_persist_roster의
+    #   tombstone 병합이 roster에서 배제하므로 include_master여도 부활 대상이 되지 않는다
+    #   (1급 원칙: 의도삭제>강제부활). raw `cys restore --include-master`도 묘비를 skip(심층방어).
+    include_master = args.include_master or getattr(args, "auto", False)
     return run_restore(
         args.socket, ticket=args.ticket or "default", stub=args.stub,
         no_breaker=args.no_breaker, roles=args.roles,
-        include_master=args.include_master, stub_sids=args.stub_sids,
+        include_master=include_master, stub_sids=args.stub_sids,
         print_result=True,
     )
 
@@ -1943,6 +1987,9 @@ def main():
     p.add_argument("--stub-sids", help='role→observed session_id JSON(오복원 시뮬레이션용)')
     p.add_argument("--roles", nargs="*"); p.add_argument("--include-master", action="store_true")
     p.add_argument("--no-breaker", action="store_true")
+    # ★W2 콜드부트: cysd가 소켓 바인드 직후 detached 스폰. master 포함 강제(부활할 상위가 없으므로)
+    #   — 단 master가 묘비면 부활 금지(1급 원칙이 include-master보다 상위, tombstone 병합으로 자동 배제).
+    p.add_argument("--auto", action="store_true", help="콜드부트 자동 복원(master 포함·묘비는 배제)")
     sub.add_parser("reconcile")
     sub.add_parser("status")
     sub.add_parser("roster")  # Phase 4: desired 로스터 현황(침식 면역) + Phase7 부서
