@@ -1651,6 +1651,10 @@ fn status(conn: &Connection, id: &Value) -> Value {
 /// cysd 기동 시 enabled=1 채널마다: ①기록된 pgid 생존 시 고아 선-kill ②새 토큰으로 재스폰
 /// ③channel.reconciled 발행. lockdown 중이면 재스폰 보류(안전측 — lockdown은 재부팅에도 유지).
 pub fn reconcile(daemon: &Arc<Daemon>) {
+    // LOW-3 H3 심층방어 — 채널 sweep/reconcile은 메인 cysd 전용(부서 데몬 no-op).
+    if cys::is_dept_socket(&daemon.socket_path) {
+        return;
+    }
     let mut guard = daemon.channels.lock().unwrap();
     let Some(conn) = guard.as_mut() else {
         return;
@@ -1862,6 +1866,10 @@ fn respawn_dead_bridges(daemon: &Arc<Daemon>, conn: &mut Connection) {
 
 /// sweep 1틱(동기) — 테스트가 직접 호출 가능. 재배달·타임아웃·프룬·재스폰.
 fn sweep_once(daemon: &Arc<Daemon>) {
+    // LOW-3 H3 심층방어 — 채널 sweep/reconcile은 메인 cysd 전용(부서 데몬 no-op).
+    if cys::is_dept_socket(&daemon.socket_path) {
+        return;
+    }
     let mut guard = daemon.channels.lock().unwrap();
     let Some(conn) = guard.as_mut() else {
         return;
