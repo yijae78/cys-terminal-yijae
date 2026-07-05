@@ -14,10 +14,11 @@ use crate::handlers::Reply;
 use crate::state::{Daemon, LedgerEntry, ProcessHealth};
 use cys::{err_response, ok_response};
 use rusqlite::{params, Connection, OptionalExtension};
+use regex::Regex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // ── 튜닝 상수 (테스트 주입 가능하게 분리 · §2.8) ──────────────────────────────
 /// 아웃바운드 receipt 부재 시 unknown 전이 창(초). 기본 30s(§2.3). 테스트는 env로 축소 가능.
@@ -52,6 +53,14 @@ const SWEEP_INTERVAL_SECS: u64 = 15;
 const SENDER_MAXLEN: usize = 16;
 /// 승인 미러 본문 요지 최대 길이(초과 시 … 절단·L4 매직넘버 상수화).
 const SUMMARY_MAXLEN: usize = 200;
+/// V7 일일 원격 승인(allow) 상한(§5) — 채널계정 탈취 시 무단 allow 폭발반경을 하루 N건으로 제한.
+/// 초과분은 원격 거부·로컬 feed로 강등(fail-closed). deny 해소는 안전측이라 비계수(§4 박사님 확정=20).
+const REMOTE_APPROVE_DAILY_CAP: u64 = 20;
+/// V4 연속 실패 임계(§5) — 한 sender가 interaction 검증에 연속 N회 실패하면 쿨다운(브루트 속도제한).
+const SENDER_COOLDOWN_FAIL_THRESHOLD: u64 = 5;
+/// V4 sender 쿨다운 지속(초) — 임계 도달 시 이 기간 원격 interaction 거부(로컬 feed는 불변).
+/// nonce 불위조성이 1차 방어이고 쿨다운은 속도제한 보조. 15분=정당 owner 락아웃 최소·브루트 억제 충분.
+const SENDER_COOLDOWN_SECS: f64 = 900.0;
 
 // ── DB open + 스키마 ─────────────────────────────────────────────────────────
 
@@ -144,12 +153,28 @@ pub fn open(socket_path: &Path) -> Option<Connection> {
             channel   TEXT NOT NULL,
             sender_id TEXT NOT NULL,
             ts        REAL NOT NULL);
-         CREATE INDEX IF NOT EXISTS ix_loopwin ON loopwin(channel, sender_id, ts);",
+         CREATE INDEX IF NOT EXISTS ix_loopwin ON loopwin(channel, sender_id, ts);
+         -- V4 원격 승인 브루트 방어: (채널,sender)별 연속 검증실패 카운터·쿨다운 만료 ts.
+         -- 성공 해소가 카운터를 0으로 리셋한다(연속성 판정). 쿨다운은 시간창 — 계정 탈취 시
+         -- 무단 시도의 속도를 제한한다(nonce 불위조성이 1차 방어·이건 보조 속도제한).
+         CREATE TABLE IF NOT EXISTS approval_attempts(
+            channel          TEXT NOT NULL,
+            sender_id        TEXT NOT NULL,
+            consecutive_fails INTEGER NOT NULL DEFAULT 0,
+            cooldown_until   REAL NOT NULL DEFAULT 0,
+            updated_ts       REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY(channel, sender_id));
+         -- V7 일일 원격 allow 상한: 로컬 날짜(YYYY-MM-DD)별 성공 allow 해소 건수. 상한 초과 시
+         -- 원격 allow 거부·로컬 강등(탈취 폭발반경 제한). deny 해소는 안전측이라 비계수.
+         CREATE TABLE IF NOT EXISTS remote_approve_daily(
+            day         TEXT PRIMARY KEY,
+            allow_count INTEGER NOT NULL DEFAULT 0,
+            updated_ts  REAL NOT NULL DEFAULT 0);",
     )
     .ok()?;
-    // schema_version 핀(D8 마이그레이션 토대). 신규 DB는 2로 출발.
+    // schema_version 핀(D8 마이그레이션 토대). 신규 DB는 3으로 출발(v3=OPP-21 원격승인 상한·쿨다운).
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','2') ON CONFLICT(key) DO NOTHING",
+        "INSERT INTO meta(key, value) VALUES('schema_version','3') ON CONFLICT(key) DO NOTHING",
         [],
     )
     .ok()?;
@@ -160,8 +185,11 @@ pub fn open(socket_path: &Path) -> Option<Connection> {
         "ALTER TABLE outbound ADD COLUMN approval_nonce_used INTEGER NOT NULL DEFAULT 0",
         [],
     );
-    // v1 DB를 v2로 올린다(신규 DB는 이미 2 → no-op). 실패해도 graceful.
+    // v1 DB를 v2로 올린다(신규 DB는 이미 3 → no-op). 실패해도 graceful.
     let _ = conn.execute("UPDATE meta SET value='2' WHERE key='schema_version' AND value='1'", []);
+    // OPP-21 v2→v3: approval_attempts·remote_approve_daily 테이블은 위 배치의 CREATE TABLE IF NOT
+    // EXISTS가 신규·기존 DB 모두에 멱등 생성한다(추가전용·비파괴). 버전 핀만 올린다(그래도 graceful).
+    let _ = conn.execute("UPDATE meta SET value='3' WHERE key='schema_version' AND value='2'", []);
     Some(conn)
 }
 
@@ -214,6 +242,73 @@ fn receipt_is_late(current_outcome: &str) -> bool {
 /// — Tier D(비가역·외부발행·헌법변경)는 구조적으로 채널에 도달 불가. "a"|"b"|"c"만 true.
 fn tier_mirrorable(tier: Option<&str>) -> bool {
     matches!(tier, Some("a") | Some("b") | Some("c"))
+}
+
+/// V6 redact 필터(순수·§5 V6) — 아웃바운드 카드에 실릴 title·요지에서 **토큰·개인경로**를 스크럽한다.
+/// 채널 계정 탈취 시에도 승인 카드 본문으로 비밀이 새지 않게 원문 전문 발송을 금지하고(원문은 로컬
+/// feed 포인터), 매칭 스팬만 `[redacted]`로 치환한다. 반환 = (스크럽본, redact 발생 여부).
+/// 패턴(deny-by-shape): Slack/GitHub/OpenAI/AWS 토큰 접두·장문 opaque(hex 32+·base64류 40+)·
+/// bearer·홈 경로(/Users/·/home/·C:\Users\). 오탐(정상 문장 스크럽)보다 누출이 위험하므로
+/// fail-closed 측(넓게 잡음)이되 일반 단어·짧은 토큰은 보존한다(길이 하한으로 구분).
+fn redact(s: &str) -> (String, bool) {
+    static PATS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let pats = PATS.get_or_init(|| {
+        [
+            // Slack: xoxb-/xoxp-/xoxa-/xoxr-/xoxs- 등 + 하이픈 세그먼트.
+            r"xox[baprs]-[A-Za-z0-9-]{8,}",
+            // OpenAI sk-, GitHub ghp_/gho_/ghs_/ghr_/github_pat_, Google AIza.
+            r"sk-[A-Za-z0-9_-]{16,}",
+            r"gh[pousr]_[A-Za-z0-9]{20,}",
+            r"github_pat_[A-Za-z0-9_]{20,}",
+            r"AIza[A-Za-z0-9_-]{20,}",
+            // AWS access key id.
+            r"AKIA[0-9A-Z]{16}",
+            // Bearer 토큰.
+            r"(?i)bearer\s+[A-Za-z0-9._-]{16,}",
+            // JWT(3 base64url 세그먼트).
+            r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+            // 홈/사용자 경로(개인정보) — 뒤 세그먼트까지 삼킨다.
+            r"/Users/[^/\s]+(?:/[^\s]*)?",
+            r"/home/[^/\s]+(?:/[^\s]*)?",
+            r"[Cc]:\\Users\\[^\\\s]+(?:\\[^\s]*)?",
+            // 장문 opaque hex(32+) — 시크릿/해시 유출 방어(짧은 hex는 보존).
+            r"\b[0-9a-fA-F]{32,}\b",
+            // 장문 opaque base64url류(40+, 하이픈/언더스코어 포함) — 일반 단어(공백 분절)와 구분.
+            r"\b[A-Za-z0-9_-]{40,}\b",
+        ]
+        .iter()
+        .filter_map(|p| Regex::new(p).ok())
+        .collect()
+    });
+    let mut out = s.to_string();
+    let mut hit = false;
+    for re in pats {
+        if re.is_match(&out) {
+            hit = true;
+            out = re.replace_all(&out, "[redacted]").into_owned();
+        }
+    }
+    (out, hit)
+}
+
+/// V7 일일 상한 키(순수) — epoch 초를 로컬 날짜 `YYYY-MM-DD` 문자열로. 상한은 로컬 하루 단위.
+fn local_date(ts: f64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(ts as i64, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".into())
+}
+
+/// V4 쿨다운 활성 판정(순수) — 만료 ts가 현재보다 미래면 쿨다운 중.
+fn cooldown_active(cooldown_until: f64, now: f64) -> bool {
+    cooldown_until > now
+}
+
+/// V7 상한 도달 판정(순수) — 오늘 allow 건수가 상한 이상이면 추가 원격 allow 금지(fail-closed).
+fn cap_reached(count: u64, cap: u64) -> bool {
+    count >= cap
 }
 
 /// inbox 재배달 대상 판정(순수·테스트 핀) — new는 즉시, injected는 TTL 초과 un-acked면 재주입.
@@ -774,8 +869,16 @@ fn sent_pending_approvals(
 /// 미러 버튼 본문: 제목·요지(절단)·feed_id·유효기간. nonce는 표시 텍스트가 아니라 outbound
 /// approval_* 원장·이벤트 payload(버튼 custom_id)로만 흐른다(§2.3 각인).
 fn mirror_body(title: &str, summary: &str, feed_id: &str, until: f64) -> String {
-    let s: String = summary.chars().take(SUMMARY_MAXLEN).collect();
-    let ell = if summary.chars().count() > SUMMARY_MAXLEN { "…" } else { "" };
+    // V6: title·요지를 카드 조립 전 redact 필터 경유(토큰·개인경로 스크럽). redact 후 절단해
+    // 창 안에 남은 비밀도 스크럽되게 한다(절단 후 redact면 창 경계의 비밀이 샐 수 있음).
+    let (title_r, hit_t) = redact(title);
+    let (summary_r, hit_s) = redact(summary);
+    let redacted = hit_t || hit_s;
+    let s: String = summary_r.chars().take(SUMMARY_MAXLEN).collect();
+    let ell = if summary_r.chars().count() > SUMMARY_MAXLEN { "…" } else { "" };
+    let title = title_r.as_str();
+    // redact 발생 시 원문은 로컬 feed 전용임을 명시(§5 V6: 원문=로컬 패널 포인터).
+    let note = if redacted { "\n(민감정보 가림 — 전문은 로컬 cys 패널 확인)" } else { "" };
     let hhmm = {
         use chrono::TimeZone;
         chrono::Local
@@ -784,7 +887,7 @@ fn mirror_body(title: &str, summary: &str, feed_id: &str, until: f64) -> String 
             .map(|dt| dt.format("%H:%M").to_string())
             .unwrap_or_else(|| "--:--".into())
     };
-    format!("[승인 요청] {title}\n{s}{ell}\nfeed:{feed_id}\n(원격 승인 버튼 · 유효 ~{hhmm})")
+    format!("[승인 요청] {title}\n{s}{ell}\nfeed:{feed_id}\n(원격 승인 버튼 · 유효 ~{hhmm}){note}")
 }
 
 /// 한 (채널,owner)에 approval_prompt 미러 1건을 멱등 발행한다(§2.6 O9: feed당 1버튼).
@@ -1073,12 +1176,93 @@ fn inbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Val
     ok_response(id, json!({"action": action, "inbox_id": inbox_id}))
 }
 
+// ── V4/V7 원격 승인 브루트·상한 원장 헬퍼(§5) ────────────────────────────────
+
+/// V4: (채널,sender) 연속 검증실패 1 증가. 임계 도달 시 쿨다운 설정+카운터 리셋(만료 후 새 슬레이트).
+/// 반환 = 이번 실패로 쿨다운이 발동됐는지(이벤트 표기용). 성공 해소는 reset_attempt로 0 복귀.
+fn record_attempt_failure(conn: &Connection, channel: &str, sender_id: &str, now: f64) -> bool {
+    let _ = conn.execute(
+        "INSERT INTO approval_attempts(channel, sender_id, consecutive_fails, cooldown_until, updated_ts)
+         VALUES(?1,?2,1,0,?3)
+         ON CONFLICT(channel,sender_id) DO UPDATE SET consecutive_fails=consecutive_fails+1, updated_ts=?3",
+        params![channel, sender_id, now],
+    );
+    let fails: u64 = conn
+        .query_row(
+            "SELECT consecutive_fails FROM approval_attempts WHERE channel=?1 AND sender_id=?2",
+            params![channel, sender_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+        .max(0) as u64;
+    if fails >= SENDER_COOLDOWN_FAIL_THRESHOLD {
+        let _ = conn.execute(
+            "UPDATE approval_attempts SET consecutive_fails=0, cooldown_until=?3, updated_ts=?4
+             WHERE channel=?1 AND sender_id=?2",
+            params![channel, sender_id, now + SENDER_COOLDOWN_SECS, now],
+        );
+        return true;
+    }
+    false
+}
+
+/// V4: 성공 해소 시 (채널,sender) 연속실패·쿨다운을 0으로 리셋(연속성 판정 — 성공이 브루트 의심 해제).
+fn reset_attempt(conn: &Connection, channel: &str, sender_id: &str, now: f64) {
+    let _ = conn.execute(
+        "UPDATE approval_attempts SET consecutive_fails=0, cooldown_until=0, updated_ts=?3
+         WHERE channel=?1 AND sender_id=?2",
+        params![channel, sender_id, now],
+    );
+}
+
+/// V4: (채널,sender) 현재 쿨다운 만료 ts(없으면 0.0). cooldown_active와 함께 진입 게이트에서 쓴다.
+fn attempt_cooldown_until(conn: &Connection, channel: &str, sender_id: &str) -> f64 {
+    conn.query_row(
+        "SELECT cooldown_until FROM approval_attempts WHERE channel=?1 AND sender_id=?2",
+        params![channel, sender_id],
+        |r| r.get::<_, f64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(0.0)
+}
+
+/// V7: 로컬 날짜 day의 성공 원격 allow 건수(없으면 0). 상한 대조에 쓴다.
+fn daily_allow_count(conn: &Connection, day: &str) -> u64 {
+    conn.query_row(
+        "SELECT allow_count FROM remote_approve_daily WHERE day=?1",
+        params![day],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(0)
+    .max(0) as u64
+}
+
+/// V7: 로컬 날짜 day의 성공 원격 allow 건수 +1(성공 allow 해소 직후 호출).
+fn bump_daily_allow(conn: &Connection, day: &str, now: f64) {
+    let _ = conn.execute(
+        "INSERT INTO remote_approve_daily(day, allow_count, updated_ts) VALUES(?1,1,?2)
+         ON CONFLICT(day) DO UPDATE SET allow_count=allow_count+1, updated_ts=?2",
+        params![day, now],
+    );
+}
+
 // ── 승인 버튼 interaction 검증(§2.4-4) — nonce 3중 + 게이트 + allow-once ─────────
 
 /// 브리지가 보고한 버튼 클릭을 검증해 원격 승인을 해소한다. 순서(각 실패는 구분된 사유+이벤트):
-/// ⓪ 게이트 ON(allow-remote-approve 유효) ① sender=owner allowlist ② decision∈{allow,deny}
-/// ③ nonce 실재+feed 일치+미사용+owner 바인딩 ④ feed_id 실재·pending ⑤ nonce 원자 소각(재생 차단)
-/// ⑥ feed reply 경로로 해소 → channel.approval.resolved. allow는 allow-once만(단회 nonce가 강제).
+/// ★V4 쿨다운(연속 실패 sender 속도제한) ⓪ 게이트 ON(allow-remote-approve 유효) ① sender=owner
+/// allowlist ② decision∈{allow,deny} ③ nonce 실재+feed 일치+미사용+owner 바인딩 ④ feed_id 실재·pending
+/// ★V7 일일 allow 상한(초과 시 로컬 강등) ⑤ nonce 원자 소각(재생 차단) ⑥ feed reply 경로로 해소 →
+/// channel.approval.resolved. allow는 allow-once만(단회 nonce가 강제).
+/// 거부는 2종: **fail_deny**(위조·미인가 시도 = V4 연속실패 계수) vs **soft_deny**(정책·게이트·상한·레이스
+/// = 정당 owner거나 무해 → 비계수, 정당 owner 락아웃 방지). 성공 해소는 카운터 리셋(+allow는 상한 +1).
 fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, params: &Value, id: &Value) -> Value {
     let sender_id = p_str(params, "sender_id").unwrap_or_default();
     let Some(feed_id) = p_str(params, "feed_id") else {
@@ -1088,23 +1272,39 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
         return err_response(id, "invalid_params", "missing nonce");
     };
     let decision = p_str(params, "decision").unwrap_or_default();
+    let now_ts = now();
 
-    // 거부 헬퍼: 구분된 사유로 이벤트 발행 + interaction_denied 결과(브리지가 ephemeral 회신).
-    let deny = |reason: &str| -> Value {
+    // 거부 헬퍼 — 이벤트 발행 + interaction_denied 결과(브리지가 ephemeral 회신).
+    let publish_denied = |reason: &str, cooldown_tripped: bool| {
         daemon.bus.publish(
             "channel.approval.denied",
             "channel",
             None,
-            json!({"channel": channel, "feed_id": feed_id, "sender_id": sender_id, "reason": reason}),
+            json!({"channel": channel, "feed_id": feed_id, "sender_id": sender_id,
+                   "reason": reason, "cooldown_tripped": cooldown_tripped}),
         );
+    };
+    // fail_deny: 위조·미인가 시도 — V4 연속실패 카운터 증가(임계 도달 시 쿨다운 발동).
+    let fail_deny = |reason: &str| -> Value {
+        let tripped = record_attempt_failure(conn, channel, &sender_id, now_ts);
+        publish_denied(reason, tripped);
+        ok_response(id, json!({"action": "interaction_denied", "reason": reason}))
+    };
+    // soft_deny: 정책·게이트·상한·무해 레이스 — 비계수(정당 owner 락아웃·brute 오탐 방지).
+    let soft_deny = |reason: &str| -> Value {
+        publish_denied(reason, false);
         ok_response(id, json!({"action": "interaction_denied", "reason": reason}))
     };
 
-    // ⓪ 원격 승인 게이트(OFF면 버튼 무효 — 폰 분실 안전측).
-    if !remote_approve_active(conn, now()) {
-        return deny("remote_approve_off");
+    // ★V4 진입 게이트: sender가 쿨다운 중이면 즉시 비계수 거부(가장 저렴·게이트 상태 비노출).
+    if cooldown_active(attempt_cooldown_until(conn, channel, &sender_id), now_ts) {
+        return soft_deny("sender_cooldown");
     }
-    // ① sender=owner allowlist(fail-closed).
+    // ⓪ 원격 승인 게이트(OFF면 버튼 무효 — 폰 분실 안전측). 비계수(owner 정책).
+    if !remote_approve_active(conn, now_ts) {
+        return soft_deny("remote_approve_off");
+    }
+    // ① sender=owner allowlist(fail-closed). 미인가 sender = fail 계수(V1·V4 브루트 주표적).
     let is_owner = conn
         .query_row(
             "SELECT 1 FROM allowlist WHERE channel=?1 AND sender_id=?2",
@@ -1116,11 +1316,11 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
         .flatten()
         .is_some();
     if !is_owner {
-        return deny("not_owner");
+        return fail_deny("not_owner");
     }
-    // ② decision 화이트리스트(allow|deny만 — allow-always 등 불가).
+    // ② decision 화이트리스트(allow|deny만 — allow-always 등 불가). 변조 = fail 계수.
     if decision != "allow" && decision != "deny" {
-        return deny("bad_decision");
+        return fail_deny("bad_decision");
     }
     // ③ nonce 실재 + feed 일치 + 미사용 + owner 바인딩(다른 owner의 nonce 도용 차단).
     let row: Option<(i64, String, i64, Option<String>)> = conn
@@ -1141,34 +1341,45 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
         .ok()
         .flatten();
     let Some((oid, row_feed, used, owner)) = row else {
-        return deny("nonce_invalid");
+        return fail_deny("nonce_invalid"); // V4 브루트 주표적 — 축약 오타·비존재 nonce.
     };
     if row_feed != feed_id {
-        return deny("nonce_feed_mismatch");
+        return fail_deny("nonce_feed_mismatch");
     }
     if used != 0 {
-        return deny("nonce_used");
+        return soft_deny("nonce_used"); // 유효 nonce 재생·double-click — 창은 valid, brute 아님(비계수).
     }
     if owner.as_deref() != Some(sender_id.as_str()) {
-        return deny("owner_mismatch");
+        return fail_deny("owner_mismatch"); // 타 owner nonce 도용 = 미인가(계수).
     }
     // ④ feed_id 실재·pending(해소 대상이 살아있어야 함). M8: feed_items 직접 순회 대신 캡슐 헬퍼.
     if !daemon.feed_item_pending(&feed_id) {
-        return deny("feed_not_pending");
+        return soft_deny("feed_not_pending"); // 유효 creds·stale feed — brute 아님(비계수).
+    }
+    // ★V7 일일 원격 allow 상한 — nonce 소각 前 검사(초과 시 소각·해소 없이 pending 유지=로컬 강등).
+    // allow만 계수·검사(deny 해소는 안전측이라 상한 비적용). soft_deny(정당 owner·비계수).
+    if decision == "allow" && cap_reached(daily_allow_count(conn, &local_date(now_ts)), REMOTE_APPROVE_DAILY_CAP) {
+        return soft_deny("daily_cap");
     }
     // ⑤ nonce 원자 소각(WHERE used=0 → 0행이면 동시 재생이 이미 태움 = 재생 차단).
     let burned = conn
         .execute(
             "UPDATE outbound SET approval_nonce_used=1, updated_ts=?2 WHERE id=?1 AND approval_nonce_used=0",
-            params![oid, now()],
+            params![oid, now_ts],
         )
         .unwrap_or(0);
     if burned == 0 {
-        return deny("nonce_race");
+        return soft_deny("nonce_race"); // 동시 소각 레이스 — 창은 valid였음(비계수).
     }
     // ⑥ 기존 feed reply 경로로 해소(pending→resolved·대기 pusher wake·feed.item.resolved).
     match daemon.resolve_feed_item(&feed_id, &decision) {
         Some(_) => {
+            // 성공 = brute 의심 해제 → V4 카운터 리셋. allow면 V7 일일 상한 +1(소각~bump 사이 동시
+            // allow 경합의 off-by-one 초과는 허용 — 상한은 soft 폭발반경 제한이라 정밀 원자성 불요).
+            reset_attempt(conn, channel, &sender_id, now_ts);
+            if decision == "allow" {
+                bump_daily_allow(conn, &local_date(now_ts), now_ts);
+            }
             daemon.bus.publish(
                 "channel.approval.resolved",
                 "channel",
@@ -1177,8 +1388,8 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
             );
             ok_response(id, json!({"action": "approval_resolved", "feed_id": feed_id, "decision": decision}))
         }
-        // 소각~해소 사이 레이스로 feed가 사라짐(다른 경로가 해소) — nonce는 이미 태워 안전.
-        None => deny("feed_gone"),
+        // 소각~해소 사이 레이스로 feed가 사라짐(다른 경로가 해소) — nonce는 이미 태워 안전(비계수).
+        None => soft_deny("feed_gone"),
     }
 }
 
@@ -1995,7 +2206,7 @@ mod tests {
         let v: String = conn
             .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, "2");
+        assert_eq!(v, "3"); // OPP-21 v3(원격승인 상한·쿨다운 테이블 추가).
     }
 
     // C1: 채널 인바운드 살균 — paste-escape·CR·ESC·C0/DEL 제거, 한글·이모지·개행·탭 보존.
@@ -2879,15 +3090,15 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_2() {
-        let d = tmp_daemon("schema2");
+    fn schema_version_is_3() {
+        let d = tmp_daemon("schema3");
         let g = d.channels.lock().unwrap();
         let conn = g.as_ref().unwrap();
         let v: String = conn
             .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, "2");
-        // approval_nonce_used 컬럼 존재(마이그레이션 확인).
+        assert_eq!(v, "3", "OPP-21 v3(원격승인 상한·쿨다운)");
+        // approval_nonce_used 컬럼 존재(v2 마이그레이션 확인).
         let has: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('outbound') WHERE name='approval_nonce_used'",
@@ -2896,6 +3107,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has, 1, "approval_nonce_used 컬럼이 있어야 한다");
+        // v3 신규 테이블 존재(OPP-21 마이그레이션 확인).
+        for t in ["approval_attempts", "remote_approve_daily"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [t],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "v3 테이블 {t} 존재해야");
+        }
     }
 
     #[test]
@@ -3105,5 +3327,201 @@ mod tests {
         }
         mirror_approval(&d, "feedLate", "t", "b", Some("c"));
         assert_eq!(count_approval_prompts(&d, "slack", "feedLate"), 0, "만료 후엔 미러 금지");
+    }
+
+    // ── OPP-21 §5 자기공격 변이 테스트(V4·V6·V7 신규 · V2 누락분 보강) ──────────────
+
+    fn seed_daily_allow(d: &Arc<Daemon>, count: i64) {
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        let day = local_date(now());
+        conn.execute(
+            "INSERT INTO remote_approve_daily(day, allow_count, updated_ts) VALUES(?1,?2,?3)
+             ON CONFLICT(day) DO UPDATE SET allow_count=?2, updated_ts=?3",
+            params![day, count, now()],
+        )
+        .unwrap();
+    }
+
+    fn read_daily(d: &Arc<Daemon>) -> u64 {
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        daily_allow_count(conn, &local_date(now()))
+    }
+
+    fn nonce_used_flag(d: &Arc<Daemon>, channel: &str, nonce: &str) -> i64 {
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        conn.query_row(
+            "SELECT approval_nonce_used FROM outbound WHERE channel=?1 AND approval_nonce=?2",
+            params![channel, nonce],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1)
+    }
+
+    fn feed_status(d: &Arc<Daemon>, feed_id: &str) -> Option<String> {
+        d.feed_items
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|i| i.request_id == feed_id)
+            .map(|i| i.status.clone())
+    }
+
+    // ── V6: redact 필터(토큰·개인경로 스크럽) ──
+    #[test]
+    fn v6_redact_scrubs_tokens_and_paths_preserves_plain() {
+        // 토큰·경로는 스크럽, 일반 단어는 보존.
+        let (r, hit) = redact("token xoxb-123456789-abcdefghij path /Users/cys/secret/key.txt done");
+        assert!(hit, "토큰/경로 있으면 redact 발생");
+        assert!(!r.contains("xoxb-123456789"), "Slack 토큰 스크럽: {r}");
+        assert!(!r.contains("/Users/cys"), "개인경로 스크럽: {r}");
+        assert!(r.contains("[redacted]"), "치환 마커 존재: {r}");
+        assert!(r.contains("token") && r.contains("path") && r.contains("done"), "일반 단어 보존: {r}");
+        // 다양한 시크릿 형상.
+        assert!(redact("sk-abcdefghijklmnop1234567").1, "OpenAI sk- 스크럽");
+        assert!(redact("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345").1, "GitHub 토큰 스크럽");
+        assert!(redact("AKIAIOSFODNN7EXAMPLE").1, "AWS access key 스크럽");
+        assert!(redact("deadbeefdeadbeefdeadbeefdeadbeef01").1, "장문 hex 스크럽");
+        // 짧은/평범한 문자열·한국어는 보존(오탐 방지).
+        let (p, hitp) = redact("일반 승인 요청 배포 확인 abc123");
+        assert!(!hitp, "평범한 문자열은 redact 없음");
+        assert_eq!(p, "일반 승인 요청 배포 확인 abc123");
+    }
+
+    #[test]
+    fn v6_mirror_body_redacts_and_points_local() {
+        // 카드 조립 경로가 redact를 경유하는지(V6 배선).
+        let body = mirror_body("배포 xoxb-999888777-secrettoken", "경로 /Users/cys/.env 유출 위험", "feedZ", now());
+        assert!(!body.contains("xoxb-999888777"), "카드에 토큰 유출 금지: {body}");
+        assert!(!body.contains("/Users/cys"), "카드에 개인경로 유출 금지: {body}");
+        assert!(body.contains("[redacted]"), "가림 마커: {body}");
+        assert!(body.contains("민감정보 가림"), "원문=로컬 포인터 명시: {body}");
+        assert!(body.contains("feed:feedZ"), "feed 포인터 유지: {body}");
+        // 민감정보 없으면 note 미부착(외과적).
+        let clean = mirror_body("일반 배포 승인", "스테이징 반영", "feedC", now());
+        assert!(!clean.contains("민감정보 가림"), "클린 본문엔 가림 note 없음: {clean}");
+    }
+
+    // ── V7: 일일 원격 allow 상한 ──
+    #[test]
+    fn v7_daily_cap_21st_allow_rejected_pending_preserved() {
+        let d = tmp_daemon("v7_cap");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        // 오늘 이미 상한(20) 소진 → 21건째 allow는 거부.
+        seed_daily_allow(&d, REMOTE_APPROVE_DAILY_CAP as i64);
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &nonce, "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("interaction_denied"), "{r}");
+        assert_eq!(r["result"]["reason"], json!("daily_cap"), "상한 초과는 daily_cap");
+        // 소각 前 거부이므로 nonce 미소각·feed pending 유지(로컬 처리 가능).
+        assert_eq!(nonce_used_flag(&d, "slack", &nonce), 0, "상한 거부는 nonce 미소각");
+        assert_eq!(feed_status(&d, "feed1").as_deref(), Some("pending"), "상한 거부는 feed pending 유지");
+    }
+
+    #[test]
+    fn v7_under_cap_allow_succeeds_and_increments() {
+        let d = tmp_daemon("v7_under");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        seed_daily_allow(&d, (REMOTE_APPROVE_DAILY_CAP - 1) as i64); // 19 → 20건째는 통과.
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &nonce, "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("approval_resolved"), "{r}");
+        assert_eq!(read_daily(&d), REMOTE_APPROVE_DAILY_CAP, "성공 allow는 상한 카운터 +1(19→20)");
+    }
+
+    #[test]
+    fn v7_cap_counts_allow_not_deny() {
+        // 상한 소진 상태여도 deny 해소는 허용(안전측)·카운터 불변.
+        let d = tmp_daemon("v7_deny");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        seed_daily_allow(&d, REMOTE_APPROVE_DAILY_CAP as i64); // 상한 도달.
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &nonce, "deny"), own_pid());
+        assert_eq!(r["result"]["action"], json!("approval_resolved"), "deny는 상한과 무관 해소: {r}");
+        assert_eq!(r["result"]["decision"], json!("deny"));
+        assert_eq!(read_daily(&d), REMOTE_APPROVE_DAILY_CAP, "deny 해소는 allow 카운터 불변");
+    }
+
+    // ── V4: 연속 실패 sender 쿨다운 ──
+    #[test]
+    fn v4_sender_cooldown_after_consecutive_fails() {
+        let d = tmp_daemon("v4_cool");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U2"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        // U1이 위조 nonce로 임계(5)회 연속 실패 → 브루트.
+        for i in 0..SENDER_COOLDOWN_FAIL_THRESHOLD {
+            let bogus = format!("forged{i}");
+            let r = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &bogus, "allow"), own_pid());
+            assert_eq!(r["result"]["reason"], json!("nonce_invalid"), "브루트 {i}회차는 nonce_invalid: {r}");
+        }
+        // 6번째: 유효 nonce여도 쿨다운으로 거부(가장 앞선 게이트).
+        let good = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &good, "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("interaction_denied"), "{r}");
+        assert_eq!(r["result"]["reason"], json!("sender_cooldown"), "임계 초과 sender는 쿨다운");
+        // feed 미해소(쿨다운이 유효 승인도 막음).
+        assert_eq!(feed_status(&d, "feed1").as_deref(), Some("pending"), "쿨다운 중 feed pending 유지");
+        // 다른 sender(U2)는 영향 없음(per-sender 쿨다운).
+        let r2 = call(&d, "inbound", interaction_params("slack", "U2", "feed1", "forgedX", "allow"), own_pid());
+        assert_eq!(r2["result"]["reason"], json!("nonce_invalid"), "U2는 쿨다운 무관(신선): {r2}");
+    }
+
+    #[test]
+    fn v4_success_resets_consecutive_fails() {
+        let d = tmp_daemon("v4_reset");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        // 임계 미만(4)회 실패.
+        for i in 0..(SENDER_COOLDOWN_FAIL_THRESHOLD - 1) {
+            let bogus = format!("forged{i}");
+            call(&d, "inbound", interaction_params("slack", "U1", "feed1", &bogus, "allow"), own_pid());
+        }
+        // 유효 승인 성공 → 카운터 리셋.
+        let good = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        let ok = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &good, "allow"), own_pid());
+        assert_eq!(ok["result"]["action"], json!("approval_resolved"), "{ok}");
+        // 리셋 후: 다시 임계-1회 실패해도 쿨다운 미발동(리셋 안 됐다면 4+1=5로 이미 쿨다운).
+        for i in 0..(SENDER_COOLDOWN_FAIL_THRESHOLD - 1) {
+            let bogus = format!("post{i}");
+            let r = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &bogus, "allow"), own_pid());
+            assert_eq!(r["result"]["reason"], json!("nonce_invalid"), "리셋 후 {i}회차는 nonce_invalid(쿨다운 아님): {r}");
+        }
+    }
+
+    // ── V2 보강: nonce_feed_mismatch(기존 owner_mismatch만 명명돼 누락분 박제) ──
+    #[test]
+    fn v2_nonce_feed_mismatch_rejected() {
+        let d = tmp_daemon("v2_feedmis");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        // feed1에 결박된 nonce를 다른 feed_id로 제시(재생/오결박) → nonce_feed_mismatch.
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "feedOTHER", &nonce, "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("interaction_denied"), "{r}");
+        assert_eq!(r["result"]["reason"], json!("nonce_feed_mismatch"), "타 feed 결박 nonce는 mismatch");
     }
 }
