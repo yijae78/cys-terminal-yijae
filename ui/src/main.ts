@@ -2720,11 +2720,13 @@ async function promptInstall() {
     if (!ok) return;
     force = true;
   }
-  toast("feed", "⬇ 업데이트 설치", `버전 ${v} 다운로드 중… 완료 후 자동 재시작됩니다.`);
+  // 지속형 토스트: 다운로드가 8초를 넘겨도 유지되며 update-progress 리스너가 진행률로 갱신한다.
+  stickyToast("upd-bin", "feed", "⬇ 업데이트 설치", `버전 ${v} 다운로드 준비 중… 완료 후 자동 재시작됩니다.`);
   try {
     await invoke("install_update", { force });
-    // 성공 시 app.restart()로 프로세스가 교체되므로 이 줄에 도달하지 않는다.
+    // 성공 시 app.restart()로 프로세스가 교체되므로 이 줄에 도달하지 않는다(sticky는 그대로 유지된 채 재시작).
   } catch (e) {
+    dismissToast("upd-bin"); // 재시작이 일어나지 않았으므로 진행 토스트를 내린다.
     const msg = String(e);
     if (msg.includes("live_sessions:")) {
       // 가드에 막힘(force 미적용 경로) — 다시 확인 흐름으로
@@ -2744,11 +2746,13 @@ async function promptPackInstall() {
     return;
   }
   const pv = packUpdateAvailable.pack_version;
-  toast("feed", "↻ 무중단 팩 업데이트", `팩 ${pv} 적용 중… 세션·데몬 유지(재시작 없음).`);
+  // 지속형 토스트: pack-progress 리스너가 갱신하고 pack-updated/update-warning이 dismiss한다.
+  stickyToast("upd-pack", "feed", "↻ 무중단 팩 업데이트", `팩 ${pv} 적용 중… 세션·데몬 유지(재시작 없음).`);
   try {
     await invoke("install_pack_update", { manifestUrl: packUpdateAvailable.manifest_url });
-    // 성공(또는 degraded)은 pack-updated/update-warning 리스너가 후속 처리.
+    // 성공(또는 degraded)은 pack-updated/update-warning 리스너가 후속 처리(sticky도 거기서 dismiss).
   } catch (e) {
+    dismissToast("upd-pack"); // 완료 이벤트 없이 reject된 경로 — 진행 토스트를 내린다.
     // 백엔드가 update-error도 emit하지만, join/실행 단계 실패는 emit 없이 reject되므로 여기서 표시.
     toast("health", "팩 업데이트 실패", String(e));
   }
@@ -3100,6 +3104,32 @@ function toast(category: string, name: string, detail: string) {
   setTimeout(() => el.remove(), 8000);
 }
 
+// 지속형(sticky) 토스트 — 8초 auto-dismiss 없이 id로 갱신/제거한다. 다운로드처럼
+// 8초를 넘기는 진행 이벤트는 완료·실패 때 명시적으로 dismissToast로 내려야 한다.
+const stickyToasts = new Map<string, HTMLElement>();
+
+function stickyToast(id: string, category: string, name: string, detail: string) {
+  const box = document.getElementById("toasts")!;
+  let el = stickyToasts.get(id);
+  if (!el) {
+    el = document.createElement("div");
+    el.className = `toast ${category}`;
+    el.innerHTML = `<span class="toast-name"></span><span class="toast-detail"></span>`;
+    box.appendChild(el);
+    stickyToasts.set(id, el);
+  }
+  (el.querySelector(".toast-name") as HTMLElement).textContent = name;
+  (el.querySelector(".toast-detail") as HTMLElement).textContent = detail;
+}
+
+function dismissToast(id: string) {
+  const el = stickyToasts.get(id);
+  if (el) {
+    el.remove();
+    stickyToasts.delete(id);
+  }
+}
+
 // OS 네이티브 배너(B4): 채팅창 밖에서도 고우선 이벤트 포착. 권한 거부·미지원은 무해(try/catch).
 async function osBanner(title: string, body: string) {
   try {
@@ -3228,15 +3258,43 @@ async function start() {
 
   await listen("daemon-event", (e) => onDaemonEvent(e.payload as Record<string, unknown>));
 
+  // 바이너리 업데이트 진행률(install_update가 emit). chunk=이번 청크 바이트(누적 아님), total=전체(Option→null 가능).
+  // UI에서 누적 합산해 지속형 토스트를 갱신한다. 성공 시 app.restart로 프로세스가 교체되므로 dismiss는 실패 경로(promptInstall catch)만.
+  let updDownloaded = 0;
+  await listen("update-progress", (e) => {
+    const p = (e.payload ?? {}) as { phase?: string; chunk?: number; total?: number };
+    const mb = (n: number) => (n / 1048576).toFixed(1);
+    if (p.phase === "download") {
+      if (p.chunk === undefined) {
+        // chunk 없는 첫 download 이벤트 = 시작 신호 → 누적 카운터 리셋
+        updDownloaded = 0;
+        stickyToast("upd-bin", "feed", "⬇ 업데이트 설치", "다운로드 시작…");
+        return;
+      }
+      updDownloaded += p.chunk;
+      if (p.total && p.total > 0) {
+        const pct = Math.floor((updDownloaded / p.total) * 100);
+        stickyToast("upd-bin", "feed", "⬇ 업데이트 설치", `다운로드 중 ${mb(updDownloaded)} / ${mb(p.total)} MB (${pct}%)`);
+      } else {
+        stickyToast("upd-bin", "feed", "⬇ 업데이트 설치", `다운로드 중 ${mb(updDownloaded)} MB`);
+      }
+    } else if (p.phase === "drain") {
+      stickyToast("upd-bin", "feed", "⬇ 업데이트 설치", "세션 정리 중…");
+    } else if (p.phase === "handoff") {
+      stickyToast("upd-bin", "feed", "⬇ 업데이트 설치", "재시작 준비 중…");
+    }
+  });
+
   // 무중단 팩 업데이트 진행 피드백(install_pack_update가 emit). ★app.restart 없음 — 세션 유지된 채 적용.
   await listen("pack-progress", (e) => {
     const p = (e.payload ?? {}) as { phase?: string };
     if (p.phase === "start")
-      toast("feed", "🔄 무중단 적용 중", "서명검증 → 다운로드 → 원자적 팩 교체 → 노드 reinject…");
+      stickyToast("upd-pack", "feed", "🔄 무중단 적용 중", "서명검증 → 다운로드 → 원자적 팩 교체 → 노드 reinject…");
   });
   await listen("pack-updated", (e) => {
     const p = (e.payload ?? {}) as { pack_version?: string; reinject_failed?: number; reinject_deferred?: number };
     packUpdateAvailable = null;
+    dismissToast("upd-pack"); // 진행 토스트를 내리고 아래 완료 토스트로 교대.
     const badge = document.getElementById("update-badge")!;
     if (!updateAvailable) badge.hidden = true; // 바이너리 업데이트가 별도로 남아있지 않으면 배지 해제
     // degraded(reinject 일부 실패/보류)면 '완료' 단정 회피 — 상세는 update-warning이 띄운다(모순 차단).
@@ -3258,6 +3316,7 @@ async function start() {
   });
   await listen("update-warning", (e) => {
     const p = (e.payload ?? {}) as { message?: string };
+    dismissToast("upd-pack"); // 진행 토스트를 내리고 아래 경고 토스트로 교대.
     toast("health", "⚠ 팩 일부 미각성", p.message ?? "디스크 팩은 갱신됐으나 일부 노드 reinject 보류/실패(라이브 유지).");
   });
 
