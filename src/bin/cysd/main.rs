@@ -462,27 +462,34 @@ fn spawn_auto_restore(
             let state_dir = state_dir.to_path_buf();
             let daemon = daemon.clone();
             std::thread::spawn(move || {
-                // ★B1: 임베드 추출 실행 우선(바이너리=스크립트 동일 커밋 하드보장) → 실패 시 manifest-검증 디스크 폴백.
-                match resolve_phoenix_source(&state_dir, &disk_phoenix, &program, &daemon) {
-                    PhoenixResolve::Ready { script, cleanup } => {
-                        let mut run_args = vec![script.to_string_lossy().into_owned()];
-                        run_args.extend(tail);
-                        loop_auto_restore(&program, &run_args, &env, &log_path);
-                        // temp 누수 0: 추출본은 실행 후 정리(디스크 폴백은 cleanup=None).
-                        if let Some(dir) = cleanup {
-                            let _ = std::fs::remove_dir_all(&dir);
+                let log_for_panic = log_path.clone();
+                // ★P0-5 침묵사 차단(D3/W5·CI 28780215417 실증: auto-restore 스레드가 std/time.rs panic 으로 즉사
+                //   → phoenix-restore.log 빈 파일·원인 불가시). 스레드 본문을 guard_restore_panic(catch_unwind)로
+                //   감싸 panic 을 삼키지 않고 stderr + phoenix-restore.log 에 **1회 기록**한다 — 무한 재스폰 금지
+                //   (재기동은 다음 데몬 부트/schtasks 소관). 이 웨이브가 죽이려는 '스레드 침묵사' 클래스의 구조 수리.
+                guard_restore_panic(&log_for_panic, || {
+                    // ★B1: 임베드 추출 실행 우선(바이너리=스크립트 동일 커밋 하드보장) → 실패 시 manifest-검증 디스크 폴백.
+                    match resolve_phoenix_source(&state_dir, &disk_phoenix, &program, &daemon) {
+                        PhoenixResolve::Ready { script, cleanup } => {
+                            let mut run_args = vec![script.to_string_lossy().into_owned()];
+                            run_args.extend(tail);
+                            loop_auto_restore(&program, &run_args, &env, &log_path);
+                            // temp 누수 0: 추출본은 실행 후 정리(디스크 폴백은 cleanup=None).
+                            if let Some(dir) = cleanup {
+                                let _ = std::fs::remove_dir_all(&dir);
+                            }
+                        }
+                        PhoenixResolve::Failed(reason) => {
+                            eprintln!("[cysd] auto-restore ABORTED — 안전한 phoenix 없음: {reason}");
+                            daemon.push_feed_notification(
+                                "error",
+                                "auto-restore 중단",
+                                &format!("안전한 phoenix 실행원 없음(임베드 추출·디스크 폴백 모두 실패): {reason}"),
+                                None,
+                            );
                         }
                     }
-                    PhoenixResolve::Failed(reason) => {
-                        eprintln!("[cysd] auto-restore ABORTED — 안전한 phoenix 없음: {reason}");
-                        daemon.push_feed_notification(
-                            "error",
-                            "auto-restore 중단",
-                            &format!("안전한 phoenix 실행원 없음(임베드 추출·디스크 폴백 모두 실패): {reason}"),
-                            None,
-                        );
-                    }
-                }
+                });
             });
             eprintln!("[cysd] auto-restore triggered (phoenix restore --auto · 임베드 추출 우선)");
         }
@@ -775,6 +782,29 @@ fn open_restore_log(log_path: &std::path::Path) -> Option<std::fs::File> {
             "[cysd] auto-restore log(primary+temp) 모두 open 실패 — 자식 stdio 를 데몬 stderr 로 inherit(증거 소실 방지)"
         );
         None
+    }
+}
+
+/// ★P0-5 침묵사 차단(D3/W5): auto-restore 스레드 본문을 catch_unwind 로 감싸 panic 을 삼키지 않는다. panic 시
+/// stderr + phoenix-restore.log 에 1회 기록하고 반환(스레드는 자연 종료 — 무한 재스폰 없음). 순수·테스트 가능:
+/// 반환 true=정상 완료·false=panic 포착(테스트 단언용).
+fn guard_restore_panic<F: FnOnce()>(log_path: &std::path::Path, body: F) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(()) => true,
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            eprintln!("[cysd] ★auto-restore 스레드 panic 포착(P0-5 침묵사 차단·재스폰 안 함): {msg}");
+            // phoenix-restore.log 에도 남겨 관측성 확보(빈 로그 → panic 기록으로 원인 직결).
+            if let Some(mut f) = open_restore_log(log_path) {
+                use std::io::Write;
+                let _ = writeln!(f, "[cysd] AUTO-RESTORE THREAD PANIC (P0-5 차단·재스폰 안 함): {msg}");
+            }
+            false
+        }
     }
 }
 
@@ -1808,7 +1838,36 @@ mod pipe_security_tests {
 
 #[cfg(test)]
 mod auto_restore_tests {
-    use super::{autorestore_retry_delay, decide_auto_restore, loop_auto_restore_with, AutoRestore};
+    use super::{
+        autorestore_retry_delay, decide_auto_restore, guard_restore_panic, loop_auto_restore_with,
+        AutoRestore,
+    };
+
+    /// ★P0-5(D3/W5·CI 28780215417): auto-restore 스레드 panic 을 삼키지 않고 포착·기록하는지 — 재현 테스트.
+    /// panic 하는 body → guard 는 false 반환(전파 안 함)·phoenix-restore.log 에 PANIC 기록. 정상 body → true.
+    #[test]
+    fn guard_restore_panic_catches_and_logs_no_propagation() {
+        let dir = std::env::temp_dir().join(format!("cys-ar-panic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("phoenix-restore.log");
+
+        // ① panic body → 포착(프로세스 안 죽음)·false 반환·로그에 PANIC 기록.
+        let ok = guard_restore_panic(&log, || panic!("boom time.rs"));
+        assert!(!ok, "panic 은 false 로 포착돼야 한다(전파 금지)");
+        let logged = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            logged.contains("AUTO-RESTORE THREAD PANIC") && logged.contains("boom time.rs"),
+            "panic 이 phoenix-restore.log 에 기록돼야 한다(침묵사 금지): {logged}"
+        );
+
+        // ② 정상 body → true·body 실행됨.
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let ok2 = guard_restore_panic(&log, || {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(ok2 && ran.load(std::sync::atomic::Ordering::SeqCst), "정상 body 는 true·실행");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// opt-out(CYS_NO_AUTORESTORE=1)이면 phoenix가 있어도 스폰하지 않는다.
     #[test]
