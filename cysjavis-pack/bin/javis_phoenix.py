@@ -745,17 +745,15 @@ def _intent_journal_path(socket):
 
 
 def _append_tombstone_intent(socket, role, remove):
-    """다운타임 폴백 — intent 를 append-only jsonl 에 flock 로 기록(C2 정책: 원자 append·부분절단 내성)."""
+    """다운타임 폴백 — intent 를 append-only jsonl 에 배타 락으로 기록(C2 정책: 원자 append·부분절단 내성).
+    ★D2(W5): 락을 unix flock·Windows msvcrt 통합(_try_lock_nb, best-effort NB) — 과거 Windows 무락(P1-8)을
+    제거. 락 실패해도 단문 append(원자성)·corrupt-line-skip 내성으로 진행(가용성). a+ 로 열어 Windows msvcrt
+    byte0 락 영역이 프로세스 간 일치하게 한다(write 는 append 모드라 end 로 간다)."""
     p = _intent_journal_path(socket)
     line = json.dumps({"op": "remove" if remove else "add", "role": role, "ts": _now()}, ensure_ascii=False)
     try:
-        with open(p, "a", encoding="utf-8") as f:
-            if not IS_WINDOWS:
-                try:
-                    import fcntl
-                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                except Exception:
-                    pass
+        with open(p, "a+", encoding="utf-8") as f:
+            _try_lock_nb(f)  # best-effort 배타 락(unix flock·Windows msvcrt.locking) — 실패해도 append 진행
             f.write(line + "\n")
     except Exception:
         pass
