@@ -43,6 +43,7 @@ spawn(생성) 백엔드 2종:
 """
 
 import argparse
+import atexit
 import json
 import os
 import re
@@ -89,6 +90,37 @@ SPAWN_RETRIES = int(os.environ.get("PHOENIX_SPAWN_RETRIES", "3"))       # 미스
 SPAWN_SETTLE = float(os.environ.get("PHOENIX_SPAWN_SETTLE", "1.0"))     # 스폰 후 surface 등장 정착 대기
 SPAWN_BACKOFF = float(os.environ.get("PHOENIX_SPAWN_BACKOFF", "1.5"))   # 재시도 간격 기준(회차마다 증가)
 
+# ★W1/C1 exit code 계약: run_restore 최종 판정 → 프로세스 exit code(P0-1 신호 역전 수리).
+#   과거: cmd_restore 는 FAILED 여도 dict 만 return → 프로세스는 항상 exit 0 → cysd 가 완전실패와 성공을
+#   구분 불가(exit 1 은 오히려 미포착 예외 crash 때만 나와 신호가 뒤집혀 있었다). 이제 판정을 결정론 exit 로 방출한다.
+#   cysd 재시도 정책과 정합: 5(BREAKER)·6(손상/identity)=재시도 금지, 1·3=1회 지연 재시도, 0=성공(재시도 없음).
+PHOENIX_EXIT_OK = 0        # VERIFIED · VERIFIED_FRESH · NOOP · LEASE_HELD(멱등 skip — 다른 restore가 담당)
+PHOENIX_EXIT_FAILED = 1    # FAILED · INCOMPLETE(재시도 소진 후 미부활) — 재시도 가치 있음
+PHOENIX_EXIT_DEGRADED = 3  # UNVERIFIED · DEGRADED(부활은 됐으나 세션 미검증) — 재시도 가치 있음
+PHOENIX_EXIT_BREAKER = 5   # BREAKER_OPEN(크래시루프 정지) — 재시도 금지(폭주 방지·사람 승인)
+PHOENIX_EXIT_CORRUPT = 6   # 손상 감지 / cys identity 불일치 — 재시도 금지(사람 개입)
+
+
+def restore_exit_code(result):
+    """run_restore 결과 dict → 프로세스 exit code(C1 계약). 최악 조건 우선(worst-wins):
+    실 미부활(INCOMPLETE)이 세션 미검증(UNVERIFIED)보다, 손상/차단기가 그보다 상위다.
+    result 가 dict 가 아니면(비정상) 보수적으로 FAILED(1) — 성공 오판 방지."""
+    if not isinstance(result, dict):
+        return PHOENIX_EXIT_FAILED
+    verdict = result.get("phoenix_restore")
+    completeness = result.get("completeness")
+    if result.get("corruption"):
+        return PHOENIX_EXIT_CORRUPT
+    if verdict == "BREAKER_OPEN":
+        return PHOENIX_EXIT_BREAKER
+    # INCOMPLETE(readiness 기반 실 미부활)는 verdict 가 무엇이든 최우선 실패 신호 — 침묵 성공 금지.
+    if verdict == "FAILED" or completeness == "INCOMPLETE":
+        return PHOENIX_EXIT_FAILED
+    if verdict in ("UNVERIFIED", "DEGRADED"):
+        return PHOENIX_EXIT_DEGRADED
+    # VERIFIED · VERIFIED_FRESH · NOOP · LEASE_HELD → 성공/무해(0)
+    return PHOENIX_EXIT_OK
+
 # ★Phase 11: 독약 세션(unresumable) fresh-spawn fallback — DRILL_LIVE_4 §15 수리.
 #   완결성(Phase10)은 resume(세션핀) 기반 spawn 을 반복하는데, 세션이 독약(resume 불가·손상)이면 매 재시도가
 #   동일하게 실패한다(DRILL_LIVE_4: claude --resume 워커만 부활 실패). 근본 = §3 원칙5 "N회 resume 실패→
@@ -106,6 +138,197 @@ CYS = None  # lazy resolve
 def _which(name):
     import shutil
     return shutil.which(name)
+
+
+# ★W1/B3·§5-1: 표준 설치 경로 폴백 후보(GUI/데몬 최소 PATH 에 cys 가 없을 때). 라이브 실증(2026-07-06):
+#   GUI 기동 데몬 PATH=/usr/bin:/bin:/usr/sbin:/sbin 뿐 → /opt/homebrew/bin/cys 미탐색 → 리터럴 'cys'
+#   FileNotFoundError → auto-restore exit 1 침묵사. 폴백은 identity-check 통과 시에만 채택한다.
+_CYS_STD_PATHS = ["/opt/homebrew/bin/cys", "/usr/local/bin/cys"]
+
+
+def _extract_version(text):
+    """`cys --version`('cys 0.12.20') / daemon.version('0.12.20') 에서 x.y.z 를 추출(진단 로깅용)."""
+    m = re.search(r"\d+\.\d+\.\d+", text or "")
+    return m.group(0) if m else ""
+
+
+# ★W1 identity 3중 대조 필드(§5-1② · codex R3 blocking): 버전 문자열 단일 대조는 shadowing 구멍
+#   (같은 version 문자열의 다른 빌드·다른 embedded pack·다른 protocol 이 통과). 3필드 전건 일치를 요구한다.
+_IDENTITY_FIELDS = ("build_id", "embedded_pack_hash", "protocol_version")
+
+# ★W1(gate2): 해석된 cys 의 identity 검증 상태(결과 JSON `cys_identity` 로 노출).
+#   "verified"=3중 대조 match · "degraded-unverified"=inconclusive 채택(데몬 미도달 등 — 검증 통과 아님·정직 분리).
+#   mismatch 는 채택 자체가 없다(exit 6). None=미해석(직접 함수 호출 등).
+_CYS_IDENTITY = None
+
+# 재시도 파라미터(gate2 fix 2a·gemini): 데몬 소켓 기동 직후 status 미도달(inconclusive) 레이스 해소.
+_IDENTITY_RETRY_TRIES = int(os.environ.get("PHOENIX_IDENTITY_RETRY_TRIES", "2"))
+_IDENTITY_RETRY_SLEEP = float(os.environ.get("PHOENIX_IDENTITY_RETRY_SLEEP", "1.0"))
+
+
+def _cys_self_identity(candidate):
+    """후보 cys 자신의 3필드 self-report(`cys phoenix-identity` — 데몬 불요·컴파일타임 상수). 실패=None."""
+    try:
+        r = subprocess.run([candidate, "phoenix-identity"], capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    try:
+        return json.loads(r.stdout or "{}")
+    except Exception:
+        return None
+
+
+def _daemon_identity(candidate, socket):
+    """대상 데몬의 3필드(`cys status --json`.daemon). 서브프로세스 실패/미도달/파싱실패=None."""
+    cmd = [candidate]
+    if socket:
+        cmd += ["--socket", socket]
+    cmd += ["status", "--json"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    try:
+        return (json.loads(r.stdout or "{}").get("daemon") or {})
+    except Exception:
+        return None
+
+
+def _cys_identity_check(candidate, socket):
+    """★3중 대조(§5-1②): 후보 self-report(phoenix-identity) ↔ 대상 데몬 status.daemon 의
+    build_id·embedded_pack_hash·protocol_version 전건 일치 검증. 반환 (status, field, detail):
+      · ('match', None, detail)        전 3필드 일치(같은 빌드·팩·프로토콜 확증)
+      · ('mismatch', <field>, detail)  특정 필드 불일치/부재(다른 빌드/팩/프로토콜 — shadowing 차단, 어느 필드인지 명시)
+      · ('inconclusive', reason, '')   self-report 또는 데몬 status 미도달로 대조 불가."""
+    self_id = _cys_self_identity(candidate)
+    if not self_id:
+        return ("inconclusive", "self-report(phoenix-identity) 실패 — 구버전 cys(커맨드 부재) 의심", "")
+    dmn = _daemon_identity(candidate, socket)
+    if not dmn:
+        return ("inconclusive", "데몬 status 미도달(대조 불가)", "")
+    for f in _IDENTITY_FIELDS:
+        sv, dv = self_id.get(f), dmn.get(f)
+        if not sv or not dv:
+            return ("mismatch", f, "self=%r daemon=%r(필드 부재 — 구버전/legacy 의심)" % (sv, dv))
+        if sv != dv:
+            return ("mismatch", f, "self=%r daemon=%r" % (sv, dv))
+    return ("match", None, "build_id=%s proto=%s" % (self_id.get("build_id"), self_id.get("protocol_version")))
+
+
+def _identity_with_retry(candidate, socket):
+    """★gate2 fix 2a(gemini): inconclusive 는 데몬 소켓 기동 직후 status 미도달 레이스일 수 있으므로,
+    1s 간격 재시도 후 재대조한다(mismatch·match 는 즉시 확정 — 재시도 불요). 최종 (status, field, detail)."""
+    status, field, detail = _cys_identity_check(candidate, socket)
+    tries = 0
+    while status == "inconclusive" and tries < _IDENTITY_RETRY_TRIES:
+        tries += 1
+        time.sleep(_IDENTITY_RETRY_SLEEP)
+        status, field, detail = _cys_identity_check(candidate, socket)
+    return status, field, detail
+
+
+def _accept_with_identity(socket, candidate, source_label, allow_inconclusive):
+    """★gate2 fix 1·2: 후보 cys 를 3중 identity 계약으로 채택/거부한다(PHOENIX_CYS·PATH·표준경로 공통 경로).
+      · match        → 채택(_CYS_IDENTITY='verified')
+      · mismatch     → 어디서든 즉사(exit 6·불일치 필드 명시) — 적극적 모순은 availability 명분으로 통과 불가
+      · inconclusive → allow_inconclusive 면 채택하되 **'검증 통과'가 아니라 degraded availability exception**으로
+                       분리 기록(_CYS_IDENTITY='degraded-unverified'·저널+stderr). 아니면 exit 6.
+    ★fix 2c(provenance): 'Rust 가 주입했다'는 출처를 env 토큰으로 증명하는 방식은 채택하지 않는다 — env 토큰은
+       위조 가능해 shadowing 을 못 막는다(같은 토큰을 심으면 우회). 정직한 해법은 검증 실패를 숨기지 않고
+       degraded 로 분리 보고하는 것(availability 는 지키되 'verified' 라 거짓말하지 않는다)."""
+    global _CYS_IDENTITY
+    status, field, detail = _identity_with_retry(candidate, socket)
+    if status == "match":
+        _CYS_IDENTITY = "verified"
+        sys.stderr.write("[phoenix] cys 채택(%s): %s — 3중 identity match(%s)\n" % (source_label, candidate, detail))
+        sys.stderr.flush()
+        return candidate
+    if status == "mismatch":
+        _resolve_die(socket, "cys(%s=%s) identity 3중 대조 불일치 — 불일치 필드=%s (%s). "
+                     "다른 빌드/팩/프로토콜 스큐 차단·exit 6." % (source_label, candidate, field, detail), 6)
+    # inconclusive
+    if not allow_inconclusive:
+        _resolve_die(socket, "cys(%s=%s) identity inconclusive(%s) — positive proof 요구 경로라 채택 거부·exit 6. "
+                     "PHOENIX_CYS 로 이 데몬과 동일 빌드의 cys 를 명시하라." % (source_label, candidate, field), 6)
+    _CYS_IDENTITY = "degraded-unverified"
+    _resolve_journal_mark(socket, "degraded",
+                          "cys(%s=%s) identity inconclusive(%s) — availability 위해 채택하되 '검증 통과' 아님"
+                          "(degraded-unverified 분리 보고)." % (source_label, candidate, field))
+    sys.stderr.write("[phoenix] ★degraded availability exception: cys(%s=%s) identity **unverified(degraded)** — "
+                     "재시도 후에도 inconclusive(%s). 채택하되 3중 대조 미완(검증 통과 아님).\n"
+                     % (source_label, candidate, field))
+    sys.stderr.flush()
+    return candidate
+
+
+def _resolve_journal_start(socket):
+    """★gemini major: _resolve_cys die 전에 저널 뼈대(ticket=resolve·타임스탬프·stage=resolve_cys)를 먼저
+    생성한다 — die 로 무단 종료해도 저널에 시도 이력이 남게 하는 관측 사각 제거. best-effort."""
+    try:
+        j = load_journal(socket, "resolve")
+        jevent(j, "*", "resolve_cys", "start", "cys 실행 경로 해석 시작")
+        save_journal(socket, "resolve", j)
+    except Exception:
+        pass
+
+
+def _resolve_journal_mark(socket, status, msg):
+    """resolve 저널에 이벤트 1건 기록(degraded 채택 등 — die 아닌 경로). best-effort."""
+    try:
+        j = load_journal(socket, "resolve")
+        jevent(j, "*", "resolve_cys", status, msg[:280])
+        save_journal(socket, "resolve", j)
+    except Exception:
+        pass
+
+
+def _resolve_die(socket, msg, code):
+    """★gemini major: resolve 실패를 저널에 기록한 뒤 die — 침묵사(저널 무이력 종료) 차단."""
+    try:
+        j = load_journal(socket, "resolve")
+        jevent(j, "*", "resolve_cys", "fail", msg[:280])
+        j.setdefault("resolve", {})["failed_at"] = _now()
+        save_journal(socket, "resolve", j)
+    except Exception:
+        pass
+    die(msg, code=code)
+
+
+def _resolve_cys(socket):
+    """cys 실행 경로 해석(§5-1 W1). 우선순위: PHOENIX_CYS > which('cys') > 표준경로 폴백.
+    ★리터럴 'cys' 최종 폴백은 제거됨 — PATH 미해석 침묵 통과가 FileNotFoundError→exit 1 침묵사 근원(2026-07-06).
+    ★gate2: 모든 실행 경로(PHOENIX_CYS·_which PATH·표준경로)에 3중 identity 계약을 적용한다 — 어느 경로든
+       mismatch=exit 6. inconclusive 정책만 경로별 차등:
+      · PHOENIX_CYS(명시)·_which PATH 후보 → X_OK + identity. inconclusive 는 재시도 후 degraded-unverified 로
+        채택(분리 보고) — 하네스·격리·비데몬 서브커맨드에서 데몬 미도달 inconclusive 가 정상 존재하므로.
+      · 표준경로 폴백(PATH·PHOENIX_CYS 모두 미해석) → positive proof 요구: **match 만** 채택(inconclusive=exit 6).
+      · PHOENIX_STRICT_CYS=1 / 하네스(--socket·PHOENIX_FORBID_LIVE) → 표준경로 폴백 자체 금지(미해석=exit 6).
+    실패·채택·degraded 전부 저널·stderr(→cysd phoenix-restore.log)에 기록한다."""
+    _resolve_journal_start(socket)
+    explicit = os.environ.get("PHOENIX_CYS")
+    if explicit:
+        if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
+            _resolve_die(socket, "PHOENIX_CYS(%s) 실행 불가(파일 부재/실행권한 없음) — 무검증 수용 금지·exit 6." % explicit, 6)
+        return _accept_with_identity(socket, explicit, "PHOENIX_CYS", allow_inconclusive=True)
+    found = _which("cys")
+    if found:
+        # ★gate2 fix 1(BLOCKING): PATH 후보도 identity gate 를 우회하지 않는다(과거엔 곧바로 return).
+        return _accept_with_identity(socket, found, "PATH(which)", allow_inconclusive=True)
+    # 여기부터 표준경로 폴백 — PATH·PHOENIX_CYS 모두 cys 미해석.
+    strict = os.environ.get("PHOENIX_STRICT_CYS") == "1"
+    harness = bool(socket) or os.environ.get("PHOENIX_FORBID_LIVE") == "1"
+    if strict:
+        _resolve_die(socket, "PHOENIX_STRICT_CYS=1 이나 cys 를 PHOENIX_CYS/PATH 로 해석하지 못했다 — 표준경로 폴백 "
+                     "금지(exit 6). Rust auto-restore 의 PHOENIX_CYS 주입이 누락됐을 수 있다(B3).", 6)
+    if harness:
+        _resolve_die(socket, "하네스 모드(--socket/PHOENIX_FORBID_LIVE)에서 cys 미해석 — 표준경로 폴백 금지"
+                     "(테스트 독립성·exit 6). 격리 실행은 PHOENIX_CYS 로 대상 cys 를 명시하라.", 6)
+    for c in _CYS_STD_PATHS:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            # 표준경로는 PATH-미해석 추측 후보 — positive proof(match) 요구(inconclusive 도 거부).
+            return _accept_with_identity(socket, c, "표준경로", allow_inconclusive=False)
+    _resolve_die(socket, "cys 실행 경로 미해석(PHOENIX_CYS·PATH·표준경로 %s 모두 실패) — 리터럴 폴백 제거됨"
+                 "(침묵사 방지·exit 6)." % _CYS_STD_PATHS, 6)
 
 
 def die(msg, code=2):
@@ -186,7 +409,13 @@ def _run_capture(cmd, env, timeout):
     ef = tempfile.TemporaryFile()
     r = _CapR()
     try:
-        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=of, stderr=ef, env=env)
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=of, stderr=ef, env=env)
+        except (FileNotFoundError, OSError) as e:
+            # ★codex major(Windows 대칭): cys.exe 미해석/실행불가 → 비구조화 crash 대신 구조화 실패(rc=127).
+            r.returncode = 127
+            r.stderr = "cys 실행 불가(%s: %s) cmd=%r" % (type(e).__name__, e, cmd)
+            return r
         try:
             p.wait(timeout=timeout)
             r.returncode = p.returncode
@@ -228,6 +457,14 @@ def cys(*args, socket=None, timeout=25):
             returncode = 124
             stdout = (e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")) if e.stdout else ""
             stderr = "TIMEOUT %ss" % timeout
+        return _R()
+    except (FileNotFoundError, OSError) as e:
+        # ★codex major: CYS 해석 후에도 파일이 사라지거나 실행 불가면 여기서 비구조화 exit 1 crash 가 났다.
+        #   구조화 실패(rc=127)로 강등해 상위 판정(스폰 실패→INCOMPLETE 등)이 정직히 흐르게 한다.
+        class _R:
+            returncode = 127
+            stdout = ""
+            stderr = "cys 실행 불가(%s: %s) cmd=%r" % (type(e).__name__, e, cmd)
         return _R()
 
 
@@ -536,12 +773,20 @@ def rollback_proposal(socket):
     snap = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_state_snapshot.py")
     prop = {"snapshot_tool": snap, "generations": [], "note": "실행하지 않는다 — 사람 승인 후 --at 롤백"}
     if os.path.exists(snap):
-        r = subprocess.run([sys.executable, snap, "list"], capture_output=True, text=True, timeout=15)
-        prop["generations_raw"] = (r.stdout or r.stderr or "").strip()[:600]
-        gens = re.findall(r"(\d{8}T\d{6}Z)", r.stdout or "")
-        prop["generations"] = gens
-        if gens:
-            prop["suggested_rollback_to"] = gens[-1]  # 목록상 직전 세대(도구 정렬 규약 따름)
+        # ★C4/P1-5: raw subprocess 가드 — TimeoutExpired→정직 강등(rc 124 상당), 인터프리터/도구 부재→명시 실패.
+        #   무가드 시 스냅샷 도구가 15초 초과하면 traceback→이유 없는 exit 1(P1-5). 롤백 '제안'은 부가정보이므로
+        #   실패해도 restore 판정을 죽이지 않고 note 로 정직히 남긴다.
+        try:
+            r = subprocess.run([sys.executable, snap, "list"], capture_output=True, text=True, timeout=15)
+            prop["generations_raw"] = (r.stdout or r.stderr or "").strip()[:600]
+            gens = re.findall(r"(\d{8}T\d{6}Z)", r.stdout or "")
+            prop["generations"] = gens
+            if gens:
+                prop["suggested_rollback_to"] = gens[-1]  # 목록상 직전 세대(도구 정렬 규약 따름)
+        except subprocess.TimeoutExpired:
+            prop["error"] = "스냅샷 도구 list 15s TIMEOUT(rc 124 상당) — 롤백 제안 생략(정직 강등)"
+        except (FileNotFoundError, OSError) as e:
+            prop["error"] = "스냅샷 도구 실행 불가(%s: %s) — 롤백 제안 생략" % (type(e).__name__, e)
     return prop
 
 
@@ -703,6 +948,29 @@ def _acquire_restore_lease(socket):
     return True, f
 
 
+def _release_lease(handle):
+    """restore lease 핸들 해제(atexit 등록 대상). flock 은 close 로 자동 해제된다. best-effort(이중 해제 무해)."""
+    try:
+        handle.close()
+    except Exception:
+        pass
+
+
+def c6_detect_stale_surfaces(socket):
+    """★C6 S0(죽은 surface 잔재 탐지) — restore 파이프라인 맨 앞. exited=true surface 를 열거·보고한다.
+    ★W1 범위 = 탐지·보고 전용(회수 미실행). 근거: phoenix 가 부를 수 있는 회수 CLI 는 surface.close(고정
+    OwnerClose)뿐이라 이를 쓰면 P0-6(역할 오묘비화) 함정을 그대로 밟는다 — 설계 절대 금지 경로. 안전한 Reap
+    (묘비 미생성)은 데몬 governance 주기 루프(reap_exited_surfaces·CloseCause::Reap)가 이미 담당한다.
+    TODO(W2): 데몬에 cause 파라미터 회수 RPC(Reap)가 노출되면 그때 실제 회수를 활성화한다(surface.close 금지).
+    라이브(exited=false)는 어떤 경우에도 비대상. 반환 = 탐지된 잔재 리스트(저널·결과에 정직 기록)."""
+    stale = []
+    for role, surfs in live_role_surfaces(socket).items():
+        for s in surfs:
+            if s.get("exited"):
+                stale.append({"surface": s.get("surface"), "role": role, "pid": s.get("pid")})
+    return stale
+
+
 def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=None,
                 include_master=False, stub_sids=None, print_result=True):
     """부활 저널 상태머신 본체(재사용 가능한 함수). cmd_restore(CLI)와 cmd_deploy(restore 단계)가 이 하나를
@@ -719,23 +987,23 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         if print_result:
             print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
+    # ★P2-7/W1: lease 핸들을 atexit 로 확실히 해제 등록(예외·sys.exit 경로에서도 flock 이 남지 않게).
+    #   flock 은 fd close 시 자동 해제되지만, 프로세스가 살아있는 채 다음 restore 를 부르는 경로(deploy 중첩)
+    #   에서 GC 타이밍에 의존하지 않도록 명시 해제한다. handle=None(fail-open)이면 등록 불요.
+    if _lease_handle is not None:
+        atexit.register(lambda h=_lease_handle: _release_lease(h))
     # ★Phase 6: 이 부팅 세대(재시작마다 변경)를 취득 — 저널 완료 마킹의 유효성 기준.
     _ACTIVE_EPOCH = get_boot_epoch(socket)
-    # M5: 이번 시도 기록 + 차단기 판정
-    if not no_breaker:
-        opened, attempts = breaker_check_and_record(socket)
-        if opened:
-            log("★M5 회로차단기 OPEN — %ss 내 %d회 부활 시도(임계 %d). 자동 부활 정지." % (
-                BREAKER_T, len(attempts), BREAKER_N))
-            prop = rollback_proposal(socket)
-            out = {"phoenix_restore": "BREAKER_OPEN", "attempts_in_window": len(attempts),
-                   "threshold": BREAKER_N, "window_secs": BREAKER_T,
-                   "rollback_proposal": prop,
-                   "alert": "정지 후 사람 승인 필요 — 자동 롤백/재부활을 실행하지 않는다."}
-            print(json.dumps(out, ensure_ascii=False, indent=2))
-            return out
 
     j = load_journal(socket, ticket)
+    # ★C6 S0: 죽은 surface 잔재 탐지·보고(회수는 W1 미실행 — surface.close=OwnerClose 함정 회피). 저널 기록.
+    c6_stale = c6_detect_stale_surfaces(socket)
+    if c6_stale:
+        jevent(j, "*", "s0_c6", "detected",
+               "exited 잔재 %d개 탐지(회수 미실행·데몬 governance Reap 담당): %s"
+               % (len(c6_stale), [x.get("surface") for x in c6_stale]))
+        log("★C6 S0: 죽은 surface 잔재 %d개 탐지(탐지·보고 전용·묘비 0 — 회수는 데몬 Reap/W2)." % len(c6_stale))
+        save_journal(socket, ticket, j)
     # ★Phase 4: 대상 판정 근거 = actual-state(topology)가 아니라 desired 로스터.
     # 관측을 조기·단조 영속해 topology 침식(부분 부활 후 미부활 역할 삭제)에 면역시킨다(§12).
     entries, _tombstones = observe_and_persist_roster(socket)
@@ -749,8 +1017,25 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         return False
 
     target_roles = roles or [r for r in entries if not _alive(r)]
+    # ★M5/P1-3 회로차단기: '실제 부활 시도(죽은 역할 존재)'에만 기록한다. NOOP(대상 0)은 스폰 시도가
+    #   아니므로 카운트하지 않고 오히려 창을 리셋한다 — NOOP 반복이 차단기를 OPEN 시켜 진짜 부활을 막는
+    #   오검출(P1-3)을 차단. target 산출 이후로 이동해 "spawn 시도가 있을 때만 기록"(설계 축C4)을 만족.
     if not target_roles:
         log("부활 대상 죽은 역할 0 — restore 무작업(멱등).")
+        if not no_breaker:
+            breaker_reset(socket)
+    elif not no_breaker:
+        opened, attempts = breaker_check_and_record(socket)
+        if opened:
+            log("★M5 회로차단기 OPEN — %ss 내 %d회 부활 시도(임계 %d). 자동 부활 정지." % (
+                BREAKER_T, len(attempts), BREAKER_N))
+            prop = rollback_proposal(socket)
+            out = {"phoenix_restore": "BREAKER_OPEN", "attempts_in_window": len(attempts),
+                   "threshold": BREAKER_N, "window_secs": BREAKER_T,
+                   "rollback_proposal": prop,
+                   "alert": "정지 후 사람 승인 필요 — 자동 롤백/재부활을 실행하지 않는다."}
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+            return out
     # dedup(P4): 이 티켓 저널에서 이미 verify까지 done 인 역할은 skip
     pending = [r for r in target_roles if not stage_done(j, r, "verify")]
     log("티켓=%s · 대상역할=%s · 이번 진행=%s (완료 skip=%s)" % (
@@ -915,7 +1200,12 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                 reason = "세션 일치"
         j["roles"][role]["outcome"] = outcome
         j["roles"][role]["verify_reason"] = reason
-        mark_stage(j, role, "verify", True, "M9: expected=%r observed=%r → %s (%s)" % (exp, obs, outcome, reason))
+        # ★P2-3: verify done 은 outcome 이 verified/fresh(성공 부활)일 때만 True. unverified(transient/fork)는
+        #   done=False 로 남겨 다음 restore 사이클이 재검증한다 — 과거처럼 unconditional done=True 로 마킹하면
+        #   같은 부트 세대 내내 UNVERIFIED 가 고착(재검증 영구 skip)됐다. dedup(pending)이 이 done 을 본다.
+        verify_done = outcome in ("verified", "fresh")
+        mark_stage(j, role, "verify", verify_done,
+                   "M9: expected=%r observed=%r → %s (%s)" % (exp, obs, outcome, reason))
         jevent(j, role, "verify", outcome, "expected=%r observed=%r [%s]" % (exp, obs, reason))
         save_journal(socket, ticket, j)
 
@@ -983,6 +1273,8 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         "backend": "surrogate(stub)" if stub else "production(cys restore)",
         "target_roles": target_roles,
         "per_role_outcome": outcomes,
+        "c6_stale_surfaces": c6_stale,     # ★C6 S0: 탐지된 죽은 surface 잔재(회수 미실행·묘비 0 — W2에서 Reap 활성화)
+        "cys_identity": _CYS_IDENTITY,     # ★gate2: 해석된 cys 의 3중 identity 검증 상태(verified|degraded-unverified|None)
         "journal": journal_path(socket, ticket),
         "honesty_note": honesty,
     }
@@ -998,12 +1290,15 @@ def cmd_restore(args):
     #   tombstone 병합이 roster에서 배제하므로 include_master여도 부활 대상이 되지 않는다
     #   (1급 원칙: 의도삭제>강제부활). raw `cys restore --include-master`도 묘비를 skip(심층방어).
     include_master = args.include_master or getattr(args, "auto", False)
-    return run_restore(
+    result = run_restore(
         args.socket, ticket=args.ticket or "default", stub=args.stub,
         no_breaker=args.no_breaker, roles=args.roles,
         include_master=include_master, stub_sids=args.stub_sids,
         print_result=True,
     )
+    # ★W1/C1: CLI 진입점에서만 exit 를 방출한다(deploy 의 내부 run_restore 호출은 반환값을 쓰고
+    #   자체 _finish 로 exit — 이 경로는 print_result=False 라 여기 오지 않는다). 판정→결정론 exit.
+    sys.exit(restore_exit_code(result))
 
 
 # ------------------------------------------------------------------ B1 조정 패스
@@ -1385,6 +1680,9 @@ def _schtasks_has_restart_on_failure(task):
         r = subprocess.run(["schtasks", "/Query", "/TN", task, "/XML"], capture_output=True, timeout=8)
         raw = (r.stdout or b"").replace(b"\x00", b"")
         return b"RestartOnFailure" in raw
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        # ★C4: 타임아웃/도구부재는 '검출 실패' = 보수적으로 False(KeepAlive 미확인 → 경고 경로). 정직 강등.
+        return False
     except Exception:
         return False
 
@@ -1698,6 +1996,9 @@ def _deploy_restart(socket, restart_hook, timeout):
         except subprocess.TimeoutExpired:
             res["hook_rc"] = 124
             res["hook_out"] = "TIMEOUT"
+        except (FileNotFoundError, OSError) as e:
+            res["hook_rc"] = 127
+            res["hook_out"] = "hook 실행 불가(%s: %s)" % (type(e).__name__, e)
     elif IS_WINDOWS:
         # Windows 라이브 재시작(schtasks/taskkill) — launchd kill 대역. 공통 pong+epoch delta 확증은 아래 그대로.
         res["path"] = "schtasks/taskkill(라이브)"
@@ -1890,6 +2191,8 @@ def cmd_deploy(args):
                 arc, aout, aerr = ar.returncode, (ar.stdout or "")[-600:], (ar.stderr or "")[-400:]
             except subprocess.TimeoutExpired:
                 arc, aout, aerr = 124, "", "TIMEOUT"
+            except (FileNotFoundError, OSError) as e:
+                arc, aout, aerr = 127, "", "apply 실행 불가(%s: %s)" % (type(e).__name__, e)
             if arc != 0:
                 _dmark(j, "apply", "fail", "apply rc=%s" % arc, epoch=cur_epoch, cmd=apply_cmd)
                 _finish("APPLY_FAILED", 2, {"apply": {"cmd": apply_cmd, "rc": arc, "out": aout, "err": aerr},
@@ -1938,6 +2241,21 @@ def cmd_deploy(args):
     # ── restore (run_restore 재사용 — 코드 복제 금지·P2). deploy 가 crash-loop 단위이므로 내부 차단기는 끈다. ──
     restore_res = run_restore(socket, ticket="deploy-" + ticket, stub=stub, no_breaker=True,
                               roles=None, include_master=include_master, stub_sids=None, print_result=False)
+    # ★P2-7/W1: deploy 내부 restore 가 다른 restore(콜드부트 auto)의 lease 에 막혀 LEASE_HELD 를 받으면,
+    #   과거엔 아래 verdict 분기가 else 로 떨어져 FAILED(허위)로 강등됐다. lease 는 짧게 잡히므로 backoff 재시도로
+    #   회복을 노리고, 2회 재시도 후에도 여전히 held 면 LEASE_HELD 를 정직히 보고한다(FAILED 아님 — 다른 restore 가
+    #   부활을 담당). 진짜 죽은(stale) lease 는 flock 이 프로세스 사망 시 자동 해제하므로 여기 오지 않는다.
+    _lease_retry = 0
+    while restore_res.get("phoenix_restore") == "LEASE_HELD" and _lease_retry < 2:
+        _lease_retry += 1
+        # ★gemini minor: 재시도 대기를 deploy 저널에 이벤트로 기록(대기 이력 관측 · 반복 run_restore 로 인한 이력 꼬임 방지).
+        _dmark(j, "restore", "lease_retry",
+               "다른 restore lease 보유 — %d/2회차 재시도 대기(backoff %.1fs)" % (_lease_retry, SPAWN_BACKOFF * _lease_retry),
+               epoch=get_boot_epoch(socket), lease_retry=_lease_retry)
+        save_deploy_journal(socket, ticket, j)
+        time.sleep(SPAWN_BACKOFF * _lease_retry)
+        restore_res = run_restore(socket, ticket="deploy-" + ticket, stub=stub, no_breaker=True,
+                                  roles=None, include_master=include_master, stub_sids=None, print_result=False)
     record["restore"] = restore_res
     _dmark(j, "restore", "ok", "phoenix_restore=%s completeness=%s"
            % (restore_res.get("phoenix_restore"), restore_res.get("completeness")),
@@ -1949,7 +2267,11 @@ def cmd_deploy(args):
     final = restore_res.get("phoenix_restore")
     completeness = restore_res.get("completeness")
     incomplete = restore_res.get("incomplete_roles") or []
-    if completeness == "NOOP" and final == "NOOP":
+    if final == "LEASE_HELD":
+        # ★P2-7/W1: 재시도 후에도 다른 restore 가 lease 보유 — 이 deploy 의 실패가 아니라 부활 담당 이관.
+        #   FAILED(재시도 소진 미부활)와 구분해 정직 보고. code 3=미확증(escalation 필요)이되 hard fail(1) 아님.
+        verdict, code = "LEASE_HELD", 3
+    elif completeness == "NOOP" and final == "NOOP":
         verdict, code = "COMPLETE", 0        # 재시작은 됐고 부활 대상 0(전원 이미 생존) — 배포 성공
     elif completeness == "COMPLETE" and final in ("VERIFIED", "VERIFIED_FRESH"):
         verdict, code = "COMPLETE", 0
@@ -1977,8 +2299,6 @@ def main():
     global CYS
     # ★Windows 패리티(S1~S5): 재부팅 자동기동 토대는 mac=launchd·win=schtasks 로 플랫폼 디스패치하고, 경로/소켓은
     # named pipe→state_dir 매핑으로 해소한다. 과거 os.name=="nt" hard-gate 는 제거됐다 — 전 서브커맨드 Windows 동작.
-    # PHOENIX_CYS 오버라이드: 격리 스모크/CI 가 PATH 밖의 cys.exe 절대경로를 주입(하네스 PHOENIX_HARNESS_CYSD 관례와 정합).
-    CYS = os.environ.get("PHOENIX_CYS") or _which("cys") or "cys"
     ap = argparse.ArgumentParser(description="불사조 부활 저널 상태머신 MVP (M1 게이트)")
     ap.add_argument("--socket", help="대상 데몬 소켓(격리 하네스 소켓 권장 — 라이브 무접촉)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2014,6 +2334,10 @@ def main():
     dp.add_argument("--no-breaker", action="store_true")
 
     args = ap.parse_args()
+    # ★W1/B3·§5-1: cys 실행 경로를 여기서(소켓 인지 후) 해석한다 — PHOENIX_CYS > which('cys') > 표준경로
+    #   폴백(identity-check·STRICT/하네스 금지). 리터럴 'cys' 최종 폴백 제거로 FileNotFoundError 침묵사를 차단.
+    #   미해석/불일치는 _resolve_cys 내부에서 die(exit 6)로 정직 정지한다(라이브 실증 2026-07-06 근원 수리).
+    CYS = _resolve_cys(args.socket)
     {
         "restore": cmd_restore, "reconcile": cmd_reconcile, "status": cmd_status,
         "roster": cmd_roster, "inherit": cmd_inherit, "tombstone": cmd_tombstone,
