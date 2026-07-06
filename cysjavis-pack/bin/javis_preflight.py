@@ -3274,13 +3274,28 @@ class Preflight:
                      "cysjavis 워크스페이스 트러스트 OK(갭 없음 · %d config 점검)" % len(targets))
 
     # ── C59 역할별 Bash denylist guard 배선 검증 (WP-2 · 감사 X-1·H-HOOK-3) ──
-    # 감사 2026-07-06: 워커(claude-cysinsight) 프로필에 Bash denylist guard 부재(X-1),
-    # master(claude-ysfuture)는 개인경로 guard 직접배선(H-HOOK-3). guard.sh를 팩 hooks/로
+    # 감사 2026-07-06: 워커 역할 프로필에 Bash denylist guard 부재(X-1),
+    # master 역할 프로필은 개인경로 guard 직접배선(H-HOOK-3). guard.sh를 팩 hooks/로
     # 편입한 뒤, 두 역할 프로필의 PreToolUse에 팩경로 guard 배선 존재를 결정론 검증한다.
     # 이전엔 guard 배선 검사 자체가 없어 배선 누락이 침묵 통과("skip정상")했다 → 부재 hard-fail.
     # 검증만 수행(자동 배선 안 함): 잘못된 Bash guard는 전 Bash를 마비시키므로 배선은 의도적
     # 수동 행위여야 한다(외과적 — settings enforcement 변경은 Tier C 정지경계).
-    GUARD_ROLE_PROFILES = (".claude-ysfuture", ".claude-cysinsight")  # master · worker (dotdir)
+    # ★PII 하드게이트(secret-scan HANDLE) 대응: 역할 프로필 dotdir 실명을 공개 리포에 박지 않는다.
+    #   공급 경로: ①env CYS_GUARD_ROLE_PROFILES(콤마구분) ②<pack>/guard-profiles.txt(로컬 파일 —
+    #   리포·임베드 미포함, 오너 머신 전용) ③둘 다 없으면 검증 대상 없음 skip(PASS) — 소비자
+    #   설치본엔 역할 프로필 자체가 없어 의미 동일.
+    @staticmethod
+    def _guard_role_profiles():
+        env = os.environ.get("CYS_GUARD_ROLE_PROFILES", "")
+        names = tuple(x.strip() for x in env.split(",") if x.strip())
+        if names:
+            return names
+        try:
+            fp = os.path.join(pack_dir(), "guard-profiles.txt")
+            with open(fp, encoding="utf-8") as f:
+                return tuple(ln.strip() for ln in f if ln.strip() and not ln.startswith("#"))
+        except OSError:
+            return ()
 
     @staticmethod
     def _guard_wired(settings_path):
@@ -3314,8 +3329,12 @@ class Preflight:
                          "hooks/guard.sh 실행권한 없음 — 직접 실행(shebang) 배선이라 755 필수(--fix로 부여)")
                 return
         # 2) 역할 프로필(master·워커)별 PreToolUse guard 배선 존재 검증
+        profiles = self._guard_role_profiles()
+        if not profiles:
+            self.add(cid, PASS, "역할 프로필 명단 미공급(env/guard-profiles.txt) — guard 배선 검증 skip")
+            return
         targets = [s for s in discover_claude_settings()
-                   if os.path.basename(os.path.dirname(s)) in self.GUARD_ROLE_PROFILES]
+                   if os.path.basename(os.path.dirname(s)) in profiles]
         if not targets:
             self.add(cid, PASS, "master·워커 역할 프로필 미설치 — guard 배선 대상 없음")
             return
