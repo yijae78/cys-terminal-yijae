@@ -2039,10 +2039,9 @@ function startGroupDrag(e0: MouseEvent, srcId: number) {
 }
 
 // ---------- 정렬: 역할(role) 기반 고정 배치 ----------
-// 현재 워크스페이스의 살아있는 surface를 역할별 표준 자리로 재배치한다:
-//   · 왼쪽 끝 컬럼  = master(위) / cso(아래), 세로 3:1
-//   · 가운데        = worker·미분류 surface를 같은 폭 컬럼으로 균등 분배(좌→우 순서 보존)
-//   · 오른쪽 끝 컬럼 = reviewer-gemini(agy, 위) / reviewer-codex(codex, 아래), 세로 1:1
+// 현재 워크스페이스의 살아있는 surface를 역할 순서(master·cso·worker·agy·codex)로
+// 전부 같은 폭 가로 컬럼으로 균등 재배치한다 — 세로 분열 없이 모두 옆으로 나란히.
+//   · master · cso · worker(미분류 포함) · reviewer-gemini(agy) · reviewer-codex(codex) 순서 보존
 // 트리 위상만 새로 짜고 attachDividerDrag는 건드리지 않으므로 수동 크기 조절은 그대로 보존된다
 // (정렬 후에도 divider를 다시 끌 수 있다 — 현재 크기만 표준 배치로 리셋될 뿐이다).
 // divider 1px·pane 헤더 등으로 컬럼 폭엔 셀 1칸 이내 잔차가 있을 수 있다.
@@ -2069,16 +2068,13 @@ function roleLayout(sids: number[], roleOf: Map<number, string | null>): Node {
   const pane = (sid: number): Node => ({ type: "pane", sid });
 
   const columns: Node[] = [];
-  // 왼쪽 끝: master(위) / cso(아래) = 3:1 (누락 시 있는 쪽이 컬럼 전체)
-  if (master != null && cso != null) columns.push({ type: "split", dir: "col", ratio: 3 / 4, a: pane(master), b: pane(cso) });
-  else if (master != null) columns.push(pane(master));
-  else if (cso != null) columns.push(pane(cso));
-  // 가운데: worker·미분류 균등 컬럼
+  // 전부 가로 균등 배치 — master · cso · worker(미분류 포함) · agy · codex 순서로 각자 개별 컬럼.
+  // (세로 분열 없이 모든 pane을 같은 폭 가로 컬럼으로 정렬)
+  if (master != null) columns.push(pane(master));
+  if (cso != null) columns.push(pane(cso));
   for (const sid of middle) columns.push(pane(sid));
-  // 오른쪽 끝: agy(위) / codex(아래) = 1:1 (누락 시 있는 쪽이 컬럼 전체)
-  if (agy != null && codex != null) columns.push({ type: "split", dir: "col", ratio: 1 / 2, a: pane(agy), b: pane(codex) });
-  else if (agy != null) columns.push(pane(agy));
-  else if (codex != null) columns.push(pane(codex));
+  if (agy != null) columns.push(pane(agy));
+  if (codex != null) columns.push(pane(codex));
 
   return evenComb(columns, "row"); // 컬럼들을 같은 폭으로 가로 배치
 }
