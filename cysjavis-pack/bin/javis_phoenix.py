@@ -584,6 +584,19 @@ def _snapshot_roster_entries(socket):
     return {}
 
 
+def _is_ephemeral_role(role, entry=None):
+    """★P2-1: fresh/ephemeral 역할 판정 — 부활 대상에서 제외한다(일회성 역할이 상설 부활로 축적되는 유령 부활 차단).
+    ① entry 의 source 플래그(source∈{fresh,ephemeral}) = 미래 유입 차단(데몬이 topology 엔트리에 기록).
+    ② 이름 패턴 '-fresh-'(schedule.rs 의 worker-fresh-<epoch> 등) = legacy 마이그레이션 heuristic — source 메타
+       없이 이미 desired 에 병합된 오염분을 quarantine. metadata 無 비-fresh 는 보존(오판 금지)."""
+    e = entry or {}
+    if e.get("source") in ("fresh", "ephemeral"):
+        return True
+    if re.search(r"-fresh-\d", str(role or "")):
+        return True
+    return False
+
+
 def observe_and_persist_roster(socket):
     """현재 관측(topology + 세대 스냅샷)을 desired 로스터에 영속하고 (roster, tombstones) 반환.
     ★W2 옵션A(A-S1): 데몬 topology.json = 묘비 유일 진실. desired 묘비 = 미러(조건부 replace). 데몬의
@@ -603,6 +616,14 @@ def observe_and_persist_roster(socket):
     last_seen_rev = prev.get("tombstones_rev")
     last_seen_epoch = prev.get("daemon_epoch")
     cur_epoch = _ACTIVE_EPOCH if _ACTIVE_EPOCH is not None else get_boot_epoch(socket)
+    # ★A-S2: 태그 = 가변 소켓 경로가 아니라 canonical state dir(실경로) — 하네스 임시 소켓의 태그 불일치 DoS 회피
+    #   (gemini R2). desired 파일이 다른 state dir 에서 복사/이동돼 온 이물(태그 불일치)이면 write 를 거부해
+    #   교차오염을 막는다(파일은 늘 state_dir_for(socket) 하위이므로 정상 경로는 항상 일치·edge 방어).
+    cur_tag = os.path.realpath(state_dir_for(socket))
+    _foreign = bool(prev.get("state_dir_tag")) and prev.get("state_dir_tag") != cur_tag
+    if _foreign:
+        log("★A-S2: desired_roster 의 state_dir_tag(%s)가 현재 canonical(%s)과 불일치 — 이물 파일, write 거부(교차오염 차단)."
+            % (prev.get("state_dir_tag"), cur_tag))
 
     topo = read_topology(socket)
     has_marker = "schema_version" in topo               # A-S1 마커(신 데몬)
@@ -636,25 +657,34 @@ def observe_and_persist_roster(socket):
             tombstones.add(t)
         log("★A-S1: legacy topology(schema_version 부재) — 조건부 replace 생략, add-merge 유지·부활 정상 진행.")
 
-    # 우선순위: 기존 desired < 세대 스냅샷 < 현재 topology (최신 관측이 메타를 갱신)
+    # 우선순위: 기존 desired < 세대 스냅샷 < 현재 topology (최신 관측이 메타를 갱신). ★P2-1: ephemeral 제외(미래 유입 차단).
     for role, e in _snapshot_roster_entries(socket).items():
-        roster[role] = e
+        if not _is_ephemeral_role(role, e):
+            roster[role] = e
     for e in topo.get("entries", []):
-        if e.get("role"):
+        if e.get("role") and not _is_ephemeral_role(e["role"], e):
             roster[e["role"]] = e
     # ★Phase 7: 라이브 role 직접 병합 — claim-role 즉시 자동 등재(topology 영속 지연/침식 무관).
     for role, _surfs in live_role_surfaces(socket).items():
-        if role and role != "-":
+        if role and role != "-" and not _is_ephemeral_role(role):
             roster.setdefault(role, {"role": role})
+    # ★P2-1 legacy 마이그레이션: 이미 desired 에 병합된 ephemeral(*-fresh-*·source flag) 오염분을 quarantine
+    #   (부활 대상 제외). 결정표: source 메타 無 '*-fresh-*'=quarantine · 메타 無 비-fresh=보존(위 병합 유지).
+    for role in list(roster.keys()):
+        if _is_ephemeral_role(role, roster.get(role)):
+            roster.pop(role, None)
     # tombstone된 역할은 desired에서 제외(의도적 폐역)
     for t in tombstones:
         roster.pop(t, None)
-    try:
-        _atomic_write_json(desired_roster_path(socket),
-                           {"roster": roster, "tombstones": sorted(tombstones),
-                            "tombstones_rev": new_rev, "daemon_epoch": cur_epoch, "updated_at": _now()})
-    except Exception:
-        pass
+    # ★A-S2: 이물(state_dir_tag 불일치) 파일이면 write 거부 — 교차오염 차단. 정상 경로는 태그를 기록해 영속.
+    if not _foreign:
+        try:
+            _atomic_write_json(desired_roster_path(socket),
+                               {"roster": roster, "tombstones": sorted(tombstones),
+                                "tombstones_rev": new_rev, "daemon_epoch": cur_epoch,
+                                "state_dir_tag": cur_tag, "updated_at": _now()})
+        except Exception:
+            pass
     return roster, tombstones
 
 

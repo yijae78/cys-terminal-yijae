@@ -82,6 +82,41 @@ def main():
     check("⑤ legacy(마커 부재)→add-merge·부활 진행", set(out.get("tombstones", [])) == {"old", "legacyx"},
           "tombstones=%s" % out.get("tombstones"))
 
+    # ⑥ P2-1: topology 엔트리의 ephemeral(worker-fresh-<epoch>)은 roster 에서 제외(부활 대상 아님)·비-fresh 는 보존.
+    out = _run(td, "s6", {"roster": {}, "tombstones": [], "tombstones_rev": 0, "daemon_epoch": "sa:E1"},
+               {"schema_version": 1, "tombstones_rev": 0, "tombstones": [],
+                "entries": [{"role": "worker-fresh-1783300000"}, {"role": "worker"}]})
+    r6 = set((out.get("roster") or {}).keys())
+    check("⑥ P2-1: ephemeral(-fresh-) 제외·비-fresh 보존", "worker" in r6 and not any("-fresh-" in x for x in r6),
+          "roster=%s" % sorted(r6))
+
+    # ⑦ P2-1 legacy 마이그레이션: 이미 desired 에 병합된 *-fresh-* 오염분을 quarantine(제거).
+    out = _run(td, "s7", {"roster": {"worker-fresh-9": {"role": "worker-fresh-9"}, "cso": {"role": "cso"}},
+                          "tombstones": [], "tombstones_rev": 0, "daemon_epoch": "sa:E1"},
+               {"schema_version": 1, "tombstones_rev": 0, "tombstones": [], "entries": []})
+    r7 = set((out.get("roster") or {}).keys())
+    check("⑦ P2-1 legacy: 병합된 *-fresh-* quarantine·정상 역할 보존", "cso" in r7 and "worker-fresh-9" not in r7,
+          "roster=%s" % sorted(r7))
+
+    # ⑧ A-S2: state_dir_tag 불일치(이물 파일) → write 거부(파일 불변). 정상 태그는 기록.
+    sd = os.path.join(td, "s8"); ph = os.path.join(sd, "phoenix"); os.makedirs(ph, exist_ok=True)
+    dp = os.path.join(ph, "desired_roster.json")
+    with open(dp, "w") as f:
+        json.dump({"roster": {"x": {"role": "x"}}, "tombstones": ["keepme"], "tombstones_rev": 9,
+                   "daemon_epoch": "sa:E1", "state_dir_tag": "/some/OTHER/state/dir"}, f)
+    m.read_topology = lambda socket: {"schema_version": 1, "tombstones_rev": 20, "tombstones": ["new"], "entries": []}
+    m._ACTIVE_EPOCH = "sa:E1"
+    m.observe_and_persist_roster(os.path.join(sd, "cys.sock"))
+    after = json.load(open(dp))
+    check("⑧ A-S2: 이물 태그 파일 write 거부(불변)",
+          after.get("state_dir_tag") == "/some/OTHER/state/dir" and after.get("tombstones") == ["keepme"],
+          "tag=%s tombstones=%s" % (after.get("state_dir_tag"), after.get("tombstones")))
+    # 정상 태그(태그 부재=신규)면 기록됨
+    out = _run(td, "s8b", {"roster": {}, "tombstones": [], "tombstones_rev": 0, "daemon_epoch": "sa:E1"},
+               {"schema_version": 1, "tombstones_rev": 1, "tombstones": [], "entries": []})
+    check("⑧ A-S2: 정상 경로는 canonical state_dir_tag 기록", bool(out.get("state_dir_tag")),
+          "tag=%s" % out.get("state_dir_tag"))
+
     import shutil; shutil.rmtree(td, ignore_errors=True)
     npass = sum(1 for c in _results if c)
     print("\n=== %d/%d PASS ===" % (npass, len(_results)))
