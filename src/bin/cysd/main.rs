@@ -248,9 +248,9 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
     // ★W2 콜드부트 자동 복원: 소켓 바인드·수신 준비가 끝난 '이후'에만 1회 발화한다(자식
     // phoenix가 이 데몬 소켓으로 즉시 RPC할 수 있어야 하므로 바인드 성공이 선행 조건).
     // raw `cys restore`가 아니라 phoenix를 태워 desired_roster·묘비·회로차단기·저널을 경유한다.
-    // ★B1: 이전 실행의 잔여 추출 디렉터리를 먼저 정리(크래시 cleanup 누락분 — temp 누수 0).
-    prune_stale_phoenix_embed(&state_dir);
-    spawn_auto_restore(&state_dir, socket_path, &daemon);
+    // ★P0-7(D1/W5): prune + auto-restore 를 공통 post_listen_boot 로 — Windows accept_loop 와 동일 함수 호출
+    //   (한쪽만 배선되던 미배선 결함 봉인). state_dir 은 함수 내부에서 canonical 매핑으로 재계산.
+    post_listen_boot(socket_path, &daemon);
 
     loop {
         match listener.accept().await {
@@ -431,6 +431,19 @@ fn bundled_python3(exe_dir: &std::path::Path) -> Option<String> {
     None
 }
 
+/// ★P0-7 최종 층위(D1/W5·CI 28780215417 계열): 소켓/파이프 listening 직후 공통 부트 — **양 플랫폼 accept_loop가
+/// 반드시 호출한다**. ①이전 실행 잔재 phoenix-embed prune(temp 누수 0) ②콜드부트 auto-restore 1회 발화.
+/// state_dir 은 canonical 매핑(crate::state::state_dir — Windows LOCALAPPDATA/cys/<slug>·unix 소켓 부모)으로
+/// 계산해 phoenix·스모크와 로그 경로가 일치한다(unix 의 socket_path.parent()는 Windows 파이프엔 부적합).
+/// ★과거 `#[cfg(windows)] accept_loop` 에 이 호출이 없어(unix 만 배선) Windows 는 auto-restore 가 발동조차
+/// 안 하고(triggered/skipped 라인 전무) phoenix-restore.log 가 빈 파일이던 P0-7 마지막 결함(CI 주입 우회가
+/// 가려온 미배선)을 봉인. cfg 무관 단일 함수라 한쪽 누락이 재발하지 않는다(회귀 테스트로 소스 잠금).
+fn post_listen_boot(socket_path: &std::path::Path, daemon: &Arc<Daemon>) {
+    let state_dir = crate::state::state_dir(socket_path);
+    prune_stale_phoenix_embed(&state_dir);
+    spawn_auto_restore(&state_dir, socket_path, daemon);
+}
+
 /// 콜드부트 auto-restore를 detached 스폰한다(env에 CYS_NO_AUTOSTART=1 — 자식 CLI가 라이벌
 /// 데몬을 autostart하는 재귀를 차단). 대기 스레드가 자식을 reap해 좀비 잔존을 막는다.
 /// ★W1: PHOENIX_CYS·PATH 주입(§5-1 침묵사 근원 수리) · stdout/stderr 를 null 대신 phoenix-restore.log 로
@@ -462,27 +475,34 @@ fn spawn_auto_restore(
             let state_dir = state_dir.to_path_buf();
             let daemon = daemon.clone();
             std::thread::spawn(move || {
-                // ★B1: 임베드 추출 실행 우선(바이너리=스크립트 동일 커밋 하드보장) → 실패 시 manifest-검증 디스크 폴백.
-                match resolve_phoenix_source(&state_dir, &disk_phoenix, &program, &daemon) {
-                    PhoenixResolve::Ready { script, cleanup } => {
-                        let mut run_args = vec![script.to_string_lossy().into_owned()];
-                        run_args.extend(tail);
-                        loop_auto_restore(&program, &run_args, &env, &log_path);
-                        // temp 누수 0: 추출본은 실행 후 정리(디스크 폴백은 cleanup=None).
-                        if let Some(dir) = cleanup {
-                            let _ = std::fs::remove_dir_all(&dir);
+                let log_for_panic = log_path.clone();
+                // ★P0-5 침묵사 차단(D3/W5·CI 28780215417 실증: auto-restore 스레드가 std/time.rs panic 으로 즉사
+                //   → phoenix-restore.log 빈 파일·원인 불가시). 스레드 본문을 guard_restore_panic(catch_unwind)로
+                //   감싸 panic 을 삼키지 않고 stderr + phoenix-restore.log 에 **1회 기록**한다 — 무한 재스폰 금지
+                //   (재기동은 다음 데몬 부트/schtasks 소관). 이 웨이브가 죽이려는 '스레드 침묵사' 클래스의 구조 수리.
+                guard_restore_panic(&log_for_panic, || {
+                    // ★B1: 임베드 추출 실행 우선(바이너리=스크립트 동일 커밋 하드보장) → 실패 시 manifest-검증 디스크 폴백.
+                    match resolve_phoenix_source(&state_dir, &disk_phoenix, &program, &daemon) {
+                        PhoenixResolve::Ready { script, cleanup } => {
+                            let mut run_args = vec![script.to_string_lossy().into_owned()];
+                            run_args.extend(tail);
+                            loop_auto_restore(&program, &run_args, &env, &log_path);
+                            // temp 누수 0: 추출본은 실행 후 정리(디스크 폴백은 cleanup=None).
+                            if let Some(dir) = cleanup {
+                                let _ = std::fs::remove_dir_all(&dir);
+                            }
+                        }
+                        PhoenixResolve::Failed(reason) => {
+                            eprintln!("[cysd] auto-restore ABORTED — 안전한 phoenix 없음: {reason}");
+                            daemon.push_feed_notification(
+                                "error",
+                                "auto-restore 중단",
+                                &format!("안전한 phoenix 실행원 없음(임베드 추출·디스크 폴백 모두 실패): {reason}"),
+                                None,
+                            );
                         }
                     }
-                    PhoenixResolve::Failed(reason) => {
-                        eprintln!("[cysd] auto-restore ABORTED — 안전한 phoenix 없음: {reason}");
-                        daemon.push_feed_notification(
-                            "error",
-                            "auto-restore 중단",
-                            &format!("안전한 phoenix 실행원 없음(임베드 추출·디스크 폴백 모두 실패): {reason}"),
-                            None,
-                        );
-                    }
-                }
+                });
             });
             eprintln!("[cysd] auto-restore triggered (phoenix restore --auto · 임베드 추출 우선)");
         }
@@ -778,6 +798,29 @@ fn open_restore_log(log_path: &std::path::Path) -> Option<std::fs::File> {
     }
 }
 
+/// ★P0-5 침묵사 차단(D3/W5): auto-restore 스레드 본문을 catch_unwind 로 감싸 panic 을 삼키지 않는다. panic 시
+/// stderr + phoenix-restore.log 에 1회 기록하고 반환(스레드는 자연 종료 — 무한 재스폰 없음). 순수·테스트 가능:
+/// 반환 true=정상 완료·false=panic 포착(테스트 단언용).
+fn guard_restore_panic<F: FnOnce()>(log_path: &std::path::Path, body: F) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(()) => true,
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            eprintln!("[cysd] ★auto-restore 스레드 panic 포착(P0-5 침묵사 차단·재스폰 안 함): {msg}");
+            // phoenix-restore.log 에도 남겨 관측성 확보(빈 로그 → panic 기록으로 원인 직결).
+            if let Some(mut f) = open_restore_log(log_path) {
+                use std::io::Write;
+                let _ = writeln!(f, "[cysd] AUTO-RESTORE THREAD PANIC (P0-5 차단·재스폰 안 함): {msg}");
+            }
+            false
+        }
+    }
+}
+
 /// 자식 1회 실행 — stdout/stderr 를 phoenix-restore.log(폴백 포함)에 append. exit code 반환(None=스폰 실패).
 fn run_auto_restore_once(
     program: &str,
@@ -973,6 +1016,10 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
             .create_with_security_attributes_raw(&pipe_name, sa_ptr)
     }
     .unwrap_or_else(|e| panic!("create pipe {pipe_name} failed: {e}"));
+    // ★P0-7 최종 층위(D1/W5): 파이프 listening 직후 공통 부트 — unix accept_loop 와 **동일 함수**(prune +
+    //   콜드부트 auto-restore). 과거 이 호출이 Windows 에만 빠져 auto-restore 가 발동조차 안 하고 phoenix-restore.log
+    //   가 빈 파일이던 결함(CI 실경로 스모크 ⑧)을 봉인. state_dir 은 함수 내부 canonical 매핑(Windows 슬러그).
+    post_listen_boot(socket_path, &daemon);
     loop {
         match server.connect().await {
             Ok(()) => {
@@ -1808,7 +1855,52 @@ mod pipe_security_tests {
 
 #[cfg(test)]
 mod auto_restore_tests {
-    use super::{autorestore_retry_delay, decide_auto_restore, loop_auto_restore_with, AutoRestore};
+    use super::{
+        autorestore_retry_delay, decide_auto_restore, guard_restore_panic, loop_auto_restore_with,
+        AutoRestore,
+    };
+
+    /// ★P0-7 회귀 잠금(D1/W5·CI 실경로 ⑧): 양 플랫폼 accept_loop 가 콜드부트 부트 공통 함수를 호출하는지 소스
+    /// 수준으로 잠근다 — Windows accept_loop 에 배선이 빠져 auto-restore 가 발동조차 안 하던 P0-7 최종 결함 재발
+    /// 차단. 호출 형태가 정확히 2회(unix+windows)여야 한다. (needle 은 concat! 으로 쪼개 이 테스트 자신을 세지
+    /// 않게 한다 — 소스에 contiguous 리터럴이 없다.)
+    #[test]
+    fn post_listen_boot_wired_in_both_accept_loops() {
+        let src = include_str!("main.rs");
+        let needle = concat!("post_listen_boot", "(socket_path, &daemon)");
+        let calls = src.matches(needle).count();
+        assert_eq!(
+            calls, 2,
+            "콜드부트 부트 호출이 양 accept_loop(unix+windows)에 정확히 2회여야 한다(현재 {calls}회) — \
+             한쪽 미배선/중복은 콜드부트 auto-restore 플랫폼 비대칭(P0-7) 재발"
+        );
+    }
+
+    /// ★P0-5(D3/W5·CI 28780215417): auto-restore 스레드 panic 을 삼키지 않고 포착·기록하는지 — 재현 테스트.
+    /// panic 하는 body → guard 는 false 반환(전파 안 함)·phoenix-restore.log 에 PANIC 기록. 정상 body → true.
+    #[test]
+    fn guard_restore_panic_catches_and_logs_no_propagation() {
+        let dir = std::env::temp_dir().join(format!("cys-ar-panic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("phoenix-restore.log");
+
+        // ① panic body → 포착(프로세스 안 죽음)·false 반환·로그에 PANIC 기록.
+        let ok = guard_restore_panic(&log, || panic!("boom time.rs"));
+        assert!(!ok, "panic 은 false 로 포착돼야 한다(전파 금지)");
+        let logged = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            logged.contains("AUTO-RESTORE THREAD PANIC") && logged.contains("boom time.rs"),
+            "panic 이 phoenix-restore.log 에 기록돼야 한다(침묵사 금지): {logged}"
+        );
+
+        // ② 정상 body → true·body 실행됨.
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let ok2 = guard_restore_panic(&log, || {
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(ok2 && ran.load(std::sync::atomic::Ordering::SeqCst), "정상 body 는 true·실행");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// opt-out(CYS_NO_AUTORESTORE=1)이면 phoenix가 있어도 스폰하지 않는다.
     #[test]
