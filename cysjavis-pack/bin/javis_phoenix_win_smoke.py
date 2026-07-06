@@ -420,6 +420,139 @@ def case7_keepalive_respawn():
         subprocess.run(["taskkill", "/IM", "cysd.exe", "/F"], capture_output=True, timeout=15)
 
 
+def _alive_pid(pid):
+    """Windows: PID 생존 여부(tasklist 필터). 죽었으면 'No tasks' 출력(pid 미포함)."""
+    try:
+        r = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
+                           capture_output=True, text=True, timeout=10)
+        return str(pid) in (r.stdout or "")
+    except Exception:
+        return False
+
+
+def case9_job_kill_on_close():
+    """★D3(W5) ConPTY 자식 트리 Job-close 종료 전파 E2E(CI Windows 러너 전용·mac 은 run() 조기 SKIP): cysd 를
+    /T 없이 taskkill 해도 KILL_ON_JOB_CLOSE 로 PTY 자식·손자가 동반사망하는지 관측. Job Object 부재(P2-9)면 고아
+    생존. ★관측 견고화: ConPTY 가 자식을 conhost 하위로 reparent 하므로 ParentProcessId 탐지 대신 '손자가 자기
+    pid 를 마커파일에 self-report' 방식 — 손자는 Job 상속으로 자동 편입되므로 손자 동반사망이 곧 트리 전파 증명."""
+    _cp("⑨ job kill-on-close setup")
+    import shutil
+    pipe = r"\\.\pipe\cys-phxsmoke-jobkill"
+    sd = _state_dir(pipe)
+    tracked = None
+    gpid = None
+    marker = os.path.join(sd, "grandchild.pid") if sd else None
+    try:
+        shutil.rmtree(sd, ignore_errors=True)
+        os.makedirs(sd, exist_ok=True)
+        tracked = spawn_test_daemon(pipe)
+        up = False
+        for _ in range(50):
+            _cp("⑨ waiting daemon")
+            if _ping_pong(pipe):
+                up = True
+                break
+            time.sleep(0.3)
+        if not check("⑨ 테스트 데몬 기동", up):
+            return
+        _cp("⑨ create surface")
+        r = cyscall(pipe, "new-surface", timeout=15)
+        ref = None
+        for tok in (getattr(r, "stdout", "") or "").split():
+            if tok.startswith("surface:"):
+                ref = tok
+                break
+        if not check("⑨ surface 생성(PTY 자식·ref)", bool(ref),
+                     "out=%r" % ((getattr(r, "stdout", "") or "")[:120])):
+            return
+        # 손자 스폰: 셸에 python3 one-liner 주입 — 자기 pid 를 마커에 기록 후 장시간 sleep(600s).
+        #   cysd 가 runtime PATH 를 주입하므로 python3.exe 는 PATH 로 해소된다(주입 우회 아님).
+        py_prog = ("import os,time; open(r'%s','w').write(str(os.getpid())); time.sleep(600)" % marker)
+        cmd = 'python3.exe -c "%s"' % py_prog.replace('"', '\\"')
+        cyscall(pipe, "send", "--surface", ref, cmd, timeout=15)
+        cyscall(pipe, "send-key", "--surface", ref, "Return", timeout=10)
+        _cp("⑨ waiting grandchild self-report")
+        for _ in range(40):  # ~20s
+            _cp("⑨ waiting grandchild self-report")
+            if os.path.exists(marker):
+                try:
+                    gpid = int(open(marker).read().strip())
+                except Exception:
+                    gpid = None
+                if gpid:
+                    break
+            time.sleep(0.5)
+        if not check("⑨ 손자 프로세스 스폰(self-report pid)", bool(gpid), "marker=%s" % marker):
+            return
+        check("⑨ 손자 생존(kill 전)", _alive_pid(gpid), "gpid=%s" % gpid)
+        # ★cysd 만 /F kill(자식 트리 /T 아님) → Job KILL_ON_JOB_CLOSE 로만 손자가 죽어야 한다.
+        _cp("⑨ taskkill cysd (no /T)")
+        subprocess.run(["taskkill", "/PID", str(tracked.pid), "/F"], capture_output=True, timeout=10)
+        dead = False
+        for _ in range(30):  # ~15s
+            _cp("⑨ waiting grandchild co-death")
+            if not _alive_pid(gpid):
+                dead = True
+                break
+            time.sleep(0.5)
+        check("⑨ cysd 사후 손자 동반사망(Job KILL_ON_JOB_CLOSE 트리 전파·P2-9 봉인)", dead,
+              "gpid=%s alive=%s" % (gpid, _alive_pid(gpid)))
+    finally:
+        _cp("⑨ teardown")
+        try:
+            if gpid and _alive_pid(gpid):
+                subprocess.run(["taskkill", "/PID", str(gpid), "/F"], capture_output=True, timeout=8)
+        except Exception:
+            pass
+        teardown_daemon(pipe, state_dir=sd, tracked=tracked)
+
+
+def case8_real_autorestore():
+    """★D4(W5) 실경로 auto-restore(주입 우회 금지): 설치된 cysd.exe 를 콜드부트해 cysd **자체**
+    decide_auto_restore(동봉 python3.exe 절대경로 + PATH 선두주입 + exe옆 cys.exe)로 phoenix 를 스폰하는지
+    관측한다. env 에서 PHOENIX_CYS 를 명시 제거해 '주입 없이' 실경로가 살아있음을 증명(P0-7·P1-9 첫 스폰 단절
+    회귀 차단). 관측: state_dir/phoenix-restore.log 에 헤더 + [phoenix] 출력이 남으면 실경로 성공(FileNotFoundError/
+    빈 로그면 실패). ★기존 케이스⑤는 phoenix 를 PHOENIX_CYS 주입해 직접 실행 → cysd auto-restore 실경로 미검증이었다."""
+    _cp("⑧ real auto-restore setup")
+    import shutil
+    pipe = r"\\.\pipe\cys-phxsmoke-realauto"
+    sd = _state_dir(pipe)
+    tracked = None
+    try:
+        shutil.rmtree(sd, ignore_errors=True)
+        # desired 로스터에 죽은 역할 seed(auto-restore 대상 존재) — phoenix_home = state_dir/phoenix.
+        ph_home = os.path.join(sd, "phoenix")
+        os.makedirs(ph_home, exist_ok=True)
+        with open(os.path.join(ph_home, "desired_roster.json"), "w", encoding="utf-8") as f:
+            json.dump({"roster": {"worker": {"role": "worker"}}, "tombstones": []}, f)
+        # ★주입 금지: cysd env 에서 PHOENIX_CYS 제거 — cysd 자체 해석만으로 phoenix 를 스폰해야 한다.
+        env = _phoenix_env({"CYS_SOCKET": pipe})
+        env.pop("PHOENIX_CYS", None)
+        CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
+        tracked = subprocess.Popen([CYSD_BIN], env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   creationflags=CREATE_NO_WINDOW)
+        _cp("⑧ waiting cold-boot auto-restore log")
+        log_path = os.path.join(sd, "phoenix-restore.log")
+        content = ""
+        for _ in range(80):  # ~40s(콜드부트 스폰 + phoenix 관측·정착 여유)
+            _cp("⑧ waiting cold-boot auto-restore log")
+            if os.path.exists(log_path):
+                content = open(log_path, encoding="utf-8", errors="replace").read()
+                if "phoenix auto-restore @ epoch=" in content and "[phoenix]" in content:
+                    break
+            time.sleep(0.5)
+        check("⑧ 실경로 auto-restore 로그 생성(cysd 자체 스폰)",
+              "phoenix auto-restore @ epoch=" in content, "head=%r" % content[:160])
+        check("⑧ phoenix 실제 실행(주입 없이 python+cys 해석 성공·[phoenix] 출력)",
+              "[phoenix]" in content, "tail=%r" % content[-300:])
+        check("⑧ 첫 스폰 단절 흔적 없음(FileNotFoundError/실행 불가 아님)",
+              ("FileNotFoundError" not in content) and ("실행 불가" not in content), "tail=%r" % content[-300:])
+    finally:
+        _cp("⑧ teardown")
+        teardown_daemon(pipe, state_dir=sd, tracked=tracked)
+
+
 def resolve_bins():
     import shutil
     cys = os.environ.get("PHOENIX_CYS") or shutil.which("cys") or shutil.which("cys.exe")
@@ -453,7 +586,7 @@ def run():
 
     for fn in (case1_path_mapping, case2_schtasks, case3_restart_primitive,
                case4_snapshot_runbook, case5_stub_restore, case6_deploy_plan,
-               case7_keepalive_respawn):
+               case7_keepalive_respawn, case8_real_autorestore, case9_job_kill_on_close):
         try:
             fn()
         except Exception as e:
