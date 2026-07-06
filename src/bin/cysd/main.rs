@@ -248,9 +248,9 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
     // ★W2 콜드부트 자동 복원: 소켓 바인드·수신 준비가 끝난 '이후'에만 1회 발화한다(자식
     // phoenix가 이 데몬 소켓으로 즉시 RPC할 수 있어야 하므로 바인드 성공이 선행 조건).
     // raw `cys restore`가 아니라 phoenix를 태워 desired_roster·묘비·회로차단기·저널을 경유한다.
-    // ★B1: 이전 실행의 잔여 추출 디렉터리를 먼저 정리(크래시 cleanup 누락분 — temp 누수 0).
-    prune_stale_phoenix_embed(&state_dir);
-    spawn_auto_restore(&state_dir, socket_path, &daemon);
+    // ★P0-7(D1/W5): prune + auto-restore 를 공통 post_listen_boot 로 — Windows accept_loop 와 동일 함수 호출
+    //   (한쪽만 배선되던 미배선 결함 봉인). state_dir 은 함수 내부에서 canonical 매핑으로 재계산.
+    post_listen_boot(socket_path, &daemon);
 
     loop {
         match listener.accept().await {
@@ -429,6 +429,19 @@ fn bundled_python3(exe_dir: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+/// ★P0-7 최종 층위(D1/W5·CI 28780215417 계열): 소켓/파이프 listening 직후 공통 부트 — **양 플랫폼 accept_loop가
+/// 반드시 호출한다**. ①이전 실행 잔재 phoenix-embed prune(temp 누수 0) ②콜드부트 auto-restore 1회 발화.
+/// state_dir 은 canonical 매핑(crate::state::state_dir — Windows LOCALAPPDATA/cys/<slug>·unix 소켓 부모)으로
+/// 계산해 phoenix·스모크와 로그 경로가 일치한다(unix 의 socket_path.parent()는 Windows 파이프엔 부적합).
+/// ★과거 `#[cfg(windows)] accept_loop` 에 이 호출이 없어(unix 만 배선) Windows 는 auto-restore 가 발동조차
+/// 안 하고(triggered/skipped 라인 전무) phoenix-restore.log 가 빈 파일이던 P0-7 마지막 결함(CI 주입 우회가
+/// 가려온 미배선)을 봉인. cfg 무관 단일 함수라 한쪽 누락이 재발하지 않는다(회귀 테스트로 소스 잠금).
+fn post_listen_boot(socket_path: &std::path::Path, daemon: &Arc<Daemon>) {
+    let state_dir = crate::state::state_dir(socket_path);
+    prune_stale_phoenix_embed(&state_dir);
+    spawn_auto_restore(&state_dir, socket_path, daemon);
 }
 
 /// 콜드부트 auto-restore를 detached 스폰한다(env에 CYS_NO_AUTOSTART=1 — 자식 CLI가 라이벌
@@ -1003,6 +1016,10 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
             .create_with_security_attributes_raw(&pipe_name, sa_ptr)
     }
     .unwrap_or_else(|e| panic!("create pipe {pipe_name} failed: {e}"));
+    // ★P0-7 최종 층위(D1/W5): 파이프 listening 직후 공통 부트 — unix accept_loop 와 **동일 함수**(prune +
+    //   콜드부트 auto-restore). 과거 이 호출이 Windows 에만 빠져 auto-restore 가 발동조차 안 하고 phoenix-restore.log
+    //   가 빈 파일이던 결함(CI 실경로 스모크 ⑧)을 봉인. state_dir 은 함수 내부 canonical 매핑(Windows 슬러그).
+    post_listen_boot(socket_path, &daemon);
     loop {
         match server.connect().await {
             Ok(()) => {
@@ -1842,6 +1859,22 @@ mod auto_restore_tests {
         autorestore_retry_delay, decide_auto_restore, guard_restore_panic, loop_auto_restore_with,
         AutoRestore,
     };
+
+    /// ★P0-7 회귀 잠금(D1/W5·CI 실경로 ⑧): 양 플랫폼 accept_loop 가 콜드부트 부트 공통 함수를 호출하는지 소스
+    /// 수준으로 잠근다 — Windows accept_loop 에 배선이 빠져 auto-restore 가 발동조차 안 하던 P0-7 최종 결함 재발
+    /// 차단. 호출 형태가 정확히 2회(unix+windows)여야 한다. (needle 은 concat! 으로 쪼개 이 테스트 자신을 세지
+    /// 않게 한다 — 소스에 contiguous 리터럴이 없다.)
+    #[test]
+    fn post_listen_boot_wired_in_both_accept_loops() {
+        let src = include_str!("main.rs");
+        let needle = concat!("post_listen_boot", "(socket_path, &daemon)");
+        let calls = src.matches(needle).count();
+        assert_eq!(
+            calls, 2,
+            "콜드부트 부트 호출이 양 accept_loop(unix+windows)에 정확히 2회여야 한다(현재 {calls}회) — \
+             한쪽 미배선/중복은 콜드부트 auto-restore 플랫폼 비대칭(P0-7) 재발"
+        );
+    }
 
     /// ★P0-5(D3/W5·CI 28780215417): auto-restore 스레드 panic 을 삼키지 않고 포착·기록하는지 — 재현 테스트.
     /// panic 하는 body → guard 는 false 반환(전파 안 함)·phoenix-restore.log 에 PANIC 기록. 정상 body → true.
