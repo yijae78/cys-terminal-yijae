@@ -62,15 +62,25 @@ def main():
 
     _release_all()  # attempt0 프로세스 종료 모사(lease 해제) — 프로덕션은 별도 스폰
 
-    # ★수동복원 모사(재시도 사이 master 개입): worker-x 폐역(tombstone) → 라이브 상태 변경.
-    with open(desired, "w") as f:
-        json.dump({"roster": {}, "tombstones": ["worker-x"], "updated_at": 1}, f)
+    # ★수동복원 모사(codex W6): worker-x 를 desired 에 **그대로 유지**하되, master 가 수동복원해 역할이 **live**가
+    #   된 상태를 만든다 — live_role_surfaces 가 worker-x exited=false 를 반환하도록 monkeypatch. attempt2 는
+    #   desired 에서 worker-x 를 제거(폐역)한 게 아니라, **_alive(worker-x) liveness 재산정** 때문에 target 에서
+    #   빠져 NOOP 이 되어야 한다(tombstone/desired-shrink 경로가 아니라 liveness 경로 봉인).
+    #   desired 는 worker-x 유지(폐역 아님).
+    _orig_live = m.live_role_surfaces
+    m.live_role_surfaces = lambda socket: {"worker-x": [{"surface": "surface:1", "pid": 4242, "exited": False}]}
 
-    # attempt1: 재실행(cysd 지연 재시도 상당) → 현재 상태 재산정 → NOOP·spawn 0.
+    # attempt1: 재실행(cysd 지연 재시도 상당) → live 재산정으로 worker-x alive → target 제외 → NOOP·spawn 0.
     r1 = m.run_restore(sock, ticket="a1", stub=True, print_result=False)
-    check("attempt1: 재산정 → NOOP(수동복원 후)", r1.get("phoenix_restore") == "NOOP",
+    m.live_role_surfaces = _orig_live
+    # desired 에 worker-x 가 여전히 남아있음을 확인(폐역 아님 — liveness 경로임을 증명).
+    dj = json.load(open(desired))
+    still_desired = "worker-x" in (dj.get("roster") or {}) and "worker-x" not in (dj.get("tombstones") or [])
+    check("attempt1: worker-x desired 유지(폐역 아님 — liveness 경로)", still_desired,
+          "roster=%s tombstones=%s" % (list((dj.get('roster') or {}).keys()), dj.get("tombstones")))
+    check("attempt1: liveness 재산정 → NOOP(수동복원으로 live)", r1.get("phoenix_restore") == "NOOP",
           "verdict=%s" % r1.get("phoenix_restore"))
-    check("attempt1: 중복 스폰 0(target_roles 비었음)", (r1.get("target_roles") or []) == [],
+    check("attempt1: 중복 스폰 0(target_roles 비었음·_alive 로 제외)", (r1.get("target_roles") or []) == [],
           "target=%s" % r1.get("target_roles"))
     check("attempt1: exit 0", m.restore_exit_code(r1) == 0, "exit=%s" % m.restore_exit_code(r1))
 

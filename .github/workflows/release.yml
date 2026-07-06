@@ -81,11 +81,15 @@ jobs:
           workspaces: './src-tauri -> target'
           key: ${{ matrix.target }}
 
-      # ★W6/E1 phoenix 데몬 교체 시뮬레이션 E2E 게이트 (macOS 전용 · 스텝 정의 — 실 실행은 릴리스 시 확인).
+      # ★W6/E1 phoenix host-level 로직 게이트 (macOS 네이티브 arm64 레그 1회 · 스텝 정의 — 실 실행은 릴리스 시 확인).
       # 실 cysd 를 격리 상태 디렉터리에서 kill→재기동해 auto-restore 부활·STRICT 주입·no-target NOOP·cross-layer
       # 재시도·C2 sentinel·E3 GC·E2 스케줄 배선을 커밋 테스트로 실증(a07cc7f Not-tested 봉인).
-      - name: phoenix E2E 게이트 (macOS)
-        if: startsWith(matrix.platform, 'macos')
+      # ★codex W6 minor: 이 게이트는 **host-아키텍처 무관 로직**(phoenix python + Rust auto-restore 단위)을
+      #   검증한다 — host debug(arm64) 바이너리로 충분하며 matrix.target 별 sidecar 는 뒤 build 스텝이 컴파일한다.
+      #   따라서 두 macOS 레그 중복 실행을 피해 **네이티브 레그(aarch64)에서 1회만** 돈다(x86_64 레그는 크로스빌드
+      #   sidecar 컴파일만 담당·동일 host arm64 재검증 무의미). target 별 실기 E2E 는 W5(Windows)·릴리스 스모크 소관.
+      - name: phoenix host-level 로직 게이트 (macOS 네이티브)
+        if: matrix.target == 'aarch64-apple-darwin'
         run: |
           set -euo pipefail
           cargo build --bin cys --bin cysd

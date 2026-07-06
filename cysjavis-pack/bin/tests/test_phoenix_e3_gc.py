@@ -35,15 +35,31 @@ def main():
     check("① 이름 기준 GC: 시계 역행 세대 오삭제(P2-5 버그 재현)", regressed in del_name,
           "regressed in delete=%s" % (regressed in del_name))
 
-    # ② mtime 병행 실효 시각 dt_of: regressed 의 실효 시각을 '지금'으로 → 최근으로 인식되어 보관.
+    # ② mtime 병행 실효(dt_eff): regressed 의 실효 시각을 '지금'으로 → 최근으로 인식되어 보관(P2-5).
     def dt_eff(name):
         if name == regressed:
             return now  # 실제로 방금 만든 세대(mtime 최근) — 이름과 무관하게 최근
         return m._parse_stamp(name)
-    keep_eff, del_eff = m.compute_gc(gens, now=now, dt_of=dt_eff)
-    check("② mtime 실효 GC: 시계 역행 세대 보관(오삭제 방어)", regressed in keep_eff and regressed not in del_eff,
+    keep_eff, del_eff = m.compute_gc(gens, now=now, dt_of=m._parse_stamp, dt_eff=dt_eff)
+    check("② P2-5: 시계 역행 세대 보관(오삭제 방어)", regressed in keep_eff and regressed not in del_eff,
           "regressed kept=%s" % (regressed in keep_eff))
-    check("② 보관 규모 불변(recent 규칙 유지)", len(keep_eff) == KEEP, "keep=%d(want %d)" % (len(keep_eff), KEEP))
+
+    # ③ ★gemini W6: mtime 오염(cp/touch)이 진짜 최근 세대를 밀어내지 않는다.
+    #    old_name(과거 이름)이 실효(mtime)만 '지금'으로 오염 + real_recent(최근 이름·정상). union 이므로
+    #    real_recent 는 명목-recent 로 보존되고, 오염 세대는 실효-recent 로 추가 잔존(무해).
+    real_recent = "20260706T110000Z"  # 진짜 최근(이름=실효 일치)
+    polluted_old = "20200101T000000Z"  # 과거 이름인데 mtime 만 지금으로 오염(cp/touch)
+    # KEEP 개 채워 real_recent 가 명목-recent 경계 근처에 오게: normal(48개) 중 가장 오래된 것을 real_recent 로 대체.
+    gens2 = normal[:-1] + [real_recent, polluted_old]  # 총 KEEP+1 → 하나는 삭제 대상
+    def dt_eff2(name):
+        if name == polluted_old:
+            return now  # cp/touch 오염(실효만 미래)
+        return m._parse_stamp(name)
+    keep2, del2 = m.compute_gc(gens2, now=now, dt_of=m._parse_stamp, dt_eff=dt_eff2)
+    check("③ 오염 가드: 진짜 최근(real_recent) 오삭제 안 됨(명목-recent 보존)",
+          real_recent in keep2 and real_recent not in del2, "real_recent kept=%s" % (real_recent in keep2))
+    check("③ 오염 세대는 실효-recent 로 잔존(무해)·명목-recent 미침해", polluted_old in keep2,
+          "polluted kept=%s del=%s" % (polluted_old in keep2, del2))
 
     # ③ _gen_effective_dt: 이름 vs mtime 중 더 나중을 취한다(디스크 실측).
     td = tempfile.mkdtemp(prefix="phoenix-e3-")
