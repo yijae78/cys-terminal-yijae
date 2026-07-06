@@ -396,6 +396,16 @@ jobs:
                       print(f"::error::tar sha256 불일치 {rel}: {extracted[rel]} != {want}", file=sys.stderr)
                       sys.exit(1)
           print(f"[gate③] tar⇔manifest⇔embed 3자 폐포 {len(files)}개 일치 — 동일성 게이트 통과")
+
+          # ④ tar.gz digest를 서명 대상 manifest에 주입(WP-6 R-SIG-1) — ★서명 前 필수.
+          #    프로덕션 검증기(pack_update_from_dir)가 전개 前 이 digest와 tarball sha256을 대조해
+          #    미검증 tarball의 pre-auth traversal-write를 차단한다. digest는 서명 안에 들어가므로
+          #    forge 불가·replay만 가능(packsig DIGEST_REQUIRED_EPOCH가 시간창으로 봉인).
+          man["digest"] = sha256_file("pack.tar.gz")
+          with open("pack-manifest.json", "w") as mf:
+              json.dump(man, mf, ensure_ascii=False, indent=2)
+              mf.write("\n")
+          print(f"[gate④] tar.gz digest 주입 → manifest.digest={man['digest'][:16]}…")
           PY
 
       # ★콘텐츠 스캔 발행 hard-gate (지점②/2 — pack.tar.gz 생성 후 발행 전). 결정론 tar로 묶은 직후·

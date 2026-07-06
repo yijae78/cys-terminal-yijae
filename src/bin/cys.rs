@@ -5664,18 +5664,73 @@ fn run_pack_manifest(
     }
 }
 
-/// 시스템 tar로 tar.gz를 dest에 푼다(§ 소스 해석 — 신규 crate 의존 회피, shell-out).
+/// tar.gz를 dest에 in-Rust로 하드닝 전개(WP-6 R-SIG-1 ③-2). 외부 `tar -xzf`는 심링크/`..`/절대경로
+/// 하드닝 플래그가 0이라 미검증 엔트리가 staging 밖으로 traversal-write할 수 있었다. 여기서는
+/// tar+flate2로 ★엔트리별★ 검증한다: 정규 파일·디렉터리만 허용하고 심링크·하드링크·디바이스·FIFO·
+/// 소켓 등 특수 엔트리와 절대경로·`..`·루트/prefix 성분·staging 경계 이탈 경로를 전건 fail-closed
+/// 거부한다. 소유자·setuid 등 특수비트는 승계하지 않는다(File::create 기본 — `--no-same-owner` 동치).
 fn extract_tar_gz(tar_gz: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| format!("staging 생성 실패 {}: {e}", dest.display()))?;
-    let status = std::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(tar_gz)
-        .arg("-C")
-        .arg(dest)
-        .status()
-        .map_err(|e| format!("tar 실행 실패: {e}"))?;
-    if !status.success() {
-        return Err(format!("tar 압축해제 실패(code {:?}) {}", status.code(), tar_gz.display()));
+    // dest를 정규화(canonicalize)해 심링크·상대성분 없는 경계 기준을 확보한다.
+    let dest_canon = std::fs::canonicalize(dest)
+        .map_err(|e| format!("staging 정규화 실패 {}: {e}", dest.display()))?;
+    let f = std::fs::File::open(tar_gz)
+        .map_err(|e| format!("tar 열기 실패 {}: {e}", tar_gz.display()))?;
+    let gz = flate2::read::GzDecoder::new(std::io::BufReader::new(f));
+    let mut ar = tar::Archive::new(gz);
+    // ★unpack 편의함수(심링크/소유자 따라감) 대신 엔트리별 수동 처리 — 하드닝의 핵심.
+    let entries = ar.entries().map_err(|e| format!("tar 엔트리 열거 실패: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("tar 엔트리 읽기 실패: {e}"))?;
+        let etype = entry.header().entry_type();
+        // ── 타입 게이트: 정규 파일·디렉터리만. 그 외(심링크/하드링크/디바이스/FIFO/…) 전건 거부. ──
+        let is_dir = etype.is_dir();
+        let is_regular = matches!(etype, tar::EntryType::Regular);
+        if !is_dir && !is_regular {
+            let name = entry
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            return Err(format!(
+                "위험 tar 엔트리 타입 {etype:?} 거부(심링크/하드링크/특수파일): {name}"
+            ));
+        }
+        // ── 경로 게이트: Normal/CurDir 성분만. 절대경로·`..`(ParentDir)·루트/prefix 거부. ──
+        let raw = entry
+            .path()
+            .map_err(|e| format!("tar 경로 파싱 실패: {e}"))?
+            .into_owned();
+        for comp in raw.components() {
+            match comp {
+                std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+                _ => {
+                    return Err(format!(
+                        "위험 tar 경로 성분(절대/../루트/prefix) 거부: {}",
+                        raw.display()
+                    ));
+                }
+            }
+        }
+        let target = dest_canon.join(&raw);
+        // 방어심층: 성분검사 우회 대비 join 결과가 staging 경계 밖이면 거부.
+        if !target.starts_with(&dest_canon) {
+            return Err(format!("tar 경로가 staging 경계 이탈: {}", raw.display()));
+        }
+        if is_dir {
+            std::fs::create_dir_all(&target)
+                .map_err(|e| format!("디렉터리 생성 실패 {}: {e}", target.display()))?;
+            continue;
+        }
+        // 정규 파일: 부모 생성 후 내용 복사. 아카이브 내 심링크는 위 타입게이트가 전건 거부하므로
+        // create_dir_all이 아카이브발 심링크 부모를 따라갈 여지가 없다.
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("부모 생성 실패 {}: {e}", parent.display()))?;
+        }
+        let mut out = std::fs::File::create(&target)
+            .map_err(|e| format!("파일 생성 실패 {}: {e}", target.display()))?;
+        std::io::copy(&mut entry, &mut out)
+            .map_err(|e| format!("파일 쓰기 실패 {}: {e}", target.display()))?;
     }
     Ok(())
 }
@@ -5800,32 +5855,43 @@ fn pack_update_from_dir(
     let sig_bytes = std::fs::read(&sig_path)
         .map_err(|e| format!("서명 읽기 실패 {}: {e}", sig_path.display()))?;
 
-    // staging: 깨끗이 비우고 tar 풀기.
-    let _ = std::fs::remove_dir_all(staging);
-    extract_tar_gz(&tar_path, staging)?;
-
-    // ⓐ 서명·신선도·replay 검증(P2, fail-closed) — 실패 시 staging 폐기·반영 0.
-    let manifest = match cys::packsig::verify_with_keyring(
+    // ── WP-6 R-SIG-1 재배치: 서명·digest 검증을 tar 전개 ★이전★에 수행한다. 미검증 tarball의
+    //    심링크/`..` 엔트리가 서명검증 전 staging 밖으로 pre-auth 임의쓰기하던 CRIT을 차단한다. ──
+    // ⓐ 서명·신선도·replay 검증(P2, fail-closed) — 전개 전. staging 무변경 상태에서 fail-closed.
+    let manifest = cys::packsig::verify_with_keyring(
         &manifest_bytes,
         &sig_bytes,
         now_unix,
         accepted_path,
         keyring,
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(staging);
-            return Err(format!("manifest 검증 실패: {e}"));
-        }
-    };
+    )
+    .map_err(|e| format!("manifest 검증 실패: {e}"))?;
 
-    // ⓑ 파일별 sha256 대조(P2 verify_files) — manifest.files → staging 전방 무결성.
+    // ⓐ' tar.gz digest 대조(전개 전) — 서명된 manifest.digest와 실제 tarball sha256 일치 강제.
+    //     digest는 서명 안에 있어 forge 불가라 tar↔서명을 이 한 줄이 바인딩한다. digest 비어있음 =
+    //     cutover 이전 서명본(verify가 signed_at<cutover만 허용) → 대조 불가라 skip(하위호환).
+    if !manifest.digest.trim().is_empty() {
+        let tar_sha = sha256_file(&tar_path.to_string_lossy())
+            .ok_or_else(|| format!("tar.gz sha256 산출 실패: {}", tar_path.display()))?;
+        if tar_sha != manifest.digest.trim() {
+            return Err(format!(
+                "tar.gz digest 불일치: 기대 {} 실제 {tar_sha} — 미검증/변조 tarball 거부",
+                manifest.digest.trim()
+            ));
+        }
+    }
+
+    // ⓑ 검증 통과 후에만 staging 비우고 ★하드닝★ 전개(엔트리별 절대/../심링크/하드링크/특수파일 거부).
+    let _ = std::fs::remove_dir_all(staging);
+    extract_tar_gz(&tar_path, staging)?;
+
+    // ⓒ 파일별 sha256 대조(P2 verify_files) — manifest.files → staging 전방 무결성.
     if let Err(e) = cys::packsig::verify_files(&manifest, staging) {
         let _ = std::fs::remove_dir_all(staging);
         return Err(format!("파일 무결성 검증 실패: {e}"));
     }
 
-    // ⓑ' 역방향 커버리지(§7-①) — staging 트리의 전 파일이 서명 manifest.files에 등재돼야.
+    // ⓒ' 역방향 커버리지(§7-①) — staging 트리의 전 파일이 서명 manifest.files에 등재돼야.
     // tarball 미서명이라 전방 검증만으로는 미등재 파일 추가 변조(악성 bin/*.py 등)를 못 막는다.
     // 전방+역방향으로 manifest ⇔ staging 집합 동치를 강제(fail-closed) — install_from_iter 진입 전 차단.
     if let Err(e) = cys::packsig::verify_no_extra_files(&manifest, staging) {
@@ -6692,6 +6758,9 @@ mod tests {
         }
         // tar czf pack.tar.gz -C tree .
         let status = std::process::Command::new("tar")
+            // macOS bsdtar가 xattr AppleDouble(._*) 사이드카를 tar에 넣지 않게 한다 — 프로덕션
+            // 결정론 tar(GNU/python)는 이런 엔트리가 없으므로 픽스처를 프로덕션 포맷과 일치시킨다.
+            .env("COPYFILE_DISABLE", "1")
             .arg("-czf")
             .arg(from_dir.join("pack.tar.gz"))
             .arg("-C")
@@ -6738,6 +6807,9 @@ mod tests {
             files_map.insert(rel.to_string(), json!(sha256_of(content.as_bytes())));
         }
         let status = std::process::Command::new("tar")
+            // macOS bsdtar가 xattr AppleDouble(._*) 사이드카를 tar에 넣지 않게 한다 — 프로덕션
+            // 결정론 tar(GNU/python)는 이런 엔트리가 없으므로 픽스처를 프로덕션 포맷과 일치시킨다.
+            .env("COPYFILE_DISABLE", "1")
             .arg("-czf")
             .arg(from_dir.join("pack.tar.gz"))
             .arg("-C")
@@ -7346,6 +7418,9 @@ mod tests {
         std::fs::create_dir_all(evil.parent().unwrap()).unwrap();
         std::fs::write(&evil, "#!/usr/bin/env python3\nprint('pwned')\n").unwrap();
         let status = std::process::Command::new("tar")
+            // macOS bsdtar가 xattr AppleDouble(._*) 사이드카를 tar에 넣지 않게 한다 — 프로덕션
+            // 결정론 tar(GNU/python)는 이런 엔트리가 없으므로 픽스처를 프로덕션 포맷과 일치시킨다.
+            .env("COPYFILE_DISABLE", "1")
             .arg("-czf")
             .arg(from_dir.join("pack.tar.gz"))
             .arg("-C")
@@ -8486,5 +8561,162 @@ mod tests {
         apply_config_dir_override(&mut env3, true, Some(recorded));
         assert_eq!(env3.len(), 1, "새 키 추가 금지");
         assert_eq!(env3[0], ("OTHER".to_string(), "v".to_string()));
+    }
+
+    // ── WP-6 R-SIG-1 전개기 하드닝(③-2) ───────────────────────────────────────────
+    /// 심링크 엔트리는 전개 前 fail-closed 거부(traversal-write 벡터 차단).
+    #[cfg(unix)]
+    #[test]
+    fn extract_tar_gz_rejects_symlink_entry() {
+        let td = std::env::temp_dir().join(format!("cys-xtar-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let tar_path = td.join("evil.tar.gz");
+        {
+            let f = std::fs::File::create(&tar_path).unwrap();
+            let gz = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+            let mut b = tar::Builder::new(gz);
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            b.append_link(&mut h, "evil", "/etc/passwd").unwrap();
+            b.into_inner().unwrap().finish().unwrap();
+        }
+        let dest = td.join("staging");
+        let e = extract_tar_gz(&tar_path, &dest).expect_err("심링크 엔트리가 거부되지 않음");
+        assert!(e.contains("심링크") || e.contains("타입"), "심링크 거부 사유 아님: {e}");
+        assert!(!dest.join("evil").exists(), "심링크가 디스크에 생성됨(전개됨)");
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// `..` 상위 traversal 성분 엔트리는 fail-closed 거부. tar 크레이트 Builder는 `..`를 거부하므로
+    /// python3 tarfile(release.yml과 동일 툴)로 악성 `..` 엔트리 tar를 만든다.
+    #[test]
+    fn extract_tar_gz_rejects_parent_traversal() {
+        let td = std::env::temp_dir().join(format!("cys-xtar-dd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let tar_path = td.join("evil.tar.gz");
+        let py = format!(
+            "import tarfile,io\n\
+             tf=tarfile.open(r'{}','w:gz')\n\
+             d=b'pwn'\n\
+             ti=tarfile.TarInfo('../escape.txt')\n\
+             ti.size=len(d)\n\
+             tf.addfile(ti, io.BytesIO(d))\n\
+             tf.close()\n",
+            tar_path.display()
+        );
+        let py_bin = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(&py)
+            .status();
+        // python3 부재 환경(드묾)에서는 스킵 — CI/빌드 환경엔 python3 상존(release.yml 의존).
+        match py_bin {
+            Ok(s) if s.success() => {}
+            _ => {
+                let _ = std::fs::remove_dir_all(&td);
+                return;
+            }
+        }
+        let dest = td.join("staging");
+        let e = extract_tar_gz(&tar_path, &dest).expect_err("../ traversal이 거부되지 않음");
+        assert!(e.contains("경로") || e.contains("이탈"), "traversal 거부 사유 아님: {e}");
+        assert!(!td.join("escape.txt").exists(), "staging 밖으로 escape 파일 생성됨");
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// 정상 tar(시스템 tar -czf 산출 · `./` prefix)는 무회귀로 전개된다.
+    #[test]
+    fn extract_tar_gz_extracts_regular_files() {
+        let td = std::env::temp_dir().join(format!("cys-xtar-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let tree = td.join("tree");
+        std::fs::create_dir_all(tree.join("bin")).unwrap();
+        std::fs::write(tree.join("soul.md"), "S\n").unwrap();
+        std::fs::write(tree.join("bin/x.py"), "print(1)\n").unwrap();
+        let tar_path = td.join("pack.tar.gz");
+        let status = std::process::Command::new("tar")
+            // macOS bsdtar가 xattr AppleDouble(._*) 사이드카를 tar에 넣지 않게 한다 — 프로덕션
+            // 결정론 tar(GNU/python)는 이런 엔트리가 없으므로 픽스처를 프로덕션 포맷과 일치시킨다.
+            .env("COPYFILE_DISABLE", "1")
+            .arg("-czf")
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&tree)
+            .arg(".")
+            .status()
+            .expect("tar czf");
+        assert!(status.success());
+        let dest = td.join("staging");
+        extract_tar_gz(&tar_path, &dest).expect("정상 tar 전개 실패");
+        assert_eq!(std::fs::read_to_string(dest.join("soul.md")).unwrap(), "S\n");
+        assert_eq!(std::fs::read_to_string(dest.join("bin/x.py")).unwrap(), "print(1)\n");
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// (WP-6 ⓐ') 서명은 유효하나 tar.gz digest가 manifest.digest와 불일치 → 전개 前 거부.
+    #[test]
+    fn pack_update_from_dir_rejects_digest_mismatch() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-pu-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let pack_dir = td.join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack_dir);
+        std::env::set_var(cys::pack::ENV_CONFIG_DIR, td.join("cysclaude"));
+        std::fs::write(pack_dir.join(".pack-version"), "1.0.0").unwrap();
+
+        let (pk, sign) = gen_signer();
+        let kr = test_keyring("TESTKEY", &pk);
+        let from_dir = td.join("from");
+        let tree = from_dir.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("soul.md"), "S\n").unwrap();
+        let status = std::process::Command::new("tar")
+            // macOS bsdtar가 xattr AppleDouble(._*) 사이드카를 tar에 넣지 않게 한다 — 프로덕션
+            // 결정론 tar(GNU/python)는 이런 엔트리가 없으므로 픽스처를 프로덕션 포맷과 일치시킨다.
+            .env("COPYFILE_DISABLE", "1")
+            .arg("-czf")
+            .arg(from_dir.join("pack.tar.gz"))
+            .arg("-C")
+            .arg(&tree)
+            .arg(".")
+            .status()
+            .expect("tar czf");
+        assert!(status.success());
+        let mut files_map = serde_json::Map::new();
+        files_map.insert("soul.md".to_string(), json!(sha256_of(b"S\n")));
+        // 서명은 유효하되 digest는 의도적으로 틀린 값(전개 前 tar↔digest 대조가 잡아야 한다).
+        let manifest = json!({
+            "pack_version": "2.0.0", "min_binary_version": "0.4.1", "key_id": "TESTKEY",
+            "signed_at": 3000, "expires_at": 9_000_000_000i64,
+            "digest": "0000000000000000000000000000000000000000000000000000000000000000",
+            "files": files_map,
+        });
+        let mbytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(from_dir.join("pack-manifest.json"), &mbytes).unwrap();
+        std::fs::write(from_dir.join("pack-manifest.json.minisig"), sign(&mbytes)).unwrap();
+
+        let staging = td.join("staging");
+        let lock = td.join(".lock");
+        let accepted = td.join(".pack-accepted.json");
+        let r =
+            pack_update_from_dir(&from_dir, &staging, &lock, &accepted, 5000, "0.4.1", &kr, false);
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        match saved_cfg {
+            Some(v) => std::env::set_var(cys::pack::ENV_CONFIG_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_CONFIG_DIR),
+        }
+        let e = r.expect_err("digest 불일치인데 통과");
+        assert!(e.contains("digest 불일치"), "digest 거부 사유 아님: {e}");
+        assert!(!staging.join("soul.md").exists(), "digest 거부인데 전개됨(전개 前 거부 위반)");
+        let _ = std::fs::remove_dir_all(&td);
     }
 }

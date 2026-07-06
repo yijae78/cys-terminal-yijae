@@ -57,6 +57,13 @@ pub struct PackManifest {
     /// pro 채널 단조 증분(base semver 동일 시의 증분 배포 축). free = 0 동치.
     #[serde(default)]
     pub pro_revision: u32,
+    /// 서명 대상 tar.gz(pack.tar.gz) 전체 바이트의 sha256(hex) — WP-6 R-SIG-1 CRIT.
+    /// 이 필드는 서명된 manifest 안에 포함되므로 위조 불가(replay만 가능)하고, pack_update_from_dir가
+    /// 서명 검증 직후·전개 이전에 tarball sha256을 이 값과 대조해 미검증 tarball 전개를 차단한다.
+    /// 빈 문자열 = cutover(DIGEST_REQUIRED_EPOCH) 이전 서명본(하위호환). signed_at이 cutover 이후면
+    /// 빈 digest는 fail-closed 거부(verify_with_keyring ⓒ').
+    #[serde(default)]
+    pub digest: String,
     /// rel → sha256(파일 바이트). pack.rs content_hash와 동일 산식.
     #[serde(default)]
     pub files: BTreeMap<String, String>,
@@ -65,6 +72,13 @@ pub struct PackManifest {
 pub(crate) fn default_channel() -> String {
     "free".to_string()
 }
+
+/// digest(tar.gz sha256) 필수화 cutover(Unix epoch 초, 2026-08-01T00:00:00Z). 이 시각 이후에
+/// 서명된 manifest(signed_at >= 이 값)는 digest가 비어있으면 거부한다(WP-6 R-SIG-1 하위호환
+/// fail-open 차단 — packsig.rs channel==pro 필수화 패턴과 동형). digest는 서명 안에 있어 forge
+/// 불가·replay만 가능하므로 epoch로 pre-cutover 미digest manifest의 재생을 시간창으로 봉인한다.
+/// 서명 파이프라인(bundle-prep.sh·release.yml)이 digest 기입을 시작한 뒤 이 epoch가 도래한다.
+pub const DIGEST_REQUIRED_EPOCH: i64 = 1_785_542_400;
 
 /// 마지막으로 수용한 팩 기록(~/.cys/.pack-accepted.json) — replay 단조 게이트의 기준선.
 /// channel·pro_revision은 #[serde(default)] = 구 포맷 파일이 free/0으로 판독(v4 §3 마이그레이션
@@ -142,6 +156,18 @@ pub fn verify_with_keyring(
 
     // ⓒ minisign 서명 검증 — 실패 = 거부.
     verify_minisign(&key.pubkey, manifest_bytes, sig_bytes)?;
+
+    // ⓒ' digest cutover(WP-6 R-SIG-1) — cutover 이후 서명본은 tar.gz digest 필수.
+    //     digest는 서명 안에 포함되므로 forge 불가·replay만 가능 → epoch로 pre-cutover
+    //     미digest manifest 재생을 봉인한다. 실제 tar↔digest 대조는 pack_update_from_dir가
+    //     전개 이전에 수행한다(이 함수는 tar 바이트 미보유). 하위호환 fail-open 금지.
+    if m.signed_at >= DIGEST_REQUIRED_EPOCH && m.digest.trim().is_empty() {
+        return Err(format!(
+            "digest 부재: signed_at {} >= cutover {DIGEST_REQUIRED_EPOCH} manifest는 \
+             tar.gz digest 필수(하위호환 fail-open 차단)",
+            m.signed_at
+        ));
+    }
 
     // ⓓ 신선도 유효창 — now ∈ [signed_at, expires_at] 밖이면 거부(Replay 만료창).
     if m.signed_at > m.expires_at {
@@ -254,6 +280,17 @@ pub fn verify_no_extra_files(manifest: &PackManifest, root: &Path) -> Result<(),
                 if !manifest.files.contains_key(&rel) {
                     return Err(format!("미등재 파일(서명 manifest에 없음): {rel}"));
                 }
+            } else {
+                // ③-4(WP-6): is_dir/is_file 외 = 심링크/FIFO/소켓/디바이스 등 비정규 엔트리.
+                // else 없이 조용히 통과하던 것을 전건 fail-closed 거부한다(사후탐지 보강 —
+                // 전개기 하드닝이 예방이라면 이건 잔여 방어심층). symlink_metadata 없이
+                // entry.file_type()는 심링크를 따르지 않으므로 심링크 자체가 여기서 걸린다.
+                let rel = path
+                    .strip_prefix(base)
+                    .map_err(|e| format!("rel 경로 실패: {e}"))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                return Err(format!("비정규 엔트리(심링크/특수파일) 거부: {rel}"));
             }
         }
         Ok(())
@@ -617,6 +654,7 @@ mod tests {
             expires_at: 0,
             channel: default_channel(),
             pro_revision: 0,
+            digest: String::new(),
             files,
         };
         assert!(verify_files(&m, &root).is_ok(), "일치인데 거부");
@@ -656,6 +694,7 @@ mod tests {
             expires_at: 0,
             channel: default_channel(),
             pro_revision: 0,
+            digest: String::new(),
             files,
         };
         assert!(verify_no_extra_files(&m, &root).is_ok(), "동치 집합인데 거부");
@@ -800,5 +839,87 @@ mod tests {
         verify_with_keyring(&m3, s3.as_bytes(), 5000, &acc, &kr).expect("구 포맷 manifest 거부됨");
 
         let _ = std::fs::remove_file(&acc);
+    }
+
+    // (WP-6 R-SIG-1) digest cutover: 서명본은 위조 불가라 forge 아닌 replay만 문제 →
+    // signed_at >= DIGEST_REQUIRED_EPOCH면 digest 필수(fail-closed), 이전이면 하위호환 통과.
+    #[test]
+    fn digest_required_after_cutover_epoch() {
+        let (pk, sign) = gen_key_and_signer();
+        let kr = keyring_with("KDG", &pk, "2040-01-01T00:00:00Z", &[]);
+        let acc = tmp_accepted("digest-cutover");
+        let _ = std::fs::remove_file(&acc);
+        let s = DIGEST_REQUIRED_EPOCH; // cutover 시각에 서명
+        let now = s + 100;
+        let exp = s + 100_000;
+
+        // (1) cutover 이후 + 빈 digest → 거부(fail-open 회귀 차단).
+        let empty = serde_json::json!({
+            "pack_version":"1.0.0","min_binary_version":"0.4.1","key_id":"KDG",
+            "signed_at":s,"expires_at":exp,"files":{}
+        })
+        .to_string();
+        let sig_empty = sign(empty.as_bytes());
+        let r = verify_with_keyring(empty.as_bytes(), sig_empty.as_bytes(), now, &acc, &kr);
+        assert!(r.is_err(), "cutover 이후 빈 digest가 통과됨(fail-open 회귀)");
+        assert!(r.unwrap_err().contains("digest 부재"), "cutover 거부 사유 아님");
+
+        // (2) cutover 이후 + digest 존재 → 통과.
+        let withd = serde_json::json!({
+            "pack_version":"1.0.0","min_binary_version":"0.4.1","key_id":"KDG",
+            "signed_at":s,"expires_at":exp,"digest":"deadbeef","files":{}
+        })
+        .to_string();
+        let sig_withd = sign(withd.as_bytes());
+        let m = verify_with_keyring(withd.as_bytes(), sig_withd.as_bytes(), now, &acc, &kr)
+            .expect("cutover 이후 digest 존재본이 거부됨");
+        assert_eq!(m.digest, "deadbeef");
+
+        // (3) cutover 이전 + 빈 digest → 통과(하위호환 무회귀).
+        let acc2 = tmp_accepted("digest-precutover");
+        let _ = std::fs::remove_file(&acc2);
+        let s0 = DIGEST_REQUIRED_EPOCH - 100_000;
+        let pre = serde_json::json!({
+            "pack_version":"1.0.0","min_binary_version":"0.4.1","key_id":"KDG",
+            "signed_at":s0,"expires_at":s0+200_000,"files":{}
+        })
+        .to_string();
+        let sig_pre = sign(pre.as_bytes());
+        assert!(
+            verify_with_keyring(pre.as_bytes(), sig_pre.as_bytes(), s0 + 100, &acc2, &kr).is_ok(),
+            "cutover 이전 빈 digest가 거부됨(하위호환 파손)"
+        );
+        let _ = std::fs::remove_file(&acc);
+        let _ = std::fs::remove_file(&acc2);
+    }
+
+    // (WP-6 ③-4) verify_no_extra_files: is_dir/is_file 외 비정규 엔트리(심링크) 전건 fail-closed.
+    #[cfg(unix)]
+    #[test]
+    fn verify_no_extra_files_rejects_symlink() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("cys-vnef-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"A").unwrap();
+        symlink("/etc/passwd", root.join("evil")).unwrap(); // 미등재 심링크
+        let mut files = BTreeMap::new();
+        files.insert("a.txt".to_string(), format!("{:x}", Sha256::digest(b"A")));
+        let m = PackManifest {
+            pack_version: "1".into(),
+            min_binary_version: String::new(),
+            key_id: "K".into(),
+            signed_at: 0,
+            expires_at: 0,
+            channel: default_channel(),
+            pro_revision: 0,
+            digest: String::new(),
+            files,
+        };
+        let r = verify_no_extra_files(&m, &root);
+        assert!(r.is_err(), "심링크가 fail-closed로 거부되지 않음");
+        assert!(r.unwrap_err().contains("비정규"), "심링크 거부 사유 아님");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
