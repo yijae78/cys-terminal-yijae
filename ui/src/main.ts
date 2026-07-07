@@ -1424,6 +1424,7 @@ async function refreshPaneTitles() {
       // 안 A: 부서 master 첫 등장 시 — 빈 셸이 없으므로 master pane으로 직행한다.
       const aSids = collectSids(current()?.tree ?? null);
       if (aSids.length && (focusedSid == null || !aSids.includes(focusedSid))) setFocus(aSids[0]);
+      await actionEqualize(); // 외부(launch-agent·cys boot) 입양 시 전체 패널 자동 균등 배치
     }
   } catch {
     /* 데몬 일시 미응답은 다음 틱에 */
@@ -2696,6 +2697,7 @@ async function actionNew() {
     : { type: "pane", sid };
   render();
   setFocus(sid);
+  await actionEqualize(); // 새 pane 생성 시 전체 패널 자동 균등 배치(모두 같은 크기)
 }
 
 async function actionSplit(dir: "row" | "col") {
@@ -2722,6 +2724,7 @@ async function actionSplit(dir: "row" | "col") {
   }
   render();
   setFocus(sid);
+  await actionEqualize(); // 분할 시 전체 패널 자동 균등 배치(모두 같은 크기)
 }
 
 async function actionClose() {
