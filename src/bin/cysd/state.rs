@@ -1100,6 +1100,36 @@ impl Daemon {
             .any(|i| i.request_id == request_id && i.status == "pending")
     }
 
+    /// 특정 surface에 데몬 발행(daemon-*) approval 감지 항목이 pending으로 남아 있는가 —
+    /// governance 승인 감지의 재발행 억제(코얼레싱) 판정. 같은 프롬프트 에피소드가 살아 있는
+    /// 동안 분당 신규 항목이 무한 누적되는 것을 막는다(2026-07-07 feed 189 폭주 재발방지 L3).
+    pub fn has_pending_daemon_approval(&self, surface_id: u64) -> bool {
+        self.feed_items.lock().unwrap().iter().any(|i| {
+            i.status == "pending"
+                && i.kind == "approval"
+                && i.surface_id == Some(surface_id)
+                && i.request_id.starts_with("daemon-")
+        })
+    }
+
+    /// 특정 surface의 pending 데몬 approval 감지 항목 id 스냅샷 — 화면에서 승인 패턴이
+    /// 사라졌을 때 stale 일괄 종결용. 락 해제 후 resolve_feed_item을 개별 호출한다
+    /// (데몬 재시작으로 in-memory 추적을 잃은 고아 pending도 이 경로로 청소된다).
+    pub fn pending_daemon_approvals(&self, surface_id: u64) -> Vec<String> {
+        self.feed_items
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| {
+                i.status == "pending"
+                    && i.kind == "approval"
+                    && i.surface_id == Some(surface_id)
+                    && i.request_id.starts_with("daemon-")
+            })
+            .map(|i| i.request_id.clone())
+            .collect()
+    }
+
     /// feed 항목을 결정으로 해소한다(pending→resolved) — feed.reply와 채널 승인 미러 interaction이
     /// 공유하는 단일 경로. 성공 시 스냅샷을 영속·대기 pusher wake·feed.item.resolved 발행하고 스냅샷
     /// 반환, pending이 아니거나 없으면 None(멱등 — 중복 해소는 None). ★락 순서: feed_items →
