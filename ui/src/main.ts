@@ -2245,8 +2245,7 @@ function buildTab(ws: Workspace): HTMLElement {
     const bits = [`${sids.length} pane`];
     if (firstTitle) bits.push(firstTitle);
     if (worst >= 60) bits.push(`CTX ${worst}%`);
-    if (idleN) bits.push(`💤${idleN}`);
-    if (dead) bits.push(`❌${dead}`);
+    // 💤 유휴 / ❌ 죽은노드 배지는 X 오인 방지 위해 제거(신교수님 요청 2026-07-07). 상태는 좌측 ws-dot 색으로만 표시.
     txt.textContent = bits.join(" · ");
     if (worst >= 80) txt.className = "sev-crit";
     else if (worst >= 60) txt.className = "sev-warn";
