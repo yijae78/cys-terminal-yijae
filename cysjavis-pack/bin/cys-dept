@@ -11,6 +11,15 @@
 # 단일 진입점: Tauri/UI·CLI 모두 이 도구를 거쳐 부서를 운용한다(직접 cysd spawn 금지 — 레지스트리/ACL 미시드 방지).
 set -euo pipefail
 
+# RC-16: Windows(MSYS/Git-Bash)가 한글 사용자명 $HOME을 CP949로 깨뜨려(예: "신이재"→½ÅÀÌÀç)
+# depts.json·pack_dir 등 모든 홈 경로 접근이 실패하는 문제 우회(＋부서 클릭→블랙화면 롤백의 근인).
+# USERPROFILE은 정상 유지되므로 cygpath -u로 올바른 POSIX 홈을 재획득한다. LANG/LC_ALL로는 못 고침
+# (bash 진입 시점에 이미 CP949). unix는 USERPROFILE 부재·cygpath 부재로 무영향(가드).
+if [ -n "${USERPROFILE:-}" ] && command -v cygpath >/dev/null 2>&1; then
+  _uhome="$(cygpath -u "$USERPROFILE" 2>/dev/null || true)"
+  [ -n "$_uhome" ] && [ -d "$_uhome" ] && export HOME="$_uhome"
+fi
+
 # ★PATH 보강(GUI Finder/Dock 런칭 대응): cys.app은 launchd 기본 PATH(/usr/bin:/bin:/usr/sbin:/sbin)만
 # 상속해 cys(/opt/homebrew/bin)·claude(~/.local/bin)를 못 찾는다 → 빈 셸의 `cys status`·사용자의 claude
 # 수동 실행 실패·dept cysd 의 claude spawn 실패 = 0 pane. 이 도구가 spawn 하는 모든 자식(cysd·빈 셸·
