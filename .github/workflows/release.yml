@@ -81,6 +81,33 @@ jobs:
           workspaces: './src-tauri -> target'
           key: ${{ matrix.target }}
 
+      # ★W6/E1 phoenix host-level 로직 게이트 (macOS 네이티브 arm64 레그 1회 · 스텝 정의 — 실 실행은 릴리스 시 확인).
+      # 실 cysd 를 격리 상태 디렉터리에서 kill→재기동해 auto-restore 부활·STRICT 주입·no-target NOOP·cross-layer
+      # 재시도·C2 sentinel·E3 GC·E2 스케줄 배선을 커밋 테스트로 실증(a07cc7f Not-tested 봉인).
+      # ★codex W6 minor: 이 게이트는 **host-아키텍처 무관 로직**(phoenix python + Rust auto-restore 단위)을
+      #   검증한다 — host debug(arm64) 바이너리로 충분하며 matrix.target 별 sidecar 는 뒤 build 스텝이 컴파일한다.
+      #   따라서 두 macOS 레그 중복 실행을 피해 **네이티브 레그(aarch64)에서 1회만** 돈다(x86_64 레그는 크로스빌드
+      #   sidecar 컴파일만 담당·동일 host arm64 재검증 무의미). target 별 실기 E2E 는 W5(Windows)·릴리스 스모크 소관.
+      - name: phoenix host-level 로직 게이트 (macOS 네이티브)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          set -euo pipefail
+          cargo build --bin cys --bin cysd
+          export PHOENIX_HARNESS_CYSD="$PWD/target/debug/cysd"
+          export PATH="$PWD/target/debug:$PATH"
+          export PHOENIX_CYS="$PWD/target/debug/cys"
+          # ★커밋된 phoenix 테스트 전건 실행(glob) — 하드코딩 리스트는 신규 웨이브 테스트(w2/w3/c6/as3 …)를 조용히
+          #   누락시키는 위험이 있어 tests/ 디렉터리를 스캔한다(정직성: 게이트가 실제 커밋 테스트 전부를 돈다).
+          for t in cysjavis-pack/bin/tests/test_phoenix_*.py; do
+            echo "== phoenix test: $(basename "$t") =="
+            CYS_PACK_DIR="$(mktemp -d)" python3 "$t"
+          done
+          # Rust auto-restore 단위(재시도 seam·env 주입·B1·B3) + pack 소유권(B2).
+          # ★--skip hwmon:: — hwmon 테스트는 실 GPU 전제(gpu.cores>0 단언)라 가상 러너에서 환경 FAIL
+          #   (v0.12.21 release run 28792111282 실증 — phoenix 게이트와 무관한 host 하드웨어 의존).
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon::
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib -- --test-threads=1
+
       # Windows 자기완결 런타임 동봉 (windows-build.yml과 동일 절차 — PortableGit + Python embeddable).
       # tauri.windows.conf.json bundle.resources("runtime/")가 이 트리를 NSIS에 싣는다.
       - name: 동봉 런타임 준비 (PortableGit + Python embeddable — Windows 전용)
@@ -369,6 +396,16 @@ jobs:
                       print(f"::error::tar sha256 불일치 {rel}: {extracted[rel]} != {want}", file=sys.stderr)
                       sys.exit(1)
           print(f"[gate③] tar⇔manifest⇔embed 3자 폐포 {len(files)}개 일치 — 동일성 게이트 통과")
+
+          # ④ tar.gz digest를 서명 대상 manifest에 주입(WP-6 R-SIG-1) — ★서명 前 필수.
+          #    프로덕션 검증기(pack_update_from_dir)가 전개 前 이 digest와 tarball sha256을 대조해
+          #    미검증 tarball의 pre-auth traversal-write를 차단한다. digest는 서명 안에 들어가므로
+          #    forge 불가·replay만 가능(packsig DIGEST_REQUIRED_EPOCH가 시간창으로 봉인).
+          man["digest"] = sha256_file("pack.tar.gz")
+          with open("pack-manifest.json", "w") as mf:
+              json.dump(man, mf, ensure_ascii=False, indent=2)
+              mf.write("\n")
+          print(f"[gate④] tar.gz digest 주입 → manifest.digest={man['digest'][:16]}…")
           PY
 
       # ★콘텐츠 스캔 발행 hard-gate (지점②/2 — pack.tar.gz 생성 후 발행 전). 결정론 tar로 묶은 직후·

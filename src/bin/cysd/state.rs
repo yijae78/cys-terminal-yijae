@@ -17,6 +17,66 @@ const SCROLLBACK_LINES: usize = 10_000;
 pub const DEFAULT_ROWS: u16 = 35;
 pub const DEFAULT_COLS: u16 = 120;
 
+// ★D3(W5): Windows Job Object — PTY 자식 동반사망(KILL_ON_JOB_CLOSE). unix 는 setsid+killpg/SIGKILL 로 이미
+//   동반사망이 성립하지만 Windows 는 자식이 데몬 사후 생존해 잔존/중복 노드가 됐다(P2-9). 데몬 소유 Job 에
+//   자식을 편입하면 데몬 프로세스 종료 시 OS 가 Job 핸들을 닫아 편입된 전 자식·손자를 강제 종료한다.
+#[cfg(windows)]
+pub(crate) mod winjob {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    // 데몬 소유 Job(프로세스 수명 = 핸들 수명, 명시 close 없음 → 프로세스 종료 시 OS 가 닫아 KILL 발동).
+    //   HANDLE(=*mut c_void)은 !Send 이므로 usize 로 보관한다(핸들 값 자체는 프로세스 전역 유효).
+    static JOB: OnceLock<usize> = OnceLock::new();
+
+    fn job() -> HANDLE {
+        (*JOB.get_or_init(|| unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if !h.is_null() {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                SetInformationJobObject(
+                    h,
+                    JobObjectExtendedLimitInformation,
+                    (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+            }
+            h as usize
+        })) as HANDLE
+    }
+
+    /// PTY 자식(pid)을 데몬 소유 Job(KILL_ON_JOB_CLOSE)에 편입 — 데몬 사후 자식·손자 동반사망(mac SIGKILL 대칭).
+    /// ★post-spawn 편입: portable-pty(ConPTY)가 pseudoconsole 핸드셰이크를 위해 자식을 즉시 실행해야 하므로
+    /// CREATE_SUSPENDED→resume 은 ConPTY 계약과 충돌한다 — 채택하지 않았다. 편입 이후 자식이 만드는 손자는
+    /// Job 을 상속(자동 편입)하고, 편입 직전 sub-ms 창의 손자만 이론적 이탈(에이전트 실무상 무해). best-effort
+    /// (실패해도 스폰을 죽이지 않는다 — 잔존 위험은 unix 대비로만 존재, 가용성 우선).
+    pub fn assign_child(pid: u32) {
+        if pid == 0 {
+            return;
+        }
+        unsafe {
+            let j = job();
+            if j.is_null() {
+                return;
+            }
+            let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if !proc.is_null() {
+                AssignProcessToJobObject(j, proc);
+                CloseHandle(proc);
+            }
+        }
+    }
+}
+
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
 pub enum WriteReq {
     /// 그대로 쓰기 (키 입력·텍스트·DSR 응답)
@@ -543,6 +603,13 @@ pub struct Daemon {
     /// 역할을 절대 재스폰하지 않는다(사고사만 부활, 의도삭제는 좀비 차단). 데몬 기동 시
     /// topology.json에서 로드한다(구 topology=필드 부재→빈 집합=기존 동작 하위호환).
     pub tombstones: Mutex<std::collections::HashSet<String>>,
+    /// ★W2/A-S1: 묘비 변경 단조 카운터(topology.json 의 tombstones_rev). persist_topology 가 묘비 집합이
+    /// 직전 영속본과 달라질 때만 +1 한다. phoenix 는 "rev ≥ 마지막으로 본 rev"일 때만 topology 묘비를 desired 에
+    /// 그대로 대입(조건부 replace)해, 부분절단·조작으로 묘비만 빈 파일(rev 부재/역행)을 걸러낸다. 기동 시
+    /// disk topology 의 tombstones_rev 를 시드해 재시작을 넘어 단조성을 유지한다.
+    pub tombstones_rev: std::sync::atomic::AtomicU64,
+    /// persist_topology 가 rev 증가 판정에 쓰는 '직전 영속 묘비 집합'(정렬본). 시드=기동 시 disk 묘비.
+    pub last_persisted_tombstones: Mutex<Vec<String>>,
     /// 적대검증 벡터-9 방어심화: master role이 현재 보유 surface로 (재)claim된 epoch초.
     /// master surface가 죽는 윈도우에 다른 노드가 claim_role("master")로 합법 승계 → 즉시
     /// approval.sign으로 위험명령을 정당 서명할 수 있다. 이 값으로 갓 승계한 master의 서명을
@@ -951,6 +1018,16 @@ impl Daemon {
             roles: Mutex::new(HashMap::new()),
             // ★W2a 콜드부트 생존: topology.json에 영속된 묘비를 기동 시 로드(구 topology=빈 집합).
             tombstones: Mutex::new(crate::governance::load_tombstones_from_disk(&socket_path)),
+            // ★W2/A-S1: rev 를 disk topology 에서 시드(재시작 넘어 단조성 유지)·직전 영속본=시드 묘비.
+            tombstones_rev: std::sync::atomic::AtomicU64::new(
+                crate::governance::load_tombstones_rev_from_disk(&socket_path),
+            ),
+            last_persisted_tombstones: Mutex::new({
+                let mut v: Vec<String> =
+                    crate::governance::load_tombstones_from_disk(&socket_path).into_iter().collect();
+                v.sort();
+                v
+            }),
             // 벡터-9 방어심화: 기동 시 master 미승계 → None (첫 claim_role("master")에서 기록).
             master_claimed_at: Mutex::new(None),
             feed_items: Mutex::new(restored),
@@ -1279,6 +1356,9 @@ impl Daemon {
             .spawn_command(builder)
             .map_err(|e| format!("spawn failed: {e}"))?;
         let pid = child.process_id().unwrap_or(0);
+        // ★D3(W5): 스폰 직후 자식을 데몬 소유 Job 에 편입 — 데몬 사후 동반사망(Windows P2-9). unix 는 no-op.
+        #[cfg(windows)]
+        winjob::assign_child(pid);
         drop(pair.slave);
 
         let reader = pair
@@ -1394,6 +1474,12 @@ impl Daemon {
         // tombstones는 리프 락 — surfaces/roles 락 해제 후 획득(락 순서 무변경).
         if let Some(rr) = registered_role {
             self.tombstones.lock().unwrap().remove(&rr);
+            // ★W2/P1-2: master 역할로 (재)기동되면 master_claimed_at 스탬프 — 부활 master 가 approval.sign
+            //   동결(master_unstable 거부) 상태로 깨어나 자율주행 게이트가 마비되던 결함 해소. claim_role
+            //   경로(handlers.rs)의 승계 스탬프와 동일 의미(새 보유자=쿨다운 시작). tombstones 와 동일 리프 락.
+            if rr == "master" {
+                *self.master_claimed_at.lock().unwrap() = Some(now_epoch());
+            }
         }
         if role.is_some() {
             crate::governance::persist_topology(self);
@@ -2151,6 +2237,25 @@ mod tests {
             )
             .unwrap();
         assert!(!s2.env_injected, "env 미주입 surface는 env_injected=false → Windows node-recover fail-closed");
+    }
+
+    /// ★W2/P1-2: master 역할로 surface 를 (재)기동하면 master_claimed_at 이 스탬프돼 approval.sign 이 즉시
+    /// 가능해야 한다(부활 master 동결 해제). 비-master 역할은 master_claimed_at 을 건드리지 않는다.
+    #[test]
+    fn create_surface_master_stamps_claimed_at() {
+        let daemon = Daemon::new(isolated_sock("p1-2-master"));
+        assert!(daemon.master_claimed_at.lock().unwrap().is_none(), "기동 직후 None");
+        // 비-master → 스탬프 없음
+        daemon
+            .create_surface_with_env(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80, &[], None)
+            .unwrap();
+        assert!(daemon.master_claimed_at.lock().unwrap().is_none(), "worker 생성은 master_claimed_at 무영향");
+        // master 부활 → 스탬프(approval.sign 동결 해제)
+        daemon
+            .create_surface_with_env(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80, &[], None)
+            .unwrap();
+        assert!(daemon.master_claimed_at.lock().unwrap().is_some(),
+                "master 부활 시 master_claimed_at 스탬프돼야 approval.sign 가능(P1-2)");
     }
 
     /// (W1-6 a·d) 계정 config_dir 영속 라운드트립 + 구 topology 하위호환.

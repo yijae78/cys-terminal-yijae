@@ -118,18 +118,29 @@ def log(msg):
 
 
 def guard_isolation():
-    """격리 경로가 라이브 상태 디렉터리와 겹치지 않는지 하드 가드 — 겹치면 즉시 중단."""
+    """격리 경로가 라이브 상태 디렉터리와 겹치지 않는지 하드 가드 — 겹치면 즉시 중단.
+    ★C5/P1-10(W3): 라이브 상태/소켓을 타깃하는 것은 **CYS_PHOENIX_ALLOW_LIVE=1 명시 opt-in** 이 있을 때만
+    허용한다(없으면 LIVE write 거부). 하네스는 격리가 기본이며, 라이브 접촉은 사고가 아니라 의도된 예외여야 한다."""
     hd = os.path.realpath(HARN_DIR)
     ls = os.path.realpath(LIVE_STATE)
-    if hd == ls or hd.startswith(ls + os.sep) or ls.startswith(hd + os.sep):
-        die("격리 디렉터리(%s)가 라이브 상태(%s)와 겹친다 — 실행 거부." % (hd, ls))
-    if os.path.realpath(HARN_SOCK) == os.path.realpath(LIVE_SOCK):
-        die("격리 소켓이 라이브 소켓과 동일 — 실행 거부.")
+    allow_live = os.environ.get("CYS_PHOENIX_ALLOW_LIVE") == "1"
+    overlap = hd == ls or hd.startswith(ls + os.sep) or ls.startswith(hd + os.sep)
+    sock_same = os.path.realpath(HARN_SOCK) == os.path.realpath(LIVE_SOCK)
+    if overlap or sock_same:
+        if not allow_live:
+            die("★C5/P1-10: 하네스가 라이브 상태(%s)/소켓을 타깃 — CYS_PHOENIX_ALLOW_LIVE=1 명시 opt-in "
+                "없으면 LIVE write 거부(격리가 기본)." % ls)
+        log("★C5 경고: CYS_PHOENIX_ALLOW_LIVE=1 — 하네스의 라이브 상태 쓰기 허용(명시 opt-in·위험 작업).")
 
 
 def _daemon_env():
     env = dict(os.environ)
     env["CYS_SOCKET"] = HARN_SOCK       # ← 데몬 bind 경로 오버라이드(실측 확정)
+    # ★W2: 하네스 데몬은 phoenix 로직을 직접 테스트한다 — cysd 콜드부트 auto-restore(W6 --socket 이후 하네스
+    #   소켓 대상)가 restore.lease 를 잡으면 드릴의 직접 restore 가 LEASE_HELD 로 경합한다. 기본 비활성화하되
+    #   (드릴 결정론화·cysd auto-restore 는 E1 e2e_replacement 가 별도 검증), 호출자가 os.environ 으로 명시
+    #   설정(예: E1 이 "0"으로 auto-restore 활성화)하면 존중한다.
+    env.setdefault("CYS_NO_AUTORESTORE", "1")
     for k in LEAKY_ENV:
         env.pop(k, None)
     return env

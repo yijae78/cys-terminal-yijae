@@ -95,7 +95,18 @@ with open("src-tauri/resources/pack.tar.gz", "wb") as raw:
         tf.addfile(ti, io.BytesIO(data))
     tf.close()
     gz.close()
-print(f"bundle-prep: pack.tar.gz {len(files)}개 파일 결정론 동봉 → src-tauri/resources/")
+
+# tar.gz digest를 manifest에 주입(WP-6 R-SIG-1 — 방출부 tar sha 기입 일관성). 임베드 팩은 미서명이나
+# 포맷을 채널 manifest와 통일한다(digest 필드 상존). 검증기는 digest 비어있지 않으면 대조한다.
+dh = hashlib.sha256()
+with open("src-tauri/resources/pack.tar.gz", "rb") as df:
+    for chunk in iter(lambda: df.read(1 << 16), b""):
+        dh.update(chunk)
+man["digest"] = dh.hexdigest()
+with open("src-tauri/resources/pack-manifest.json", "w") as mf:
+    json.dump(man, mf, ensure_ascii=False, indent=2)
+    mf.write("\n")
+print(f"bundle-prep: pack.tar.gz {len(files)}개 파일 결정론 동봉 + digest 주입 → src-tauri/resources/")
 PY
 
 echo "bundle-prep ready (ui/dist + binaries + resources/pack.tar.gz for $triple)"

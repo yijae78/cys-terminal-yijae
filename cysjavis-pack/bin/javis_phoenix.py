@@ -43,9 +43,11 @@ spawn(생성) 백엔드 2종:
 """
 
 import argparse
+import atexit
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -89,6 +91,37 @@ SPAWN_RETRIES = int(os.environ.get("PHOENIX_SPAWN_RETRIES", "3"))       # 미스
 SPAWN_SETTLE = float(os.environ.get("PHOENIX_SPAWN_SETTLE", "1.0"))     # 스폰 후 surface 등장 정착 대기
 SPAWN_BACKOFF = float(os.environ.get("PHOENIX_SPAWN_BACKOFF", "1.5"))   # 재시도 간격 기준(회차마다 증가)
 
+# ★W1/C1 exit code 계약: run_restore 최종 판정 → 프로세스 exit code(P0-1 신호 역전 수리).
+#   과거: cmd_restore 는 FAILED 여도 dict 만 return → 프로세스는 항상 exit 0 → cysd 가 완전실패와 성공을
+#   구분 불가(exit 1 은 오히려 미포착 예외 crash 때만 나와 신호가 뒤집혀 있었다). 이제 판정을 결정론 exit 로 방출한다.
+#   cysd 재시도 정책과 정합: 5(BREAKER)·6(손상/identity)=재시도 금지, 1·3=1회 지연 재시도, 0=성공(재시도 없음).
+PHOENIX_EXIT_OK = 0        # VERIFIED · VERIFIED_FRESH · NOOP · LEASE_HELD(멱등 skip — 다른 restore가 담당)
+PHOENIX_EXIT_FAILED = 1    # FAILED · INCOMPLETE(재시도 소진 후 미부활) — 재시도 가치 있음
+PHOENIX_EXIT_DEGRADED = 3  # UNVERIFIED · DEGRADED(부활은 됐으나 세션 미검증) — 재시도 가치 있음
+PHOENIX_EXIT_BREAKER = 5   # BREAKER_OPEN(크래시루프 정지) — 재시도 금지(폭주 방지·사람 승인)
+PHOENIX_EXIT_CORRUPT = 6   # 손상 감지 / cys identity 불일치 — 재시도 금지(사람 개입)
+
+
+def restore_exit_code(result):
+    """run_restore 결과 dict → 프로세스 exit code(C1 계약). 최악 조건 우선(worst-wins):
+    실 미부활(INCOMPLETE)이 세션 미검증(UNVERIFIED)보다, 손상/차단기가 그보다 상위다.
+    result 가 dict 가 아니면(비정상) 보수적으로 FAILED(1) — 성공 오판 방지."""
+    if not isinstance(result, dict):
+        return PHOENIX_EXIT_FAILED
+    verdict = result.get("phoenix_restore")
+    completeness = result.get("completeness")
+    if result.get("corruption"):
+        return PHOENIX_EXIT_CORRUPT
+    if verdict == "BREAKER_OPEN":
+        return PHOENIX_EXIT_BREAKER
+    # INCOMPLETE(readiness 기반 실 미부활)는 verdict 가 무엇이든 최우선 실패 신호 — 침묵 성공 금지.
+    if verdict == "FAILED" or completeness == "INCOMPLETE":
+        return PHOENIX_EXIT_FAILED
+    if verdict in ("UNVERIFIED", "DEGRADED"):
+        return PHOENIX_EXIT_DEGRADED
+    # VERIFIED · VERIFIED_FRESH · NOOP · LEASE_HELD → 성공/무해(0)
+    return PHOENIX_EXIT_OK
+
 # ★Phase 11: 독약 세션(unresumable) fresh-spawn fallback — DRILL_LIVE_4 §15 수리.
 #   완결성(Phase10)은 resume(세션핀) 기반 spawn 을 반복하는데, 세션이 독약(resume 불가·손상)이면 매 재시도가
 #   동일하게 실패한다(DRILL_LIVE_4: claude --resume 워커만 부활 실패). 근본 = §3 원칙5 "N회 resume 실패→
@@ -100,12 +133,206 @@ POISON_FRESH_FALLBACK = os.environ.get("PHOENIX_POISON_FRESH_FALLBACK", "1") != 
 
 CYS = None  # lazy resolve
 
+# ★phoenix protocol version — Rust cys::pack::PHOENIX_PROTOCOL_VERSION 과 동기(identity 3중 대조·B1 self-test 표기).
+PHOENIX_PROTOCOL_VERSION = "1"
+
 
 # ------------------------------------------------------------------ 기반 유틸
 
 def _which(name):
     import shutil
     return shutil.which(name)
+
+
+# ★W1/B3·§5-1: 표준 설치 경로 폴백 후보(GUI/데몬 최소 PATH 에 cys 가 없을 때). 라이브 실증(2026-07-06):
+#   GUI 기동 데몬 PATH=/usr/bin:/bin:/usr/sbin:/sbin 뿐 → /opt/homebrew/bin/cys 미탐색 → 리터럴 'cys'
+#   FileNotFoundError → auto-restore exit 1 침묵사. 폴백은 identity-check 통과 시에만 채택한다.
+_CYS_STD_PATHS = ["/opt/homebrew/bin/cys", "/usr/local/bin/cys"]
+
+
+def _extract_version(text):
+    """`cys --version`('cys 0.12.20') / daemon.version('0.12.20') 에서 x.y.z 를 추출(진단 로깅용)."""
+    m = re.search(r"\d+\.\d+\.\d+", text or "")
+    return m.group(0) if m else ""
+
+
+# ★W1 identity 3중 대조 필드(§5-1② · codex R3 blocking): 버전 문자열 단일 대조는 shadowing 구멍
+#   (같은 version 문자열의 다른 빌드·다른 embedded pack·다른 protocol 이 통과). 3필드 전건 일치를 요구한다.
+_IDENTITY_FIELDS = ("build_id", "embedded_pack_hash", "protocol_version")
+
+# ★W1(gate2): 해석된 cys 의 identity 검증 상태(결과 JSON `cys_identity` 로 노출).
+#   "verified"=3중 대조 match · "degraded-unverified"=inconclusive 채택(데몬 미도달 등 — 검증 통과 아님·정직 분리).
+#   mismatch 는 채택 자체가 없다(exit 6). None=미해석(직접 함수 호출 등).
+_CYS_IDENTITY = None
+
+# 재시도 파라미터(gate2 fix 2a·gemini): 데몬 소켓 기동 직후 status 미도달(inconclusive) 레이스 해소.
+_IDENTITY_RETRY_TRIES = int(os.environ.get("PHOENIX_IDENTITY_RETRY_TRIES", "2"))
+_IDENTITY_RETRY_SLEEP = float(os.environ.get("PHOENIX_IDENTITY_RETRY_SLEEP", "1.0"))
+
+
+def _cys_self_identity(candidate):
+    """후보 cys 자신의 3필드 self-report(`cys phoenix-identity` — 데몬 불요·컴파일타임 상수). 실패=None."""
+    try:
+        r = subprocess.run([candidate, "phoenix-identity"], capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    try:
+        return json.loads(r.stdout or "{}")
+    except Exception:
+        return None
+
+
+def _daemon_identity(candidate, socket):
+    """대상 데몬의 3필드(`cys status --json`.daemon). 서브프로세스 실패/미도달/파싱실패=None."""
+    cmd = [candidate]
+    if socket:
+        cmd += ["--socket", socket]
+    cmd += ["status", "--json"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    try:
+        return (json.loads(r.stdout or "{}").get("daemon") or {})
+    except Exception:
+        return None
+
+
+def _cys_identity_check(candidate, socket):
+    """★3중 대조(§5-1②): 후보 self-report(phoenix-identity) ↔ 대상 데몬 status.daemon 의
+    build_id·embedded_pack_hash·protocol_version 전건 일치 검증. 반환 (status, field, detail):
+      · ('match', None, detail)        전 3필드 일치(같은 빌드·팩·프로토콜 확증)
+      · ('mismatch', <field>, detail)  특정 필드 불일치/부재(다른 빌드/팩/프로토콜 — shadowing 차단, 어느 필드인지 명시)
+      · ('inconclusive', reason, '')   self-report 또는 데몬 status 미도달로 대조 불가."""
+    self_id = _cys_self_identity(candidate)
+    if not self_id:
+        return ("inconclusive", "self-report(phoenix-identity) 실패 — 구버전 cys(커맨드 부재) 의심", "")
+    dmn = _daemon_identity(candidate, socket)
+    if not dmn:
+        return ("inconclusive", "데몬 status 미도달(대조 불가)", "")
+    for f in _IDENTITY_FIELDS:
+        sv, dv = self_id.get(f), dmn.get(f)
+        if not sv or not dv:
+            return ("mismatch", f, "self=%r daemon=%r(필드 부재 — 구버전/legacy 의심)" % (sv, dv))
+        if sv != dv:
+            return ("mismatch", f, "self=%r daemon=%r" % (sv, dv))
+    return ("match", None, "build_id=%s proto=%s" % (self_id.get("build_id"), self_id.get("protocol_version")))
+
+
+def _identity_with_retry(candidate, socket):
+    """★gate2 fix 2a(gemini): inconclusive 는 데몬 소켓 기동 직후 status 미도달 레이스일 수 있으므로,
+    1s 간격 재시도 후 재대조한다(mismatch·match 는 즉시 확정 — 재시도 불요). 최종 (status, field, detail)."""
+    status, field, detail = _cys_identity_check(candidate, socket)
+    tries = 0
+    while status == "inconclusive" and tries < _IDENTITY_RETRY_TRIES:
+        tries += 1
+        time.sleep(_IDENTITY_RETRY_SLEEP)
+        status, field, detail = _cys_identity_check(candidate, socket)
+    return status, field, detail
+
+
+def _accept_with_identity(socket, candidate, source_label, allow_inconclusive):
+    """★gate2 fix 1·2: 후보 cys 를 3중 identity 계약으로 채택/거부한다(PHOENIX_CYS·PATH·표준경로 공통 경로).
+      · match        → 채택(_CYS_IDENTITY='verified')
+      · mismatch     → 어디서든 즉사(exit 6·불일치 필드 명시) — 적극적 모순은 availability 명분으로 통과 불가
+      · inconclusive → allow_inconclusive 면 채택하되 **'검증 통과'가 아니라 degraded availability exception**으로
+                       분리 기록(_CYS_IDENTITY='degraded-unverified'·저널+stderr). 아니면 exit 6.
+    ★fix 2c(provenance): 'Rust 가 주입했다'는 출처를 env 토큰으로 증명하는 방식은 채택하지 않는다 — env 토큰은
+       위조 가능해 shadowing 을 못 막는다(같은 토큰을 심으면 우회). 정직한 해법은 검증 실패를 숨기지 않고
+       degraded 로 분리 보고하는 것(availability 는 지키되 'verified' 라 거짓말하지 않는다)."""
+    global _CYS_IDENTITY
+    status, field, detail = _identity_with_retry(candidate, socket)
+    if status == "match":
+        _CYS_IDENTITY = "verified"
+        sys.stderr.write("[phoenix] cys 채택(%s): %s — 3중 identity match(%s)\n" % (source_label, candidate, detail))
+        sys.stderr.flush()
+        return candidate
+    if status == "mismatch":
+        _resolve_die(socket, "cys(%s=%s) identity 3중 대조 불일치 — 불일치 필드=%s (%s). "
+                     "다른 빌드/팩/프로토콜 스큐 차단·exit 6." % (source_label, candidate, field, detail), 6)
+    # inconclusive
+    if not allow_inconclusive:
+        _resolve_die(socket, "cys(%s=%s) identity inconclusive(%s) — positive proof 요구 경로라 채택 거부·exit 6. "
+                     "PHOENIX_CYS 로 이 데몬과 동일 빌드의 cys 를 명시하라." % (source_label, candidate, field), 6)
+    _CYS_IDENTITY = "degraded-unverified"
+    _resolve_journal_mark(socket, "degraded",
+                          "cys(%s=%s) identity inconclusive(%s) — availability 위해 채택하되 '검증 통과' 아님"
+                          "(degraded-unverified 분리 보고)." % (source_label, candidate, field))
+    sys.stderr.write("[phoenix] ★degraded availability exception: cys(%s=%s) identity **unverified(degraded)** — "
+                     "재시도 후에도 inconclusive(%s). 채택하되 3중 대조 미완(검증 통과 아님).\n"
+                     % (source_label, candidate, field))
+    sys.stderr.flush()
+    return candidate
+
+
+def _resolve_journal_start(socket):
+    """★gemini major: _resolve_cys die 전에 저널 뼈대(ticket=resolve·타임스탬프·stage=resolve_cys)를 먼저
+    생성한다 — die 로 무단 종료해도 저널에 시도 이력이 남게 하는 관측 사각 제거. best-effort."""
+    try:
+        j = load_journal(socket, "resolve")
+        jevent(j, "*", "resolve_cys", "start", "cys 실행 경로 해석 시작")
+        save_journal(socket, "resolve", j)
+    except Exception:
+        pass
+
+
+def _resolve_journal_mark(socket, status, msg):
+    """resolve 저널에 이벤트 1건 기록(degraded 채택 등 — die 아닌 경로). best-effort."""
+    try:
+        j = load_journal(socket, "resolve")
+        jevent(j, "*", "resolve_cys", status, msg[:280])
+        save_journal(socket, "resolve", j)
+    except Exception:
+        pass
+
+
+def _resolve_die(socket, msg, code):
+    """★gemini major: resolve 실패를 저널에 기록한 뒤 die — 침묵사(저널 무이력 종료) 차단."""
+    try:
+        j = load_journal(socket, "resolve")
+        jevent(j, "*", "resolve_cys", "fail", msg[:280])
+        j.setdefault("resolve", {})["failed_at"] = _now()
+        save_journal(socket, "resolve", j)
+    except Exception:
+        pass
+    die(msg, code=code)
+
+
+def _resolve_cys(socket):
+    """cys 실행 경로 해석(§5-1 W1). 우선순위: PHOENIX_CYS > which('cys') > 표준경로 폴백.
+    ★리터럴 'cys' 최종 폴백은 제거됨 — PATH 미해석 침묵 통과가 FileNotFoundError→exit 1 침묵사 근원(2026-07-06).
+    ★gate2: 모든 실행 경로(PHOENIX_CYS·_which PATH·표준경로)에 3중 identity 계약을 적용한다 — 어느 경로든
+       mismatch=exit 6. inconclusive 정책만 경로별 차등:
+      · PHOENIX_CYS(명시)·_which PATH 후보 → X_OK + identity. inconclusive 는 재시도 후 degraded-unverified 로
+        채택(분리 보고) — 하네스·격리·비데몬 서브커맨드에서 데몬 미도달 inconclusive 가 정상 존재하므로.
+      · 표준경로 폴백(PATH·PHOENIX_CYS 모두 미해석) → positive proof 요구: **match 만** 채택(inconclusive=exit 6).
+      · PHOENIX_STRICT_CYS=1 / 하네스(--socket·PHOENIX_FORBID_LIVE) → 표준경로 폴백 자체 금지(미해석=exit 6).
+    실패·채택·degraded 전부 저널·stderr(→cysd phoenix-restore.log)에 기록한다."""
+    _resolve_journal_start(socket)
+    explicit = os.environ.get("PHOENIX_CYS")
+    if explicit:
+        if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
+            _resolve_die(socket, "PHOENIX_CYS(%s) 실행 불가(파일 부재/실행권한 없음) — 무검증 수용 금지·exit 6." % explicit, 6)
+        return _accept_with_identity(socket, explicit, "PHOENIX_CYS", allow_inconclusive=True)
+    found = _which("cys")
+    if found:
+        # ★gate2 fix 1(BLOCKING): PATH 후보도 identity gate 를 우회하지 않는다(과거엔 곧바로 return).
+        return _accept_with_identity(socket, found, "PATH(which)", allow_inconclusive=True)
+    # 여기부터 표준경로 폴백 — PATH·PHOENIX_CYS 모두 cys 미해석.
+    strict = os.environ.get("PHOENIX_STRICT_CYS") == "1"
+    harness = bool(socket) or os.environ.get("PHOENIX_FORBID_LIVE") == "1"
+    if strict:
+        _resolve_die(socket, "PHOENIX_STRICT_CYS=1 이나 cys 를 PHOENIX_CYS/PATH 로 해석하지 못했다 — 표준경로 폴백 "
+                     "금지(exit 6). Rust auto-restore 의 PHOENIX_CYS 주입이 누락됐을 수 있다(B3).", 6)
+    if harness:
+        _resolve_die(socket, "하네스 모드(--socket/PHOENIX_FORBID_LIVE)에서 cys 미해석 — 표준경로 폴백 금지"
+                     "(테스트 독립성·exit 6). 격리 실행은 PHOENIX_CYS 로 대상 cys 를 명시하라.", 6)
+    for c in _CYS_STD_PATHS:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            # 표준경로는 PATH-미해석 추측 후보 — positive proof(match) 요구(inconclusive 도 거부).
+            return _accept_with_identity(socket, c, "표준경로", allow_inconclusive=False)
+    _resolve_die(socket, "cys 실행 경로 미해석(PHOENIX_CYS·PATH·표준경로 %s 모두 실패) — 리터럴 폴백 제거됨"
+                 "(침묵사 방지·exit 6)." % _CYS_STD_PATHS, 6)
 
 
 def die(msg, code=2):
@@ -116,6 +343,23 @@ def die(msg, code=2):
 def log(msg):
     sys.stdout.write("[phoenix] %s\n" % msg)
     sys.stdout.flush()
+
+
+def _emit_evt(evt_type, **fields):
+    """★C2/C3(W3): 구조화 이벤트를 HUD·음성 버스로 best-effort 방출(EVENT_CONTRACT v2·형제 javis_event.py).
+    손상 escalation·설명불가 축소 거부 등 운영자 가시성이 필요한 사건 전용. 절대 restore 판정을 죽이지 않는다
+    (버스 미도달·도구 부재는 조용히 무시하되, 사건 자체는 호출측이 log()/저널로도 남긴다=이중 기록)."""
+    mod = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_event.py")
+    if not os.path.exists(mod):
+        return False
+    cmd = [sys.executable, mod, "emit", evt_type]
+    for k, v in fields.items():
+        cmd += ["--field", "%s=%s" % (k, v)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        return r.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
 
 
 _SNAP_MOD = None
@@ -186,7 +430,13 @@ def _run_capture(cmd, env, timeout):
     ef = tempfile.TemporaryFile()
     r = _CapR()
     try:
-        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=of, stderr=ef, env=env)
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=of, stderr=ef, env=env)
+        except (FileNotFoundError, OSError) as e:
+            # ★codex major(Windows 대칭): cys.exe 미해석/실행불가 → 비구조화 crash 대신 구조화 실패(rc=127).
+            r.returncode = 127
+            r.stderr = "cys 실행 불가(%s: %s) cmd=%r" % (type(e).__name__, e, cmd)
+            return r
         try:
             p.wait(timeout=timeout)
             r.returncode = p.returncode
@@ -229,6 +479,14 @@ def cys(*args, socket=None, timeout=25):
             stdout = (e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")) if e.stdout else ""
             stderr = "TIMEOUT %ss" % timeout
         return _R()
+    except (FileNotFoundError, OSError) as e:
+        # ★codex major: CYS 해석 후에도 파일이 사라지거나 실행 불가면 여기서 비구조화 exit 1 crash 가 났다.
+        #   구조화 실패(rc=127)로 강등해 상위 판정(스폰 실패→INCOMPLETE 등)이 정직히 흐르게 한다.
+        class _R:
+            returncode = 127
+            stdout = ""
+            stderr = "cys 실행 불가(%s: %s) cmd=%r" % (type(e).__name__, e, cmd)
+        return _R()
 
 
 def get_boot_epoch(socket):
@@ -248,16 +506,24 @@ def get_boot_epoch(socket):
     return "sa:%s" % sa
 
 
-def _atomic_write_json(path, obj):
+def _atomic_write_json(path, obj, keep_bak=False):
     """tmp+fsync+replace+dir fsync — javis_state_snapshot 과 동일한 원자성 규약.
     ★os.replace(os.rename 아님): 대상이 이미 존재해도 원자적 덮어쓰기. POSIX는 rename과 동일 동작(mac 무변경)이고
-    Windows는 os.rename 이 대상 존재 시 FileExistsError 로 죽어(저널은 반복 갱신됨) 반드시 replace 여야 한다."""
+    Windows는 os.rename 이 대상 존재 시 FileExistsError 로 죽어(저널은 반복 갱신됨) 반드시 replace 여야 한다.
+    ★C2(W3): keep_bak=True 면 새 내용으로 덮기 **직전**에 현재 유효본을 `<path>.bak` 으로 보존한다 —
+    손상 폴백 체인의 '직전 유효본' 소스. 현재 파일이 손상(파싱 실패)이면 백업하지 않는다(손상 전파 차단)."""
     d = os.path.dirname(path)
     tmp = os.path.join(d, ".tmp-%d-%s" % (os.getpid(), os.path.basename(path)))
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=1)
         f.flush()
         os.fsync(f.fileno())
+    if keep_bak and os.path.exists(path):
+        try:
+            if _roster_file_status(path) == "valid":  # 유효본만 .bak 으로 승격(손상 백업 금지)
+                shutil.copy2(path, path + ".bak")
+        except Exception:
+            pass
     os.replace(tmp, path)
     try:
         dfd = os.open(d, os.O_RDONLY)
@@ -288,6 +554,20 @@ def read_topology(socket):
 #   desired는 관측으로만 늘고, ★tombstone(의도적 폐역)으로만 준다 — transient 사망으로 줄지 않는다.
 #   죽은 역할 판정 = desired − 현재 생존. topology 침식과 무관해진다.
 
+def _roster_file_status(path):
+    """★C2 sentinel(W4 게이트): 상태파일 3분류 — 부재='missing'(fresh install 정상)·파싱성공='valid'·
+    파싱실패='corrupt'. corrupt 를 missing 과 **구분**해, 손상 desired 가 빈 상태(fresh)로 위장해 통과하는
+    silent-empty 를 차단하는 근거를 제공한다(현행 load_* 는 corrupt 를 missing 과 동일 빈집합 처리 — 그 구멍)."""
+    if not os.path.exists(path):
+        return "missing"
+    try:
+        with open(path) as f:
+            json.load(f)
+        return "valid"
+    except Exception:
+        return "corrupt"
+
+
 def desired_roster_path(socket):
     return os.path.join(phoenix_home(socket), "desired_roster.json")
 
@@ -299,7 +579,8 @@ def load_desired_roster(socket):
             d = json.load(open(p))
             return d.get("roster", {}), set(d.get("tombstones", []))
         except Exception:
-            pass
+            # ★C2: 손상은 침묵 빈집합이 아니라 로그(sentinel 이 run_restore 진입에서 부활 차단). 전체 복원 체인=W3.
+            log("★C2 경고: desired_roster 파싱 실패(손상) — %s (빈 상태 반환은 run_restore sentinel 이 차단)" % p)
     return {}, set()
 
 
@@ -314,7 +595,11 @@ def _snapshot_roster_entries(socket):
         gens = sorted(g for g in os.listdir(gen_root) if re.match(r"\d{8}T\d{6}Z", g))
     except Exception:
         return {}
-    for g in reversed(gens):  # 최신 세대부터
+    # ★E3 주의(gemini W6): 여기는 단일 '최신 세대' 선택(heal 소스)이라 GC 처럼 union 보호가 불가능하다.
+    #   mtime max 를 쓰면 cp/touch 오염 세대가 '최신'으로 오선택돼 stale topology 로 heal 할 위험이 있어,
+    #   명목(이름) 기준을 유지한다(best-effort 소스 — 데이터 손실 아님). P2-5 의 실질 수리(오삭제 방어)는
+    #   compute_gc 의 명목∪실효 union 이 담당한다.
+    for g in reversed(gens):  # 이름(명목) 최신 세대부터
         tp = os.path.join(gen_root, g, "topology.json")
         if os.path.exists(tp):
             try:
@@ -325,37 +610,453 @@ def _snapshot_roster_entries(socket):
     return {}
 
 
-def observe_and_persist_roster(socket):
-    """현재 관측(topology + 세대 스냅샷)을 desired 로스터에 단조 병합·영속하고 (roster, tombstones) 반환.
-    ★침식 전에 호출되면 전 역할이 박제된다 — 이후 topology가 줄어도 desired는 보존된다."""
-    roster, tombstones = load_desired_roster(socket)
-    topo = read_topology(socket)
-    # ★W2a 좀비 차단: 데몬 소유 topology.json의 tombstones(surface.close 경유 의도삭제)를 desired
-    #   tombstones로 병합한다. 데몬이 유일 작성자(이중 작성자 금지 — phoenix는 desired_roster.json에만,
-    #   데몬은 topology.json에만 쓴다). 병합된 역할은 아래 pop 루프로 roster에서 제외 → entries/need/
-    #   fresh-fallback 대상에서 자동 배제(기존 소비 로직 그대로 활용). 구 topology(필드 부재)=무병합.
-    for t in topo.get("tombstones", []):
-        if isinstance(t, str):
-            tombstones.add(t)
-    # 우선순위: 기존 desired < 세대 스냅샷 < 현재 topology (최신 관측이 메타를 갱신)
-    for role, e in _snapshot_roster_entries(socket).items():
-        roster[role] = e
-    for e in topo.get("entries", []):
-        if e.get("role"):
-            roster[e["role"]] = e
-    # ★Phase 7: 라이브 role 직접 병합 — claim-role 즉시 자동 등재(topology 영속 지연/침식 무관).
-    #   '태어날 때부터 보호': 역할이 살아있는 순간 보호집합에 편입된다. 이미 있으면 갱신 안 함(topology 엔트리 우선).
-    for role, _surfs in live_role_surfaces(socket).items():
-        if role and role != "-":
-            roster.setdefault(role, {"role": role})
-    # tombstone된 역할은 desired에서 제외(의도적 폐역)
-    for t in tombstones:
-        roster.pop(t, None)
+def _snapshot_tombstones(socket):
+    """직전 세대 스냅샷 topology.json 의 tombstones 필드(옵션A: 데몬이 여기에 묘비를 영속) — desired 손상 시
+    묘비 복원 소스. 라이브 대상일 때만 유효(격리 하네스는 자기 topology 만). 반환 set|None(스냅샷 부재)."""
+    if state_dir_for(socket) != LIVE_STATE:
+        return None
+    gen_root = os.path.join(HOME, ".cys", "state-generations")
     try:
-        _atomic_write_json(desired_roster_path(socket),
-                           {"roster": roster, "tombstones": sorted(tombstones), "updated_at": _now()})
+        gens = sorted(g for g in os.listdir(gen_root) if re.match(r"\d{8}T\d{6}Z", g))
+    except Exception:
+        return None
+    for g in reversed(gens):  # 명목 최신 세대부터(_snapshot_roster_entries 와 동일 규약)
+        tp = os.path.join(gen_root, g, "topology.json")
+        if os.path.exists(tp):
+            try:
+                t = json.load(open(tp))
+                return set(x for x in t.get("tombstones", []) if isinstance(x, str))
+            except Exception:
+                continue
+    return None
+
+
+# ---------------- C2(W3): 손상 격리 + 폴백 체인 ----------------
+# retention-critical(desired/dept) 파일이 파싱 실패(손상)면 침묵 빈-empty 통과 금지(W4 sentinel). W3 는 그 위에
+# 완전한 복원 체인을 얹는다: .corrupt-<ts> 로 격리(최근 3개만·inode DoS 차단) → .bak(직전 유효본) → 세대 스냅샷 →
+# 전부 불가면 unrecoverable(exit 6). 폴백으로 복원되면 degraded(묘비 불확실 → 부활 보류+escalation, fail-safe).
+
+def _isolate_corrupt(path):
+    """손상 파일을 `<path>.corrupt-<ts>` 로 격리(원본 자리 비움) 후 최근 3개만 유지·초과 prune(inode DoS 차단).
+    반환: 격리된 경로(str)|None(격리 실패)."""
+    ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + "-%06d" % (int(time.time() * 1e6) % 1000000)
+    dst = "%s.corrupt-%s" % (path, ts)
+    isolated = None
+    try:
+        os.replace(path, dst)  # 손상 원본을 자리에서 치워 다음 로드가 폴백/빈 상태로 가게
+        isolated = dst
+    except Exception:
+        isolated = None
+    _prune_corrupt(path, keep=3)
+    return isolated
+
+
+def _prune_corrupt(path, keep=3):
+    """`<path>.corrupt-*` 격리본을 최근 keep 개만 남기고 오래된 것 제거(이름=시각순 정렬 규약)."""
+    d = os.path.dirname(path) or "."
+    prefix = os.path.basename(path) + ".corrupt-"
+    try:
+        cands = sorted(f for f in os.listdir(d) if f.startswith(prefix))
+    except OSError:
+        return
+    for f in cands[:-keep] if len(cands) > keep else []:
+        try:
+            os.remove(os.path.join(d, f))
+        except OSError:
+            pass
+
+
+def _recovered_provenance(path):
+    """복구본에 영속된 degraded provenance(`recovered_from`)를 읽는다 — 있으면 dict{source,ts}, 없으면 None.
+    ★codex W3 BLOCKING: 이 필드가 존재하는 한(파일이 유효 JSON 이어도) 부활 보류가 유지된다 — degraded 가
+    복구 1회로 휘발하지 않고 auto-retry 전반에 걸쳐 영속(fail-safe). 해제=검증된-건강 topology replace 또는 --rebase."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        rf = d.get("recovered_from")
+        return rf if isinstance(rf, dict) else None
+    except Exception:
+        return None
+
+
+def _write_recovered(path, obj, source):
+    """복구본을 provenance(`recovered_from`)와 함께 원자적으로 쓴다 — degraded 영속의 단일 지점."""
+    obj = dict(obj)
+    obj["recovered_from"] = {"source": source, "ts": _now()}
+    obj.setdefault("updated_at", _now())
+    _atomic_write_json(path, obj, keep_bak=False)
+
+
+def _recover_retention_file(socket, path, kind):
+    """retention-critical 파일 상태를 판정하고, 손상이면 폴백 체인으로 복원한다(복원분을 path 에 되써 후속
+    load_* 가 정상 읽게 한다). ★codex W3 BLOCKING: 복구본에 `recovered_from` provenance 를 영속해 degraded
+    부활 보류가 1회로 휘발하지 않게 한다(다음 auto-retry 도 동일 hold). 반환 dict:
+      · {'status':'valid'}              정상(provenance 없음)
+      · {'status':'missing'}            부재(fresh install 정상 — hard-fail 아님)
+      · {'status':'degraded','source':..,'isolated':..,'pending':bool}  손상→폴백 복원 또는 valid+provenance(보류 유지)
+      · {'status':'unrecoverable','isolated':..}          손상→전 폴백 실패(exit 6)"""
+    st = _roster_file_status(path)
+    if st == "missing":
+        return {"status": "missing"}
+    if st == "valid":
+        # ★영속된 degraded: 유효 JSON 이어도 provenance 가 있으면 아직 보류 상태(전 auto-retry 지속).
+        prov = _recovered_provenance(path)
+        if prov:
+            return {"status": "degraded", "source": prov.get("source"), "pending": True, "isolated": None}
+        return {"status": "valid"}
+    # corrupt — 격리 후 폴백 체인
+    isolated = _isolate_corrupt(path)
+    bak = path + ".bak"
+    if _roster_file_status(bak) == "valid":
+        try:
+            with open(bak, encoding="utf-8") as f:
+                bak_obj = json.load(f)
+            _write_recovered(path, bak_obj, "bak")
+            return {"status": "degraded", "source": "bak", "isolated": isolated}
+        except Exception:
+            pass
+    if kind == "desired_roster":
+        snap_r = _snapshot_roster_entries(socket)
+        snap_t = _snapshot_tombstones(socket)
+        if snap_r or snap_t:
+            try:
+                _write_recovered(path, {"roster": snap_r, "tombstones": sorted(snap_t or [])}, "snapshot")
+                return {"status": "degraded", "source": "snapshot", "isolated": isolated}
+            except Exception:
+                pass
+    elif kind == "dept_roster":
+        # 부서는 glob(cys-dept-*)∪registry 로 재발견 가능(discover_depts) — 빈 상태로 복원하면 observe 가 roster 를
+        #   재구성한다. 단 묘비는 스냅샷 소스가 없어 소실 → degraded(부활 보류). '전부 불가' 아님(재발견 경로 존재).
+        try:
+            _write_recovered(path, {"roster": {}, "tombstones": []}, "discovery")
+            return {"status": "degraded", "source": "discovery", "isolated": isolated}
+        except Exception:
+            pass
+    return {"status": "unrecoverable", "isolated": isolated}
+
+
+# ---------------- A-S3 tombstone intent 저널 (다운타임 폴백) ----------------
+# 데몬이 topology 묘비 유일 작성자(옵션A). CLI 폐역은 데몬 RPC 경유가 정석이나, 데몬 다운타임엔 append-only
+# intent 저널에 기록하고 observe 가 replace **이전** 멱등 적용 → 데몬 복귀 후 RPC 재동기 → **갱신 rev 담긴
+# topology.json 디스크 영속을 phoenix 가 로드 확인한 후에만 절단**(gemini R3: RPC 응답 시점 절단 금지·TOCTOU).
+
+def _intent_journal_path(socket):
+    return os.path.join(phoenix_home(socket), "tombstone-intents.jsonl")
+
+
+def _append_tombstone_intent(socket, role, remove):
+    """다운타임 폴백 — intent 를 append-only jsonl 에 배타 락으로 기록(C2 정책: 원자 append·부분절단 내성).
+    ★D2(W5): 락을 unix flock·Windows msvcrt 통합(_try_lock_nb, best-effort NB) — 과거 Windows 무락(P1-8)을
+    제거. 락 실패해도 단문 append(원자성)·corrupt-line-skip 내성으로 진행(가용성). a+ 로 열어 Windows msvcrt
+    byte0 락 영역이 프로세스 간 일치하게 한다(write 는 append 모드라 end 로 간다)."""
+    p = _intent_journal_path(socket)
+    line = json.dumps({"op": "remove" if remove else "add", "role": role, "ts": _now()}, ensure_ascii=False)
+    try:
+        with open(p, "a+", encoding="utf-8") as f:
+            _try_lock_nb(f)  # best-effort 배타 락(unix flock·Windows msvcrt.locking) — 실패해도 append 진행
+            f.write(line + "\n")
     except Exception:
         pass
+
+
+def _read_tombstone_intents(socket):
+    """intent jsonl 파싱 → [{op, role, ts}]. 손상 라인은 skip(부분절단·조작 내성)."""
+    p = _intent_journal_path(socket)
+    out = []
+    if os.path.exists(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        out.append(json.loads(ln))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    return out
+
+
+def _apply_intents_to_tombstones(intents, tombstones):
+    """intent 를 기록 순서대로 tombstones 집합에 멱등 적용(add→추가·remove→제거)."""
+    for it in intents:
+        role = it.get("role")
+        if not role:
+            continue
+        if it.get("op") == "remove":
+            tombstones.discard(role)
+        else:
+            tombstones.add(role)
+    return tombstones
+
+
+def _truncate_tombstone_intents(socket):
+    """intent 저널 절단(소화 완료). ★gemini R3: 호출측이 topology.json 디스크 영속(갱신 rev·묘비 반영) 확인 후에만."""
+    p = _intent_journal_path(socket)
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+
+def _resync_intents_if_daemon_up(socket, intents):
+    """★A-S3: 데몬 복귀 시 미소화 intent 를 RPC(cys tombstone) 로 재동기하고, topology.json 을 다시 로드해
+    intent 효과가 **디스크에 영속**(add 역할이 topology 묘비에 존재·remove 역할이 부재)됐음을 확인한 후에만
+    절단한다(gemini R3 TOCTOU: RPC 응답 직후 데몬이 topology 영속 전 크래시하면 묘비 소실 — 그 전에 절단 금지).
+    반환: True(절단됨)/False(보류)."""
+    if not intents:
+        return False
+    for it in intents:
+        role = it.get("role")
+        if not role:
+            continue
+        args = ["tombstone", role]
+        if it.get("op") == "remove":
+            args.append("--remove")
+        r = cys(*args, socket=socket, timeout=12)
+        if getattr(r, "returncode", 1) != 0:
+            return False  # 데몬 미도달/RPC 실패 — 다음 observe 에서 재시도(절단 보류)
+    # ★영속 확인: topology.json 재로드 → intent 효과가 디스크에 반영됐는지.
+    topo2 = read_topology(socket)
+    if "_error" in topo2 or "schema_version" not in topo2:
+        return False  # 손상/legacy — 확인 불가, 절단 보류
+    topo_tombs = set(t for t in topo2.get("tombstones", []) if isinstance(t, str))
+    for it in intents:
+        role = it.get("role")
+        if not role:
+            continue
+        if it.get("op") == "remove" and role in topo_tombs:
+            return False  # remove 미반영
+        if it.get("op") != "remove" and role not in topo_tombs:
+            return False  # add 미반영
+    _truncate_tombstone_intents(socket)  # 디스크 영속 확인 완료 → 절단
+    return True
+
+
+def _ephemeral_verdict(role, entry=None):
+    """★P2-1 legacy migration 결정표(codex W2 minor): 세 판정 반환.
+    · 'ephemeral' = 명백한 일회성 → quarantine(부활 대상 제외·엔트리 제거). 근거: source 플래그
+      (source∈{fresh,ephemeral}·데몬 기록) 또는 이름의 '-fresh-' **부분문자열**(worker-fresh-<epoch> 등).
+    · 'ambiguous' = 비표준 변형('fresh' 포함하나 '-fresh-' 패턴 아님) → 부활 보류 + escalation(사람 판단).
+    · 'normal' = metadata 無 비-fresh → 보존·정상 부활(오판 금지)."""
+    e = entry or {}
+    if e.get("source") in ("fresh", "ephemeral"):
+        return "ephemeral"
+    r = str(role or "")
+    if "-fresh-" in r:
+        return "ephemeral"
+    if "fresh" in r.lower():
+        return "ambiguous"
+    return "normal"
+
+
+def _is_ephemeral_role(role, entry=None):
+    """★P2-1: 명백한 ephemeral(quarantine 대상)인가. ambiguous/normal 은 False(관측 병합 단계 제외 판정용)."""
+    return _ephemeral_verdict(role, entry) == "ephemeral"
+
+
+def _try_lock_nb(f):
+    """★D2(W5): 비차단 배타 락 1회 시도(unix·Windows 통합). 반환 True(획득)·False(다른 보유)·None(락 기구
+    미가용=fail-open). unix=fcntl.flock(LOCK_EX|NB) · Windows=msvcrt.locking(LK_NBLCK, byte0). 둘 다 프로세스
+    사망 시 OS 가 자동 해제(stale lock 없음). Windows 는 seek(0)로 동일 바이트 영역을 잠가 상호배제를 보장한다."""
+    if IS_WINDOWS:
+        try:
+            import msvcrt
+        except Exception:
+            return None
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False          # 다른 프로세스가 byte0 보유 — 경합
+        except Exception:
+            return None           # 예기치 못한 실패 → fail-open
+    try:
+        import fcntl
+    except Exception:
+        return None
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return None
+
+
+def _acquire_roster_lock(socket, tag="roster", tries=40, sleep=0.05):
+    """★P1-7(W3): desired/dept read-modify-write 직렬화 lock. reconcile·roster·inherit·restore 가 동시에
+    desired/dept 를 RMW 하면 lost update 가 난다 — `<phoenix_home>/<tag>.lock` 에 비차단 배타 락을 tries×sleep
+    동안 재시도해 직렬화한다. ★D2(W5): unix flock·Windows msvcrt 통합(_try_lock_nb) — 과거 Windows fail-open
+    (P1-8)을 제거. 끝내 못 잡거나 락 기구 미가용이면 fail-open(핸들 보유·경고) — 무한 블록/행 금지. 반환 handle|None."""
+    try:
+        p = os.path.join(phoenix_home(socket), "%s.lock" % tag)
+        f = open(p, "a+")  # 무truncate·생성·byte0 락 대상(Windows msvcrt 영역 일치)
+    except Exception:
+        return None
+    for _ in range(max(1, tries)):
+        r = _try_lock_nb(f)
+        if r is True:
+            return f
+        if r is None:
+            return f  # 락 기구 미가용 → fail-open(가용성)
+        time.sleep(sleep)  # r is False(다른 보유) → 재시도
+    log("★P1-7: roster RMW lock(%s) 확보 실패(경합 지속) — fail-open 진행(가용성)." % tag)
+    return f  # 못 잡아도 핸들 보유(fail-open·무한 블록 금지)
+
+
+def observe_and_persist_roster(socket, rebase=False):
+    """desired 로스터 관측·영속의 공개 진입점. ★P1-7(W3): RMW 를 roster.lock flock 으로 직렬화(lost update 차단)."""
+    _lock = _acquire_roster_lock(socket, "roster")
+    try:
+        return _observe_and_persist_roster_locked(socket, rebase)
+    finally:
+        _release_lease(_lock)
+
+
+def _observe_and_persist_roster_locked(socket, rebase=False):
+    """현재 관측(topology + 세대 스냅샷)을 desired 로스터에 영속하고 (roster, tombstones) 반환.
+    ★C3(W3): rebase=True 면 '설명-가능-축소 불변식'을 1회 우회해 현재 관측을 강제 수용한다(운영자 `phoenix
+    roster --rebase` 전용 — 정당한 축소로 판단한 사람이 교착을 푸는 경로).
+    ★W2 옵션A(A-S1): 데몬 topology.json = 묘비 유일 진실. desired 묘비 = 미러(조건부 replace). 데몬의
+    claim/create 해제(topology 묘비 감소)가 자동으로 desired 에 흘러 제3겹(수동 tombstone --remove 불요)이 소멸한다.
+    replace 게이트: 파싱 성공 + schema_version 마커 실존 + tombstones_rev ≥ 마지막으로 본 rev. 역행은 gemini R3
+    rebase(epoch 변경/rev=0)로만 허용하고, 정당근거 없는 역행(부분절단·조작)은 replace 생략+desired 보존. legacy
+    (마커 부재)는 add-merge 유지+경고+부활 정상 진행. 손상(파싱 실패)은 replace 생략(전체 폴백은 W3/governance)."""
+    roster, tombstones = load_desired_roster(socket)
+    # 이전에 본 rev/epoch(desired_roster.json) — A-S1 조건부 replace 판정 기준.
+    prev = {}
+    try:
+        _dp = desired_roster_path(socket)
+        if os.path.exists(_dp):
+            prev = json.load(open(_dp))
+    except Exception:
+        prev = {}
+    last_seen_rev = prev.get("tombstones_rev")
+    last_seen_epoch = prev.get("daemon_epoch")
+    cur_epoch = _ACTIVE_EPOCH if _ACTIVE_EPOCH is not None else get_boot_epoch(socket)
+    # ★A-S2: 태그 = 가변 소켓 경로가 아니라 canonical state dir(실경로) — 하네스 임시 소켓의 태그 불일치 DoS 회피
+    #   (gemini R2). desired 파일이 다른 state dir 에서 복사/이동돼 온 이물(태그 불일치)이면 write 를 거부해
+    #   교차오염을 막는다(파일은 늘 state_dir_for(socket) 하위이므로 정상 경로는 항상 일치·edge 방어).
+    cur_tag = os.path.realpath(state_dir_for(socket))
+    _foreign = bool(prev.get("state_dir_tag")) and prev.get("state_dir_tag") != cur_tag
+    if _foreign:
+        log("★A-S2: desired_roster 의 state_dir_tag(%s)가 현재 canonical(%s)과 불일치 — 이물 파일, write 거부(교차오염 차단)."
+            % (prev.get("state_dir_tag"), cur_tag))
+
+    # ★A-S3: 데몬 복귀 시 미소화 intent 를 RPC 재동기·topology 디스크 영속 확인 후에만 절단(gemini R3 TOCTOU).
+    #   재동기 전에 intent 를 읽어둔다 — 절단됐으면 이후 replace 는 topology(이미 반영)만 보면 되고,
+    #   절단 보류면 아래에서 replace 결과에 intent 를 멱등 재적용(다운타임 CLI 폐역이 즉시 반영되게).
+    _intents = _read_tombstone_intents(socket)
+    _intents_truncated = _resync_intents_if_daemon_up(socket, _intents)
+
+    topo = read_topology(socket)
+    has_marker = "schema_version" in topo               # A-S1 마커(신 데몬)
+    topo_rev = topo.get("tombstones_rev")
+    topo_tombs = set(t for t in topo.get("tombstones", []) if isinstance(t, str))
+    new_rev = last_seen_rev
+
+    # ★codex W3 BLOCKING(2): degraded provenance 해제 판정 — 검증된-건강 topology replace(rev 마커 확정)가
+    #   묘비 집합을 확정하는 시점에만 True. 그때 복구본의 recovered_from 을 제거(부활 보류 자동 해제).
+    _healthy_replace = False
+    # ★버그 수정: A-S1 rev-rollback rebase 는 함수 파라미터 rebase(운영자 --rebase)와 **별개 개념**이다 —
+    #   지역명을 _rev_rebase 로 분리한다(과거 동명 재대입이 has_marker 경로에서 운영자 rebase 를 무력화했음).
+    if "_error" in topo:
+        # 손상 topology → replace 금지(desired 보존). 전체 폴백 체인(.bak·스냅샷·degraded)은 W3/governance(P0-3).
+        log("★A-S1: topology 손상(%s) — 묘비 replace 생략, desired 보존." % topo.get("_error"))
+    elif has_marker and topo_rev is not None:
+        _rev_rebase = False
+        if last_seen_rev is not None and topo_rev < last_seen_rev:
+            # 역행 — gemini R3: epoch 변경 또는 rev=0(리셋/fresh install/.bak) 만 정당한 rebase.
+            if topo_rev == 0 or (cur_epoch is not None and cur_epoch != last_seen_epoch):
+                _rev_rebase = True
+        if last_seen_rev is None or topo_rev >= last_seen_rev or _rev_rebase:
+            # ★옵션A 조건부 replace: 데몬 topology 묘비를 desired 에 **그대로 대입**(add-merge 아님).
+            #   데몬 해제가 자동 반영 → 제3겹 소멸. rebase 시엔 정당한 역행을 손상으로 오판하지 않는다.
+            tombstones = set(topo_tombs)
+            new_rev = topo_rev
+            _healthy_replace = True  # 건강 데몬이 묘비 집합 확정 → degraded provenance 해제 근거
+            if _rev_rebase:
+                log("★A-S1 rebase: topology rev 정당 역행(%s<%s·epoch변경/rev0) — 강제 rebase 후 replace."
+                    % (topo_rev, last_seen_rev))
+        else:
+            log("★A-S1: topology rev 역행(%s<%s·정당근거 없음) — replace 생략, desired 보존(부분절단/조작 의심)."
+                % (topo_rev, last_seen_rev))
+    else:
+        # legacy topology(마커 부재)=손상 아님 → 조건부 replace 생략·add-merge 하위호환·경고·부활 정상 진행.
+        for t in topo_tombs:
+            tombstones.add(t)
+        log("★A-S1: legacy topology(schema_version 부재) — 조건부 replace 생략, add-merge 유지·부활 정상 진행.")
+
+    # ★A-S3: 미절단(=데몬이 아직 소화 못한) intent 를 replace 결과에 멱등 재적용 — 다운타임 CLI 폐역/해제가
+    #   데몬 복귀·영속 확인 전에도 즉시 반영되게(절단됐으면 topology 에 이미 반영돼 재적용 무해).
+    if _intents and not _intents_truncated:
+        _apply_intents_to_tombstones(_intents, tombstones)
+
+    # 우선순위: 기존 desired < 세대 스냅샷 < 현재 topology (최신 관측이 메타를 갱신). ★P2-1: ephemeral 제외(미래 유입 차단).
+    for role, e in _snapshot_roster_entries(socket).items():
+        if not _is_ephemeral_role(role, e):
+            roster[role] = e
+    for e in topo.get("entries", []):
+        if e.get("role") and not _is_ephemeral_role(e["role"], e):
+            roster[e["role"]] = e
+    # ★Phase 7: 라이브 role 직접 병합 — claim-role 즉시 자동 등재(topology 영속 지연/침식 무관).
+    for role, _surfs in live_role_surfaces(socket).items():
+        if role and role != "-" and not _is_ephemeral_role(role):
+            roster.setdefault(role, {"role": role})
+    # ★P2-1 legacy 마이그레이션 결정표(codex W2): ephemeral=quarantine(엔트리 제거·일회성) · ambiguous=부활 보류+
+    #   escalation(엔트리 보존·tombstones 로 target 제외해 사람 판단까지 부활 안 함·untomb 로 재편입 가능).
+    for role in list(roster.keys()):
+        v = _ephemeral_verdict(role, roster.get(role))
+        if v == "ephemeral":
+            roster.pop(role, None)
+        elif v == "ambiguous":
+            tombstones.add(role)  # 부활 보류(엔트리 보존·target 제외)
+            log("★P2-1 escalation: 비표준 ephemeral 변형(%s) 판정 애매 — 부활 보류(사람 판단·untomb 로 재편입)." % role)
+    # ★codex W2 BLOCKING: 묘비 역할의 **roster 엔트리는 보존**한다(pop 금지). 배제는 부활 target 산정 시점에
+    #   tombstones 대조로 수행(run_restore·cmd_reconcile). 엔트리·메타(session/cwd/agent)가 남아 있어야 데몬이
+    #   묘비를 해제(untomb)하면 즉시 부활 가능하다 — 과거 pop 은 untomb 를 무의미하게 만드는 함정(false-green).
+    #   ※ 기존 desired 파일에 이미 pop 된 역할은 세대 스냅샷·live 병합이 자연 치유한다(신규 의미론은 전향 적용).
+    # ★C3 설명-가능-축소 불변식(W3): desired 는 관측으로만 늘고 묘비(OwnerClose)·ephemeral 로만 준다. 직전
+    #   영속본 대비 '설명되지 않는 축소'(사라진 역할이 tombstone 도 ephemeral 도 아님)는 손상/조작/버그 신호다 —
+    #   영구 교착 대신 이 write 1회 거부(직전 상태 보존)+EVT/저널 escalation → 다음 관측 사이클이 재평가한다
+    #   (gemini R2 TOCTOU: 데몬의 엔트리 제거↔묘비 등록 지연이 만든 오판은 1사이클 유예로 자연 해소). 정당한 축소는
+    #   운영자 `phoenix roster --rebase`(rebase=True)로 강제 수용.
+    _prev_roster = prev.get("roster") or {}
+    _lost = set(_prev_roster.keys()) - set(roster.keys())
+    _unexplained = sorted(r for r in _lost
+                          if r not in tombstones
+                          and _ephemeral_verdict(r, _prev_roster.get(r)) != "ephemeral")
+    if _unexplained and not rebase and not _foreign:
+        log("★C3 설명불가 축소 거부: 직전 대비 사라진 역할 %s 이 묘비·ephemeral 로 설명 안 됨 — 이 write 1회 "
+            "거부(직전 상태 보존·다음 사이클 재평가). 정당하면 `phoenix roster --rebase`." % _unexplained)
+        _emit_evt("agent.error", agent="phoenix",
+                  summary="C3 설명불가 desired 축소 거부(%s) — write 보류, --rebase 로 수용" % _unexplained)
+        # 직전 영속본을 그대로 반환(축소를 확정하지 않음) — 다운스트림(target 산정)이 좋은 이전 상태를 쓴다.
+        return dict(_prev_roster), set(t for t in (prev.get("tombstones") or []) if isinstance(t, str))
+    # ★A-S2: 이물(state_dir_tag 불일치) 파일이면 write 거부 — 교차오염 차단. 정상 경로는 태그를 기록해 영속.
+    #   ★C2(W3): keep_bak=True 로 직전 유효본을 .bak 에 보존(손상 폴백 소스). 쓰기 실패는 침묵(except:pass) 금지 →
+    #   log+EVT(P2-8: 영속 실패 무보고 차단).
+    if not _foreign:
+        _out = {"roster": roster, "tombstones": sorted(tombstones),
+                "tombstones_rev": new_rev, "daemon_epoch": cur_epoch,
+                "state_dir_tag": cur_tag, "updated_at": _now()}
+        # ★codex W3 BLOCKING(1): degraded provenance 영속 — 복구본의 recovered_from 을 다음 write 로 이월해
+        #   부활 보류가 auto-retry 전반에 지속되게 한다. 해제 조건: 검증된-건강 topology replace(_healthy_replace)
+        #   또는 운영자 --rebase(rebase) — 그때만 provenance 를 떨궈 정상 복귀. 그 외에는 계속 보류(fail-safe).
+        _prev_prov = prev.get("recovered_from")
+        if isinstance(_prev_prov, dict) and not _healthy_replace and not rebase:
+            _out["recovered_from"] = _prev_prov
+        try:
+            _atomic_write_json(desired_roster_path(socket), _out, keep_bak=True)
+        except Exception as _e:
+            log("★C3/P2-8: desired_roster 원자쓰기 실패(%s: %s) — 침묵 삼킴 금지, escalation." % (type(_e).__name__, _e))
+            _emit_evt("agent.error", agent="phoenix",
+                      summary="desired_roster 영속 실패(%s) — 상태 갱신 미반영" % type(_e).__name__)
     return roster, tombstones
 
 
@@ -416,34 +1117,128 @@ def load_dept_roster(socket):
     return {}, set()
 
 
-def observe_and_persist_depts(socket):
+def observe_and_persist_depts(socket, rebase=False):
     """발견된 부서를 dept_roster 에 단조 병합·영속(침식 면역). (roster, tombstones) 반환.
-    ★phoenix 소유 dept_roster.json 에만 쓴다 — 실 depts.json 무접촉. tombstone 된 부서는 제외(의도적 폐역)."""
+    ★phoenix 소유 dept_roster.json 에만 쓴다 — 실 depts.json 무접촉. tombstone 된 부서는 제외(의도적 폐역).
+    ★P1-7(W3): dept RMW 도 dept.lock flock 으로 직렬화(lost update 차단·role 경로와 대칭).
+    ★C2(W3): rebase=True 면 degraded provenance(recovered_from) 를 제거해 부활 보류를 해제(운영자 --rebase)."""
+    _lock = _acquire_roster_lock(socket, "dept")
+    try:
+        return _observe_and_persist_depts_locked(socket, rebase)
+    finally:
+        _release_lease(_lock)
+
+
+def _observe_and_persist_depts_locked(socket, rebase=False):
     roster, tombstones = load_dept_roster(socket)
+    # ★codex W3 BLOCKING(1): dept degraded provenance 이월 — 손상 복구 후 부활 보류가 auto-retry 전반 지속.
+    #   dept 는 topology 건강-replace 경로가 없으므로(glob 재발견) 해제=운영자 --rebase 만(fail-safe 기본).
+    _prev_prov = None
+    try:
+        _dp = dept_roster_path(socket)
+        if os.path.exists(_dp):
+            _prev_prov = json.load(open(_dp)).get("recovered_from")
+    except Exception:
+        _prev_prov = None
     for dept, info in discover_depts().items():
         cur = roster.get(dept, {})
         cur.update(info)
         roster[dept] = cur
-    for t in tombstones:
-        roster.pop(t, None)
+    # ★codex W2 BLOCKING(dept 동형): 묘비 부서의 roster 엔트리 보존(pop 금지) — untomb 즉시 부활. 배제는
+    #   소비 시점(target 산정)에 tombstones 대조로 수행한다(role 경로와 대칭).
+    _out = {"roster": roster, "tombstones": sorted(tombstones), "updated_at": _now()}
+    if isinstance(_prev_prov, dict) and not rebase:
+        _out["recovered_from"] = _prev_prov  # 보류 지속(해제=--rebase)
     try:
-        _atomic_write_json(dept_roster_path(socket),
-                           {"roster": roster, "tombstones": sorted(tombstones), "updated_at": _now()})
-    except Exception:
-        pass
+        _atomic_write_json(dept_roster_path(socket), _out, keep_bak=True)  # ★C2(W3): .bak 유지(손상 폴백 소스)
+    except Exception as _e:
+        log("★P2-8: dept_roster 원자쓰기 실패(%s: %s) — 침묵 삼킴 금지, escalation." % (type(_e).__name__, _e))
+        _emit_evt("agent.error", agent="phoenix",
+                  summary="dept_roster 영속 실패(%s)" % type(_e).__name__)
     return roster, tombstones
 
 
-def live_role_surfaces(socket):
-    """현재 살아있는 surface들의 role→(surface_ref, pid, exited) 실측."""
+def _status_json(socket):
+    """★C5(W3): `cys status --json` 파싱 결과(dict) — 구조화 liveness/readiness 단일 소스. 실패=None."""
+    r = cys("status", "--json", socket=socket, timeout=12)
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    try:
+        return json.loads(r.stdout or "{}")
+    except Exception:
+        return None
+
+
+def _live_role_surfaces_from_list(socket):
+    """폴백: `cys list` 화면 정규식 파싱(status --json 미도달 시). 반환 (dict, known:bool).
+    ★codex W3 BLOCKING(3): 이 폴백이 P1-6(정규식 취약)을 되살리지 않도록 **구조 유효성**을 판정한다 — list 가
+    rc≠0 이거나, stdout 이 비어있지 않은데 파싱 0건이거나, `surface:` 로 시작하는 행 중 4필드 정규식 미매칭이
+    하나라도 있으면 known=False(구조 드리프트). known=False 는 '전원 사망' 추정 금지 신호로, 호출측이 부활을
+    보류한다(대량 오스폰 방지 fail-safe). 구조 유효(빈 출력=surface 0, 또는 surface 행 전부 매칭)일 때만 known=True."""
     r = cys("list", socket=socket, timeout=12)
+    txt = r.stdout or ""
     out = {}
-    for line in (r.stdout or "").splitlines():
+    lines = [ln for ln in txt.splitlines() if ln.strip()]
+    surface_lines = [ln for ln in lines if ln.strip().startswith("surface:")]
+    matched = 0
+    for line in lines:
         m = re.match(r"(surface:\d+)\s+role=(\S+)\s+pid=(\d+)\s+exited=(\S+)", line)
         if m:
+            matched += 1
             ref, role, pid, exited = m.group(1), m.group(2), int(m.group(3)), m.group(4)
             out.setdefault(role, []).append({"surface": ref, "pid": pid, "exited": exited == "true"})
+    # ★codex W3(3) 정밀: known=False 는 **구조 드리프트**(데몬이 살아 데이터를 주는데 형식이 바뀐 오파싱)로 한정한다
+    #   — 즉 stdout 이 비어있지 않은데 파싱 0건, 또는 `surface:` 행 일부 미매칭. rc≠0·빈 출력(데몬 미도달/콜드부트)은
+    #   '살아있는 surface 0'이 정당한 관측이므로 known=True(그 경우 부활은 정상 진행 = phoenix 본연). 형식 드리프트만
+    #   전원 사망 오판 → 대량 스폰 위험이라 보류시킨다.
+    known = True
+    if lines and matched == 0:
+        known = False                                   # 비어있지 않은데 0건 = 구조 드리프트
+    if surface_lines and matched < len(surface_lines):
+        known = False                                   # surface: 행 일부 미매칭 = 부분 드리프트
+    return out, known
+
+
+# ★codex W3(3): 직전 liveness 관측의 신뢰도(구조 유효성). live_role_surfaces 가 실제 소스를 파싱할 때 갱신되고,
+#   테스트가 live_role_surfaces 를 통째로 몽키패치하면(=실 소스 우회) 직전값(기본 True=신뢰)을 유지한다.
+_LAST_LIVENESS_KNOWN = True
+
+
+def _live_surfaces_raw(socket):
+    """실 liveness 파싱 — status --json(구조화) 우선·실패 시 list 폴백. _LAST_LIVENESS_KNOWN 을 갱신하고 dict 반환."""
+    global _LAST_LIVENESS_KNOWN
+    st = _status_json(socket)
+    if st is None:
+        out, known = _live_role_surfaces_from_list(socket)
+        _LAST_LIVENESS_KNOWN = known
+        return out
+    out = {}
+    for s in st.get("surfaces", []):
+        # 미claim surface 는 status --json 에서 role=null — 구 `cys list` 규약(미claim="-")과 일치시켜 보존한다.
+        #   role 무관 잔재(C6 exited 회수 등)를 놓치지 않기 위함(role=null skip 은 P1-6 회귀).
+        role = s.get("role") or "-"
+        out.setdefault(role, []).append({
+            "surface": s.get("surface_ref"),
+            "pid": None,  # OS pid 는 status --json 미노출(보고 전용 필드 — liveness 판정엔 exited 사용)
+            "exited": bool(s.get("exited")),
+            "agent_alive": s.get("agent_alive"),  # ★C5 구조화 readiness ack 신호(P1-10)
+        })
+    _LAST_LIVENESS_KNOWN = True
     return out
+
+
+def live_role_surfaces(socket):
+    """현재 살아있는 surface들의 role→[{surface, pid, exited, agent_alive}] 실측(dict만).
+    ★C5/P1-6(W3): liveness 근원을 화면 정규식(`cys list`)에서 **구조화 소스**(`cys status --json`.surfaces)로
+    전환. 보고/관측·부활 target 산정 공통 진입점(몽키패치 지점)."""
+    return _live_surfaces_raw(socket)
+
+
+def _live_role_surfaces_checked(socket):
+    """부활 target 산정용 liveness (dict, known:bool). live_role_surfaces 를 경유해(몽키패치 존중) dict 를 얻고,
+    직전 파싱의 구조 신뢰도(_LAST_LIVENESS_KNOWN)를 함께 반환한다 — known=False 면 호출측이 부활 보류(fail-safe)."""
+    d = live_role_surfaces(socket)
+    return d, _LAST_LIVENESS_KNOWN
 
 
 # ------------------------------------------------------------------ 저널
@@ -461,8 +1256,15 @@ def load_journal(socket, ticket_id):
     if os.path.exists(p):
         try:
             return json.load(open(p))
-        except Exception:
-            pass
+        except Exception as _e:
+            # ★C2 2단계 보조상태(W3): 저널은 retention-critical 이 아니다(단계 진행 캐시 — 소실 시 재수행). 손상 시
+            #   hard-fail 하지 않고 격리(.corrupt-<ts>·최근3)+경고 후 fresh 로 시작한다. 단 '침묵 삼킴'(try:pass)은
+            #   금지 — 재개가 불가능해졌음을 log/EVT 로 가시화(gemini W1-gate3: resolve 저널 침묵 제거).
+            isolated = _isolate_corrupt(p)
+            log("★C2 보조상태: journal(%s) 손상 — 격리(%s) 후 fresh 시작(단계 재수행). 침묵 아님."
+                % (ticket_id, isolated))
+            _emit_evt("agent.error", agent="phoenix",
+                      summary="phoenix journal(%s) 손상 — fresh 재시작(단계 진행 소실)" % ticket_id)
     return {"ticket_id": ticket_id, "roles": {}, "events": [], "created": _now()}
 
 
@@ -510,7 +1312,9 @@ def breaker_file(socket):
 
 
 def breaker_check_and_record(socket):
-    """이번 restore 시도를 기록하고, T초 내 N회 이상이면 (open=True, 최근 시도 리스트) 반환."""
+    """이번 restore 시도를 기록하고, T초 내 N회 이상이면 (open=True, 최근 시도 리스트) 반환.
+    ★C2/P2-6(W3): 보조상태(breaker)는 retention-critical 이 아니므로 손상 시 hard-fail 하지 않고 격리+경고 후
+    빈 카운트로 재시작한다 — 단 '침묵 리셋'은 금지(크래시루프 감지 무력화 위험)이므로 log+EVT 로 가시화한다."""
     p = breaker_file(socket)
     now = _now()
     attempts = []
@@ -518,6 +1322,11 @@ def breaker_check_and_record(socket):
         try:
             attempts = json.load(open(p)).get("attempts", [])
         except Exception:
+            isolated = _isolate_corrupt(p)  # 손상 격리(.corrupt-<ts>·최근3 prune)
+            log("★P2-6: breaker.json 손상 — 격리(%s) 후 빈 카운트 재시작(침묵 리셋 아님·경고). "
+                "크래시루프 감지가 이번 창에서 리셋될 수 있음." % isolated)
+            _emit_evt("agent.error", agent="phoenix",
+                      summary="breaker.json 손상 격리+리셋 — 크래시루프 감지 일시 약화")
             attempts = []
     attempts = [t for t in attempts if now - t <= BREAKER_T]  # 창 밖 제거
     attempts.append(now)
@@ -536,12 +1345,20 @@ def rollback_proposal(socket):
     snap = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_state_snapshot.py")
     prop = {"snapshot_tool": snap, "generations": [], "note": "실행하지 않는다 — 사람 승인 후 --at 롤백"}
     if os.path.exists(snap):
-        r = subprocess.run([sys.executable, snap, "list"], capture_output=True, text=True, timeout=15)
-        prop["generations_raw"] = (r.stdout or r.stderr or "").strip()[:600]
-        gens = re.findall(r"(\d{8}T\d{6}Z)", r.stdout or "")
-        prop["generations"] = gens
-        if gens:
-            prop["suggested_rollback_to"] = gens[-1]  # 목록상 직전 세대(도구 정렬 규약 따름)
+        # ★C4/P1-5: raw subprocess 가드 — TimeoutExpired→정직 강등(rc 124 상당), 인터프리터/도구 부재→명시 실패.
+        #   무가드 시 스냅샷 도구가 15초 초과하면 traceback→이유 없는 exit 1(P1-5). 롤백 '제안'은 부가정보이므로
+        #   실패해도 restore 판정을 죽이지 않고 note 로 정직히 남긴다.
+        try:
+            r = subprocess.run([sys.executable, snap, "list"], capture_output=True, text=True, timeout=15)
+            prop["generations_raw"] = (r.stdout or r.stderr or "").strip()[:600]
+            gens = re.findall(r"(\d{8}T\d{6}Z)", r.stdout or "")
+            prop["generations"] = gens
+            if gens:
+                prop["suggested_rollback_to"] = gens[-1]  # 목록상 직전 세대(도구 정렬 규약 따름)
+        except subprocess.TimeoutExpired:
+            prop["error"] = "스냅샷 도구 list 15s TIMEOUT(rc 124 상당) — 롤백 제안 생략(정직 강등)"
+        except (FileNotFoundError, OSError) as e:
+            prop["error"] = "스냅샷 도구 실행 불가(%s: %s) — 롤백 제안 생략" % (type(e).__name__, e)
     return prop
 
 
@@ -606,10 +1423,28 @@ def spawn_surrogate(socket, role, observed_sid, attempt=0, mode="resume"):
 
 # ------------------------------------------------------------------ 단계 실행기
 
+def _surface_agent_alive(socket, surface):
+    """★C5/P1-10(W3): 특정 surface 의 agent_alive(구조화 readiness ack) — status --json 에서 surface_ref 대조.
+    반환 True/False/None(미도달·미관측). 배너 리터럴 대신 구조화 신호로 readiness 를 판정하는 근거."""
+    st = _status_json(socket)
+    if st is None:
+        return None
+    for s in st.get("surfaces", []):
+        if s.get("surface_ref") == surface:
+            return s.get("agent_alive")
+    return None
+
+
 def stage_ready(socket, role, surface, stub):
     """기동 완료(ready) 판정 — 실 응답 신호(ready_marker) 확인. ★Phase10: 대량 부활에서 스폰이 스태거되면
     watch(신규 출력)가 이미 emit된 marker를 놓쳐 ready 타임아웃 → 부분부활. 먼저 현재 화면(read-screen)에
-    marker 존재를 확인해 '지금 응답 가능한가'를 판정하고, 없을 때만 watch(신규 출력)로 대기한다."""
+    marker 존재를 확인해 '지금 응답 가능한가'를 판정하고, 없을 때만 watch(신규 출력)로 대기한다.
+    ★C5/P1-10(W3): prod 는 배너 리터럴 이전에 **구조화 ack**(status --json agent_alive)를 우선 확인한다 —
+    배너 문자열 파싱의 취약성(포맷 변경 시 오판)을 줄이는 근원 신호. 구조화 미확정 시 배너 폴백(가용성)."""
+    if not stub:
+        alive = _surface_agent_alive(socket, surface)
+        if alive is True:
+            return True, "structured ack: agent_alive=true (status --json)"
     marker = "PHOENIX_STUB_READY" if stub else "bypass permissions on"
     r0 = cys("read-screen", "--surface", surface, socket=socket, timeout=10)
     if marker in (r0.stdout or ""):
@@ -661,8 +1496,29 @@ def stage_observe_session(socket, surface, stub, role=None):
     return None, last_txt.strip()[-200:]  # grace 소진·미관측 → transient(verify가 unverified 처리)
 
 
+def _surface_agent_present(socket, surface):
+    """★WP-11 각성핑 agent-gate: 대상 surface에 배정된 에이전트가 있는지 조회.
+    True=agent 배정됨(재주입 대상)·False=agent=None 빈 셸(각성 핑 skip)·None=조회불가(보수적=진행).
+    빈 zsh 셸(role=master·agent=None)에 reinject --check 핑을 쏘면 셸이 glob/pipe로 오해석해
+    zsh 에러(감사 에러①)가 난다. 실 크래시 master(agent 있던)는 계속 복구하므로 agent=None만 skip한다."""
+    try:
+        r = cys("status", "--json", socket=socket, timeout=8)
+        if r.returncode != 0:
+            return None
+        surfaces = (json.loads(r.stdout or "{}") or {}).get("surfaces", [])
+    except Exception:
+        return None
+    for s in surfaces:
+        if s.get("surface_ref") == surface or ("surface:%s" % s.get("surface_id")) == surface:
+            return s.get("agent") is not None
+    return None
+
+
 def stage_reinject(socket, role, surface, stub):
-    """디렉티브 재주입 — reinject --check 재사용(각성 핑 후 필요 시 주입)."""
+    """디렉티브 재주입 — reinject --check 재사용(각성 핑 후 필요 시 주입).
+    ★WP-11 agent-gate: agent=None 빈 셸엔 각성 핑을 쏘지 않는다(zsh 오해석 에러 차단)."""
+    if _surface_agent_present(socket, surface) is False:
+        return True, "reinject skip: agent 없음(빈 셸) — 각성 핑 미발사(WP-11 agent-gate)"
     r = cys("reinject", "--check", "--role", role, "--surface", surface, "--timeout", "6",
             socket=socket, timeout=12)
     return r.returncode == 0, "reinject rc=%s %s" % (r.returncode, (r.stdout or r.stderr or "").strip()[:120])
@@ -671,7 +1527,10 @@ def stage_reinject(socket, role, surface, stub):
 def stage_g2_ack(socket, role, surface, stub):
     """G2 핸드셰이크 ack — 부활 노드가 원장 대조 핑에 응답하는지(M7). 응답 없으면
     타임아웃 → unverified 격하 모드로 전진(무한 보류 금지). stub은 응답자가 없으므로
-    best-effort 로 시도만 하고 결과를 저널에 남긴다."""
+    best-effort 로 시도만 하고 결과를 저널에 남긴다.
+    ★WP-11 agent-gate: agent=None 빈 셸엔 각성 핑을 쏘지 않는다(빈 셸은 ack 주체 없음)."""
+    if _surface_agent_present(socket, surface) is False:
+        return False, "g2 skip: agent 없음(빈 셸) — 각성 핑 미발사(WP-11 agent-gate)"
     r = cys("reinject", "--check", "--role", role, "--surface", surface, "--timeout", "4",
             socket=socket, timeout=10)
     acked = (r.returncode == 0) and ("각성" in (r.stdout or "") or "awake" in (r.stdout or "").lower())
@@ -685,22 +1544,55 @@ def _acquire_restore_lease(socket):
     오케스트레이션이 동시에 restore를 돌려 같은 역할을 이중 스폰하는 TOCTOU를 차단한다.
     반환 (ok, handle): ok=False 는 '다른 restore가 진행 중 → 중복 skip'. ok=True 면 진행하되
     handle(열린 파일객체)를 함수 끝까지 살려 락을 유지해야 한다(fail-open 시 handle=None).
-    unix=fcntl.flock(LOCK_EX|NB) · Windows/기타=best-effort(핸들 보유만·flock 부재는 fail-open)."""
+    ★D2(W5): unix flock·Windows msvcrt 통합(_try_lock_nb) — 과거 Windows 전면 fail-open(P1-8: auto+수동
+    restore 이중 스폰)을 제거. 락 기구 미가용만 fail-open."""
     try:
         lease_path = os.path.join(phoenix_home(socket), "restore.lease")
-        f = open(lease_path, "w")
+        f = open(lease_path, "a+")  # 무truncate·생성·byte0 락 대상(Windows msvcrt 영역 일치)
     except Exception:
         return True, None  # 락 파일 생성 실패 = 게이트 없이 진행(가용성 우선 fail-open)
-    if not IS_WINDOWS:
-        try:
-            import fcntl
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            f.close()
-            return False, None  # 다른 restore 보유 중 — 중복 인지 skip
-        except Exception:
-            pass  # fcntl 미가용 등 → fail-open(핸들 보유)
-    return True, f
+    r = _try_lock_nb(f)
+    if r is False:
+        f.close()
+        return False, None  # 다른 restore 보유 중 — 중복 인지 skip
+    return True, f          # True(획득) 또는 None(락 기구 미가용=fail-open) → 핸들 보유하고 진행
+
+
+def _release_lease(handle):
+    """restore lease 핸들 해제(atexit 등록 대상). flock 은 close 로 자동 해제된다. best-effort(이중 해제 무해)."""
+    try:
+        handle.close()
+    except Exception:
+        pass
+
+
+def c6_detect_stale_surfaces(socket):
+    """★C6 S0: exited=true surface 잔재를 열거한다. 라이브(exited=false)는 어떤 경우에도 비대상."""
+    stale = []
+    for role, surfs in live_role_surfaces(socket).items():
+        for s in surfs:
+            if s.get("exited"):
+                stale.append({"surface": s.get("surface"), "role": role, "pid": s.get("pid")})
+    return stale
+
+
+def c6_reap_stale_surfaces(socket):
+    """★C6 S0 실 회수(W2 — P0-6 cause 활용): exited=true 잔재를 **Reap 사유로만** 회수한다
+    (`cys close-surface <ref> --reap` → CloseCause::Reap → 묘비 미생성·부활 대상 유지). 고정 OwnerClose 경로
+    (--reap 없는 close)는 절대 쓰지 않는다(P0-6 오묘비 함정). 라이브(exited=false)는 비대상. 반환:
+    {"detected":[...], "reaped":[refs], "reap_failed":[...]}. 회수 후에도 묘비 0이어야 함(호출측 게이트 검증)."""
+    detected = c6_detect_stale_surfaces(socket)
+    reaped, failed = [], []
+    for item in detected:
+        ref = item.get("surface")
+        if not ref:
+            continue
+        r = cys("close-surface", ref, "--reap", socket=socket, timeout=12)
+        if getattr(r, "returncode", 1) == 0:
+            reaped.append(ref)
+        else:
+            failed.append({"surface": ref, "err": (getattr(r, "stderr", "") or getattr(r, "stdout", ""))[:120]})
+    return {"detected": detected, "reaped": reaped, "reap_failed": failed}
 
 
 def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=None,
@@ -719,10 +1611,131 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         if print_result:
             print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
+    # ★P2-7/W1: lease 핸들을 atexit 로 확실히 해제 등록(예외·sys.exit 경로에서도 flock 이 남지 않게).
+    #   flock 은 fd close 시 자동 해제되지만, 프로세스가 살아있는 채 다음 restore 를 부르는 경로(deploy 중첩)
+    #   에서 GC 타이밍에 의존하지 않도록 명시 해제한다. handle=None(fail-open)이면 등록 불요.
+    if _lease_handle is not None:
+        atexit.register(lambda h=_lease_handle: _release_lease(h))
     # ★Phase 6: 이 부팅 세대(재시작마다 변경)를 취득 — 저널 완료 마킹의 유효성 기준.
     _ACTIVE_EPOCH = get_boot_epoch(socket)
-    # M5: 이번 시도 기록 + 차단기 판정
-    if not no_breaker:
+
+    # ★C2 손상 대응 — 2단계 계층화(W4 sentinel + W3 폴백 체인). missing(부재)=fresh install 정상 진행.
+    #   corrupt(파싱 실패)=격리(.corrupt-<ts>·최근3 prune) 후 폴백 체인(.bak → 세대 스냅샷 → dept 재발견):
+    #     · 폴백 복원 성공 = degraded(묘비 불확실 → 부활 보류+escalation, fail-safe · exit 3)
+    #     · 전 폴백 실패 = unrecoverable(부활 중단+escalation · exit 6)
+    #   빈 상태(fresh) 위장 통과는 어느 경우도 없다(silent-empty 차단).
+    #     · 폴백 복원(신규 손상)=recovered_from provenance 를 파일에 영속 → degraded(부활 보류·전 auto-retry 지속).
+    #   ★codex W3 BLOCKING: degraded 최종 판정은 observe **후** 파일의 recovered_from 으로 한다(휘발 방지 — 아래).
+    for _p, _kind in ((desired_roster_path(socket), "desired_roster"),
+                      (dept_roster_path(socket), "dept_roster")):
+        _rec = _recover_retention_file(socket, _p, _kind)
+        if _rec["status"] == "unrecoverable":
+            log("★C2 손상 감지: %s 파싱 실패·전 폴백(.bak/스냅샷) 불가 — 부활 중단(exit 6). 격리=%s"
+                % (_kind, _rec.get("isolated")))
+            _emit_evt("agent.error", agent="phoenix",
+                      summary="C2 손상 복원 불가(%s) — 부활 중단, 사람 개입 필요" % _kind)
+            out = {"phoenix_restore": "CORRUPT", "corruption": True, "corrupt_file": _kind,
+                   "corrupt_path": _p, "isolated": _rec.get("isolated"),
+                   "note": ("손상된 %s — .bak·세대 스냅샷 전 폴백 불가. 빈 상태(fresh)로 진행하지 않는다"
+                            "(missing≠corrupt). 사람 개입(phoenix roster --rebase 또는 복원) 필요." % _kind)}
+            if print_result:
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+            return out
+        if _rec["status"] == "degraded" and not _rec.get("pending"):
+            # 이번 실행에서 새로 손상→복구(fresh) — escalation EVT 1회. pending(전 auto-retry 이월)은 재방출 안 함.
+            log("★C2 폴백 복원: %s 손상 → %s 로 복원(degraded·provenance 영속). 묘비 불확실 → 부활 보류(fail-safe)."
+                % (_kind, _rec.get("source")))
+            _emit_evt("agent.error", agent="phoenix",
+                      summary="C2 손상→폴백 복원(%s src=%s) — degraded, 부활 보류(영속)"
+                              % (_kind, _rec.get("source")))
+
+    j = load_journal(socket, ticket)
+    # ★C6 S0 실 회수(W2 — P0-6 cause): exited=true 잔재를 Reap 사유로만 회수(cys close-surface --reap →
+    #   CloseCause::Reap → 묘비 미생성). 라이브(exited=false)는 비대상. OwnerClose 경로는 절대 미사용(오묘비 함정).
+    c6 = c6_reap_stale_surfaces(socket)
+    c6_stale = c6.get("detected", [])
+    if c6_stale:
+        jevent(j, "*", "s0_c6", "reaped",
+               "exited 잔재 %d개 탐지·%d개 Reap 회수(묘비 미생성): %s"
+               % (len(c6_stale), len(c6.get("reaped", [])), c6.get("reaped", [])))
+        log("★C6 S0: 죽은 surface 잔재 %d개 탐지 → %d개 Reap 회수(묘비 0·라이브 무접촉)."
+            % (len(c6_stale), len(c6.get("reaped", []))))
+        save_journal(socket, ticket, j)
+    # ★Phase 4: 대상 판정 근거 = actual-state(topology)가 아니라 desired 로스터.
+    # 관측을 조기·단조 영속해 topology 침식(부분 부활 후 미부활 역할 삭제)에 면역시킨다(§12).
+    entries, _tombstones = observe_and_persist_roster(socket)
+    # ★codex W3 BLOCKING(1): degraded 최종 판정 = observe **후** 영속된 recovered_from(진실은 파일 상태).
+    #   observe 의 검증된-건강 topology replace 가 provenance 를 떨궜으면 해제(부활 진행), 남아있으면 hold —
+    #   따라서 복구본이 유효 JSON 이 된 뒤 도는 cysd auto-retry 2차 실행도 동일하게 보류가 유지된다(휘발 방지).
+    _c2_degraded = []
+    for _p, _kind in ((desired_roster_path(socket), "desired_roster"),
+                      (dept_roster_path(socket), "dept_roster")):
+        _prov = _recovered_provenance(_p)
+        if _prov:
+            _c2_degraded.append({"file": _kind, "source": _prov.get("source"), "ts": _prov.get("ts")})
+    live, _live_known = _live_role_surfaces_checked(socket)
+
+    # 대상 = desired 로스터에 있으나 살아있지 않은(또는 exited) 역할
+    def _alive(role):
+        for s in live.get(role, []):
+            if not s["exited"]:
+                return True
+        return False
+
+    # ★codex W2 BLOCKING: 묘비 제외는 target 산정 **시점**에 tombstones 대조로 수행(roster 엔트리는 보존됨).
+    #   entries 에 묘비 역할이 남아 있어도 부활 대상에서만 빠진다 — untomb 시 엔트리·메타가 있어 즉시 부활 가능.
+    # ★codex W2 재판정: 명시 --roles 경로도 tombstone 필터를 반드시 통과시킨다(과거 `roles or [...]` 는 명시
+    #   경로가 필터를 우회 — 의도삭제된 역할을 강제 부활시키는 구멍). '의도삭제>강제부활' 1급 원칙상 우회 스위치
+    #   (--ignore-tombstones 류)는 추가하지 않는다 — 정당한 재편입은 untomb RPC(cys tombstone --remove)가 정도(正道)다.
+    _requested = roles if roles is not None else [r for r in entries if not _alive(r)]
+    _tomb_skipped = [r for r in _requested if r in _tombstones]
+    target_roles = [r for r in _requested if not _alive(r) and r not in _tombstones]
+    if _tomb_skipped:
+        log("★묘비 필터: 요청 역할 중 폐역(tombstone) %s 은 부활 대상에서 제외(의도삭제>강제부활). untomb 로만 재편입." % _tomb_skipped)
+        for _r in _tomb_skipped:
+            jevent(j, _r, "target", "skip_tombstoned",
+                   "명시 요청됐으나 폐역(tombstone) — 부활 제외(의도삭제>강제부활). 재편입=untomb RPC.")
+        save_journal(socket, ticket, j)
+    # ★C5 unknown-liveness 부활 보류(codex W3 BLOCKING(3)·fail-safe): status --json 실패 + list 폴백 구조
+    #   드리프트로 liveness 를 신뢰할 수 없으면(_live_known=False) 전 역할을 '죽음'으로 오판해 대량 스폰하지 않고
+    #   보류+escalation 한다(P1-6 재도입 차단). 복귀 = liveness 소스 회복(status --json 정상 또는 list 형식 복구).
+    if not _live_known:
+        log("★C5 unknown-liveness: status --json 실패 + list 폴백 구조 무효 — 전원 사망 추정 금지, 부활 보류(fail-safe).")
+        _emit_evt("agent.error", agent="phoenix",
+                  summary="liveness 소스 불신(status --json 실패+list 드리프트) — 부활 보류, 대량 스폰 차단")
+        jevent(j, "*", "c5_unknown_liveness", "hold", "liveness 불신 — 부활 보류(대량 오스폰 방지)")
+        save_journal(socket, ticket, j)
+        out = {"phoenix_restore": "DEGRADED", "degraded_reason": "unknown_liveness",
+               "note": ("liveness 소스(status --json/list) 불신 — 전원 사망 추정 금지, 부활 보류(fail-safe). "
+                        "복귀: liveness 소스 회복.")}
+        if print_result:
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    # ★C2 degraded 부활 보류(fail-safe): retention 파일에 recovered_from provenance 가 영속돼 있으면(손상 폴백
+    #   복원으로 묘비 불확실) 전 대상 부활을 보류하고 DEGRADED(exit 3)로 종료한다. ★codex W3 BLOCKING(1): 이
+    #   판정은 observe 후 파일 상태(recovered_from)로 하므로, 복구본이 유효 JSON 이 된 뒤 도는 auto-retry 2차
+    #   실행도 동일하게 보류가 유지된다. 복귀 = 검증된-건강 topology replace(provenance 자동 제거) 또는 `--rebase`.
+    if _c2_degraded:
+        for _d in _c2_degraded:
+            jevent(j, "*", "c2_degraded", "hold",
+                   "손상 폴백 복원(%s src=%s·provenance 영속) — 묘비 불확실, 부활 보류(fail-safe)" % (_d["file"], _d["source"]))
+        jevent(j, "*", "c2_degraded", "held_roles", "부활 보류 역할: %s" % target_roles)
+        save_journal(socket, ticket, j)
+        out = {"phoenix_restore": "DEGRADED", "degraded_reason": "c2_corrupt_fallback",
+               "degraded": _c2_degraded, "held_roles": target_roles,
+               "note": ("retention 파일 손상→폴백 복원(recovered_from 영속)으로 묘비 불확실 — 부활 보류(fail-safe). "
+                        "복귀: 검증된-건강 topology replace 또는 `phoenix roster --rebase`.")}
+        if print_result:
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    # ★M5/P1-3 회로차단기: '실제 부활 시도(죽은 역할 존재)'에만 기록한다. NOOP(대상 0)은 스폰 시도가
+    #   아니므로 카운트하지 않고 오히려 창을 리셋한다 — NOOP 반복이 차단기를 OPEN 시켜 진짜 부활을 막는
+    #   오검출(P1-3)을 차단. target 산출 이후로 이동해 "spawn 시도가 있을 때만 기록"(설계 축C4)을 만족.
+    if not target_roles:
+        log("부활 대상 죽은 역할 0 — restore 무작업(멱등).")
+        if not no_breaker:
+            breaker_reset(socket)
+    elif not no_breaker:
         opened, attempts = breaker_check_and_record(socket)
         if opened:
             log("★M5 회로차단기 OPEN — %ss 내 %d회 부활 시도(임계 %d). 자동 부활 정지." % (
@@ -734,23 +1747,6 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                    "alert": "정지 후 사람 승인 필요 — 자동 롤백/재부활을 실행하지 않는다."}
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return out
-
-    j = load_journal(socket, ticket)
-    # ★Phase 4: 대상 판정 근거 = actual-state(topology)가 아니라 desired 로스터.
-    # 관측을 조기·단조 영속해 topology 침식(부분 부활 후 미부활 역할 삭제)에 면역시킨다(§12).
-    entries, _tombstones = observe_and_persist_roster(socket)
-    live = live_role_surfaces(socket)
-
-    # 대상 = desired 로스터에 있으나 살아있지 않은(또는 exited) 역할
-    def _alive(role):
-        for s in live.get(role, []):
-            if not s["exited"]:
-                return True
-        return False
-
-    target_roles = roles or [r for r in entries if not _alive(r)]
-    if not target_roles:
-        log("부활 대상 죽은 역할 0 — restore 무작업(멱등).")
     # dedup(P4): 이 티켓 저널에서 이미 verify까지 done 인 역할은 skip
     pending = [r for r in target_roles if not stage_done(j, r, "verify")]
     log("티켓=%s · 대상역할=%s · 이번 진행=%s (완료 skip=%s)" % (
@@ -915,7 +1911,12 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                 reason = "세션 일치"
         j["roles"][role]["outcome"] = outcome
         j["roles"][role]["verify_reason"] = reason
-        mark_stage(j, role, "verify", True, "M9: expected=%r observed=%r → %s (%s)" % (exp, obs, outcome, reason))
+        # ★P2-3: verify done 은 outcome 이 verified/fresh(성공 부활)일 때만 True. unverified(transient/fork)는
+        #   done=False 로 남겨 다음 restore 사이클이 재검증한다 — 과거처럼 unconditional done=True 로 마킹하면
+        #   같은 부트 세대 내내 UNVERIFIED 가 고착(재검증 영구 skip)됐다. dedup(pending)이 이 done 을 본다.
+        verify_done = outcome in ("verified", "fresh")
+        mark_stage(j, role, "verify", verify_done,
+                   "M9: expected=%r observed=%r → %s (%s)" % (exp, obs, outcome, reason))
         jevent(j, role, "verify", outcome, "expected=%r observed=%r [%s]" % (exp, obs, reason))
         save_journal(socket, ticket, j)
 
@@ -983,6 +1984,10 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         "backend": "surrogate(stub)" if stub else "production(cys restore)",
         "target_roles": target_roles,
         "per_role_outcome": outcomes,
+        "c6_stale_surfaces": c6_stale,     # ★C6 S0: 탐지된 죽은 surface 잔재
+        "c6_reaped": c6.get("reaped", []), # ★C6 S0(W2): Reap 사유로 실제 회수한 잔재(묘비 미생성·라이브 무접촉)
+        "c6_reap_failed": c6.get("reap_failed", []),
+        "cys_identity": _CYS_IDENTITY,     # ★gate2: 해석된 cys 의 3중 identity 검증 상태(verified|degraded-unverified|None)
         "journal": journal_path(socket, ticket),
         "honesty_note": honesty,
     }
@@ -998,12 +2003,15 @@ def cmd_restore(args):
     #   tombstone 병합이 roster에서 배제하므로 include_master여도 부활 대상이 되지 않는다
     #   (1급 원칙: 의도삭제>강제부활). raw `cys restore --include-master`도 묘비를 skip(심층방어).
     include_master = args.include_master or getattr(args, "auto", False)
-    return run_restore(
+    result = run_restore(
         args.socket, ticket=args.ticket or "default", stub=args.stub,
         no_breaker=args.no_breaker, roles=args.roles,
         include_master=include_master, stub_sids=args.stub_sids,
         print_result=True,
     )
+    # ★W1/C1: CLI 진입점에서만 exit 를 방출한다(deploy 의 내부 run_restore 호출은 반환값을 쓰고
+    #   자체 _finish 로 exit — 이 경로는 print_result=False 라 여기 오지 않는다). 판정→결정론 exit.
+    sys.exit(restore_exit_code(result))
 
 
 # ------------------------------------------------------------------ B1 조정 패스
@@ -1017,7 +2025,9 @@ def cmd_reconcile(args):
     live = live_role_surfaces(socket)
     todo = _read_worker_todo()
 
-    expected_roles = sorted(roster.keys())
+    # ★codex W2 BLOCKING: 묘비 역할은 roster 엔트리가 보존되므로 여기서 tombstones 대조로 제외 —
+    #   의도적 폐역을 'MISSING(부활 필요)'로 오판하지 않는다(엔트리는 untomb 시 부활용으로 보존).
+    expected_roles = sorted(r for r in roster.keys() if r not in tombstones)
     alive_roles = [role for role, ss in live.items() if role != "-" and any(not s["exited"] for s in ss)]
 
     missing = [r for r in expected_roles if r not in alive_roles]           # 대장엔 있는데 죽음
@@ -1048,37 +2058,50 @@ def cmd_tombstone(args):
     폐역을 구분해, 폐역된 대상은 부활/보호 집합에서 빠진다. --dept 면 부서 dept_roster 에 적용(Phase7 대칭)."""
     socket = args.socket
     is_dept = getattr(args, "dept", False)
+    name = args.role
     if is_dept:
+        # 부서(dept)는 phoenix 소유 dept_roster.json 이 진실(데몬 topology 무관) — 기존 파일 경로 유지.
         roster, tombstones = load_dept_roster(socket)
         path = dept_roster_path(socket)
-        kind = "dept"
+        if args.remove:
+            tombstones.discard(name); action = "폐역 해제(재편입 가능)"
+        else:
+            # ★codex W2 BLOCKING(dept): 엔트리 보존(pop 금지) — 배제는 소비 시점 tombstones 대조. untomb 즉시 부활.
+            tombstones.add(name); action = "폐역(보호집합에서 제외 — 엔트리 보존·untomb 시 부활)"
+        _atomic_write_json(path, {"roster": roster, "tombstones": sorted(tombstones), "updated_at": _now()})
+        out = {"tombstone": name, "kind": "dept", "action": action, "via": "dept_roster",
+               "tombstones": sorted(tombstones),
+               "remaining": sorted(r for r in roster.keys() if r not in tombstones)}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    # ★A-S3: role 폐역은 desired 직접 쓰기 대신 **데몬 RPC 경유**(옵션A 단일 작성자=데몬). RPC 성공=topology 묘비.
+    #   실패(데몬 다운타임)=intent 저널 폴백 → observe 가 replace 이전 멱등 적용·데몬 복귀 후 재동기+영속 확인 후 절단.
+    rpc_args = ["tombstone", name] + (["--remove"] if args.remove else [])
+    r = cys(*rpc_args, socket=socket, timeout=12)
+    if getattr(r, "returncode", 1) == 0:
+        action = ("폐역 해제(RPC·데몬 topology)" if args.remove else "폐역(RPC·데몬 topology 묘비)")
+        out = {"tombstone": name, "kind": "role", "action": action, "via": "daemon-rpc",
+               "rpc_out": (getattr(r, "stdout", "") or "").strip()[:200]}
     else:
-        roster, tombstones = load_desired_roster(socket)
-        path = desired_roster_path(socket)
-        kind = "role"
-    name = args.role
-    if args.remove:
-        tombstones.discard(name)
-        action = "폐역 해제(재편입 가능)"
-    else:
-        tombstones.add(name)
-        roster.pop(name, None)
-        action = "폐역(보호집합에서 제외 — 부활 안 함)"
-    _atomic_write_json(path, {"roster": roster, "tombstones": sorted(tombstones), "updated_at": _now()})
-    out = {"tombstone": name, "kind": kind, "action": action, "tombstones": sorted(tombstones),
-           "remaining": sorted(roster.keys())}
+        _append_tombstone_intent(socket, name, args.remove)
+        action = ("폐역 해제(intent 저널·데몬 down)" if args.remove else "폐역(intent 저널·데몬 down)")
+        out = {"tombstone": name, "kind": "role", "action": action, "via": "intent-journal",
+               "note": "데몬 미도달 — intent 저널 기록. observe 가 replace 이전 멱등 적용·데몬 복귀 후 재동기·영속 확인 후 절단."}
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
 
 def cmd_roster(args):
-    """desired 로스터(대장) 현황 — actual topology와 분리된 선언 상태를 노출(§12)."""
+    """desired 로스터(대장) 현황 — actual topology와 분리된 선언 상태를 노출(§12).
+    ★C3: --rebase 면 설명-가능-축소 불변식을 1회 우회해 현재 관측을 강제 수용한다(운영자 명시 재기반)."""
     socket = args.socket
-    roster, tombstones = observe_and_persist_roster(socket)
+    _rebase = getattr(args, "rebase", False)
+    roster, tombstones = observe_and_persist_roster(socket, rebase=_rebase)
     live = live_role_surfaces(socket)
     alive = {r for r, ss in live.items() if r != "-" and any(not s["exited"] for s in ss)}
     topo_roles = sorted(e.get("role") for e in read_topology(socket).get("entries", []) if e.get("role"))
-    dept_roster, dept_tomb = observe_and_persist_depts(socket)  # ★Phase7: 부서도 보호집합에 노출
+    # ★C2(W3): --rebase 는 dept degraded provenance 도 해제(운영자 명시 재기반).
+    dept_roster, dept_tomb = observe_and_persist_depts(socket, rebase=_rebase)  # ★Phase7: 부서도 보호집합에 노출
     out = {
         "desired_roster(선언·침식 면역)": sorted(roster.keys()),
         "tombstones(의도적 폐역)": sorted(tombstones),
@@ -1385,6 +2408,9 @@ def _schtasks_has_restart_on_failure(task):
         r = subprocess.run(["schtasks", "/Query", "/TN", task, "/XML"], capture_output=True, timeout=8)
         raw = (r.stdout or b"").replace(b"\x00", b"")
         return b"RestartOnFailure" in raw
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        # ★C4: 타임아웃/도구부재는 '검출 실패' = 보수적으로 False(KeepAlive 미확인 → 경고 경로). 정직 강등.
+        return False
     except Exception:
         return False
 
@@ -1540,7 +2566,11 @@ def load_deploy_journal(socket, ticket):
         try:
             return json.load(open(p))
         except Exception:
-            pass
+            # ★C2 2단계 보조상태(W3): deploy 저널도 재개 캐시(비 retention) — 손상 시 격리+경고 후 fresh.
+            isolated = _isolate_corrupt(p)
+            log("★C2 보조상태: deploy journal(%s) 손상 — 격리(%s) 후 fresh 시작." % (ticket, isolated))
+            _emit_evt("agent.error", agent="phoenix",
+                      summary="phoenix deploy journal(%s) 손상 — fresh 재시작" % ticket)
     return {"ticket": ticket, "stages": {}, "events": [], "created": _now()}
 
 
@@ -1698,6 +2728,9 @@ def _deploy_restart(socket, restart_hook, timeout):
         except subprocess.TimeoutExpired:
             res["hook_rc"] = 124
             res["hook_out"] = "TIMEOUT"
+        except (FileNotFoundError, OSError) as e:
+            res["hook_rc"] = 127
+            res["hook_out"] = "hook 실행 불가(%s: %s)" % (type(e).__name__, e)
     elif IS_WINDOWS:
         # Windows 라이브 재시작(schtasks/taskkill) — launchd kill 대역. 공통 pong+epoch delta 확증은 아래 그대로.
         res["path"] = "schtasks/taskkill(라이브)"
@@ -1890,6 +2923,8 @@ def cmd_deploy(args):
                 arc, aout, aerr = ar.returncode, (ar.stdout or "")[-600:], (ar.stderr or "")[-400:]
             except subprocess.TimeoutExpired:
                 arc, aout, aerr = 124, "", "TIMEOUT"
+            except (FileNotFoundError, OSError) as e:
+                arc, aout, aerr = 127, "", "apply 실행 불가(%s: %s)" % (type(e).__name__, e)
             if arc != 0:
                 _dmark(j, "apply", "fail", "apply rc=%s" % arc, epoch=cur_epoch, cmd=apply_cmd)
                 _finish("APPLY_FAILED", 2, {"apply": {"cmd": apply_cmd, "rc": arc, "out": aout, "err": aerr},
@@ -1938,6 +2973,21 @@ def cmd_deploy(args):
     # ── restore (run_restore 재사용 — 코드 복제 금지·P2). deploy 가 crash-loop 단위이므로 내부 차단기는 끈다. ──
     restore_res = run_restore(socket, ticket="deploy-" + ticket, stub=stub, no_breaker=True,
                               roles=None, include_master=include_master, stub_sids=None, print_result=False)
+    # ★P2-7/W1: deploy 내부 restore 가 다른 restore(콜드부트 auto)의 lease 에 막혀 LEASE_HELD 를 받으면,
+    #   과거엔 아래 verdict 분기가 else 로 떨어져 FAILED(허위)로 강등됐다. lease 는 짧게 잡히므로 backoff 재시도로
+    #   회복을 노리고, 2회 재시도 후에도 여전히 held 면 LEASE_HELD 를 정직히 보고한다(FAILED 아님 — 다른 restore 가
+    #   부활을 담당). 진짜 죽은(stale) lease 는 flock 이 프로세스 사망 시 자동 해제하므로 여기 오지 않는다.
+    _lease_retry = 0
+    while restore_res.get("phoenix_restore") == "LEASE_HELD" and _lease_retry < 2:
+        _lease_retry += 1
+        # ★gemini minor: 재시도 대기를 deploy 저널에 이벤트로 기록(대기 이력 관측 · 반복 run_restore 로 인한 이력 꼬임 방지).
+        _dmark(j, "restore", "lease_retry",
+               "다른 restore lease 보유 — %d/2회차 재시도 대기(backoff %.1fs)" % (_lease_retry, SPAWN_BACKOFF * _lease_retry),
+               epoch=get_boot_epoch(socket), lease_retry=_lease_retry)
+        save_deploy_journal(socket, ticket, j)
+        time.sleep(SPAWN_BACKOFF * _lease_retry)
+        restore_res = run_restore(socket, ticket="deploy-" + ticket, stub=stub, no_breaker=True,
+                                  roles=None, include_master=include_master, stub_sids=None, print_result=False)
     record["restore"] = restore_res
     _dmark(j, "restore", "ok", "phoenix_restore=%s completeness=%s"
            % (restore_res.get("phoenix_restore"), restore_res.get("completeness")),
@@ -1949,7 +2999,11 @@ def cmd_deploy(args):
     final = restore_res.get("phoenix_restore")
     completeness = restore_res.get("completeness")
     incomplete = restore_res.get("incomplete_roles") or []
-    if completeness == "NOOP" and final == "NOOP":
+    if final == "LEASE_HELD":
+        # ★P2-7/W1: 재시도 후에도 다른 restore 가 lease 보유 — 이 deploy 의 실패가 아니라 부활 담당 이관.
+        #   FAILED(재시도 소진 미부활)와 구분해 정직 보고. code 3=미확증(escalation 필요)이되 hard fail(1) 아님.
+        verdict, code = "LEASE_HELD", 3
+    elif completeness == "NOOP" and final == "NOOP":
         verdict, code = "COMPLETE", 0        # 재시작은 됐고 부활 대상 0(전원 이미 생존) — 배포 성공
     elif completeness == "COMPLETE" and final in ("VERIFIED", "VERIFIED_FRESH"):
         verdict, code = "COMPLETE", 0
@@ -1975,10 +3029,15 @@ def cmd_deploy(args):
 
 def main():
     global CYS
+    # ★B1 self-test(임베드 추출 직후 cysd 가 호출): 추출된 phoenix 가 실행가능한지만 확인한다 — 데몬·cys 해석·
+    #   상태파일 무접촉. argparse(서브커맨드 required)·_resolve_cys 이전에 조기 종료해 순수 실행성만 검증.
+    #   설계 §2 B1③ 수용조건. --pack-version 은 별칭(설계 표기 정합).
+    if "--selftest" in sys.argv or "--pack-version" in sys.argv:
+        sys.stdout.write("phoenix selftest ok (proto=%s)\n" % PHOENIX_PROTOCOL_VERSION)
+        sys.stdout.flush()
+        sys.exit(0)
     # ★Windows 패리티(S1~S5): 재부팅 자동기동 토대는 mac=launchd·win=schtasks 로 플랫폼 디스패치하고, 경로/소켓은
     # named pipe→state_dir 매핑으로 해소한다. 과거 os.name=="nt" hard-gate 는 제거됐다 — 전 서브커맨드 Windows 동작.
-    # PHOENIX_CYS 오버라이드: 격리 스모크/CI 가 PATH 밖의 cys.exe 절대경로를 주입(하네스 PHOENIX_HARNESS_CYSD 관례와 정합).
-    CYS = os.environ.get("PHOENIX_CYS") or _which("cys") or "cys"
     ap = argparse.ArgumentParser(description="불사조 부활 저널 상태머신 MVP (M1 게이트)")
     ap.add_argument("--socket", help="대상 데몬 소켓(격리 하네스 소켓 권장 — 라이브 무접촉)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1992,7 +3051,9 @@ def main():
     p.add_argument("--auto", action="store_true", help="콜드부트 자동 복원(master 포함·묘비는 배제)")
     sub.add_parser("reconcile")
     sub.add_parser("status")
-    sub.add_parser("roster")  # Phase 4: desired 로스터 현황(침식 면역) + Phase7 부서
+    rp = sub.add_parser("roster")  # Phase 4: desired 로스터 현황(침식 면역) + Phase7 부서
+    rp.add_argument("--rebase", action="store_true",
+                    help="★C3: 설명-가능-축소 불변식을 1회 우회해 현재 관측을 강제 수용(운영자 명시 재기반)")
     sub.add_parser("inherit")  # ★Phase 7: 자동 보호 상속 — 노드+부서 능동 포착
     tb = sub.add_parser("tombstone")  # Phase 4/7: 의도적 폐역(roster 축소 유일 경로)
     tb.add_argument("role"); tb.add_argument("--remove", action="store_true")
@@ -2014,6 +3075,16 @@ def main():
     dp.add_argument("--no-breaker", action="store_true")
 
     args = ap.parse_args()
+    # ★W1/B3·§5-1: cys 실행 경로를 여기서(소켓 인지 후) 해석한다 — PHOENIX_CYS > which('cys') > 표준경로
+    #   폴백(identity-check·STRICT/하네스 금지). 리터럴 'cys' 최종 폴백 제거로 FileNotFoundError 침묵사를 차단.
+    #   미해석/불일치는 _resolve_cys 내부에서 die(exit 6)로 정직 정지한다(라이브 실증 2026-07-06 근원 수리).
+    # ★W5(⑥ 수리·CI run 28778120380 실증): `deploy --plan` 은 계획만 출력하고 sys.exit(0) 하는 **무실행** 경로라
+    #   cys 를 전혀 호출하지 않는다. 그런데 _resolve_cys 는 identity 프로브(subprocess `cys status/phoenix-identity`)를
+    #   돌리는데, 데몬이 없는 환경(스모크 ⑥)에서 Windows 는 이 프로브가 12s×재시도로 지연돼 --plan 이 30s 타임아웃
+    #   (exit 124)됐다. 무실행 서브커맨드는 CYS 해석을 lazy 로 건너뛴다(실 subprocess 필요 경로는 모두 CYS 해석 후에
+    #   실행되므로 무영향). die 경로(cys 부재)도 --plan 에선 부적절(계획 출력에 cys 불요)이라 함께 해소된다.
+    _no_exec_plan = args.cmd == "deploy" and getattr(args, "plan", False)
+    CYS = None if _no_exec_plan else _resolve_cys(args.socket)
     {
         "restore": cmd_restore, "reconcile": cmd_reconcile, "status": cmd_status,
         "roster": cmd_roster, "inherit": cmd_inherit, "tombstone": cmd_tombstone,

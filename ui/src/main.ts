@@ -8,6 +8,7 @@ import { imeStep, initialImeState, type ImeEvent } from "./ime";
 import { shellQuote, shellQuoteJoin } from "./shellquote";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
+import { deptPlaceholderLabel } from "./deptlabel";
 
 declare global {
   interface Window {
@@ -1604,9 +1605,11 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // WKWebView는 표준 composition 없이 음절 첫 자모를 insertText로 커밋하거나(자모 유출), 혼성 프로필에선
   // 첫 자모를 insertText로 커밋한 뒤 나머지 조합을 표준 composition 이벤트로 진행한다.
   // 자모 pending, 병합 커밋, 음절 확정 flush, 조합 흡수 자모 폐기(drop) 판단은 ime.ts 리듀서가 하고,
-  // 여기서는 DOM 이벤트를 리듀서에 배선만 한다. 계측: localStorage.cysImeDebug="1" 시 이벤트 시퀀스를
-  // log_ime로 기록(유실 경로를 결정론으로 확정하는 채널). 평시 비용 0.
-  const imeDbg = localStorage.getItem("cysImeDebug") === "1";
+  // 여기서는 DOM 이벤트를 리듀서에 배선만 한다. 계측: localStorage.cysImeDebug="1" 또는 파일
+  // 게이트(~/.cys/ime-debug)/CYS_IME_DEBUG=1 시 이벤트 시퀀스를 log_ime로 기록(유실 경로를
+  // 결정론으로 확정하는 채널 — 릴리스 빌드엔 devtools가 없어 파일 게이트가 최종 사용자 진단 경로). 평시 비용 0.
+  let imeDbg = localStorage.getItem("cysImeDebug") === "1";
+  if (!imeDbg) invoke("ime_debug_enabled").then((v) => { imeDbg = v === true; }).catch(() => {});
   const dbg = (line: string) => {
     if (imeDbg) invoke("log_ime", { line: `[s${sid}] ${line}` }).catch(() => {});
   };
@@ -1835,8 +1838,10 @@ function paneAtPhysicalPoint(pos?: { x: number; y: number }): PaneRuntime | unde
 function render() {
   for (const rt of panes.values()) rt.el.remove();
   root.innerHTML = "";
-  const tree = current()?.tree;
+  const ws = current();
+  const tree = ws?.tree;
   if (tree) root.appendChild(renderNode(tree));
+  else if (ws?.pending) root.appendChild(renderDeptPending()); // WP-10: 부서 준비 중 빈 pane 스피너·안내
   renderWsTabs();
   requestAnimationFrame(() => {
     for (const sid of collectSids(current()?.tree ?? null)) {
@@ -1845,6 +1850,27 @@ function render() {
     }
   });
   saveLayout();
+}
+
+// WP-10: 부서 데몬 준비(~12초·tree:null) 동안 빈 pane 호스트에 중앙 스피너+안내 문구를 표시한다.
+// 성공 시 tree가 채워져 자연 교체되고, 실패 시 placeholder 탭이 롤백된다(addDeptWorkspace 3분기 로직 불변).
+// aria-busy/aria-live 로 스크린리더에 진행/해소를 통지. 스피너 회전·정지는 CSS(prefers-reduced-motion)가 담당.
+function renderDeptPending(): HTMLElement {
+  const host = document.createElement("div");
+  host.className = "pane dept-pending";
+  host.setAttribute("aria-busy", "true");
+  host.setAttribute("aria-live", "polite");
+  const box = document.createElement("div");
+  box.className = "dept-pending-box";
+  const spin = document.createElement("div");
+  spin.className = "dept-spinner";
+  spin.setAttribute("aria-hidden", "true");
+  const msg = document.createElement("div");
+  msg.className = "dept-pending-msg";
+  msg.textContent = "부서를 준비하고 있습니다 — 최대 십여 초 걸릴 수 있어요";
+  box.append(spin, msg);
+  host.appendChild(box);
+  return host;
 }
 
 function renderNode(node: Node): HTMLElement {
@@ -2174,12 +2200,20 @@ function buildTab(ws: Workspace): HTMLElement {
   titleRow.className = "ws-title-row";
   const label = document.createElement("span");
   label.className = "ws-name";
-  label.textContent = ws.name;
+  label.textContent = deptPlaceholderLabel(ws); // WP-10: pending이면 "부서 제작 중…" (멈춘 줄 오해 방지)
   const close = document.createElement("span");
   close.className = "ws-close";
   close.textContent = "×";
   close.title = "워크스페이스 닫기 (surface 전부 종료)";
   titleRow.append(label, close);
+  // WP-10: 부서 준비 중 탭엔 스피너 글리프를 라벨 앞에 붙이고 aria-busy 로 진행을 알린다(CSS가 회전·정지 담당).
+  if (ws.pending) {
+    const spin = document.createElement("span");
+    spin.className = "ws-tab-spinner";
+    spin.setAttribute("aria-hidden", "true");
+    titleRow.prepend(spin);
+    tab.setAttribute("aria-busy", "true");
+  }
   // 승인 대기 배지(B3): 중복 표시 방지 위해 활성 ws 행에만 1개 노출.
   if (pendingApprovals > 0 && workspaces.indexOf(ws) === activeWs) {
     const badge = document.createElement("span");
@@ -2652,9 +2686,9 @@ async function addDeptWorkspace(catalogKey?: string): Promise<Workspace> {
       if (firstSid != null) setFocus(firstSid);
       return dup;
     }
-    // 안 A(C4 더블 surface 해소): cys-dept(create=javis_boot_node·allocate=자동각성)가 부서장 role=master
-    // surface를 띄우므로 UI는 plain 셸을 직접 만들지 않는다. socket 확정 + pending 해제 → refreshPaneTitles
-    // 자동입양이 그 master를 '첫 pane'으로 채운다(rolePri master=0 → 좌측·focus). 빈 셸 0·더블 surface 0.
+    // 안 A(C4 더블 surface 해소): cys-dept(create·allocate 모두 role=master '빈 셸' — WP-11 일원화)가 부서장
+    // role=master surface를 띄우므로 UI는 plain 셸을 직접 만들지 않는다. socket 확정 + pending 해제 → refreshPaneTitles
+    // 자동입양이 그 master(빈 셸)를 '첫 pane'으로 채운다(rolePri master=0 → 좌측·focus). 별도 UI 셸 0·더블 surface 0.
     // 탭이 await 중 닫혀도(close 핸들러가 socket 기준 데몬 teardown) 좀비 없음 — 별도 plain-셸 회수 불필요.
     ws.socket = info.socket;
     ws.pending = false;
@@ -2776,6 +2810,18 @@ interface FeedItem {
 function openFeed() {
   if (!ccOpen) setCcOpen(true);
   setCcTab("feed");
+}
+
+// 승인 자동 화면전환 유예: master가 이 시간 안에 자동 승인(reply)하면 전환하지 않는다.
+// 유예 후에도 pending인 항목 = 사람 수동 승인 필요 → 그때만 승인 Feed 탭으로 전환.
+const FEED_SWITCH_GRACE_MS = 30_000;
+function scheduleFeedSwitchIfStillPending(requestId: string) {
+  if (!requestId) return;
+  setTimeout(async () => {
+    const r = (await invoke("feed_list", { status: null }).catch(() => null)) as { items: FeedItem[] } | null;
+    const item = r?.items.find((i) => i.request_id === requestId);
+    if (item?.status === "pending") openFeed();
+  }, FEED_SWITCH_GRACE_MS);
 }
 
 // ---------- file tree (오른쪽 섹션 — 선택한 surface의 폴더 탐색) ----------
@@ -3026,6 +3072,44 @@ async function promptInstall() {
     } else {
       toast("health", "업데이트 설치 실패", msg);
     }
+  }
+}
+
+/// 스큐 교대 — rotate_daemon 호출(세션 없으면 자동·있으면 확인, promptInstall 정책 동형).
+/// app.restart가 없는 경로라 완료·실패 토스트까지 이 함수가 책임진다. 성공 시 배지 제거(스큐 해소).
+let rotatingDaemon = false;
+async function promptRotateDaemon(badge: HTMLElement, appVer: string) {
+  if (rotatingDaemon) return; // 유휴 자동 교대와 수동 클릭의 중복 발동 방지
+  const sessions = (await invoke("live_session_count").catch(() => 0)) as number;
+  let force = false;
+  if (sessions > 0) {
+    const ok = await confirmModal(
+      `데몬 교대 (새 버전 v${appVer})`,
+      `작업 세션 ${sessions}개가 구 데몬에 물려 있습니다. 저장(drain) 신호 후 데몬을 새 버전으로 ` +
+        `교대하고 세션을 복원합니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 교대하시겠습니까?`,
+    );
+    if (!ok) return;
+    force = true;
+  }
+  rotatingDaemon = true;
+  stickyToast("rotate-daemon", "feed", "↻ 데몬 교대", `새 버전 v${appVer}로 교대 중… 저장 후 세션을 복원합니다.`);
+  try {
+    await invoke("rotate_daemon", { force });
+    dismissToast("rotate-daemon");
+    badge.remove(); // 스큐 해소 — 배지 내림(유휴 타이머도 isConnected 가드로 멈춘다)
+    toast("watchdog", "✅ 데몬 교대 완료", `데몬이 v${appVer}로 교대됐습니다. 노드 복원이 진행됩니다.`);
+  } catch (e) {
+    dismissToast("rotate-daemon");
+    const msg = String(e);
+    if (msg.includes("live_sessions:")) {
+      // 가드에 막힘(force 미적용 경로 — 확인 사이 세션 증가 등) — 다시 확인 흐름으로
+      rotatingDaemon = false;
+      await promptRotateDaemon(badge, appVer);
+      return;
+    }
+    toast("health", "데몬 교대 실패", msg);
+  } finally {
+    rotatingDaemon = false;
   }
 }
 
@@ -3443,7 +3527,8 @@ function onDaemonEvent(event: Record<string, unknown>) {
   if (name === "approval.request") {
     toast("approval", "⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`);
     osBanner("⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`); // B4 OS 배너(고우선)
-    openFeed(); // 승인은 즉시 승인 Feed 탭 오픈 (feed.item.created의 wait 경로와 정합)
+    // 자동 화면전환 없음 — 페인 승인 프롬프트는 master 즉각 자동승인 관할.
+    // 토스트·OS 배너·사이드바 배지로만 알린다(feed.item.created의 유예 경로와 정합).
     refreshFeed();
     refreshSidebarStatus(); // 사이드바 ⚠ 배지 갱신 (B3)
     return;
@@ -3495,7 +3580,9 @@ function onDaemonEvent(event: Record<string, unknown>) {
   } else if (category === "feed") {
     if (name === "feed.item.created") {
       toast("feed", "📥 승인 요청", String(payload.title ?? ""));
-      if (payload.wait === true) openFeed();
+      // 즉시 전환하지 않는다 — master 자동 승인 유예 후에도 pending인 항목만
+      // 사람 개입 필요로 보고 전환한다(자동 승인분은 무전환).
+      if (payload.wait === true) scheduleFeedSwitchIfStillPending(String(payload.request_id ?? ""));
     }
     refreshFeed();
     refreshSidebarStatus(); // 피드 이벤트 시 집계 배지 갱신(멀티부서 정합)
@@ -3541,8 +3628,21 @@ async function start() {
       badge.className = "ver-skew-badge";
       badge.textContent = `데몬 v${daemonVer} · 앱 v${appVer} — 세션 보존 중`;
       badge.title =
-        "업데이트가 적용됐지만 실행 중인 세션(마스터·워커·부서)을 보존하기 위해 기존 데몬이 계속 봉사합니다.\n모든 작업이 유휴일 때 데몬을 재시작하면 새 버전으로 교대됩니다. 세션은 죽지 않습니다.";
+        "업데이트가 적용됐지만 실행 중인 세션(마스터·워커·부서)을 보존하기 위해 기존 데몬이 계속 봉사합니다.\n클릭하면 저장(drain) 후 새 버전으로 교대하고 세션을 복원합니다.";
+      badge.addEventListener("click", () => void promptRotateDaemon(badge, appVer));
       info.appendChild(badge);
+      // 유휴 자동 교대: 잃을 세션이 0이면 무손실 — 시작 시 1회 + 5분 주기로 확인해 자동 교대.
+      // 카운트 실패(-1)는 자동 발동 금지(보수적) — 수동 클릭 경로만 남긴다.
+      const tryIdleRotate = async () => {
+        if (!badge.isConnected) {
+          clearInterval(idleTimer); // 이미 교대됨(수동 클릭 성공) — 재교대 방지
+          return;
+        }
+        const n = (await invoke("live_session_count").catch(() => -1)) as number;
+        if (n === 0) await promptRotateDaemon(badge, appVer);
+      };
+      const idleTimer = setInterval(() => void tryIdleRotate(), 5 * 60_000);
+      void tryIdleRotate();
     }
   } catch {
     /* 배지는 부가 기능 — 실패해도 시작을 막지 않는다 */

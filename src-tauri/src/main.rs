@@ -392,6 +392,14 @@ fn log_ime(line: String) {
     }
 }
 
+/// IME 디버그 게이트(파일/환경변수): 릴리스 빌드엔 devtools가 없어 localStorage.cysImeDebug를
+/// 최종 사용자가 켤 수 없다 → ~/.cys/ime-debug 파일 존재 또는 CYS_IME_DEBUG=1이면 계측 활성.
+#[tauri::command]
+fn ime_debug_enabled() -> bool {
+    std::env::var("CYS_IME_DEBUG").map(|v| v == "1").unwrap_or(false)
+        || cys::home_dir().join(".cys/ime-debug").exists()
+}
+
 #[tauri::command]
 async fn send_input(socket: Option<String>, surface_id: u64, data: String) -> Result<(), String> {
     // human=true: T3-13 타이핑 가드의 신호 — UI 키 입력을 '사람'으로 표시해
@@ -1721,6 +1729,38 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     app.restart();
 }
 
+/// 데몬 세대교체(업데이트 없이) — Windows rename-swap 후 lame-duck 스큐(구 데몬 + 새 앱)의
+/// 지연 핸드오프 완결(P2 스큐 배지의 짝). NSIS 경로는 install_update의 핸드오프 코드가 실행될 수
+/// 없어(인스톨러가 앱을 죽임) 디스크만 새 버전·프로세스는 구 버전으로 남는다 — 이 command가
+/// install_update 3~4단계를 업데이트 없이 재현한다: drain → 복귀 마커 → 구 데몬 종료 →
+/// 디스크의 새 cysd 기동. app.restart()가 없어 setup이 다시 돌지 않으므로
+/// maybe_apply_pending_update(팩 반영 + cys restore 노드 복원)를 여기서 직접 수행한다.
+/// ★update-progress는 emit하지 않는다 — drain/handoff 페이즈가 UI "업데이트 설치" sticky 토스트를
+/// 만드는데 이 경로엔 재시작이 없어 영구 잔류한다. 진행 표시는 UI(promptRotateDaemon) 토스트 담당.
+/// force=false: 살아있는 세션이 있으면 거부(UI가 확인 후 force=true로 재호출) — install_update 가드 동형.
+#[tauri::command]
+async fn rotate_daemon(app: AppHandle, force: bool) -> Result<(), String> {
+    let sessions = live_session_count().await.unwrap_or(0);
+    if sessions > 0 && !force {
+        return Err(format!("live_sessions:{sessions}"));
+    }
+    // drain(best-effort): 교대 전 살아있는 노드에 저장 신호 + 유예 (install_update 3단계 동형).
+    let _ = tokio::task::spawn_blocking(|| {
+        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+        cmd.arg("drain");
+        no_console(&mut cmd);
+        cmd.status()
+    })
+    .await;
+    let _ = std::fs::write(pending_restore_path(), "");
+    stop_running_daemon().await;
+    ensure_daemon().await?;
+    // init-pack이 blocking Command::status()라 blocking 풀에서 실행(위 drain 패턴과 일치).
+    let app2 = app.clone();
+    let _ = tokio::task::spawn_blocking(move || maybe_apply_pending_update(&app2)).await;
+    Ok(())
+}
+
 /// P5: 무중단 팩 업데이트 UI 브리지(DESIGN-noshutdown-pack-update §2-②·§7-③/④).
 /// UI "업데이트 버튼"이 호출 → `cys pack-update`(P4) 사이드카를 실행해 서명검증→디스크 반영→
 /// 살아있는 노드 reinject를 시킨다. ★`app.restart()`를 **절대 호출하지 않는다** — cysd·cys-app·
@@ -1906,6 +1946,7 @@ fn main() {
             send_input,
             save_pasted_image,
             log_ime,
+            ime_debug_enabled,
             rename_surface,
             resize_surface,
             close_surface,
@@ -1925,6 +1966,7 @@ fn main() {
             check_pack_update,
             live_session_count,
             install_update,
+            rotate_daemon,
             install_pack_update,
             launch_dept_daemon,
             allocate_dept_daemon,

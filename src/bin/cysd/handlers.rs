@@ -141,6 +141,15 @@ fn resolve_surface_id(params: &Value) -> Option<u64> {
     }
 }
 
+/// ★W2/P0-6: surface.close 의 cause 파라미터 파싱 — "reap"=Reap(묘비 미생성·부활 대상), 그 외/부재=OwnerClose
+/// (묘비 생성·좀비 부활 차단). 미지 값은 안전측 OwnerClose(오타로 부활 폭주 방지). 순수 함수(테스트 가능).
+fn close_cause_from_params(params: &Value) -> governance::CloseCause {
+    match params.get("cause").and_then(|v| v.as_str()) {
+        Some("reap") => governance::CloseCause::Reap,
+        _ => governance::CloseCause::OwnerClose,
+    }
+}
+
 /// 단순 글롭 매칭: '*'만 와일드카드, 나머지는 리터럴 (역할 패턴용 — reviewer-*)
 pub fn glob_match(pattern: &str, value: &str) -> bool {
     let mut re = String::from("^");
@@ -1185,12 +1194,47 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 }
             }
-            match governance::close_surface(daemon, sid, governance::CloseCause::OwnerClose) {
-                Ok(()) => {
-                    Reply::Single(ok_response(&id, json!({"surface_id": sid, "closed": true})))
-                }
+            // ★W2/P0-6: cause 파라미터 — 기본 OwnerClose(묘비 생성·좀비 부활 차단)이나, launch-agent 롤백처럼
+            // "생성 실패로 되돌리는" 발신처는 cause="reap"을 보내 묘비를 남기지 않는다(실패한 launch 는 부활
+            // 대상이지 의도적 폐역이 아니다 — 롤백이 역할을 오묘비화하던 P0-6 우회로 차단). 미지 값은 안전측
+            // OwnerClose(묘비)로 폴백(오타로 부활 폭주하지 않게).
+            let cause = close_cause_from_params(&params);
+            match governance::close_surface(daemon, sid, cause) {
+                Ok(()) => Reply::Single(ok_response(
+                    &id,
+                    json!({"surface_id": sid, "closed": true, "cause": format!("{cause:?}")}),
+                )),
                 Err(e) => Reply::Single(err_response(&id, "not_found", &e)),
             }
+        }
+
+        // ★W2/A-S3: 명시적 묘비 set — 데몬이 topology 묘비의 유일 작성자(단일 작성자 원칙). phoenix tombstone CLI 가
+        // desired 직접 쓰기 대신 이 RPC 로 topology 묘비를 심는다(옵션A). remove=true 면 폐역 해제. persist 로 rev 증가.
+        "tombstone.set" => {
+            let Some(role) = param_str(&params, "role") else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing role"));
+            };
+            let remove = params.get("remove").and_then(|v| v.as_bool()).unwrap_or(false);
+            {
+                let mut tombs = daemon.tombstones.lock().unwrap();
+                if remove {
+                    tombs.remove(&role);
+                } else {
+                    tombs.insert(role.clone());
+                    // 폐역이면 role-map 에서도 제외(살아있는 surface 는 close_surface 가 별도 처리 — 여기선 선언만).
+                    daemon.roles.lock().unwrap().remove(&role);
+                }
+            }
+            governance::persist_topology(daemon); // 엔트리+묘비+rev 단일 영속(단조 카운터 증가)
+            let rev = daemon
+                .tombstones_rev
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let mut tv: Vec<String> = daemon.tombstones.lock().unwrap().iter().cloned().collect();
+            tv.sort();
+            Reply::Single(ok_response(
+                &id,
+                json!({"role": role, "removed": remove, "tombstones_rev": rev, "tombstones": tv}),
+            ))
         }
 
         // 사후 역할 등록: 이미 떠 있는 세션이 자기 surface를 역할 주소로 등록 ("너는 마스터이다" 경로)
@@ -2473,6 +2517,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "daemon": {"version": env!("CARGO_PKG_VERSION"),
                                "started_at": daemon.started_at,
                                "latest_seq": daemon.bus.latest_seq(),
+                               // ★W1 identity(3중 대조): 폴백 cys 가 이 데몬과 같은 빌드인지 python 이 교차대조.
+                               "build_id": cys::pack::build_id(),
+                               "embedded_pack_hash": cys::pack::embedded_pack_hash(),
+                               "protocol_version": cys::pack::PHOENIX_PROTOCOL_VERSION,
                                // (W4) 데몬 전체 파서 패닉 격리 누적 — health 신호.
                                "parser_panics": daemon.parser_panics_total.load(Ordering::Relaxed)},
                     "surfaces": list,
@@ -3193,14 +3241,26 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 _ => Vec::new(),
             };
             let prefix: Vec<String> = prefix.into_iter().filter(|t| !t.is_empty()).collect();
-            if prefix.is_empty() {
+            // R-GOV-1: 최소 2토큰 강제 — 단일 토큰(git·bash 등) 광역 prefix는 넓은 명령군을 자동
+            // 통과시키므로 거부(비어있음 폴백 차단 + 광역 단일토큰 차단). 서명 후 위조불가라 생성
+            // 게이트가 광역 승인 발급을 원천 봉인한다.
+            if prefix.len() < 2 {
                 return Reply::Single(err_response(
                     &id,
                     "invalid_params",
-                    "command_prefix must be a non-empty array (폴백 차단)",
+                    "command_prefix must have >= 2 tokens (광역 단일토큰 승인 차단; 폴백 차단)",
                 ));
             }
+            // R-GOV-3: cwd 필수 — cwd=None 레코드는 matches()에서 cwd 검사를 skip해 모든 디렉터리에
+            // 매칭(광역)되므로 승인 생성 자체를 거부한다(디렉터리 스코프 강제).
             let cwd = crate::approval::normalize_cwd(param_str(&params, "cwd").as_deref());
+            if cwd.is_none() {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "cwd is required (광역 전-디렉터리 매칭 차단)",
+                ));
+            }
             let env = params
                 .get("env")
                 .map(crate::approval::env_from_json)
@@ -3251,6 +3311,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★W2/P0-6: cause 파싱 — "reap"=Reap, 그 외/부재/미지 값=안전측 OwnerClose(묘비).
+    #[test]
+    fn close_cause_reap_vs_owner() {
+        use governance::CloseCause;
+        assert_eq!(close_cause_from_params(&json!({"cause": "reap"})), CloseCause::Reap);
+        assert_eq!(close_cause_from_params(&json!({"cause": "owner"})), CloseCause::OwnerClose);
+        assert_eq!(close_cause_from_params(&json!({"cause": "typo-xyz"})), CloseCause::OwnerClose);
+        assert_eq!(close_cause_from_params(&json!({})), CloseCause::OwnerClose);
+        assert_eq!(close_cause_from_params(&json!({"cause": 5})), CloseCause::OwnerClose);
+    }
 
     #[test]
     fn glob_literal_and_star() {
