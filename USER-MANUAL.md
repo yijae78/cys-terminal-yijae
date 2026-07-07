@@ -62,7 +62,7 @@
 2. 앱을 1회 실행하면 온보딩이 자동으로 팩 설치·훅 등록·데몬 자동 기동(작업 스케줄러
    ONLOGON)을 마칩니다.
 3. 확인: `dir %USERPROFILE%\.cys\pack` · `schtasks /Query /TN cysd`
-4. 상세(비기술자용 안내 포함): [INSTALL-Windows-KR.md](INSTALL-Windows-KR.md)
+4. 상세(비기술자용 안내 포함): [INSTALL-Windows-KR.md](docs/INSTALL-Windows-KR.md)
 
 ### 2.3 데몬 상시 가동 (24/365, 선택)
 
@@ -96,7 +96,7 @@ cys doctor          # 자기진단 (문제 시 --fix)
 3. 선택 — 데이터까지 완전 삭제(비가역): `~/.cys`(팩·설정)와 `~/.local/state/cys`(소켓·
    관제 DB) 삭제. 장기기억·soul.md도 함께 사라지므로 백업 후 진행하세요.
 
-상세: [INSTALL.md](INSTALL.md)
+상세: [INSTALL.md](docs/INSTALL.md)
 
 ---
 
@@ -621,4 +621,4 @@ todo.updated   approval.request   approval.stalled   master.deadman   osc.notify
   암호학적 방어가 아니라 탐지·fail-safe 층입니다.
 - 비밀 스캐너는 정적 패턴 매칭 — 난독화·신종 토큰은 못 잡습니다(1차 방어선일 뿐).
 
-취약점 신고는 [SECURITY.md](../SECURITY.md)를 따라 주세요.
+취약점 신고는 [SECURITY.md](SECURITY.md)를 따라 주세요.

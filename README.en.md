@@ -15,8 +15,8 @@ cost, context, and hardware in real time.
 
 ## Docs
 
-- **[Architecture & Philosophy](docs/ARCHITECTURE-AND-PHILOSOPHY.md)** — design theses, system architecture, security model, invariants (Korean)
-- **[User Manual](docs/USER-MANUAL.md)** — install to fleet operations, full CLI/env/protocol reference (Korean)
+- **[Architecture & Philosophy](ARCHITECTURE-AND-PHILOSOPHY.md)** — design theses, system architecture, security model, invariants (Korean)
+- **[User Manual](USER-MANUAL.md)** — install to fleet operations, full CLI/env/protocol reference (Korean)
 
 ## Why
 
@@ -108,7 +108,7 @@ Report vulnerabilities per [SECURITY.md](SECURITY.md).
 Protocol methods/events, environment variables, governance tables, the 19 Jarvis-native
 features, approval feed, in-flight queue semantics, and source-build instructions are
 documented in the Korean [README.md](README.md) and the
-[User Manual](docs/USER-MANUAL.md) (the canonical references).
+[User Manual](USER-MANUAL.md) (the canonical references).
 
 ## Contributing · License
 

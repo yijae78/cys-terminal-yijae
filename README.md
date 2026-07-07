@@ -16,8 +16,8 @@
 
 | 문서 | 내용 |
 |---|---|
-| **[Architecture & Philosophy](docs/ARCHITECTURE-AND-PHILOSOPHY.md)** | 설계 철학 10명제·시스템 아키텍처·보안 모델·불변식 |
-| **[User Manual](docs/USER-MANUAL.md)** | 설치부터 함대 운용, CLI·환경변수·프로토콜 전체 레퍼런스까지 |
+| **[Architecture & Philosophy](ARCHITECTURE-AND-PHILOSOPHY.md)** | 설계 철학 10명제·시스템 아키텍처·보안 모델·불변식 |
+| **[User Manual](USER-MANUAL.md)** | 설치부터 함대 운용, CLI·환경변수·프로토콜 전체 레퍼런스까지 |
 | [INSTALL.md](docs/INSTALL.md) · [INSTALL-Windows-KR.md](docs/INSTALL-Windows-KR.md) | 설치 상세 |
 | [SECURITY.md](SECURITY.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [NOTICE.md](NOTICE.md) | 보안 신고 · 기여 · 서드파티 귀속 |
 
@@ -56,7 +56,7 @@
 - 외부 터미널에서 `cys` 명령 쓰기: 앱 Control Center → **"셸에 cys 설치"** 1클릭.
 
 설치·제거 상세는 [docs/INSTALL.md](docs/INSTALL.md), 사용법 전체는
-[User Manual](docs/USER-MANUAL.md).
+[User Manual](USER-MANUAL.md).
 
 ## 빠른 시작
 
@@ -103,8 +103,8 @@ soul.md와 memory/는 **의도적으로 비어 있는 골격**입니다 — "운
 자율 완주)은 오너가 soul.md에 명시적으로 부여할 때만 켜지며, **오너의 어떤 입력이든
 즉시 일시정지시키는 kill-switch**가 최우선입니다.
 
-상세: [Architecture & Philosophy](docs/ARCHITECTURE-AND-PHILOSOPHY.md) §2–4,
-운용법: [User Manual](docs/USER-MANUAL.md) §12.
+상세: [Architecture & Philosophy](ARCHITECTURE-AND-PHILOSOPHY.md) §2–4,
+운용법: [User Manual](USER-MANUAL.md) §12.
 
 ## Control Center (실시간 관제 + 영속 분석)
 
@@ -197,7 +197,7 @@ cys feed reply <request_id> allow                            # CLI 또는 UI All
 ## 프로토콜 · 환경변수
 
 NDJSON(한 줄 = JSON 하나), RPC 60여 개 + `channel.*` 13종, 이벤트 60여 종.
-전수 목록과 환경변수 표는 [User Manual §16–17](docs/USER-MANUAL.md)에 있습니다.
+전수 목록과 환경변수 표는 [User Manual §16–17](USER-MANUAL.md)에 있습니다.
 
 ## 소스 빌드 (기여 시)
 
@@ -224,7 +224,7 @@ UI 재시작·앱 재설치에도 세션 유지(재attach).
 - 승인 자동응답 없음(HITL) · 자기결재 차단 · 외부 URL은 하드 허용목록(로컬 설정으로만 확장).
 - 발행 전 비밀/PII 게이트: `scripts/secret-scan.sh --all` (fail-closed).
 
-취약점 신고: [SECURITY.md](SECURITY.md) · 상세: [Architecture & Philosophy §6](docs/ARCHITECTURE-AND-PHILOSOPHY.md)
+취약점 신고: [SECURITY.md](SECURITY.md) · 상세: [Architecture & Philosophy §6](ARCHITECTURE-AND-PHILOSOPHY.md)
 
 ## 알려진 한계
 
