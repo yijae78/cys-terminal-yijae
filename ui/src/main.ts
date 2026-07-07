@@ -1668,6 +1668,15 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   });
   const un2 = await listen(ev.exited_event, () => {
     term.write("\r\n\x1b[31m[surface exited]\x1b[0m\r\n");
+    // surface가 (셸 종료·프로세스 사망 등으로) 스스로 종료되면 트리에서 제거하고
+    // 형제 pane으로 축소·재렌더해 빈 공간을 회수한다 (close 버튼 × 경로와 동일 처리).
+    const ws = workspaces.find((w) => w.socket === socket);
+    if (ws?.tree && collectSids(ws.tree).includes(sid)) {
+      ws.tree = replaceNode(ws.tree, sid, () => null);
+      if (focusedSid === sid) focusedSid = collectSids(ws.tree)[0] ?? null;
+      destroyPaneRuntime(sid, socket);
+      render();
+    }
   });
   // listen 등록을 마친 뒤에 스트림을 시작해야 초기 화면 snapshot(프롬프트)이 유실되지 않는다
   // (런치 시 첫 pane 빈 화면 버그 — snapshot이 listen 전에 emit되던 race 차단).
