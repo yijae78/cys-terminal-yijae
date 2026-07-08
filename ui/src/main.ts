@@ -2819,6 +2819,7 @@ async function actionClose() {
   focusedSid = collectSids(ws.tree)[0] ?? null;
   render();
   if (focusedSid != null) setFocus(focusedSid);
+  await actionEqualize(); // 닫은 뒤 남은 패널을 전체 공간에 균등 재배치 (닫힌 자리 여백 회수)
 }
 
 // 데몬에서 사라진(종료·닫힘·reap) surface의 UI pane을 자동 제거 — 멱등(이미 없으면 무동작).
@@ -2828,6 +2829,10 @@ function removeDeadPane(sid: number, socket?: string) {
   const sameSock = (w: Workspace) => (w.socket ?? undefined) === (socket ?? undefined);
   const inLayout = workspaces.some((w) => sameSock(w) && w.tree != null && collectSids(w.tree).includes(sid));
   if (!panes.has(paneKey(sid, socket)) && !inLayout) return; // 이미 정리됨
+  // 활성 ws에서 빠지는 pane인지 제거 전에 기록 — 아래 equalize를 활성 ws 변화에만 국한(타부서 정리가
+  // 현 화면 레이아웃을 흔들지 않게).
+  const cur0 = current();
+  const wasInCurrent = cur0 != null && sameSock(cur0) && cur0.tree != null && collectSids(cur0.tree).includes(sid);
   destroyPaneRuntime(sid, socket);
   for (const ws of workspaces) {
     if (sameSock(ws) && ws.tree != null && collectSids(ws.tree).includes(sid)) {
@@ -2839,6 +2844,9 @@ function removeDeadPane(sid: number, socket?: string) {
     focusedSid = collectSids(current()?.tree ?? null)[0] ?? null;
   render();
   if (focusedSid != null) setFocus(focusedSid);
+  // 자력 종료(셸 exit·노드 사망·reap)로 pane이 빠진 자리도 ✕닫기(actionClose)와 동일하게 회수 —
+  // 남은 패널을 전체 공간에 균등 재배치. ✕닫기에만 있던 equalize가 이 경로에 없어 빈 공간이 남던 결함.
+  if (wasInCurrent) void actionEqualize();
 }
 
 // ---------- 승인 Feed (Control Center 탭) ----------
@@ -3936,64 +3944,74 @@ async function start() {
   // 재-launch된 경우)는 위 병합 루프가 못 채운다 — plain 셸 1개로 충전해 빈 탭 소실/고아 placeholder 방지.
   for (const ws of workspaces) {
     if (ws.tree || ws.socket == null || liveBySock.get(ws.socket)?.ok !== true) continue;
-    const sid = await newSurface(null, ws.socket);
-    ws.tree = { type: "pane", sid };
+    try {
+      const sid = await newSurface(null, ws.socket);
+      ws.tree = { type: "pane", sid };
+    } catch {
+      /* 부서 셸 충전 실패 — start() 전체를 죽이지 않는다(빈 탭은 이후 자동입양/재시도로 회복) */
+    }
+  }
+  // RC2(자동연결 재설계): 기본 데몬에 live master가 없으면 — 잔존 role=- 빈 셸이 입양돼 tree가 차
+  // 있어도 — master(claude)를 정석 자동기동한다(cys launch-agent). 이전 게이트(tree가 빈 경우만)는
+  // 상시가동 cysd에 남은 빈 셸이 한 번이라도 입양되면 영원히 발화하지 않는 결함(껐다 켤 때마다
+  // '클로드 미연결' 재현)이었다. launch-agent가 claude ready 폴링 후에야 directive를 주입하므로
+  // '빈 셸 오해석'(과거 WP-11 자동연결 폐지 사유)은 여전히 원천 차단. live master 존재 시 스킵이라
+  // 중복 기동 0. 기동된 master는 refreshPaneTitles 자동입양(rolePri master=0)이 첫 pane으로 흡수한다.
+  let masterEnsured: boolean | null = null; // false=이미 존재 · true=방금 기동 · null=조회/기동 실패(불명)
+  try {
+    const r = (await invoke("list_surfaces", { socket: undefined })) as {
+      surfaces: { role: string | null; exited: boolean }[];
+    };
+    if (r.surfaces.some((s) => s.role === "master" && !s.exited)) {
+      masterEnsured = false;
+    } else {
+      await invoke("launch_master");
+      masterEnsured = true;
+    }
+  } catch {
+    /* 기본 데몬 미응답/launch 실패 → 아래 빈 셸 폴백이 화면 공백을 막는다 */
   }
   if (!current().tree) {
     const cur = current();
-    // RC(최초 자동연결): 기본 데몬(socket undefined)에 live master surface가 없으면 = 앱 최초 실행 →
-    // 빈 셸 대신 master(claude)를 정석 자동기동한다(cys launch-agent). launch-agent가 claude ready를
-    // 폴링 확인한 뒤에야 directive를 주입하므로 '빈 셸 오해석'(과거 WP-11 자동연결 폐지 사유)이 원천
-    // 차단된다. cysd는 상시가동(schtasks)이라 앱 재시작 시엔 기존 master가 남아 복원 병합 루프가 이미
-    // 입양 → 이 분기를 안 타고 중복 기동 0. 부서/미응답 ws 등 그 외는 아래 빈 셸 폴백(정상 경로 불변).
     let launchedMaster = false;
     if (cur.socket == null) {
-      let hasMaster = false;
-      try {
-        const r = (await invoke("list_surfaces", { socket: undefined })) as {
-          surfaces: { role: string | null; exited: boolean }[];
-        };
-        hasMaster = r.surfaces.some((s) => s.role === "master" && !s.exited);
-      } catch {
-        /* 조회 실패 → 보수적으로 아래 빈 셸 폴백 */
-      }
-      if (hasMaster) {
+      if (masterEnsured === false) {
         launchedMaster = true; // 기존 master는 refreshPaneTitles 자동입양에 맡김 — 빈 셸 미생성
-      } else {
-        try {
-          await invoke("launch_master");
-          // surface.create 반영(=master가 list에 등장)까지 짧게 폴링(최대 ~4s). claude ready 폴링은
-          // 백그라운드로 계속되고 여기선 surface 등장(빠름)만 기다린다. 등장하면 tree는 비운 채 두고
-          // 아래 started=true 후 refreshPaneTitles 자동입양(rolePri master=0)이 첫 pane으로 흡수한다.
-          for (let i = 0; i < 20; i++) {
-            await new Promise((res) => setTimeout(res, 200));
-            try {
-              const r = (await invoke("list_surfaces", { socket: undefined })) as {
-                surfaces: { role: string | null; exited: boolean }[];
-              };
-              if (r.surfaces.some((s) => s.role === "master" && !s.exited)) {
-                launchedMaster = true;
-                break;
-              }
-            } catch {
-              /* 계속 폴링 */
+      } else if (masterEnsured === true) {
+        // surface.create 반영(=master가 list에 등장)까지 짧게 폴링(최대 ~4s). claude ready 폴링은
+        // 백그라운드로 계속되고 여기선 surface 등장(빠름)만 기다린다. 등장하면 tree는 비운 채 두고
+        // 아래 started=true 후 refreshPaneTitles 자동입양(rolePri master=0)이 첫 pane으로 흡수한다.
+        for (let i = 0; i < 20; i++) {
+          await new Promise((res) => setTimeout(res, 200));
+          try {
+            const r = (await invoke("list_surfaces", { socket: undefined })) as {
+              surfaces: { role: string | null; exited: boolean }[];
+            };
+            if (r.surfaces.some((s) => s.role === "master" && !s.exited)) {
+              launchedMaster = true;
+              break;
             }
+          } catch {
+            /* 계속 폴링 */
           }
-        } catch {
-          /* launch 실패 → 빈 셸 폴백 */
         }
       }
+      // masterEnsured === null(조회/기동 실패)은 launchedMaster=false → 아래 빈 셸 폴백(보수적)
     }
     // 최초 자동연결이 안 잡힌 모든 경우(부서 미응답 ws·launch 실패·master 미등장)는 기존대로 빈 셸로
     // 폴백해 빈 화면/미처리 rejection을 막는다(죽은 부서 socket이면 기본 데몬으로 재폴백).
     if (!launchedMaster) {
-      let sid: number;
       try {
-        sid = await newSurface(null, cur.socket);
+        let sid: number;
+        try {
+          sid = await newSurface(null, cur.socket);
+        } catch {
+          sid = await newSurface(null, undefined);
+        }
+        cur.tree = { type: "pane", sid };
       } catch {
-        sid = await newSurface(null, undefined);
+        /* 기본 데몬까지 실패 — 빈 tree로 두고 start()는 계속 진행(started 게이트가 벽돌되지 않게) */
       }
-      cur.tree = { type: "pane", sid };
     }
   }
   render();
@@ -4203,4 +4221,13 @@ window.addEventListener("keydown", (e) => {
 
 start().catch((e) => {
   document.getElementById("daemon-info")!.textContent = `startup failed: ${e}`;
+  // 자가치유: 복원 도중 예외가 나도 UI를 벽돌로 두지 않는다 — started 게이트를 열어 인터벌
+  // 자동입양과 '+부서' 버튼(started 가드 4126)을 살리고, 실패를 토스트로 보이게 알린다(침묵 브릭 방지).
+  toast("watchdog", "시작 복원 일부 실패", String(e));
+  if (!started) {
+    started = true;
+    refreshPaneTitles();
+    refreshSidebarStatus();
+    setInterval(refreshSidebarStatus, 10000);
+  }
 });
