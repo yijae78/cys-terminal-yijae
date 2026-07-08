@@ -873,6 +873,25 @@ fn run_skill(name: String, ticket: String, agent: Option<String>, close_after: O
     Ok(json!({"ok": true, "name": name}))
 }
 
+/// RC(최초 자동연결): 기본 데몬(CEO)의 첫 화면에 master(claude)를 정석 자동기동한다.
+/// `cys launch-agent`가 surface.create → claude 주입 → ready 폴링 → directive 주입 → role=master
+/// 등록을 원자 수행하므로, claude가 실제로 뜬 뒤에야 지침을 넣어 '빈 셸 오해석'(WP-11 자동연결
+/// 폐지의 사유)이 원천 차단된다. spawn(fire-and-forget) 후 UI의 refreshPaneTitles 자동입양
+/// (rolePri master=0)이 이 surface를 첫 pane으로 흡수한다. socket 미지정 = 기본 데몬(최초 실행은
+/// 항상 기본 데몬). 호출부(main.ts)가 'live master 부재'일 때만 부르므로 role 점유 경합 없음.
+#[tauri::command]
+fn launch_master() -> Result<Value, String> {
+    let cys = resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" });
+    let mut cmd = std::process::Command::new(&cys);
+    inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime PATH 주입 — GUI 런칭 시 claude/node PATH 누락 방지
+    cmd.arg("launch-agent").args(["--role", "master", "--agent", "claude"]);
+    cmd.stdin(std::process::Stdio::null());
+    no_console(&mut cmd);
+    cmd.spawn()
+        .map_err(|e| format!("cys launch-agent(master) 실행 실패 ({}): {e}", cys.display()))?;
+    Ok(json!({ "ok": true }))
+}
+
 /// D5/SB-6: 산출물 회수 결정론 위치(~/.cys/_round/skill-out) — make_ticket output_format과 정합.
 #[tauri::command]
 fn skill_out_dir() -> String {
@@ -1824,6 +1843,7 @@ fn main() {
             read_dept_catalog,
             install_cli_to_path,
             app_version,
+            launch_master,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

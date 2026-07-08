@@ -3874,16 +3874,61 @@ async function start() {
     ws.tree = { type: "pane", sid };
   }
   if (!current().tree) {
-    // 복원 시 current()가 미응답(ok===false) 부서 ws일 수 있다(필터의 ok===false 절로 보존·activeWs가 선택,
-    // 충전 루프는 ok!==true라 스킵) — 죽은 부서 socket에 newSurface하면 backend가 reject해 복원이 깨진다.
-    // 기본 데몬(socket undefined·상시 가용)으로 폴백해 빈 화면/미처리 rejection을 막는다(정상 경로 불변).
-    let sid: number;
-    try {
-      sid = await newSurface(null, current().socket);
-    } catch {
-      sid = await newSurface(null, undefined);
+    const cur = current();
+    // RC(최초 자동연결): 기본 데몬(socket undefined)에 live master surface가 없으면 = 앱 최초 실행 →
+    // 빈 셸 대신 master(claude)를 정석 자동기동한다(cys launch-agent). launch-agent가 claude ready를
+    // 폴링 확인한 뒤에야 directive를 주입하므로 '빈 셸 오해석'(과거 WP-11 자동연결 폐지 사유)이 원천
+    // 차단된다. cysd는 상시가동(schtasks)이라 앱 재시작 시엔 기존 master가 남아 복원 병합 루프가 이미
+    // 입양 → 이 분기를 안 타고 중복 기동 0. 부서/미응답 ws 등 그 외는 아래 빈 셸 폴백(정상 경로 불변).
+    let launchedMaster = false;
+    if (cur.socket == null) {
+      let hasMaster = false;
+      try {
+        const r = (await invoke("list_surfaces", { socket: undefined })) as {
+          surfaces: { role: string | null; exited: boolean }[];
+        };
+        hasMaster = r.surfaces.some((s) => s.role === "master" && !s.exited);
+      } catch {
+        /* 조회 실패 → 보수적으로 아래 빈 셸 폴백 */
+      }
+      if (hasMaster) {
+        launchedMaster = true; // 기존 master는 refreshPaneTitles 자동입양에 맡김 — 빈 셸 미생성
+      } else {
+        try {
+          await invoke("launch_master");
+          // surface.create 반영(=master가 list에 등장)까지 짧게 폴링(최대 ~4s). claude ready 폴링은
+          // 백그라운드로 계속되고 여기선 surface 등장(빠름)만 기다린다. 등장하면 tree는 비운 채 두고
+          // 아래 started=true 후 refreshPaneTitles 자동입양(rolePri master=0)이 첫 pane으로 흡수한다.
+          for (let i = 0; i < 20; i++) {
+            await new Promise((res) => setTimeout(res, 200));
+            try {
+              const r = (await invoke("list_surfaces", { socket: undefined })) as {
+                surfaces: { role: string | null; exited: boolean }[];
+              };
+              if (r.surfaces.some((s) => s.role === "master" && !s.exited)) {
+                launchedMaster = true;
+                break;
+              }
+            } catch {
+              /* 계속 폴링 */
+            }
+          }
+        } catch {
+          /* launch 실패 → 빈 셸 폴백 */
+        }
+      }
     }
-    current().tree = { type: "pane", sid };
+    // 최초 자동연결이 안 잡힌 모든 경우(부서 미응답 ws·launch 실패·master 미등장)는 기존대로 빈 셸로
+    // 폴백해 빈 화면/미처리 rejection을 막는다(죽은 부서 socket이면 기본 데몬으로 재폴백).
+    if (!launchedMaster) {
+      let sid: number;
+      try {
+        sid = await newSurface(null, cur.socket);
+      } catch {
+        sid = await newSurface(null, undefined);
+      }
+      cur.tree = { type: "pane", sid };
+    }
   }
   render();
   const first = collectSids(current().tree)[0];
