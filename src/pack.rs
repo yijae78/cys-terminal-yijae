@@ -340,6 +340,10 @@ pub(crate) fn is_user_owned(rel: &str) -> bool {
         // 사용자 잡이 소실(비가역 데이터 손실)된다. user 소유로 보존하고, built-in 잡(phoenix-*)은 데몬 부트 시
         // 코드가 idempotent ensure 한다(cysd schedule::ensure_builtin_jobs). 기본 잡 드리프트(복구 가능) < 사용자 잡 소실.
         || rel == "schedule.json"
+        // ★RC-18: memory/MEMORY.md 는 장기기억 색인 — javis_memory.py add 가 한 줄씩 축적하는 사용자
+        // 데이터다. system 치유가 덮으면 색인이 임베드 골격으로 롤백되어 기억 파일이 고아가 된다
+        // (색인↔파일 정합 FAIL — 비가역 데이터 손실). schedule.json 과 동일한 혼합 파일 원리로 보존.
+        || rel == "memory/MEMORY.md"
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
