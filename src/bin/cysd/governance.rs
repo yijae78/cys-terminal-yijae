@@ -27,6 +27,11 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut alert_fired: HashMap<String, f64> = HashMap::new();
         let mut learn_stuck_debounce: HashMap<u64, f64> = HashMap::new();
         let mut zombie_miss: HashMap<u64, u32> = HashMap::new();
+        let mut launch_flag_warned: std::collections::HashSet<u64> =
+            std::collections::HashSet::new();
+        let mut feed_backlog_alerted: bool = false;
+        let mut approval_stall_fired: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut tick_no: u64 = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await;
@@ -45,11 +50,14 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 check_agent_death(&daemon, &sys, &mut restart_counts);
                 check_surface_crash(&daemon);
                 check_feed_aging(&daemon, &mut feed_reminded);
+                check_feed_backlog(&daemon, &mut feed_backlog_alerted);
+                check_approval_stall(&daemon, &mut approval_stall_fired);
                 check_master_deadman(&daemon, &mut deadman_last_alert);
                 // 저빈도 검사(15초): 파일 stat·화면 렌더 — 5초마다 돌릴 필요 없음
                 if tick_no.is_multiple_of(3) {
                     check_todo(&daemon);
                     check_approvals(&daemon, &mut approval_debounce);
+                    check_launch_flags(&daemon, &sys, &mut launch_flag_warned);
                 }
                 // T7 E6 경보(30초): rate·주간예산·반복실패 — analytics SQL 동반이라 저빈도
                 if tick_no.is_multiple_of(6) {
@@ -72,6 +80,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 queue_depth_alerted.retain(|sid, _| live_surface_ids.contains(sid));
                 learn_stuck_debounce.retain(|sid, _| live_surface_ids.contains(sid));
                 zombie_miss.retain(|sid, _| live_surface_ids.contains(sid));
+                launch_flag_warned.retain(|sid| live_surface_ids.contains(sid));
             });
             if std::panic::catch_unwind(tick).is_err() {
                 daemon.bus.publish(
@@ -658,6 +667,7 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
             continue;
         }
         let screen = s.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().contents();
+        let mut any_match = false;
         for p in patterns {
             let (Some(name), Some(pattern)) = (p["name"].as_str(), p["pattern"].as_str()) else {
                 continue;
@@ -666,6 +676,14 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
                 continue;
             };
             let Some(m) = re.find(&screen) else { continue };
+            any_match = true;
+            // L3 코얼레싱(2026-07-07 feed 189 폭주 재발방지): 이 surface의 감지 항목이
+            // 아직 pending이면 같은 프롬프트 에피소드 — 이벤트·항목을 재발행하지 않는다.
+            // (debounce는 rate-limit일 뿐이라 방치 시 분당 1건 무한 누적되던 구조를 차단.
+            //  해소 경로 = reply 또는 아래 stale-clear.)
+            if daemon.has_pending_daemon_approval(s.id) {
+                continue;
+            }
             let key = (s.id, name.to_string());
             if debounce.get(&key).map(|t| now - t < 60.0).unwrap_or(false) {
                 continue;
@@ -692,7 +710,201 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
                 &excerpt,
                 Some(s.id),
             );
+            // L2 방치 차단(2026-07-07 재발방지): 새 에피소드 1건당 master를 큐로 1회 각성 —
+            // '즉각 승인' 산문 계약의 기계 배선(재발행 억제는 위 L3 코얼레싱이 보장).
+            // 배달은 deliver_queued의 조용시점·typing-guard 규약을 그대로 탄다.
+            enqueue_master_wakeup(
+                daemon,
+                s.id,
+                &format!(
+                    "[승인감지] {agent} {}에 승인 프롬프트 대기 — read-screen으로 확인 후 즉시 처리하라: {excerpt}",
+                    cys::surface_ref(s.id)
+                ),
+            );
         }
+        // L3 stale-clear: 화면에서 승인 패턴이 전부 사라졌으면 이 surface의 pending 감지
+        // 항목은 알림 수명 종료 — 자동 종결한다. 프롬프트가 (사람·master의 pane 응답으로)
+        // 해소돼도 feed 항목이 영구 pending으로 남아 배지를 오염시키던 생명주기 부재를
+        // 봉인하고, 데몬 재시작 고아 백로그도 같은 경로로 청소된다.
+        if !any_match {
+            for rid in daemon.pending_daemon_approvals(s.id) {
+                daemon.resolve_feed_item(&rid, "stale-cleared");
+            }
+        }
+    }
+}
+
+/// L2 방치 차단(2026-07-07 feed 폭주 재발방지): master role surface의 pending_queue에
+/// 텍스트 1건을 직접 적재한다 — 승인 감지가 이벤트 bus에만 실려 master stdin에 닿지 않던
+/// 갭의 봉인. cap(100)·배달 규약(deliver_queued 조용시점·typing-guard)은 큐 기존 계약을
+/// 그대로 따른다. master 부재·종료·큐 포화면 조용히 무시하고, 감지 대상이 master 자신이면
+/// 적재하지 않는다(자기 프롬프트에 큐 배달 시 다이얼로그 오입력 위험 — stalled escalation이 커버).
+fn enqueue_master_wakeup(daemon: &Arc<Daemon>, detected_sid: u64, text: &str) {
+    let Some(master_sid) = daemon.roles.lock().unwrap().get("master").copied() else {
+        return;
+    };
+    if master_sid == detected_sid {
+        return;
+    }
+    let Some(s) = daemon.get_surface(master_sid) else {
+        return;
+    };
+    if s.exited.load(Ordering::Relaxed) {
+        return;
+    }
+    let depth = {
+        let mut q = s.pending_queue.lock().unwrap();
+        if q.len() >= 100 {
+            return;
+        }
+        q.push_back(text.to_string());
+        q.len()
+    };
+    daemon.bus.publish(
+        "queue.enqueued",
+        "queue",
+        Some(master_sid),
+        json!({"bytes": text.len(), "depth": depth, "from": "governance-approval"}),
+    );
+    daemon.persist_queue_state();
+}
+
+/// L2 escalation(2026-07-07 재발방지): 데몬 감지(approval) 항목이 stall 임계
+/// (CYS_APPROVAL_STALL_SECS, 기본 300s)를 넘겨 pending이면 사람 개입 필요 신호
+/// approval.stalled를 항목당 1회 발행한다 — 'master가 처리 못한 승인만 사람에게'
+/// (v0.12.27 화면전환 원칙)의 데몬측 짝. resolved는 종결 상태라 재발화 없음. 0=비활성.
+fn check_approval_stall(daemon: &Arc<Daemon>, fired: &mut std::collections::HashSet<String>) {
+    let stall = env_u64("CYS_APPROVAL_STALL_SECS", 300);
+    if stall == 0 {
+        return;
+    }
+    let now = now_epoch();
+    let (pending_ids, stalled): (
+        std::collections::HashSet<String>,
+        Vec<(String, String, f64, Option<u64>)>,
+    ) = {
+        let items = daemon.feed_items.lock().unwrap();
+        let pend: std::collections::HashSet<String> = items
+            .iter()
+            .filter(|i| {
+                i.status == "pending"
+                    && i.kind == "approval"
+                    && i.request_id.starts_with("daemon-")
+            })
+            .map(|i| i.request_id.clone())
+            .collect();
+        let st = items
+            .iter()
+            .filter(|i| {
+                i.status == "pending"
+                    && i.kind == "approval"
+                    && i.request_id.starts_with("daemon-")
+                    && now - i.created_at >= stall as f64
+            })
+            .map(|i| (i.request_id.clone(), i.title.clone(), now - i.created_at, i.surface_id))
+            .collect();
+        (pend, st)
+    };
+    fired.retain(|id| pending_ids.contains(id)); // 해소된 항목 키 회수(맵 누수 차단)
+    for (rid, title, age, sid) in stalled {
+        if !fired.insert(rid.clone()) {
+            continue; // 항목당 1회
+        }
+        daemon.bus.publish(
+            "approval.stalled",
+            "watchdog",
+            sid,
+            json!({"request_id": rid, "title": title, "age_secs": age as u64,
+                   "surface_ref": sid.map(cys::surface_ref)}),
+        );
+    }
+}
+
+/// L4 백로그 임계 에지 판정(순수) — 임계 이상으로 '처음' 넘어설 때만 true, 임계 미만으로
+/// 내려오면 재무장한다. threshold=0은 비활성.
+fn feed_backlog_crossed(total: usize, threshold: u64, alerted: &mut bool) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+    if total >= threshold as usize {
+        if *alerted {
+            return false;
+        }
+        *alerted = true;
+        true
+    } else {
+        *alerted = false;
+        false
+    }
+}
+
+/// L4 백로그 메타 감시(2026-07-07 feed 189 폭주 재발방지): pending 총량이 임계
+/// (CYS_FEED_BACKLOG_ALERT, 기본 25)를 넘으면 에지 1회 경보. 개별 항목 aging 재알림
+/// (check_feed_aging)과 달리 '쌓임' 자체를 신호화한다 — 생산 경로가 무엇이든(감지 폭주·
+/// 처리 주체 부재) 총량 비정상을 조기에 드러낸다.
+fn check_feed_backlog(daemon: &Arc<Daemon>, alerted: &mut bool) {
+    let threshold = env_u64("CYS_FEED_BACKLOG_ALERT", 25);
+    let total = daemon
+        .feed_items
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|i| i.status == "pending")
+        .count();
+    if feed_backlog_crossed(total, threshold, alerted) {
+        daemon.bus.publish(
+            "feed.backlog_high",
+            "watchdog",
+            None,
+            json!({"pending_total": total, "threshold": threshold}),
+        );
+    }
+}
+
+/// L1 비정규 기동 감시(2026-07-07 feed 폭주 재발방지): claude 에이전트 노드가
+/// --dangerously-skip-permissions 없이 떠 있으면 권한 프롬프트가 발생해 승인 감지·방치
+/// 폭주의 씨앗이 된다(오늘 사고의 Why-1). 강제 없이 surface당 1회 경고 이벤트만 발행한다
+/// — 수동 기동 자체는 합법이므로, 정규 플래그 복귀를 잊은 상태를 조기에 드러내는 게 목적.
+/// 정규 플래그로 복귀가 관측되면 재무장한다(이후 재이탈 시 다시 1회 경고).
+fn check_launch_flags(
+    daemon: &Arc<Daemon>,
+    sys: &System,
+    warned: &mut std::collections::HashSet<u64>,
+) {
+    let surfaces: Vec<Arc<crate::state::Surface>> =
+        daemon.surfaces.lock().unwrap().values().cloned().collect();
+    for s in surfaces {
+        if s.exited.load(Ordering::Relaxed) {
+            continue;
+        }
+        let Some((agent, bin)) = s.agent_meta.lock().unwrap().clone() else {
+            continue;
+        };
+        if agent != "claude" {
+            continue;
+        }
+        let bin_base = bin.rsplit(['/', '\\']).next().unwrap_or(&bin).to_string();
+        let Some((_, cmdline)) = collect_descendants(sys, s.pid)
+            .into_iter()
+            .find(|(_, c)| cmdline_matches_agent(c, &bin_base))
+        else {
+            continue;
+        };
+        if cmdline.contains("--dangerously-skip-permissions") {
+            warned.remove(&s.id); // 정규 복귀 — 재무장
+            continue;
+        }
+        if !warned.insert(s.id) {
+            continue; // 이미 경고함
+        }
+        let role = s.role.lock().unwrap().clone();
+        daemon.bus.publish(
+            "node.nonstandard_launch",
+            "watchdog",
+            Some(s.id),
+            json!({"agent": agent, "role": role, "surface_ref": cys::surface_ref(s.id),
+                   "note": "claude 노드가 bypass 플래그 없이 구동 — 권한 프롬프트 발생 가능(정규 재기동 권장)"}),
+        );
     }
 }
 
@@ -1562,6 +1774,83 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
 #[cfg(test)]
 mod tests {
     use super::{learn_stuck_candidates, plan_duplicate_kills};
+
+    /// L3 재발방지 핀(2026-07-07 feed 189 폭주): 데몬 감지 항목의 surface 단위
+    /// pending 판정·stale 스냅샷·멱등 해소 계약을 박제한다.
+    #[test]
+    fn daemon_approval_dedup_helpers_and_stale_clear() {
+        let dir = std::env::temp_dir().join(format!("cys_feed_dedup_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = crate::state::Daemon::new(dir.join("cysd.sock"));
+
+        assert!(!daemon.has_pending_daemon_approval(7));
+        daemon.push_feed_notification(
+            "approval",
+            "claude 승인 대기 감지 (surface:7)",
+            "Do you want to proceed?",
+            Some(7),
+        );
+        assert!(daemon.has_pending_daemon_approval(7), "감지 직후 pending");
+        assert!(!daemon.has_pending_daemon_approval(8), "타 surface 독립");
+
+        let ids = daemon.pending_daemon_approvals(7);
+        assert_eq!(ids.len(), 1);
+        assert!(daemon.resolve_feed_item(&ids[0], "stale-cleared").is_some());
+        assert!(!daemon.has_pending_daemon_approval(7), "해소 후 pending 소거");
+        assert!(
+            daemon.resolve_feed_item(&ids[0], "stale-cleared").is_none(),
+            "중복 해소=None(멱등)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L2 escalation 핀: stall 임계 초과 pending 감지 항목은 approval.stalled를 항목당
+    /// 정확히 1회 발행하고, 해소된 항목은 fired 집합에서 회수된다.
+    #[test]
+    fn approval_stall_fires_once_per_item() {
+        let dir = std::env::temp_dir().join(format!("cys_stall_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let mut rx = daemon.bus.subscribe();
+        daemon.push_feed_notification("approval", "claude 승인 대기 감지 (surface:7)", "b", Some(7));
+        // 인위 노화: created_at을 임계(기본 300s) 밖으로 이동
+        {
+            let mut items = daemon.feed_items.lock().unwrap();
+            items.last_mut().unwrap().created_at -= 400.0;
+        }
+        let mut fired = std::collections::HashSet::new();
+        super::check_approval_stall(&daemon, &mut fired);
+        super::check_approval_stall(&daemon, &mut fired); // 2회 호출해도
+        let mut stalled_events = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("approval.stalled") {
+                stalled_events += 1;
+                assert_eq!(ev["payload"]["surface_ref"].as_str(), Some("surface:7"));
+            }
+        }
+        assert_eq!(stalled_events, 1, "항목당 1회만 발화");
+        // 해소 후 fired 집합 회수
+        let rid = daemon.pending_daemon_approvals(7).pop().unwrap();
+        daemon.resolve_feed_item(&rid, "allow");
+        super::check_approval_stall(&daemon, &mut fired);
+        assert!(fired.is_empty(), "해소 항목 키 회수");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L4 백로그 에지 판정 핀: 임계 교차 1회 발화·지속 무재발화·하강 재무장·0=비활성.
+    #[test]
+    fn feed_backlog_crossed_edge_fire_and_rearm() {
+        use super::feed_backlog_crossed;
+        let mut alerted = false;
+        assert!(!feed_backlog_crossed(24, 25, &mut alerted));
+        assert!(feed_backlog_crossed(25, 25, &mut alerted), "임계 도달 첫 교차 발화");
+        assert!(!feed_backlog_crossed(180, 25, &mut alerted), "지속 중 재발화 없음");
+        assert!(!feed_backlog_crossed(3, 25, &mut alerted), "하강 — 재무장(무발화)");
+        assert!(feed_backlog_crossed(30, 25, &mut alerted), "재교차 재발화");
+        let mut off = false;
+        assert!(!feed_backlog_crossed(999, 0, &mut off), "threshold=0 비활성");
+    }
 
     /// (RSI 학습 자율추천 i) 막힘 판정 순수 함수 — 임계·디바운스·비활성(threshold=0)을 박제한다.
     #[test]

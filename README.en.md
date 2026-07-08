@@ -13,6 +13,11 @@ cost, context, and hardware in real time.
 
 *한국어 문서(전체 레퍼런스 포함)는 [README.md](README.md)를 보세요.*
 
+## Docs
+
+- **[Architecture & Philosophy](ARCHITECTURE-AND-PHILOSOPHY.md)** — design theses, system architecture, security model, invariants (Korean)
+- **[User Manual](USER-MANUAL.md)** — install to fleet operations, full CLI/env/protocol reference (Korean)
+
 ## Why
 
 Existing terminals and multiplexers are built for humans typing commands. Run several
@@ -102,7 +107,8 @@ Report vulnerabilities per [SECURITY.md](SECURITY.md).
 
 Protocol methods/events, environment variables, governance tables, the 19 Jarvis-native
 features, approval feed, in-flight queue semantics, and source-build instructions are
-documented in the Korean [README.md](README.md) (the canonical reference).
+documented in the Korean [README.md](README.md) and the
+[User Manual](USER-MANUAL.md) (the canonical references).
 
 ## Contributing · License
 
