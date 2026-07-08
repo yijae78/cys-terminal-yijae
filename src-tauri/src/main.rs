@@ -674,12 +674,61 @@ struct InstallCliReport {
     warnings: Vec<String>,
 }
 
+// ── Windows: 사용자 PATH 등록 순수 헬퍼(가드/PATH 계산) ──────────────────
+/// current_exe가 백업/정규 실행인지 분류한다. 파일명에 .bak/.prev/.old가 있으면 백업으로 본다
+/// (실측 백업 명명: `cys-app.exe.bak-before-pane-fix`, `cysd.prev.exe`). macOS classify_bundle_dir의
+/// Backup 가드와 대칭 — 백업본에서 PATH를 등록하면 잘못된 실행파일을 가리키므로 거부한다.
+#[cfg(any(target_os = "windows", test))]
+#[derive(PartialEq, Debug)]
+enum InstallDirKind {
+    Normal, // 정규 설치 폴더에서 실행
+    Backup, // *.bak* / *.prev* / *.old 백업본에서 실행
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn classify_install_dir_win(exe: &std::path::Path) -> InstallDirKind {
+    let name = exe
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if name.contains(".bak") || name.contains(".prev") || name.contains(".old") {
+        return InstallDirKind::Backup;
+    }
+    InstallDirKind::Normal
+}
+
+/// 사용자 PATH에 `dir`을 추가하는 계획(순수·부작용 없음). 이미(대소문자·후행 구분자 무시) 있으면
+/// `None`(멱등 no-op), 없으면 뒤에 append한 새 PATH 문자열을 반환한다. macOS가 /usr/local/bin을
+/// 쓰듯 뒤에 붙여 기존 도구를 가리지 않는다(선행 shadow는 where 검증으로 경고).
+#[cfg(any(target_os = "windows", test))]
+fn plan_path_add(current_path: &str, dir: &str) -> Option<String> {
+    let norm = |p: &str| {
+        p.trim()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    };
+    let target = norm(dir);
+    if target.is_empty() {
+        return None;
+    }
+    let exists = current_path.split(';').any(|p| norm(p) == target);
+    if exists {
+        return None; // 멱등: 이미 등록됨
+    }
+    let base = current_path.trim().trim_end_matches(';');
+    if base.is_empty() {
+        Some(dir.to_string())
+    } else {
+        Some(format!("{base};{dir}"))
+    }
+}
+
 /// 명시 메뉴 트리거. macOS에서 cys·cysd를 /usr/local/bin에 1회 승격으로 심볼릭한다.
 #[tauri::command]
 fn install_cli_to_path() -> Result<InstallCliReport, String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        return Err("이 기능은 macOS 전용입니다.".into());
+        return Err("이 기능은 macOS·Windows 전용입니다.".into());
     }
     #[cfg(target_os = "macos")]
     {
@@ -740,6 +789,109 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
             cys_link: target_cys,
             cysd_link: format!("{target_dir}/cysd"),
             source_cys: plan.cys_src.to_string_lossy().to_string(),
+            effective_cys,
+            shadowed_by,
+            warnings,
+        })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        // 백업본(.bak/.prev/.old)에서 실행 중이면 거부 — 잘못된 실행파일을 PATH에 고정 방지.
+        if classify_install_dir_win(&exe) == InstallDirKind::Backup {
+            return Err(
+                "백업 실행파일에서 실행 중입니다. 정규 cys-app.exe(%LOCALAPPDATA%\\cys)에서 다시 열고 시도하세요."
+                    .into(),
+            );
+        }
+        // 설치 폴더 = current_exe().parent() = cys.exe·cysd.exe가 있는 곳.
+        let install_dir = exe.parent().ok_or("설치 디렉토리 해석 실패")?.to_path_buf();
+        let cys_exe = install_dir.join("cys.exe");
+        let cysd_exe = install_dir.join("cysd.exe");
+        if !cys_exe.exists() {
+            return Err("설치 폴더에서 cys.exe를 찾지 못했습니다.".into());
+        }
+        let mut warnings = vec![];
+        if !cysd_exe.exists() {
+            warnings.push(
+                "설치 폴더에 cysd.exe가 없습니다 — 데몬 실행에 문제가 될 수 있습니다.".to_string(),
+            );
+        }
+        let install_dir_str = install_dir.to_string_lossy().to_string();
+
+        // 현재 사용자 PATH(레지스트리 User 범위) 조회.
+        let cur = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Environment]::GetEnvironmentVariable('Path','User')",
+            ])
+            .output()
+            .map_err(|e| format!("사용자 PATH 조회 실패: {e}"))?;
+        if !cur.status.success() {
+            return Err(format!(
+                "사용자 PATH 조회 실패: {}",
+                String::from_utf8_lossy(&cur.stderr).trim()
+            ));
+        }
+        let current_path = String::from_utf8_lossy(&cur.stdout).trim().to_string();
+
+        // 멱등: 이미 등록됐으면 SetEnvironmentVariable 생략(no-op).
+        match plan_path_add(&current_path, &install_dir_str) {
+            None => {}
+            Some(new_path) => {
+                // 특수문자(세미콜론·공백) 안전을 위해 새 PATH를 환경변수로 전달한다.
+                // SetEnvironmentVariable(User)는 관리자 불필요 — 레지스트리 기록 + WM_SETTINGCHANGE 브로드캐스트.
+                let set = std::process::Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "[Environment]::SetEnvironmentVariable('Path', $env:CYS_NEW_PATH, 'User')",
+                    ])
+                    .env("CYS_NEW_PATH", &new_path)
+                    .output()
+                    .map_err(|e| format!("PATH 등록 실패: {e}"))?;
+                if !set.status.success() {
+                    return Err(format!(
+                        "PATH 등록 실패: {}",
+                        String::from_utf8_lossy(&set.stderr).trim()
+                    ));
+                }
+            }
+        }
+
+        // 검증: where cys → 선행 shadow 감지(parse_which_a 재사용). 현재 프로세스 PATH 기준이라
+        // 방금 등록한 폴더는 아직 안 보일 수 있고, 잡히는 건 기존에 앞서던 다른 cys뿐이다.
+        let where_out = std::process::Command::new("where").arg("cys").output().ok();
+        let entries = where_out
+            .as_ref()
+            .filter(|o| o.status.success())
+            .map(|o| parse_which_a(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_default();
+        let effective_cys = entries.first().cloned();
+        let target_cys = cys_exe.to_string_lossy().to_string();
+        let shadowed_by = match &effective_cys {
+            Some(p) if p.to_lowercase() != target_cys.to_lowercase() => Some(p.clone()),
+            _ => None,
+        };
+        if let Some(sh) = &shadowed_by {
+            warnings.push(format!(
+                "PATH 선행 위치의 다른 cys가 우선합니다: {sh}. 새로 등록한 {target_cys}는 그 뒤에 있습니다."
+            ));
+        }
+        warnings.push(
+            "PATH 변경은 새로 여는 터미널(PowerShell·cmd·Cursor)부터 적용됩니다. 기존 창은 재시작하세요."
+                .to_string(),
+        );
+
+        Ok(InstallCliReport {
+            ok: true,
+            target_dir: install_dir_str,
+            cys_link: target_cys,
+            cysd_link: cysd_exe.to_string_lossy().to_string(),
+            source_cys: cys_exe.to_string_lossy().to_string(),
             effective_cys,
             shadowed_by,
             warnings,
@@ -2167,5 +2319,57 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         assert!(!plan.osascript_arg.starts_with("do shell script '"));
         assert!(plan.osascript_arg.contains("'/usr/local/bin/cys'"));
         assert!(plan.osascript_arg.contains("ln -sf"));
+    }
+
+    // ── Windows: 사용자 PATH 등록 헬퍼 ─────────────────────────────────
+    #[test]
+    fn classify_install_dir_win_flags_backups() {
+        use std::path::Path;
+        assert_eq!(
+            classify_install_dir_win(Path::new(r"C:\Users\x\AppData\Local\cys\cys-app.exe")),
+            InstallDirKind::Normal
+        );
+        // 실측 백업 명명(cys-app.exe.bak-*, cysd.prev.exe)과 .old를 모두 거부
+        assert_eq!(
+            classify_install_dir_win(Path::new(
+                r"C:\Users\x\AppData\Local\cys\cys-app.exe.bak-before-pane-fix"
+            )),
+            InstallDirKind::Backup
+        );
+        assert_eq!(
+            classify_install_dir_win(Path::new(r"C:\Users\x\AppData\Local\cys\cysd.prev.exe")),
+            InstallDirKind::Backup
+        );
+        assert_eq!(
+            classify_install_dir_win(Path::new(r"C:\Users\x\AppData\Local\cys\cys-app.exe.old")),
+            InstallDirKind::Backup
+        );
+    }
+
+    #[test]
+    fn plan_path_add_appends_when_absent() {
+        let cur = r"C:\Windows\System32;C:\Users\x\.cargo\bin";
+        assert_eq!(
+            plan_path_add(cur, r"C:\Users\x\AppData\Local\cys"),
+            Some(
+                r"C:\Windows\System32;C:\Users\x\.cargo\bin;C:\Users\x\AppData\Local\cys"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn plan_path_add_is_idempotent_case_and_trailing_slash_insensitive() {
+        // 이미 존재(대소문자·후행 구분자 무시) → None(멱등 no-op)
+        let cur = r"C:\Windows;c:\users\x\appdata\local\cys\";
+        assert_eq!(plan_path_add(cur, r"C:\Users\x\AppData\Local\cys"), None);
+    }
+
+    #[test]
+    fn plan_path_add_handles_empty_path() {
+        assert_eq!(
+            plan_path_add("", r"C:\Users\x\AppData\Local\cys"),
+            Some(r"C:\Users\x\AppData\Local\cys".to_string())
+        );
     }
 }

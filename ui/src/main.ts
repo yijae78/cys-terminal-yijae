@@ -1446,6 +1446,7 @@ async function refreshPaneTitles() {
       // 안 A: 부서 master 첫 등장 시 — 빈 셸이 없으므로 master pane으로 직행한다.
       const aSids = collectSids(current()?.tree ?? null);
       if (aSids.length && (focusedSid == null || !aSids.includes(focusedSid))) setFocus(aSids[0]);
+      await actionEqualize(); // 외부(launch-agent·cys boot) 입양 시 전체 패널 자동 균등 배치
     }
   } catch {
     /* 데몬 일시 미응답은 다음 틱에 */
@@ -1719,6 +1720,15 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   });
   const un2 = await listen(ev.exited_event, () => {
     term.write("\r\n\x1b[31m[surface exited]\x1b[0m\r\n", snapToBottom);
+    // surface가 (셸 종료·프로세스 사망 등으로) 스스로 종료되면 트리에서 제거하고
+    // 형제 pane으로 축소·재렌더해 빈 공간을 회수한다 (close 버튼 × 경로와 동일 처리).
+    const ws = workspaces.find((w) => w.socket === socket);
+    if (ws?.tree && collectSids(ws.tree).includes(sid)) {
+      ws.tree = replaceNode(ws.tree, sid, () => null);
+      if (focusedSid === sid) focusedSid = collectSids(ws.tree)[0] ?? null;
+      destroyPaneRuntime(sid, socket);
+      render();
+    }
   });
   // listen 등록을 마친 뒤에 스트림을 시작해야 초기 화면 snapshot(프롬프트)이 유실되지 않는다
   // (런치 시 첫 pane 빈 화면 버그 — snapshot이 listen 전에 emit되던 race 차단).
@@ -2114,10 +2124,9 @@ function startGroupDrag(e0: MouseEvent, srcId: number) {
 }
 
 // ---------- 정렬: 역할(role) 기반 고정 배치 ----------
-// 현재 워크스페이스의 살아있는 surface를 역할별 표준 자리로 재배치한다:
-//   · 왼쪽 끝 컬럼  = master(위) / cso(아래), 세로 3:1
-//   · 가운데        = worker·미분류 surface를 같은 폭 컬럼으로 균등 분배(좌→우 순서 보존)
-//   · 오른쪽 끝 컬럼 = reviewer-gemini(agy, 위) / reviewer-codex(codex, 아래), 세로 1:1
+// 현재 워크스페이스의 살아있는 surface를 역할 순서(master·cso·worker·agy·codex)로
+// 전부 같은 폭 가로 컬럼으로 균등 재배치한다 — 세로 분열 없이 모두 옆으로 나란히.
+//   · master · cso · worker(미분류 포함) · reviewer-gemini(agy) · reviewer-codex(codex) 순서 보존
 // 트리 위상만 새로 짜고 attachDividerDrag는 건드리지 않으므로 수동 크기 조절은 그대로 보존된다
 // (정렬 후에도 divider를 다시 끌 수 있다 — 현재 크기만 표준 배치로 리셋될 뿐이다).
 // divider 1px·pane 헤더 등으로 컬럼 폭엔 셀 1칸 이내 잔차가 있을 수 있다.
@@ -2144,16 +2153,13 @@ function roleLayout(sids: number[], roleOf: Map<number, string | null>): Node {
   const pane = (sid: number): Node => ({ type: "pane", sid });
 
   const columns: Node[] = [];
-  // 왼쪽 끝: master(위) / cso(아래) = 3:1 (누락 시 있는 쪽이 컬럼 전체)
-  if (master != null && cso != null) columns.push({ type: "split", dir: "col", ratio: 3 / 4, a: pane(master), b: pane(cso) });
-  else if (master != null) columns.push(pane(master));
-  else if (cso != null) columns.push(pane(cso));
-  // 가운데: worker·미분류 균등 컬럼
+  // 전부 가로 균등 배치 — master · cso · worker(미분류 포함) · agy · codex 순서로 각자 개별 컬럼.
+  // (세로 분열 없이 모든 pane을 같은 폭 가로 컬럼으로 정렬)
+  if (master != null) columns.push(pane(master));
+  if (cso != null) columns.push(pane(cso));
   for (const sid of middle) columns.push(pane(sid));
-  // 오른쪽 끝: agy(위) / codex(아래) = 1:1 (누락 시 있는 쪽이 컬럼 전체)
-  if (agy != null && codex != null) columns.push({ type: "split", dir: "col", ratio: 1 / 2, a: pane(agy), b: pane(codex) });
-  else if (agy != null) columns.push(pane(agy));
-  else if (codex != null) columns.push(pane(codex));
+  if (agy != null) columns.push(pane(agy));
+  if (codex != null) columns.push(pane(codex));
 
   return evenComb(columns, "row"); // 컬럼들을 같은 폭으로 가로 배치
 }
@@ -2288,8 +2294,7 @@ function buildTab(ws: Workspace): HTMLElement {
     const bits = [`${sids.length} pane`];
     if (firstTitle) bits.push(firstTitle);
     if (worst >= 60) bits.push(`CTX ${worst}%`);
-    if (idleN) bits.push(`💤${idleN}`);
-    if (dead) bits.push(`❌${dead}`);
+    // 💤 유휴 / ❌ 죽은노드 배지는 X 오인 방지 위해 제거(신교수님 요청 2026-07-07). 상태는 좌측 ws-dot 색으로만 표시.
     txt.textContent = bits.join(" · ");
     if (worst >= 80) txt.className = "sev-crit";
     else if (worst >= 60) txt.className = "sev-warn";
@@ -2774,6 +2779,7 @@ async function actionNew() {
     : { type: "pane", sid };
   render();
   setFocus(sid);
+  await actionEqualize(); // 새 pane 생성 시 전체 패널 자동 균등 배치(모두 같은 크기)
 }
 
 async function actionSplit(dir: "row" | "col") {
@@ -2800,6 +2806,7 @@ async function actionSplit(dir: "row" | "col") {
   }
   render();
   setFocus(sid);
+  await actionEqualize(); // 분할 시 전체 패널 자동 균등 배치(모두 같은 크기)
 }
 
 async function actionClose() {
