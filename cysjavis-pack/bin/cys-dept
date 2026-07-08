@@ -87,8 +87,10 @@ graceful_kill(){
 }
 
 reg_init(){ [ -f "$REG" ] || { mkdir -p "$(dirname "$REG")"; printf '{"depts":{}}\n' > "$REG"; }; }
-reg_count(){ reg_init; python3 -c "import json;print(len(json.load(open('$REG'))['depts']))"; }
-reg_names(){ reg_init; python3 -c "import json;[print(k) for k in json.load(open('$REG'))['depts']]"; }
+# RC-17: $REG를 -c 문자열에 삽입하면 MSYS 경로 자동변환이 적용되지 않아(인자만 변환) Windows
+# 네이티브 Python이 POSIX 경로(/c/...)를 열지 못한다 → argv 전달로 통일(reg_upsert와 동일 패턴·unix 무영향).
+reg_count(){ reg_init; python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))['depts']))" "$REG"; }
+reg_names(){ reg_init; python3 -c "import json,sys;[print(k) for k in json.load(open(sys.argv[1]))['depts']]" "$REG"; }
 # reg_upsert/reg_remove: 동시 부서 운용 시 lost-update 방지 — fcntl.flock으로 RMW 직렬화 +
 # temp+os.replace 원자 교체(읽는 쪽이 부분 파일을 보지 않음). macOS엔 flock(1) CLI가 없어 python fcntl 사용.
 reg_upsert(){ reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'

@@ -23,7 +23,7 @@
     ]
   },
   "gemini": {
-    "cmd": "~/.local/bin/agy --dangerously-skip-permissions",
+    "cmd": "~/AppData/Local/agy/bin/agy.exe --dangerously-skip-permissions",
     "inject_delay_secs": 12,
     "ready_marker": "? for shortcuts",
     "notes": "Antigravity CLI(agy) — 구 Gemini CLI가 2026-06-18 소비자 티어(무료·AI Pro·Ultra) 중단되어 이주(오너 Google AI Ultra 연동 실측 2026-06-13). 키 이름 'gemini' 유지: 역할(reviewer-gemini)·orchestra check·boot PLAN 계약 무변. 로그인은 사람 단계(Google OAuth — 첫 기동 시 화면 안내). 절대경로인 이유: 설치 스크립트가 ~/.profile에만 PATH를 넣어 zsh 비로그인 셸에서 'agy'가 안 잡힌다.",
@@ -45,7 +45,7 @@
     ]
   },
   "codex": {
-    "cmd": "~/.npm-global/bin/codex --dangerously-bypass-approvals-and-sandbox",
+    "cmd": "~/AppData/Roaming/npm/codex.cmd --dangerously-bypass-approvals-and-sandbox",
     "inject_delay_secs": 12,
     "notes": "OpenAI Codex CLI (YOLO 모드 — cys 터미널 소켓 push 무프롬프트). 첫 실행 update 프롬프트는 Skip. 홈 기반 경로(~)인 이유: brew 본 /opt/homebrew/bin/codex가 dangling symlink(Caskroom 0.76.0 타깃 소멸)라 PATH 순서·로그인셸 차이에 따라 끊긴 본을 잡을 수 있다 → npm 설치본(~/.npm-global/bin/codex)으로 고정해 회피. ~ 는 로그인셸이 전개(gemini agy 어댑터와 동일 방식). 설치 위치가 다르면 이 경로를 수정.",
     "clear_cmd": "/new",
