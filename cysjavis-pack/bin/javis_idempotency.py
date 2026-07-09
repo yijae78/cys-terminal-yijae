@@ -76,9 +76,10 @@ def _extract_verb(argv):
     if not argv:
         return None
     first = os.path.basename(str(argv[0]))
-    # Windows: 'cys.EXE'·'CYS.exe' 등 확장자·대소문자 변형 정규화 (preflight C53)
-    first = os.path.splitext(first)[0].lower()
-    if first != "cys":
+    # Windows: 실행 확장자 허용목록('', .exe, .cmd, .bat)만 cys 로 인정 + 대소문자 무시(preflight C53).
+    # splitext 전면 절단은 cys.py·cys.bak 등 비실행 사칭까지 오인식하므로 허용목록으로 한정(R1).
+    stem, ext = os.path.splitext(first)
+    if ext.lower() not in ("", ".exe", ".cmd", ".bat") or stem.lower() != "cys":
         return None
     i = 1
     while i < len(argv):
@@ -381,15 +382,44 @@ def _invariants():
     return "FULL(cys 표면 전부 분류됨)"
 
 
+def _extract_verb_windows_cases():
+    """Windows 바이너리명 변형 허용/거부 박제(R1 · preflight C53).
+
+    허용 = 실행 확장자('', .exe, .cmd, .bat)의 cys(대소문자 무시)만.
+    거부 = 비실행 사칭(cys.py·cys.bak)·타 바이너리 — 오인식 시 관찰멱등 계약이 구멍난다."""
+    allow = [
+        (["cys.EXE", "status", "--json"], "status"),
+        (["CYS.cmd", "send", "--to", "master", "x"], "send"),
+        ([r"C:\Users\x\cys.exe", "list"], "list"),          # 절대경로 + 소문자 .exe
+        (["cys.BAT", "status"], "status"),                   # .bat 대문자
+        (["cys", "status"], "status"),                       # 무확장(POSIX)
+    ]
+    deny = [
+        ["cys.py", "status"],        # 비실행 사칭
+        ["cys.bak", "status"],       # 비실행 사칭
+        ["cysd.exe", "status"],      # 타 바이너리(데몬)
+        ["yt-dlp.exe", "status"],    # 타 바이너리
+        ["cys.exe.bak", "status"],   # 이중 확장자 사칭(.bak 로 끝남)
+    ]
+    for argv, want in allow:
+        got = _extract_verb(argv)
+        assert got == want, "허용 케이스 오판: %s → %r (기대 %r)" % (argv, got, want)
+    for argv in deny:
+        got = _extract_verb(argv)
+        assert got is None, "거부 케이스 통과(사칭 오인식): %s → %r" % (argv, got)
+
+
 def self_test():
     _invariants_msg = _invariants()
+    _extract_verb_windows_cases()
     _spy_cmd_check()
     _spy_negative_assertion_self_attack()
     _spy_preflight_daemon_observe_phase()
     _ast_self_attack()
     _ast_msg = _ast_coverage_battery()
     print("javis_idempotency self-test OK "
-          "(불변식·표면커버리지[%s] · cmd_check 관찰멱등 negative assertion · "
+          "(불변식·표면커버리지[%s] · Windows verb 변형 허용/거부 10케이스 · "
+          "cmd_check 관찰멱등 negative assertion · "
           "자기공격 변이검증 RED · C12.daemon fix=False Popen 0 · "
           "coverage_battery AST 관찰전용[%s])" % (_invariants_msg, _ast_msg))
     return 0
