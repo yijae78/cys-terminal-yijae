@@ -11,3 +11,14 @@ export const DEPT_PENDING_LABEL = "부서 제작 중…";
 export function deptPlaceholderLabel(ws: { pending?: boolean; name: string }): string {
   return ws.pending ? DEPT_PENDING_LABEL : ws.name;
 }
+
+// Control Center 노드 행 라벨(오너 지시 R2-4): 표준 역할(master·cso·worker*·reviewer-*)은
+// role 그대로, 비표준 role(예: dashboard)은 surface title(예: '체크판')을 표시한다 —
+// role 원문자열이 그대로 보여 체크판이 'dashboard'로 표시되던 문제 수정.
+// title 부재·자동제목("surface N")이면 role로 폴백. 순수 함수(main.ts taskRow가 배선만).
+export function ccNodeLabel(role: string | null | undefined, title: string | null | undefined): string {
+  const r = String(role ?? "?");
+  if (r === "master" || r === "cso" || r.startsWith("worker") || r.startsWith("reviewer-")) return r;
+  const t = (title ?? "").trim();
+  return !t || /^surface \d+$/.test(t) ? r : t;
+}

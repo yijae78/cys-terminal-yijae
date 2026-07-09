@@ -9,7 +9,7 @@ import { shellQuote, shellQuoteJoin } from "./shellquote";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { orderPreservingEqualize, equalizeAdoptedTrees } from "./layout";
-import { deptPlaceholderLabel } from "./deptlabel";
+import { deptPlaceholderLabel, ccNodeLabel } from "./deptlabel";
 
 declare global {
   interface Window {
@@ -563,7 +563,7 @@ function taskRow(s: any, deptKey: string): string {
   return (
     `<div class="cc-task-row${stale}" data-key="${ccEsc(deptKey)}:${s.surface_id ?? "?"}" title="${ccEsc(task)}">` +
     `<span class="cc-dot ${cls}"></span>` +
-    `<span class="cc-task-role" style="color:${color}">${ccEsc(role)}</span>` +
+    `<span class="cc-task-role" style="color:${color}">${ccEsc(ccNodeLabel(role, s.title))}</span>` +
     `<span class="cc-task-text">${ccEsc(task)}</span>` +
     ctx +
     `<span class="cc-task-meta">${trust} · ${ccEsc(age)} · ${ccEsc(label)}</span>` +
