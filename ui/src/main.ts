@@ -8,7 +8,7 @@ import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
 import { shellQuote, shellQuoteJoin } from "./shellquote";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
-import { roleLayout, equalizeAdoptedTrees } from "./layout";
+import { orderPreservingEqualize, equalizeAdoptedTrees } from "./layout";
 import { deptPlaceholderLabel } from "./deptlabel";
 
 declare global {
@@ -1405,8 +1405,8 @@ async function refreshPaneTitles() {
   try {
     // 멀티마스터 F4: workspace별 소켓을 순회 — 각 데몬의 surface를 그 소켓 ws에만 귀속시킨다.
     const sockets = [...new Set(workspaces.map((w) => w.socket))];
-    // R1: 입양이 일어난 ws만 균등화 대상으로 수집 — ws → 그 소켓의 roleOf(surface.list 재사용, 추가 호출 0).
-    const adoptedWs = new Map<Workspace, Map<number, string | null>>();
+    // R1: 입양이 일어난 ws만 균등화 대상으로 수집 (순서 보존 균등화라 role 정보 불요).
+    const adoptedWs = new Set<Workspace>();
     for (const sk of sockets) {
       const r = (await invoke("list_surfaces", { socket: sk })) as {
         surfaces: {
@@ -1439,7 +1439,7 @@ async function refreshPaneTitles() {
         ws.tree = ws.tree
           ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
           : { type: "pane", sid: s.surface_id };
-        if (!adoptedWs.has(ws)) adoptedWs.set(ws, new Map(r.surfaces.map((x) => [x.surface_id, x.role])));
+        adoptedWs.add(ws);
       }
     }
     if (adoptedWs.size) {
@@ -2153,11 +2153,11 @@ function startGroupDrag(e0: MouseEvent, srcId: number) {
   window.addEventListener("mouseup", up, true);
 }
 
-// ---------- 정렬: 역할(role) 기반 고정 배치 ----------
-// 순수 트리 변형(evenComb·firstWithRole·roleLayout·equalizeAdoptedTrees)은 ./layout으로 이관(R1) —
-// 여기는 데몬 조회·render 배선만 남는다. 배치 규칙 설명은 layout.ts 머리주석 참조.
-// 트리 위상만 새로 짜고 attachDividerDrag는 건드리지 않으므로 수동 크기 조절은 그대로 보존된다
-// (정렬 후에도 divider를 다시 끌 수 있다 — 현재 크기만 표준 배치로 리셋될 뿐이다).
+// ---------- 정렬: 순서 보존 균등 배치 (오너 요구 R2-3) ----------
+// 순수 트리 변형(evenComb·orderPreservingEqualize·equalizeAdoptedTrees)은 ./layout으로 이관 —
+// 여기는 render 배선만 남는다. 정렬은 좌→우 순서를 보존하고 폭만 균등화한다("내가 옮긴 곳이
+// 내 자리"). 역할 기반 초기 배치는 자동입양 rolePri 정렬(refreshPaneTitles)이 담당.
+// 트리 위상만 새로 짜고 attachDividerDrag는 건드리지 않으므로 divider 재드래그는 그대로 가능.
 // divider 1px·pane 헤더 등으로 컬럼 폭엔 셀 1칸 이내 잔차가 있을 수 있다.
 
 async function actionEqualize() {
@@ -2165,15 +2165,9 @@ async function actionEqualize() {
   if (!ws?.tree) return;
   const live = collectSids(ws.tree).filter((sid) => panes.has(paneKey(sid, ws.socket))); // 죽은/placeholder 노드 제외 (F4 복합키)
   if (live.length < 2) return; // 0~1개는 정렬할 대상이 없음
-  // 역할은 데몬 surface.list에서 조회 (UI 생성 pane은 role=null → 가운데로)
-  const roleOf = new Map<number, string | null>();
-  try {
-    const r = (await invoke("list_surfaces", { socket: ws.socket })) as { surfaces: { surface_id: number; role: string | null }[] };
-    for (const s of r.surfaces) roleOf.set(s.surface_id, s.role);
-  } catch {
-    /* 데몬 일시 미응답: role 없이 진행 → 전부 가운데 균등 */
-  }
-  ws.tree = roleLayout(live, roleOf);
+  // ★순서 보존형(오너 요구 R2-3): 좌→우 순서를 그대로 두고 폭만 균등화 — "내가 옮긴 곳이 내 자리".
+  // 역할 재배치(roleLayout)·데몬 role 조회는 제거됐다(역할 초기 배치는 자동입양 rolePri 정렬이 담당).
+  ws.tree = orderPreservingEqualize(live);
   render(); // 새 트리로 DOM 재구성 + fitPane→resize_surface + saveLayout
 }
 
