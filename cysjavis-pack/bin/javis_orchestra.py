@@ -60,6 +60,12 @@ import shutil
 import subprocess
 import sys
 
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않아
+# 동봉 모듈(javis_verdict 등) 지연 import가 실패한다(R1 실측 버그) — 자기 dir 명시 삽입.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
 # 4차 앵커4-1: 프로젝트 상주 의무 노드(grok은 선택). 이것은 *표준(Tier-2 이상) 기본 로스터*다.
 # ★check 가 실제로 검증하는 것은 effective_required_roles()(=감지 폴백 적용) — REQUIRED_ROLES 는
 # 계약·문서용 표준 상수로 보존한다. agy/codex 미감지 시 리뷰어 슬롯은 Claude 대체로 치환된다.
