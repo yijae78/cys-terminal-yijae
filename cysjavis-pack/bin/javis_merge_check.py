@@ -34,6 +34,9 @@ Exit 코드
   3  repo 없음 · 브랜치 없음 · git 오류 · 시간초과
   4  병합 충돌
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import json

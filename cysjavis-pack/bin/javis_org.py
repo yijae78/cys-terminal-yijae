@@ -4,6 +4,9 @@
 하우스스타일: javis_manifest.py (--self-test 밀폐 검증)
 exit: 0=성공 1=위반/실패 2=입출력 3=권한(CSO아님) 4=대상없음
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse, json, os, sys, hashlib, subprocess, tempfile, tarfile, time, shutil
 
 # RC-6: OS중립 파일락 — unix는 fcntl.flock(제로 회귀·파일 닫힐 때 자동 해제), Windows는 fcntl

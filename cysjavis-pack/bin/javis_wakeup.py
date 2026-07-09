@@ -20,6 +20,9 @@ enqueue 직렬화: pending 파일별 read-modify-write를 .lock 디렉터리(mkd
 
 exit codes: 0 ok · 2 usage · 5 nothing-to-do
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import json
 import os

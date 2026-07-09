@@ -18,6 +18,9 @@
 
 원본 ViMax retry.py의 코드를 복사하지 않고 규칙(철학)만 클린룸 재구현했다.
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import functools
 import inspect

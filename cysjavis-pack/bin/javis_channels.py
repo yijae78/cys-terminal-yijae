@@ -24,6 +24,9 @@ YouTube/Reddit/X/네이버/HN/arXiv 같은 콘텐츠 채널의 공개 접근 루
 
 종료: 0 = self-test ok 또는 전 채널 도달, 1 = self-test 실패 또는 도달 불가 채널 존재.
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import json

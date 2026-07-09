@@ -32,6 +32,9 @@
 ★fail-open 원칙(threat model = 비악의 오작동 방지, 적대 봉쇄 아님):
   마커 부재·TTL 만료·status=passed/done/abandoned·파싱 실패·판단 불가 → 전부 통과측.
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import hashlib
 import json

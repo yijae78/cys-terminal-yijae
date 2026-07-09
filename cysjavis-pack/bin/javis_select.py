@@ -28,6 +28,9 @@ cys 제약 정합:
 종료 코드: 0 성공(1위 결정) · 1 가용 후보 없음(전부 키 미설정 등) · 2 인자/입력 오류 · 3 — (미사용)
 의존성: 파이썬 표준 라이브러리만 (네트워크·LLM 호출 없음·점수를 게이트에 먹이지 않음).
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import io

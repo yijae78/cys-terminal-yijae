@@ -31,6 +31,9 @@ producer≠evaluator 하드절: success_criteria는 **콘텐츠 속성**(citatio
           4 매니페스트 없음(resolve — README 폴백 신호)
 의존성: 파이썬 표준 라이브러리만 (jsonschema 미사용·hand-roll·네트워크·LLM 없음·점수 미생성).
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import contextlib

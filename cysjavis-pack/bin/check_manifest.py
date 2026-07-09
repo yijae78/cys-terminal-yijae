@@ -6,6 +6,9 @@ skip 조건 = 산출물 파일 실존 AND 동일 inputs_hash의 status=ok 레코
 append-only: record는 추가만 한다(수정·삭제 금지 — 감사·retention).
 stdlib만 사용. 네트워크 0.
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import hashlib
 import json

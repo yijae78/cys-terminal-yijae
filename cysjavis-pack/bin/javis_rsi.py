@@ -23,6 +23,9 @@ soul/CLAUDE의 ★eval-driven 원칙(producer≠evaluator·측정실패 hard fai
 ★불변: 점수 자체 생성 금지(주입만)·rollback은 백업 ref 없이는 절대 reset 안 함·--execute 없으면 무실행.
 사용: python3 javis_rsi.py <cmd> ... · 의존성: 표준 라이브러리 + PATH의 git.
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import json
 import os

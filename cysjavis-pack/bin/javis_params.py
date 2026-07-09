@@ -29,6 +29,9 @@ ParamDefinition 형식(JSON 배열):
           2 인자/입출력/JSON 오류.
 의존성: 파이썬 표준 라이브러리만(네트워크·LLM·점수 생성 없음·결정론).
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import json

@@ -15,6 +15,9 @@
 
 의존성: 표준 라이브러리(json, re, sys)만 사용한다.
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import json
 import re
 import sys

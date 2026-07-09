@@ -3367,14 +3367,24 @@ class Preflight:
             hook_txt = ""
         if not (os.path.isfile(gate) and "inject_gate.py" in hook_txt):
             probs.append("재주입 포이즌 게이트 미배선(hooks/inject_gate.py + inject-context.sh _gate)")
-        # (b) memory 포이즌 스캐너 로드 가능 — 다운이면 부트 FAIL(fail-closed 층)
-        r = subprocess.run(
-            [sys.executable, "-c",
-             "import sys; sys.path.insert(0, %r); import javis_memory as m; "
-             "sys.exit(0 if m._skillscan is not None else 3)" % os.path.join(pack_dir(), "bin")],
-            capture_output=True, timeout=60)
-        if r.returncode != 0:
-            probs.append("memory 포이즌 스캐너 다운(_skillscan=None · fail-open 상태)")
+        # (b) memory 포이즌 스캐너 로드 가능 — 다운이면 부트 FAIL(fail-closed 층).
+        #     ★실사용 조건 검사(R2 · CSO c60 진단): 이전 -c 스니펫은 sys.path를 수동 삽입해
+        #     embeddable python(._pth 잠금)의 스크립트 직접 실행 실패를 못 봤다(감시 사각) —
+        #     실제 호출과 동일하게 javis_memory.py를 직접 실행하고 scan --json의
+        #     skillscan_available(결정론 필드)로 판정한다.
+        avail, rc = False, -1
+        try:
+            r = subprocess.run(
+                [sys.executable, os.path.join(pack_dir(), "bin", "javis_memory.py"),
+                 "scan", "--json"],
+                capture_output=True, timeout=60)
+            rc = r.returncode
+            avail = bool(json.loads(r.stdout or b"{}").get("skillscan_available"))
+        except (json.JSONDecodeError, ValueError, subprocess.TimeoutExpired):
+            avail = False
+        if rc != 0 or not avail:
+            probs.append("memory 포이즌 스캐너 다운(실사용 직접 실행 skillscan_available=False · "
+                         "fail-open 상태)")
         # (c) skillscan 집행 스캔(전 스킬 정적·~6s 실측) — BLOCK verdict는 정지경계 정책
         #     (feedback_skillscan-gate-policy)에 따라 WARN+명시 목록(처분은 master/CSO).
         #     ★승인 저장소(2026-07-04 master 승인): _round/skillscan_acknowledged.json —

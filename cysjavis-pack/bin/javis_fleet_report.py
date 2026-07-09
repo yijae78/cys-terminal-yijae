@@ -22,6 +22,9 @@ CORE-DEPENDENT(부재 cys.app/cysd 소스 필요 — 본 스크립트는 정직 
   usage_records.role NULL → per-role 비용 귀속 불가(agent/model 그룹만).
   events에 command/tool_input 컬럼 없음 → 토큰-loss 랭킹은 recall FTS 만(HEURISTIC).
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import glob

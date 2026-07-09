@@ -13,6 +13,9 @@ WorldState(§4)로 정규화해 127.0.0.1 전용 HTTP(+SSE)로 내보낸다.
 기동:  cys run --scoped -- python3 bin/javis_hud_bridge.py
 접속:  http://127.0.0.1:8765
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import json
 import os
 import re

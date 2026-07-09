@@ -22,6 +22,9 @@ watch. javis_channels.py(OPP-02 헬스 doctor)를 입력으로, 직전 스냅샷
     javis_channel_watch.py [--json] [--no-push] [--channels reddit,x]
 종료: 0 = self-test ok 또는 watch 정상, 1 = self-test 실패.
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import json

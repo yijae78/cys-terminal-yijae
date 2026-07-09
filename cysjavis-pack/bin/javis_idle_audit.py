@@ -18,6 +18,9 @@ exit code는 항상 0 (보고 도구 — 게이트 아님).
   python3 javis_idle_audit.py [--idle-hours 6] [--cpu-max 1.0] [--json]
   python3 javis_idle_audit.py --self-test
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import json
 import os

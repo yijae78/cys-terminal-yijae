@@ -26,6 +26,9 @@
 #   javis_state_snapshot.py gc [--dry-run]         # 보관정책 적용(삭제 대상 산출/실행)
 #   javis_state_snapshot.py self-test              # 원자성/중단내성 실증(격리 임시폴더)
 
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import glob as _glob
 import hashlib

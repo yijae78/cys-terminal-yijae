@@ -9,6 +9,9 @@ preflight exit/마지막 줄 + SESSION_STATE 상태 + _round/*_TODO.md 미완 �
   python3 javis_checklist.py [--preflight-cmd "<명령>"] \
       [--state <SESSION_STATE 경로>] [--round-dir <_round 경로>]
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import os
 import re

@@ -20,6 +20,9 @@ producer ≠ evaluator (file-level):
 
 GATE: net-win 입증 + 구체 crossover_lines/factor 산출 전에는 directive 승격(crossover stanza) 금지.
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import hashlib
 import json

@@ -31,6 +31,9 @@
 종료 코드: 0 성공 · 2 인자/계약 위반(hard fail) · 3 위임 도구 실패.
 의존성: 파이썬 표준 라이브러리 + 같은 bin의 javis_rsi.py·javis_memory.py. 네트워크·LLM 호출 없음.
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import json
 import os

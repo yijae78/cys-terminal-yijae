@@ -20,6 +20,9 @@ AGENTREACH OPP-19/OPP-20 통합(새 도구 안 만듦 — 본 도구에 1-체크
 종료 코드: 0 = 정합/수리 완료, 1 = missing/broken/drifted/license 위반(check) 또는 self-test 실패,
             3 = vendor-snapshot 승인대기(CYS_VENDOR_SNAPSHOT_OWNER_APPROVED 미설정).
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import glob

@@ -47,6 +47,9 @@
 종료 코드: 0 정상 판정 · 1 self-test 실패 · 2 트리거 파일 없음 · 3 JSON 파싱 실패 ·
           4 (--resolve-manifest) 매니페스트 없음 → README 디스패치 폴백
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import json

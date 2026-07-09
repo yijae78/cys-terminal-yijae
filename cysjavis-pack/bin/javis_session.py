@@ -16,6 +16,9 @@ ensure의 corrupt 경로는 DUPLICATE append가 아니라 in-place REPAIR(깨진
                                             # exit 0=두 예약 필드 정상, 1=불변식 위반, 2=I/O
     javis_session.py --self-test            # exit 0=배터리 ok, 1=fail (JSON 출력)
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import json
 import os

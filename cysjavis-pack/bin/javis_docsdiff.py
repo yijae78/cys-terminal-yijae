@@ -23,6 +23,9 @@ exit: 0=정상 산출(변경 없음 포함) / 2=git repo 아님·git 부재·인
 
 의존성: 파이썬 표준 라이브러리 + PATH의 git.
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import os

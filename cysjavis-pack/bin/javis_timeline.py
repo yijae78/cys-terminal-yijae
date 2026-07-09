@@ -27,6 +27,9 @@ replay·diff). 시간은 정수 틱(W0-2 edit_decisions.schema.json, TICKS_PER_S
 종료 코드: 0 성공 · 1 편집 오류(id 없음·undo 빈 저널·in≥out·at 범위밖 등) · 2 인자/입출력/JSON 오류.
 의존성: 파이썬 표준 라이브러리만(네트워크·LLM 없음·결정론).
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import json

@@ -14,6 +14,9 @@
   - stdio per-node serena 는 dashboard OFF(heartbeat 없음) → 라이브니스=노드, 프로버는 child-cap만.
   - --self-test: network 없이 port-scan/child-count/state round-trip 검증 후 exit 0 (C18 self-test 컨벤션).
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import json
 import os

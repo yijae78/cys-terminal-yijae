@@ -15,6 +15,9 @@ stdlib만(re·json·unicodedata·hashlib). 점수 미노출 — enum verdict(REV
   javis_mcpgate.py --self-test
 종료: 0 ACCEPT|REVISE · 1 BLOCK · 2 오류 (defensive §6 exit-code 차단)
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import base64
 import hashlib

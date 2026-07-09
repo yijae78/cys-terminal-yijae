@@ -22,6 +22,9 @@
 사용 예: python3 javis_resource_gate.py check --context 42 --json
 exit codes: 0 allow · 1 soft · 2 hard · (3+ 내부 오류)
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import json
 import os

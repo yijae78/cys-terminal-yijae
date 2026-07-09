@@ -25,6 +25,9 @@ mac(비-Windows)에서 실행 시: "Windows 전용" 정직 안내 후 exit 0(ski
 
 환경: PHOENIX_CYS(cys.exe)·PHOENIX_CYSD(cysd.exe) 미설정 시 PATH. 자기 stdout·phoenix 하위프로세스는 utf-8 고정.
 """
+# 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import importlib.util
 import json
