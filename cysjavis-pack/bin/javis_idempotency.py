@@ -76,6 +76,8 @@ def _extract_verb(argv):
     if not argv:
         return None
     first = os.path.basename(str(argv[0]))
+    # Windows: 'cys.EXE'·'CYS.exe' 등 확장자·대소문자 변형 정규화 (preflight C53)
+    first = os.path.splitext(first)[0].lower()
     if first != "cys":
         return None
     i = 1
