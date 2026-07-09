@@ -11,7 +11,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "cys — CYSJavis Terminal",
+        "title": "cys — CYSJavis Terminal · Nobel",
         "width": 1280,
         "height": 820
       }

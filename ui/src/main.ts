@@ -2842,6 +2842,28 @@ function removeDeadPane(sid: number, socket?: string) {
   // 자력 종료(셸 exit·노드 사망·reap)로 pane이 빠진 자리도 ✕닫기(actionClose)와 동일하게 회수 —
   // 남은 패널을 전체 공간에 균등 재배치. ✕닫기에만 있던 equalize가 이 경로에 없어 빈 공간이 남던 결함.
   if (wasInCurrent) void actionEqualize();
+  // pane이 전부 사라진 ws 탭 자동 정리 — master가 CLI(셸 exit·close-surface)만으로 탭까지
+  // 닫을 수 있는 통로(오너 2026-07-09). 시작 복원 직후 남는 유령 탭도 같은 경로로 청소된다.
+  void reapEmptyWorkspaces();
+}
+
+// 빈(tree=null·비pending) workspace 탭을 ✕ 2-click 핸들러와 동일한 teardown으로 제거한다 —
+// 부서 socket은 '그 socket을 쓰는 마지막 탭'일 때만 데몬 stop(중복 탭 보호 규칙 동일).
+// pending(부서 제작 중) 탭은 보호 — addDeptWorkspace 3분기 롤백 로직이 책임진다.
+async function reapEmptyWorkspaces() {
+  const empties = workspaces.filter((w) => !w.pending && w.tree == null);
+  if (!empties.length) return;
+  for (const ws of empties) {
+    const i = workspaces.indexOf(ws);
+    if (i < 0) continue;
+    workspaces.splice(i, 1);
+    if (i < activeWs) activeWs -= 1;
+    const stillUsed = ws.socket && workspaces.some((w) => w.socket === ws.socket);
+    if (ws.socket && !stillUsed) await invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch(() => {});
+  }
+  if (workspaces.length === 0) await addWorkspace(); // addWorkspace가 activeWs를 설정
+  activeWs = Math.min(Math.max(activeWs, 0), workspaces.length - 1);
+  render();
 }
 
 // ---------- 승인 Feed (Control Center 탭) ----------
