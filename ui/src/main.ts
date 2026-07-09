@@ -1955,7 +1955,12 @@ function renderDeptPending(): HTMLElement {
 function renderNode(node: Node): HTMLElement {
   if (node.type === "pane") {
     const rt = panes.get(paneKey(node.sid, current()?.socket));
-    if (rt) return rt.el;
+    // 분할 시절 인라인 flex(비율) 초기화 — 마지막 1개로 남을 때 grow<1 잔존분이 화면 일부만
+    // 채우는 결함 차단. 분할 소속이면 아래 split 분기가 반환 직후 비율을 다시 덮어쓴다.
+    if (rt) {
+      rt.el.style.flex = "1 1 0%";
+      return rt.el;
+    }
     const placeholder = document.createElement("div");
     placeholder.className = "pane";
     placeholder.textContent = `surface:${node.sid} (없음)`;
