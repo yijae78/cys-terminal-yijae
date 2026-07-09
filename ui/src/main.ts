@@ -8,6 +8,7 @@ import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
 import { shellQuote, shellQuoteJoin } from "./shellquote";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
+import { roleLayout, equalizeAdoptedTrees } from "./layout";
 import { deptPlaceholderLabel } from "./deptlabel";
 
 declare global {
@@ -1404,7 +1405,8 @@ async function refreshPaneTitles() {
   try {
     // 멀티마스터 F4: workspace별 소켓을 순회 — 각 데몬의 surface를 그 소켓 ws에만 귀속시킨다.
     const sockets = [...new Set(workspaces.map((w) => w.socket))];
-    let adopted = false;
+    // R1: 입양이 일어난 ws만 균등화 대상으로 수집 — ws → 그 소켓의 roleOf(surface.list 재사용, 추가 호출 0).
+    const adoptedWs = new Map<Workspace, Map<number, string | null>>();
     for (const sk of sockets) {
       const r = (await invoke("list_surfaces", { socket: sk })) as {
         surfaces: {
@@ -1437,16 +1439,19 @@ async function refreshPaneTitles() {
         ws.tree = ws.tree
           ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
           : { type: "pane", sid: s.surface_id };
-        adopted = true;
+        if (!adoptedWs.has(ws)) adoptedWs.set(ws, new Map(r.surfaces.map((x) => [x.surface_id, x.role])));
       }
     }
-    if (adopted) {
+    if (adoptedWs.size) {
       render();
       // 자동입양으로 pane이 생긴 활성 ws에 유효 포커스가 없으면 그 첫 pane에 포커스(포커스 회수, 탈취 아님).
       // 안 A: 부서 master 첫 등장 시 — 빈 셸이 없으므로 master pane으로 직행한다.
       const aSids = collectSids(current()?.tree ?? null);
       if (aSids.length && (focusedSid == null || !aSids.includes(focusedSid))) setFocus(aSids[0]);
-      await actionEqualize(); // 외부(launch-agent·cys boot) 입양 시 전체 패널 자동 균등 배치
+      // R1: 외부(launch-agent·cys boot) 입양 시 "입양된 그 ws들"만 자동 균등 배치 —
+      // 활성 ws 고정(actionEqualize)이던 기존 배선은 비활성 부서 ws 입양을 놓쳤다.
+      equalizeAdoptedTrees(adoptedWs, (w) => collectSids(w.tree).filter((sid) => panes.has(paneKey(sid, w.socket))));
+      render(); // 균등화된 트리 반영 (비활성 ws는 탭 전환 시 표시)
     }
   } catch {
     /* 데몬 일시 미응답은 다음 틱에 */
@@ -2149,45 +2154,11 @@ function startGroupDrag(e0: MouseEvent, srcId: number) {
 }
 
 // ---------- 정렬: 역할(role) 기반 고정 배치 ----------
-// 현재 워크스페이스의 살아있는 surface를 역할 순서(master·cso·worker·agy·codex)로
-// 전부 같은 폭 가로 컬럼으로 균등 재배치한다 — 세로 분열 없이 모두 옆으로 나란히.
-//   · master · cso · worker(미분류 포함) · reviewer-gemini(agy) · reviewer-codex(codex) 순서 보존
+// 순수 트리 변형(evenComb·firstWithRole·roleLayout·equalizeAdoptedTrees)은 ./layout으로 이관(R1) —
+// 여기는 데몬 조회·render 배선만 남는다. 배치 규칙 설명은 layout.ts 머리주석 참조.
 // 트리 위상만 새로 짜고 attachDividerDrag는 건드리지 않으므로 수동 크기 조절은 그대로 보존된다
 // (정렬 후에도 divider를 다시 끌 수 있다 — 현재 크기만 표준 배치로 리셋될 뿐이다).
 // divider 1px·pane 헤더 등으로 컬럼 폭엔 셀 1칸 이내 잔차가 있을 수 있다.
-function evenComb(nodes: Node[], dir: "row" | "col"): Node {
-  let acc = nodes[nodes.length - 1];
-  for (let i = nodes.length - 2; i >= 0; i--) {
-    acc = { type: "split", dir, ratio: 1 / (nodes.length - i), a: nodes[i], b: acc };
-  }
-  return acc;
-}
-
-function firstWithRole(sids: number[], roleOf: Map<number, string | null>, role: string): number | null {
-  for (const sid of sids) if (roleOf.get(sid) === role) return sid;
-  return null;
-}
-
-function roleLayout(sids: number[], roleOf: Map<number, string | null>): Node {
-  const master = firstWithRole(sids, roleOf, "master");
-  const cso = firstWithRole(sids, roleOf, "cso");
-  const agy = firstWithRole(sids, roleOf, "reviewer-gemini"); // 안티그래피티
-  const codex = firstWithRole(sids, roleOf, "reviewer-codex");
-  const corners = new Set([master, cso, agy, codex].filter((x): x is number => x != null));
-  const middle = sids.filter((sid) => !corners.has(sid)); // worker·미분류 전부 가운데
-  const pane = (sid: number): Node => ({ type: "pane", sid });
-
-  const columns: Node[] = [];
-  // 전부 가로 균등 배치 — master · cso · worker(미분류 포함) · agy · codex 순서로 각자 개별 컬럼.
-  // (세로 분열 없이 모든 pane을 같은 폭 가로 컬럼으로 정렬)
-  if (master != null) columns.push(pane(master));
-  if (cso != null) columns.push(pane(cso));
-  for (const sid of middle) columns.push(pane(sid));
-  if (agy != null) columns.push(pane(agy));
-  if (codex != null) columns.push(pane(codex));
-
-  return evenComb(columns, "row"); // 컬럼들을 같은 폭으로 가로 배치
-}
 
 async function actionEqualize() {
   const ws = current();
