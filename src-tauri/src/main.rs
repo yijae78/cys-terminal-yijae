@@ -1412,6 +1412,86 @@ async fn stop_dept_daemon_by_socket(socket: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 부서 소켓의 살아있는 세션 수 — live_session_count(메인 데몬 전용·기본 소켓 하드코딩)의 부서판.
+/// rotate_dept_daemon force 가드용. 판정 규칙은 live_session_count와 동일(exited!=true=live)하되 대상만
+/// 부서 소켓으로 파라미터화(rpc_on). 조회 실패는 호출부에서 0으로 접어 보수적으로 처리.
+async fn dept_live_session_count(sock: &std::path::Path) -> Result<u64, String> {
+    let r = rpc_on(sock, "surface.list", json!({})).await?;
+    let n = r["surfaces"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|s| !s["exited"].as_bool().unwrap_or(true))
+                .count() as u64
+        })
+        .unwrap_or(0);
+    Ok(n)
+}
+
+/// 부서 데몬 버전 스큐 세대교체(재기동) — 메인 rotate_daemon의 부서판. `cys-dept rotate <name>`에 일임한다:
+/// 데몬 프로세스만 정지→새 on-disk cysd로 재기동하고 **레지스트리·phoenix 묘비·CEO는 건드리지 않는다**
+/// (down=폐기와 결정적 차이 — CSO 단일소유 부서 생성/폐기 권한 불침범·rotate=순수 재기동). force 가드는
+/// rotate_daemon 동형이되 대상이 부서 소켓이라 세션 카운트를 dept_live_session_count(부서소켓 surface.list)로
+/// 산출한다(live_session_count는 메인 전용이라 재사용 불가). 반환=새 데몬 identify(+rotate_log) — UI 스큐 해소 판정.
+#[tauri::command]
+async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool) -> Result<Value, String> {
+    let sock = dept_socket_path(&name);
+    // 세션 가드(rotate_daemon 동형). ★F1(리뷰): force=false는 카운트 실패를 0으로 접지 않고
+    // Err("live_sessions:unknown")로 보류한다 — 세션 보유 부서를 무확인 교대할 위험 차단(UI가 held 분류·다음
+    // tick 재시도). Ok(0)만 진행. force=true(사용자 확인 완료)는 카운트 건너뜀.
+    if !force {
+        match dept_live_session_count(&sock).await {
+            Ok(0) => {}
+            Ok(n) => return Err(format!("live_sessions:{n}")),
+            Err(_) => return Err("live_sessions:unknown".to_string()),
+        }
+    }
+    // drain(best-effort): 교대 전 부서 노드에 저장 신호. 부서 소켓 대상(CYS_SOCKET)으로 cys drain 실행
+    // (메인 rotate_daemon의 drain 동형·spawn_blocking 패턴 일치). cys drain 자체 watchdog로 hang 시에도 종료.
+    let dsock = sock.to_string_lossy().into_owned();
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+        cmd.env(cys::ENV_SOCKET, &dsock);
+        cmd.arg("drain");
+        no_console(&mut cmd);
+        cmd.status()
+    })
+    .await;
+    // cys-dept rotate <name> — 프로세스 정지→새 바이너리 재기동(reg_upsert 메타보존·묘비 불변).
+    // launch_dept_daemon의 bash+inject_runtime_path+no_console+spawn_blocking 패턴 동형.
+    let tool = dept_tool();
+    let n = name.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("bash");
+        inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(bash.exe) PATH 주입
+        cmd.arg(&tool).arg("rotate").arg(&n);
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).to_string());
+    }
+    // 이벤트 포워더 재확립 + 새 데몬 identify(버전 확인·UI 스큐 해소 판정). launch_dept_daemon 반환 동형.
+    spawn_event_forwarder(app.clone(), sock.clone());
+    let mut info = rpc_on(&sock, "system.identify", json!({"caller": "ui"})).await?;
+    if let Some(obj) = info.as_object_mut() {
+        obj.insert("socket".into(), json!(sock.to_string_lossy()));
+        obj.insert("socket_slug".into(), json!(sock_slug(&sock)));
+        // rotate verb의 "rotated <name>: vX→vY" 확정 줄(검증 게이트) 전달 — 사람 로그·성공 판정 보조.
+        if let Some(l) = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("rotated "))
+        {
+            obj.insert("rotate_log".into(), json!(l));
+        }
+    }
+    Ok(info)
+}
+
 /// 업데이트 확인: 새 버전이 있으면 (version, notes)를 반환, 없으면 null.
 #[tauri::command]
 async fn check_update(app: AppHandle) -> Result<Option<Value>, String> {
@@ -1584,13 +1664,19 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
 /// 디스크의 새 cysd 기동. app.restart()가 없어 setup이 다시 돌지 않으므로
 /// maybe_apply_pending_update(팩 반영 + cys restore 노드 복원)를 여기서 직접 수행한다.
 /// ★update-progress는 emit하지 않는다 — drain/handoff 페이즈가 UI "업데이트 설치" sticky 토스트를
-/// 만드는데 이 경로엔 재시작이 없어 영구 잔류한다. 진행 표시는 UI(promptRotateDaemon) 토스트 담당.
+/// 만드는데 이 경로엔 재시작이 없어 영구 잔류한다. 진행 표시는 UI(checkVersionSkew/manualRotateSkewed) 토스트 담당.
 /// force=false: 살아있는 세션이 있으면 거부(UI가 확인 후 force=true로 재호출) — install_update 가드 동형.
 #[tauri::command]
 async fn rotate_daemon(app: AppHandle, force: bool) -> Result<(), String> {
-    let sessions = live_session_count().await.unwrap_or(0);
-    if sessions > 0 && !force {
-        return Err(format!("live_sessions:{sessions}"));
+    // ★F1(리뷰): force=false는 UI checkVersionSkew(무손실 자동 교대)만 호출한다 — 세션 카운트 실패를 0으로
+    // 접으면 세션 보유 노드를 무확인 교대할 위험 → Err("live_sessions:unknown")로 보류(UI가 "held" 분류·다음
+    // tick 재시도). Ok(0)만 진행. force=true(사용자 확인 완료 수동 경로)는 카운트 자체를 건너뛴다(무영향).
+    if !force {
+        match live_session_count().await {
+            Ok(0) => {}
+            Ok(n) => return Err(format!("live_sessions:{n}")),
+            Err(_) => return Err("live_sessions:unknown".to_string()),
+        }
     }
     // drain(best-effort): 교대 전 살아있는 노드에 저장 신호 + 유예 (install_update 3단계 동형).
     let _ = tokio::task::spawn_blocking(|| {
@@ -1820,6 +1906,7 @@ fn main() {
             allocate_dept_daemon,
             stop_dept_daemon,
             stop_dept_daemon_by_socket,
+            rotate_dept_daemon,
             list_depts,
             read_dept_catalog,
             install_cli_to_path,

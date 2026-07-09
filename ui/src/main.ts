@@ -3141,41 +3141,174 @@ async function promptInstall() {
   }
 }
 
-/// 스큐 교대 — rotate_daemon 호출(세션 없으면 자동·있으면 확인, promptInstall 정책 동형).
-/// app.restart가 없는 경로라 완료·실패 토스트까지 이 함수가 책임진다. 성공 시 배지 제거(스큐 해소).
+// ── 버전 스큐 세대교체(무중단 rename-swap의 짝) — 메인 + 부서 데몬 ──
+// 업데이트 후 구 데몬(lame-duck)이 세션을 보존하는 동안 "데몬 vX ↔ 앱 vY" 스큐를 비차단으로 알린다.
+// 강제 재시작 없음(세션 보존 우선). 잃을 세션 0인 노드는 무손실 자동 교대, 세션 있는 노드만 배지+1회 안내.
+// ★거버넌스: 부서 교대는 '재기동'일 뿐 CSO 단일소유 생성/폐기 권한을 건드리지 않는다
+// (rotate_dept_daemon=cys-dept rotate=데몬 프로세스만 재기동·레지스트리·묘비·CEO 불변).
 let rotatingDaemon = false;
-async function promptRotateDaemon(badge: HTMLElement, appVer: string) {
-  if (rotatingDaemon) return; // 유휴 자동 교대와 수동 클릭의 중복 발동 방지
-  const sessions = (await invoke("live_session_count").catch(() => 0)) as number;
-  let force = false;
-  if (sessions > 0) {
-    const ok = await confirmModal(
-      `데몬 교대 (새 버전 v${appVer})`,
-      `작업 세션 ${sessions}개가 구 데몬에 물려 있습니다. 저장(drain) 신호 후 데몬을 새 버전으로 ` +
-        `교대하고 세션을 복원합니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 교대하시겠습니까?`,
-    );
-    if (!ok) return;
-    force = true;
+let verSkewBadge: HTMLElement | null = null;
+let skewNoticeShown = false; // C: 세션당 1회 능동 안내 플래그(스큐 해소 시 리셋)
+
+interface SkewedDept {
+  name: string;
+  socket: string;
+}
+
+// rotate_daemon/rotate_dept_daemon 래퍼 — force=false면 백엔드가 세션>0 시 "live_sessions:N"로 거부(=보류).
+async function rotateMainDaemon(force: boolean): Promise<"ok" | "held" | "err"> {
+  try {
+    await invoke("rotate_daemon", { force });
+    return "ok";
+  } catch (e) {
+    return String(e).includes("live_sessions:") ? "held" : "err";
   }
+}
+async function rotateDeptDaemon(name: string, force: boolean): Promise<"ok" | "held" | "err"> {
+  try {
+    await invoke("rotate_dept_daemon", { name, force });
+    return "ok";
+  } catch (e) {
+    return String(e).includes("live_sessions:") ? "held" : "err";
+  }
+}
+
+// 메인+부서 데몬 버전 스큐 감지. 부서 열거=list_depts(레지스트리 SOT — 열린 탭 무관·Windows pipe 포함).
+async function detectSkew(
+  appVer: string,
+): Promise<{ mainSkew: boolean; daemonVer: string; skewedDepts: SkewedDept[] }> {
+  let daemonVer = "";
+  let mainSkew = false;
+  try {
+    const st = (await invoke("daemon_status")) as Record<string, unknown>;
+    daemonVer = String(st.version ?? "");
+    mainSkew = !!(daemonVer && daemonVer !== appVer);
+  } catch {
+    /* 조회 실패=판정 보류(보수적) */
+  }
+  // ★F3(리뷰): 부서 열거를 레지스트리 SOT(list_depts)로 — name+socket을 레지스트리에서 직접 얻어
+  // deptNameFromSocket(unix 전용 정규식) 의존을 없앤다(Windows named pipe 우회). 죽은 등재 항목은
+  // daemon_status(socket) 실패로 skip돼 무해.
+  const reg = (await invoke("list_depts").catch(() => ({ depts: {} }))) as {
+    depts?: Record<string, { socket?: string }>;
+  };
+  const skewedDepts: SkewedDept[] = [];
+  for (const [name, meta] of Object.entries(reg.depts ?? {})) {
+    const socket = meta.socket;
+    if (!socket) continue;
+    try {
+      const st = (await invoke("daemon_status", { socket })) as Record<string, unknown>;
+      const dv = String(st.version ?? "");
+      if (dv && dv !== appVer) skewedDepts.push({ name, socket });
+    } catch {
+      /* 죽은/전이 중 부서 소켓 skip(무해) */
+    }
+  }
+  return { mainSkew, daemonVer, skewedDepts };
+}
+
+function clearSkewBadge() {
+  if (verSkewBadge) {
+    verSkewBadge.remove();
+    verSkewBadge = null;
+  }
+  skewNoticeShown = false;
+}
+
+// 보류(세션>0) 노드만 배지에 반영(멱등 갱신·이미 있으면 갱신·없으면 생성). 부서 스큐 개수 병기.
+function showSkewBadge(
+  info: HTMLElement,
+  appVer: string,
+  heldMain: boolean,
+  daemonVer: string,
+  heldDepts: SkewedDept[],
+) {
+  if (!verSkewBadge || !verSkewBadge.isConnected) {
+    verSkewBadge = document.createElement("span");
+    verSkewBadge.className = "ver-skew-badge";
+    info.appendChild(verSkewBadge);
+  }
+  const suffix = heldDepts.length ? ` (+부서 ${heldDepts.length}개)` : "";
+  verSkewBadge.textContent = heldMain
+    ? `데몬 v${daemonVer} · 앱 v${appVer}${suffix} — 세션 보존 중`
+    : `앱 v${appVer} · 부서 ${heldDepts.length}개 구버전 — 세션 보존 중`;
+  verSkewBadge.title =
+    "업데이트가 적용됐지만 실행 중인 세션(마스터·워커·부서)을 보존하기 위해 기존 데몬이 계속 봉사합니다.\n" +
+    "클릭하면 저장(drain) 후 새 버전으로 순차 교대(메인→부서)하고 세션을 복원합니다.";
+  verSkewBadge.onclick = () => void manualRotateSkewed(appVer, heldMain, heldDepts);
+}
+
+// 배지 클릭(수동) — 확인 1회 후 force=true로 순차 교대(메인→부서). app.restart 없는 경로라 토스트까지 책임.
+async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: SkewedDept[]) {
+  if (rotatingDaemon) return;
+  const nodes = (heldMain ? 1 : 0) + heldDepts.length;
+  const ok = await confirmModal(
+    `데몬 교대 (새 버전 v${appVer})`,
+    `작업 세션이 물려 있는 데몬 ${nodes}개를 새 버전으로 순차 교대(메인→부서)합니다. 저장(drain) 신호 후 ` +
+      `교대하고 세션을 복원합니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 교대하시겠습니까?`,
+  );
+  if (!ok) return;
   rotatingDaemon = true;
   stickyToast("rotate-daemon", "feed", "↻ 데몬 교대", `새 버전 v${appVer}로 교대 중… 저장 후 세션을 복원합니다.`);
   try {
-    await invoke("rotate_daemon", { force });
+    if (heldMain) await invoke("rotate_daemon", { force: true });
+    for (const d of heldDepts) await invoke("rotate_dept_daemon", { name: d.name, force: true });
     dismissToast("rotate-daemon");
-    badge.remove(); // 스큐 해소 — 배지 내림(유휴 타이머도 isConnected 가드로 멈춘다)
+    clearSkewBadge();
     toast("watchdog", "✅ 데몬 교대 완료", `데몬이 v${appVer}로 교대됐습니다. 노드 복원이 진행됩니다.`);
   } catch (e) {
     dismissToast("rotate-daemon");
-    const msg = String(e);
-    if (msg.includes("live_sessions:")) {
-      // 가드에 막힘(force 미적용 경로 — 확인 사이 세션 증가 등) — 다시 확인 흐름으로
-      rotatingDaemon = false;
-      await promptRotateDaemon(badge, appVer);
-      return;
-    }
-    toast("health", "데몬 교대 실패", msg);
+    toast("health", "데몬 교대 실패", String(e));
   } finally {
     rotatingDaemon = false;
+  }
+}
+
+// 시작 시 1회 + 5분 주기(B) — 스큐 재검·배지 멱등 갱신·무손실 자동 교대·1회 능동 안내(C).
+async function checkVersionSkew() {
+  if (rotatingDaemon) return; // 교대 진행 중 중복 발동 방지(주기 타이머·수동 클릭)
+  let appVer = "";
+  try {
+    appVer = (await invoke("app_version")) as string;
+  } catch {
+    return;
+  }
+  if (!appVer) return;
+  const info = document.getElementById("daemon-info");
+  if (!info) return;
+  const { mainSkew, daemonVer, skewedDepts } = await detectSkew(appVer);
+  if (!mainSkew && skewedDepts.length === 0) {
+    clearSkewBadge();
+    return;
+  }
+  // 무손실 자동 교대(세션 0인 노드만 — 백엔드 게이트가 force=false로 판정). 보류(세션>0·"held")만 남긴다.
+  // ★F3(리뷰): "held"(세션 보유 보류)뿐 아니라 "err"(카운트·교대 실패)도 배지 대상에 포함 —
+  // 스큐가 사용자에게 계속 보이게(구 배지 가시성 보존). 실패는 다음 tick 재검·재시도로 자가 교정된다.
+  // 참고: F1로 카운트 실패는 "live_sessions:unknown"→래퍼가 "held" 분류, "err"는 그 외 교대 실패.
+  let heldMain = false;
+  const heldDepts: SkewedDept[] = [];
+  rotatingDaemon = true;
+  try {
+    if (mainSkew) {
+      const r = await rotateMainDaemon(false);
+      if (r === "held" || r === "err") heldMain = true;
+    }
+    for (const d of skewedDepts) {
+      const r = await rotateDeptDaemon(d.name, false);
+      if (r === "held" || r === "err") heldDepts.push(d);
+    }
+  } finally {
+    rotatingDaemon = false;
+  }
+  if (!heldMain && heldDepts.length === 0) {
+    clearSkewBadge(); // 전부 무손실 자동 교대됨 — 배지 없음
+    return;
+  }
+  showSkewBadge(info, appVer, heldMain, daemonVer, heldDepts);
+  if (!skewNoticeShown) {
+    // C: 자동 교대가 보류/실패로 남을 때 1회 안내(sticky 아님 — 8초 auto-dismiss)
+    skewNoticeShown = true;
+    toast("feed", "새 버전 준비", `새 버전 v${appVer} 준비 — 상태바 배지를 눌러 저장 후 교대하세요.`);
   }
 }
 
@@ -3694,35 +3827,11 @@ async function start() {
   const status = (await invoke("daemon_status")) as Record<string, unknown>;
   info.textContent = `daemon pid=${status.daemon_pid} sock=${status.socket_path}`;
 
-  // ★P2 버전 스큐 배지(무중단 rename-swap의 짝): 업데이트 후 구 데몬(lame-duck)이 세션을 계속
-  // 보존하는 동안 "데몬 vX ↔ 앱 vY" 스큐를 비차단으로 알린다. 강제 재시작 없음 — 세션 보존이 우선.
-  try {
-    const appVer = (await invoke("app_version")) as string;
-    const daemonVer = String(status.version ?? "");
-    if (daemonVer && appVer && daemonVer !== appVer) {
-      const badge = document.createElement("span");
-      badge.className = "ver-skew-badge";
-      badge.textContent = `데몬 v${daemonVer} · 앱 v${appVer} — 세션 보존 중`;
-      badge.title =
-        "업데이트가 적용됐지만 실행 중인 세션(마스터·워커·부서)을 보존하기 위해 기존 데몬이 계속 봉사합니다.\n클릭하면 저장(drain) 후 새 버전으로 교대하고 세션을 복원합니다.";
-      badge.addEventListener("click", () => void promptRotateDaemon(badge, appVer));
-      info.appendChild(badge);
-      // 유휴 자동 교대: 잃을 세션이 0이면 무손실 — 시작 시 1회 + 5분 주기로 확인해 자동 교대.
-      // 카운트 실패(-1)는 자동 발동 금지(보수적) — 수동 클릭 경로만 남긴다.
-      const tryIdleRotate = async () => {
-        if (!badge.isConnected) {
-          clearInterval(idleTimer); // 이미 교대됨(수동 클릭 성공) — 재교대 방지
-          return;
-        }
-        const n = (await invoke("live_session_count").catch(() => -1)) as number;
-        if (n === 0) await promptRotateDaemon(badge, appVer);
-      };
-      const idleTimer = setInterval(() => void tryIdleRotate(), 5 * 60_000);
-      void tryIdleRotate();
-    }
-  } catch {
-    /* 배지는 부가 기능 — 실패해도 시작을 막지 않는다 */
-  }
+  // 버전 스큐 세대교체(메인 + 부서 데몬) — 시작 1회 + 5분 주기 재검(B). 무중단 rename-swap의 짝으로
+  // 구 데몬(lame-duck) 스큐를 비차단 배지로 알리고, 잃을 세션 0인 노드는 무손실 자동 교대한다.
+  // 상세=checkVersionSkew(감지·배지 멱등·자동 교대·1회 능동 안내). 배지는 부가 기능이라 실패해도 시작 무영향.
+  void checkVersionSkew();
+  setInterval(() => void checkVersionSkew(), 5 * 60_000);
 
   await listen("daemon-event", (e) => onDaemonEvent(e.payload as Record<string, unknown>));
 
