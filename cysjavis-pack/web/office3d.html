@@ -186,6 +186,8 @@ const ROLE_COLOR = { master:0xd9a441, worker:0x3fb8dd, cso:0x9b7bd8,
 const HAIR = [0x2b2119, 0x1a1a1e, 0x4a3320, 0x555a60];
 const SKIN = 0xe4b48c;
 const FLOOR_H = 3.8, SLAB_W = 13.0, SLAB_D = 8.6;
+// 회장실 왕좌 위치·좌면 — makeChairmanOffice(배치)와 자동 착석(updateThroneSeat)의 단일 SOT.
+const THRONE = { x: 0.5, z: -3.65, seatY: 0.55, nearR: 0.9 };
 const TOOL_ICON = { Bash:'⌘', Read:'📖', Edit:'✎', Write:'✎', Grep:'🔍', Glob:'🔍',
   WebSearch:'🌐', WebFetch:'🌐', Task:'⚙', Agent:'⚙', TodoWrite:'☑' };
 const PRESENCE_KO = { active:'활동중', waiting:'대기', drowsy:'꾸벅', sleeping:'수면',
@@ -759,7 +761,8 @@ function makeChairmanOffice(roofY){
   g.add(mesh(new THREE.BoxGeometry(2.2, 0.08, 0.95), goldWood, cx, roofY+0.78, cz-0.3));
   g.add(mesh(new THREE.BoxGeometry(0.09, 0.74, 0.85), M.woodDark, cx-1.0, roofY+0.38, cz-0.3));
   g.add(mesh(new THREE.BoxGeometry(0.09, 0.74, 0.85), M.woodDark, cx+1.0, roofY+0.38, cz-0.3));
-  const throne = new THREE.Group(); throne.position.set(cx, roofY, cz-1.15);
+  const throne = new THREE.Group(); throne.position.set(THRONE.x, roofY, THRONE.z);
+  throne.rotation.y = Math.PI;   // 등받이를 유리벽(-z) 쪽으로 — 착석자가 책상·오피스를 본다(구: 뒤돌아 있음)
   throne.add(mesh(new THREE.BoxGeometry(0.6, 0.1, 0.55), goldWood, 0, 0.5, 0));
   throne.add(mesh(new THREE.BoxGeometry(0.58, 0.85, 0.09), goldWood, 0, 0.95, 0.26));
   throne.add(mesh(G.chairPost, M.metal, 0, 0.3, 0, false));
@@ -1109,6 +1112,25 @@ function addChat(cls, name, text){
 // ---------- 주인(오너) 아바타 · 엘리베이터 · 강림 (#2) ----------
 const ELEV = { x: -SLAB_W/2+0.9, z: SLAB_D/2-0.8 };
 let owner = null, elevCar = null, ownerHome = new THREE.Vector3();
+// 👑 왕좌 근접 자동 착석 — 주인이 옥상 왕좌 반경 안에서 멈추면 앉고, 이동을 시작하면 일어선다.
+let ownerSeated = false;
+function updateThroneSeat(){
+  const g = owner.pr.grp;
+  const roofY = FLOORS.length ? FLOORS[FLOORS.length-1] : 0;
+  const near = Math.abs(g.position.y - (roofY + 0.74)) < 0.45 &&
+               Math.hypot(g.position.x - THRONE.x, g.position.z - THRONE.z) < THRONE.nearR;
+  if (near && !ownerSeated){
+    ownerSeated = true;
+    g.position.set(THRONE.x, roofY + THRONE.seatY, THRONE.z);
+    g.rotation.y = Math.PI;            // ㄴ자 다리(-z)가 책상(+z)으로 — 직원 착석과 동일 패턴
+    owner.pr.setStanding(false);       // 착석 포즈
+  }
+}
+function standFromThrone(){
+  if (!ownerSeated) return;
+  ownerSeated = false;
+  owner.pr.setStanding(true);          // 기립 — 방향·높이는 walk 스텝이 자연 복귀
+}
 function buildOwner(roofY){
   const pr = makePerson('owner', 0);
   pr.setStanding(true);
@@ -1153,7 +1175,11 @@ function ownerDeliver(key, text, opts={}){
   return true;
 }
 function advanceOwner(dt, t){
-  if (!owner || !owner.plan.length){ if (owner) owner.busy = false; return; }
+  if (!owner || !owner.plan.length){
+    if (owner){ owner.busy = false; updateThroneSeat(); }   // 정지 상태 — 왕좌 근접이면 착석
+    return;
+  }
+  standFromThrone();                                        // 이동 계획 생김 — 앉아 있었다면 기립
   const g = owner.pr.grp, step = owner.plan[0];
   if (step.t === 'walk'){
     const d = step.to.clone().sub(g.position); d.y = 0;
