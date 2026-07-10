@@ -3,6 +3,8 @@
 #
 #   cys-dept launch <name>    부서 데몬 spawn + ACL 시드 + 부서장 자리 + (부서≥1)CEO 승격 + 레지스트리 등재
 #   cys-dept down   <name>    teardown: SIGTERM + 소켓/lock 정리 + 레지스트리 해제 + (마지막)CEO 강등
+#   cys-dept rotate <name>    버전 스큐 세대교체(재기동): 데몬 프로세스만 정지→새 on-disk cysd로 재기동
+#                             (★폐기 아님 — 레지스트리·묘비·CEO 불변). stdout 마지막 줄=rotated <name>: vX→vY
 #   cys-dept list             부서명 목록
 #   cys-dept sock   <name>    부서 소켓 경로 출력 (broadcast fan-out 루프용)
 #   cys-dept <name> -- <cmd>  부서 컨텍스트(CYS_SOCKET+CYS_PACK_DIR)로 명령 실행
@@ -356,13 +358,13 @@ ceo_demote(){
   ceo_reinject_master "표준 master 복귀"
 }
 
-cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|reap|list|sock <name> | <name> -- <cmd>}"
+cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|rotate|reap|list|sock <name> | <name> -- <cmd>}"
 # ★단일소유 기술 강제(CEO 2026-06-22): 부서 lifecycle mutation은 CSO(CYS_ROLE=cso)·GUI(role 없음·오너
 # 직접)만 허용한다. roled 비-CSO 노드(부서장 master·워커·리뷰어·CEO)의 cys-dept create/down 직접 호출을
 # 차단해 다중주체 churn(빈 dept-N·중복·레이스)을 기술적으로 방지. (defense-in-depth — 의도적 unset 우회는
 # 거버넌스 영역이나, 정상 다중 노드 churn은 차단). 읽기 전용(list/sock/<name> --)은 무제한.
 case "$cmd" in
-  launch|allocate|create|down|down-sock|reap)
+  launch|allocate|create|down|down-sock|rotate|reap)
     if [ -n "${CYS_ROLE:-}" ] && [ "${CYS_ROLE}" != "cso" ]; then
       echo "[cys-dept] ★단일소유 강제: 부서 lifecycle mutation은 CSO/GUI 전용(CYS_ROLE=$CYS_ROLE 차단·다중 churn 방지). CSO에 요청하라." >&2
       exit 7
@@ -659,6 +661,53 @@ PY
     [ -n "$name" ] && dept_tombstone "$name" || true
     [ "$(reg_count)" = "0" ] && ceo_demote || true
     echo "[cys-dept] socket teardown 완료(name=${name:-미등록}). 부서 수=$(reg_count)"
+    ;;
+  rotate)
+    # ★버전 스큐 세대교체(재기동, ★폐기 아님): 데몬 프로세스만 정지→새 on-disk cysd로 재기동한다.
+    # down(reg_remove+dept_tombstone+ceo_demote=의도적 폐기)과 달리 레지스트리·묘비·CEO를 절대 건드리지
+    # 않는다 — CSO 단일소유 부서 생성/폐기 권한 불침범(rotate=순수 재기동). launch 로직을 재귀 재사용해
+    # reg_upsert(merge·메타보존)+새 바이너리 spawn+seed+ceo_promote를 재확립한다.
+    name="${2:?usage: cys-dept rotate <name>}"
+    sock="$(dept_sock "$name")"
+    # ★필수2(A·리뷰) 사전 게이트: 미등재(down됨/없음) 부서는 즉시 중단(exit 8·부활 금지). ping/identify(autostart
+    # 부작용) 이전에 레지스트리(SOT)부터 확인해 side-effect 0으로 빠르게 거부한다. reg_names(SOT) 재사용.
+    if ! reg_names | grep -Fxq "$name"; then
+      echo "[cys-dept] $name 미등재(down됨) — rotate 중단(부활 금지)" >&2
+      exit 8
+    fi
+    # ★필수4(B·리뷰): rotate 대상 데몬이 실제 살아있는지 ping으로 먼저 확인(autostart 없는 연결 프로브).
+    # ★함정: `cys identify`는 죽은 소켓에서 cysd를 autostart하는 부작용이 있어(스모크 실증) pid가 항상 채워져
+    # "미확인" 판정을 못 한다 → ping(연결만·autostart 없음)으로 게이트한다. 미응답=소유자 사망 미확인이므로
+    # 중단(exit 9): 이 상태에서 kill·rm·launch로 가면 유령 중복/오kill 위험. detectSkew가 방금 daemon_status
+    # 성공한 부서만 넘기므로 이 실패는 일시적 — 다음 tick 재시도가 옳다(되살리기·중복 금지).
+    if ! CYS_SOCKET="$sock" "$CYS" ping >/dev/null 2>&1; then
+      echo "[cys-dept] $name 데몬 미응답(ping 실패) — rotate 중단(소유자 사망 미확인·유령 중복 방지)" >&2
+      exit 9
+    fi
+    # 살아있음이 확인됐으니 identify는 실 데몬에 연결(autostart 없음). 구 버전(검증 게이트)·pid(kill 대상) 취득.
+    oldver="$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || true)"
+    pid=$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
+    # 방어적 재확인(ping↔identify 사이 경합으로 pid 비면 중단 — 위와 동일 근거).
+    if [ -z "${pid:-}" ]; then
+      echo "[cys-dept] $name pid 미확인 — rotate 중단(소유자 사망 미확인·유령 중복 방지)" >&2
+      exit 9
+    fi
+    # 프로세스만 종료(down의 graceful_kill 재사용 — OS중립·Windows taskkill 분기 포함, 신설 분기 없음).
+    # graceful_kill이 사망을 동기 확인하므로 아래 launch의 ready 프로브가 죽은 소켓을 새것으로 오인하지 않는다.
+    graceful_kill "$pid"
+    rm -f "$sock" "$sock.lock" 2>/dev/null || true
+    # ★필수2(A·리뷰) TOCTOU 재확인: kill·rm 도중 CSO down(reg_remove+dept_tombstone)이 레이스로 끼어들어
+    # 폐기됐으면 launch(부활) 금지 — 사전 게이트 이후 창을 최소화하려 launch 직전에 한 번 더 확인(미등재→exit 8).
+    if ! reg_names | grep -Fxq "$name"; then
+      echo "[cys-dept] $name 미등재(down됨·rotate 중 폐기) — rotate 중단(부활 금지)" >&2
+      exit 8
+    fi
+    # launch 재귀 호출: 소켓이 죽었으니 새 바이너리로 재spawn. CYS_ROLE 그대로 상속(게이트 통과 주체 동일).
+    # launch stdout은 로그로 흘리고, 아래서 새 버전을 확정 출력한다.
+    bash "$0" launch "$name" || { echo "[cys-dept] ERROR: $name rotate 재기동 실패" >&2; exit 1; }
+    newver="$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || true)"
+    # ★검증 게이트(지시3): Rust/UI 성공 판정·사람 로그 확인용 — 마지막 줄에 확정 출력.
+    echo "rotated $name: v${oldver:-?}→v${newver:-?}"
     ;;
   reap)
     # idle reaper: depts.json 순회 — ①소켓 死 등록 reg_remove ②유휴(live master 부재 AND agent-backed
