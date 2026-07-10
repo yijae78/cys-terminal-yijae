@@ -999,6 +999,17 @@ fn peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
 #[cfg_attr(not(windows), allow(dead_code))]
 const PIPE_ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Windows named pipe 리스너 풀 크기 — UDS listen backlog 의 대응물. named pipe 엔 backlog 가
+/// 없어 '여분 listening 인스턴스 수'가 곧 동시 접속 수용량이다. 1이면 accept→인스턴스 재생성
+/// 사이 창(tokio 스케줄링 지연 포함)에 도착한 동시 접속이 전부 ERROR_PIPE_BUSY(os error 231,
+/// "모든 파이프 인스턴스가 사용 중")로 튕긴다 — 멀티 노드(master·cso·worker·reviewer 동시 RPC)
+/// + GUI 기동 fan-out(daemon_status·pane attach·event forwarder)에서 상시 재현
+/// (2026-07-10 Windows 실사고: GUI "startup failed … os error 231"). 클라이언트 busy-retry 와
+/// 이중 방어. (Windows arm 은 이 호스트에서 컴파일/실행 불가하므로, 정책 값을 모듈 최상위로 빼
+///  비-Windows 테스트가 '풀 ≥ 2' 불변을 박제하게 한다 — PIPE_ACCEPT_ERROR_BACKOFF 와 같은 방식.)
+#[cfg_attr(not(windows), allow(dead_code))]
+const PIPE_LISTENER_POOL: usize = 8;
+
 /// owner-only DACL의 SDDL: D:P=보호된(상속차단) DACL, FA=full access를
 /// OW(OWNER_RIGHTS=creator)·SY(SYSTEM)·BA(BUILTIN\Administrators)에게만 부여.
 /// WD(Everyone)·AU(Authenticated Users) 같은 광역 SID가 없어 같은 머신의 임의 사용자를 배제한다.
@@ -1067,12 +1078,17 @@ impl Drop for OwnerOnlySecurity {
     }
 }
 
+/// named pipe listening 인스턴스 1개 생성. owner-only DACL 은 인스턴스마다 새로 변환한다 —
+/// 커널이 CreateNamedPipe 시점에 SD 를 파이프 객체로 복사하므로 SECURITY_ATTRIBUTES 는 이 호출
+/// 동안만 살아있으면 되고(호출 후 drop 안전), 가드를 태스크 간 공유하지 않아 리스너 풀의
+/// spawn(Send 경계)과 충돌하지 않는다. SDDL 변환 실패(이론상 거의 없음)면 null 폴백 + 경고
+/// — 기존 accept_loop 폴백 정책 그대로.
 #[cfg(windows)]
-async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
+fn create_pipe_instance(
+    pipe_name: &str,
+    first: bool,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     use tokio::net::windows::named_pipe::ServerOptions;
-    let pipe_name = socket_path.to_string_lossy().into_owned();
-    // owner-only DACL 보안 디스크립터 — 데몬 수명 동안 보유해 모든 파이프 인스턴스에 적용.
-    // SDDL 변환이 실패하면(이론상 거의 없음) None → null 포인터로 폴백하되 경고를 남긴다.
     let security = OwnerOnlySecurity::new();
     if security.is_none() {
         eprintln!(
@@ -1085,34 +1101,59 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
         .map(|s| s.as_ptr())
         .unwrap_or(std::ptr::null_mut());
     // Safety: sa_ptr는 null이거나 `security` 가드가 소유한 유효한 SECURITY_ATTRIBUTES를 가리키며,
-    // 그 가드는 이 함수(=데몬 수명) 끝까지 살아있어 모든 파이프 생성보다 오래 산다.
-    let mut server = unsafe {
+    // 그 가드는 이 함수 끝까지 살아있어 파이프 생성 호출보다 오래 산다.
+    unsafe {
         ServerOptions::new()
-            .first_pipe_instance(true)
-            .create_with_security_attributes_raw(&pipe_name, sa_ptr)
+            .first_pipe_instance(first)
+            .create_with_security_attributes_raw(pipe_name, sa_ptr)
     }
-    .unwrap_or_else(|e| panic!("create pipe {pipe_name} failed: {e}"));
-    // ★P0-7 최종 층위(D1/W5): 파이프 listening 직후 공통 부트 — unix accept_loop 와 **동일 함수**(prune +
-    //   콜드부트 auto-restore). 과거 이 호출이 Windows 에만 빠져 auto-restore 가 발동조차 안 하고 phoenix-restore.log
-    //   가 빈 파일이던 결함(CI 실경로 스모크 ⑧)을 봉인. state_dir 은 함수 내부 canonical 매핑(Windows 슬러그).
-    post_listen_boot(socket_path, &daemon);
+}
+
+/// listening 인스턴스 재생성 — 실패 시 backoff 후 무한 재시도(리스너 태스크 침묵사 방지).
+/// 과거 `.expect()` panic 은 메인 accept 태스크에선 데몬 전사(fail-fast·Task Scheduler 재기동)
+/// 였지만, 풀의 spawn 태스크에선 tokio 가 panic 을 삼켜 리스너만 조용히 줄어드는 최악
+/// (전 리스너 소진 = 무증상 접속 불능)이 된다 — 로그 + 재시도가 정직하다.
+#[cfg(windows)]
+async fn recreate_pipe_instance(
+    pipe_name: &str,
+) -> tokio::net::windows::named_pipe::NamedPipeServer {
+    loop {
+        match create_pipe_instance(pipe_name, false) {
+            Ok(s) => return s,
+            Err(e) => {
+                eprintln!("recreate pipe {pipe_name} failed: {e} — retrying");
+                tokio::time::sleep(PIPE_ACCEPT_ERROR_BACKOFF).await;
+            }
+        }
+    }
+}
+
+/// 리스너 풀의 태스크 1개 — 자기 listening 인스턴스로 accept 루프를 돈다.
+#[cfg(windows)]
+async fn pipe_listener(
+    daemon: Arc<Daemon>,
+    pipe_name: String,
+    mut server: tokio::net::windows::named_pipe::NamedPipeServer,
+) {
     loop {
         match server.connect().await {
             Ok(()) => {
+                // 접속 완료된 클라이언트를 먼저 서빙한다 — 재생성(recreate)을 앞에 두면 재생성이
+                // 실패를 반복하는 비정상 상태에서 '이미 accept 된' 클라이언트까지 무기한 기아가
+                // 된다(liveness 역전). 재생성 지연으로 listening 정원이 잠깐 N-1이 되는 것은
+                // 나머지 리스너 + 클라이언트 busy-retry 가 흡수한다.
                 let connected = server;
-                server = unsafe {
-                    ServerOptions::new().create_with_security_attributes_raw(&pipe_name, sa_ptr)
-                }
-                .expect("recreate pipe failed");
                 // 발신자 신원: 커널이 보증하는 named pipe 클라이언트 pid (UDS peer_pid와 대칭).
                 // 박는 이유: claim_role·surface.close·status.set 등은 발신 신원이 None이면 무조건
                 // 거부하므로, 미구현(None)이면 Windows에서 자기 surface 자가-claim('cys claim-role
                 // master' 등 launch-agent 밖 직접 기동 노드)이 영영 막힌다. boxing 전에 조회한다.
                 let caller_pid = peer_pid(&connected);
-                let daemon = Arc::clone(&daemon);
+                let handler_daemon = Arc::clone(&daemon);
                 tokio::spawn(async move {
-                    handle_connection(daemon, Box::new(connected) as Stream, caller_pid).await;
+                    handle_connection(handler_daemon, Box::new(connected) as Stream, caller_pid)
+                        .await;
                 });
+                server = recreate_pipe_instance(&pipe_name).await;
             }
             Err(e) => {
                 // connect()가 즉시 Err를 반환하면(broken 핸들 등) 같은 인스턴스에 곧장
@@ -1120,13 +1161,41 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
                 // 플래그를 즉시 해제해 self-throttle도 없음). Unix arm(accept err→다음 await)·
                 // tokio 표준 루프(?로 전파)와 대칭이 되도록: ①로그 ②인스턴스 재생성 ③짧은 backoff.
                 eprintln!("accept error: {e}");
-                server = unsafe {
-                    ServerOptions::new().create_with_security_attributes_raw(&pipe_name, sa_ptr)
-                }
-                .expect("recreate pipe failed");
+                server = recreate_pipe_instance(&pipe_name).await;
                 tokio::time::sleep(PIPE_ACCEPT_ERROR_BACKOFF).await;
             }
         }
+    }
+}
+
+#[cfg(windows)]
+async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
+    let pipe_name = socket_path.to_string_lossy().into_owned();
+    // 첫 인스턴스: first_pipe_instance(true) = 데몬 싱글턴 가드(이름 선점 시 즉사) — 기존 의미 유지.
+    let first = create_pipe_instance(&pipe_name, true)
+        .unwrap_or_else(|e| panic!("create pipe {pipe_name} failed: {e}"));
+    // ★P0-7 최종 층위(D1/W5): 파이프 listening 직후 공통 부트 — unix accept_loop 와 **동일 함수**(prune +
+    //   콜드부트 auto-restore). 과거 이 호출이 Windows 에만 빠져 auto-restore 가 발동조차 안 하고 phoenix-restore.log
+    //   가 빈 파일이던 결함(CI 실경로 스모크 ⑧)을 봉인. state_dir 은 함수 내부 canonical 매핑(Windows 슬러그).
+    post_listen_boot(socket_path, &daemon);
+    // ★리스너 풀(PIPE_LISTENER_POOL): listening 인스턴스 N개를 병렬 대기 — 단일 인스턴스의
+    // accept→재생성 사이 창에서 동시 접속이 ERROR_PIPE_BUSY(231)로 튕기던 결함 봉인(상수 주석 참조).
+    let mut first = Some(first);
+    let mut tasks = Vec::new();
+    for _ in 0..PIPE_LISTENER_POOL {
+        let server = match first.take() {
+            Some(s) => s,
+            None => recreate_pipe_instance(&pipe_name).await,
+        };
+        tasks.push(tokio::spawn(pipe_listener(
+            Arc::clone(&daemon),
+            pipe_name.clone(),
+            server,
+        )));
+    }
+    // accept_loop 는 반환하지 않는 계약(unix arm 대칭) — 리스너 태스크들을 영구 대기한다.
+    for t in tasks {
+        let _ = t.await;
     }
 }
 
@@ -1925,6 +1994,23 @@ mod pipe_security_tests {
             !backoff.is_zero(),
             "accept-error backoff must be non-zero, else connect() Err re-tries on the same \
              broken pipe instance with no yield → 100% CPU spin: {backoff:?}"
+        );
+    }
+
+    /// ★회귀 박제 (Windows named pipe 리스너 풀 — ERROR_PIPE_BUSY 231 봉인):
+    /// named pipe 엔 UDS listen backlog 가 없어 '여분 listening 인스턴스 수'가 곧 동시 접속
+    /// 수용량이다. 풀이 1로 돌아가면 accept→인스턴스 재생성 사이 창에 도착한 동시 접속
+    /// (멀티 노드 RPC + GUI 기동 fan-out)이 전부 os error 231("모든 파이프 인스턴스가 사용 중")
+    /// 로 튕긴다 — 2026-07-10 Windows GUI "startup failed" 실사고의 서버측 근원. 누가 풀을
+    /// 다시 1로 줄이면 이 테스트가 깨진다. (Windows arm 은 이 호스트에서 컴파일/실행 불가하므로
+    /// 정책 상수 정합성으로 의도를 박제한다 — PIPE_ACCEPT_ERROR_BACKOFF 박제와 같은 방식.)
+    #[test]
+    fn pipe_listener_pool_absorbs_concurrent_connects() {
+        let pool = super::PIPE_LISTENER_POOL;
+        assert!(
+            pool >= 2,
+            "listener pool must be ≥2, else concurrent connects hit ERROR_PIPE_BUSY(231) \
+             in the accept→recreate window: {pool}"
         );
     }
 }
