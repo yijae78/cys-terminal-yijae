@@ -330,11 +330,24 @@ sys.exit(3)' 2>/dev/null) || true
   fi
 }
 # CEO 승격: 부서가 1개 이상이면 기본 데몬을 CEO로(디렉티브 교체, 가역 백업). 부서 0이면 표준 master 보존(하위호환).
-ceo_promote(){
+# ★첫 승격은 자동이 아니다(오너 2026-07-14): 최소 1개 마스터(부서)가 존재한 뒤 오너가 승인(feed)
+# 하거나 지명(promote-ceo)해야 한다. 마커(.pre-ceo)=기승인 상태라 조정(무결 유지)은 묻지 않는다.
+ceo_promote(){  # $1: "consented"면 동의 게이트 생략(오너 지명 promote-ceo 경로)
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
   local ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
   [ -f "$ceo" ] || { echo "[cys-dept] CEO 템플릿 없음 — 승격 생략(cys init-pack 필요)"; return 0; }
   cmp -s "$md" "$ceo" 2>/dev/null && return 0
+  if [ ! -f "$md.pre-ceo" ] && [ "${1:-}" != "consented" ]; then
+    # deny/timeout/feed불가 = 승격 보류(표준 master 유지·다음 부서 이벤트에 재질의) — fail-safe는 '승격 안 함'.
+    # env -u CYS_SOCKET: 승격 대상은 기본 데몬이므로 승인 요청도 기본 데몬 feed로(ceo_reinject_master와 동형).
+    if env -u CYS_SOCKET "$CYS" feed push --wait --title "CEO 승격 승인 요청" \
+         --body "부서 생성 감지 — 기본 데몬 master를 CEO(master of master)로 승격합니까? (MASTER_DIRECTIVE→CEO 규약 교체·헌법은 .pre-ceo 보존·ceo_demote로 가역)"; then
+      echo "[cys-dept] CEO 승격 오너 승인됨"
+    else
+      echo "[cys-dept] CEO 승격 보류(오너 미승인/응답없음) — 표준 master 유지" >&2
+      return 0
+    fi
+  fi
   [ -f "$md.pre-ceo" ] || cp "$md" "$md.pre-ceo"
   cp "$ceo" "$md"
   echo "[cys-dept] 기본 데몬 CEO 승격(directives 교체·백업 .pre-ceo)"
@@ -348,13 +361,13 @@ ceo_demote(){
   ceo_reinject_master "표준 master 복귀"
 }
 
-cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|rotate|reap|list|sock <name> | <name> -- <cmd>}"
+cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|rotate|reap|promote-ceo|list|sock <name> | <name> -- <cmd>}"
 # ★단일소유 기술 강제(CEO 2026-06-22): 부서 lifecycle mutation은 CSO(CYS_ROLE=cso)·GUI(role 없음·오너
 # 직접)만 허용한다. roled 비-CSO 노드(부서장 master·워커·리뷰어·CEO)의 cys-dept create/down 직접 호출을
 # 차단해 다중주체 churn(빈 dept-N·중복·레이스)을 기술적으로 방지. (defense-in-depth — 의도적 unset 우회는
 # 거버넌스 영역이나, 정상 다중 노드 churn은 차단). 읽기 전용(list/sock/<name> --)은 무제한.
 case "$cmd" in
-  launch|allocate|create|down|down-sock|rotate|reap)
+  launch|allocate|create|down|down-sock|rotate|reap|promote-ceo)
     if [ -n "${CYS_ROLE:-}" ] && [ "${CYS_ROLE}" != "cso" ]; then
       echo "[cys-dept] ★단일소유 강제: 부서 lifecycle mutation은 CSO/GUI 전용(CYS_ROLE=$CYS_ROLE 차단·다중 churn 방지). CSO에 요청하라." >&2
       exit 7
@@ -755,6 +768,12 @@ PY
 $snap
 EOF
     echo "[cys-dept] reap 완료(dry=$dry): DEAD=$nd IDLE=$ni SKIP=$ns. 부서 수=$(reg_count)"
+    ;;
+  promote-ceo)
+    # 오너 지명 경로(오너 2026-07-14): 오너/CSO가 기본 데몬 master를 CEO로 직접 지명 — 호출 자체가 동의.
+    n=$(reg_count)
+    [ "$n" -ge 1 ] || { echo "[cys-dept] 부서 0개 — CEO는 최소 1개 마스터(부서) 존재 후 단계다(승격 안 함)"; exit 4; }
+    ceo_promote consented
     ;;
   list) reg_names ;;
   sock) dept_sock "${2:?usage: cys-dept sock <name>}" ;;

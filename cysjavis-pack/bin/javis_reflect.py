@@ -45,7 +45,12 @@ FRICTION_PATTERNS = [
 ]
 
 # 시스템/하네스가 끼워넣은 user 줄(로컬 커맨드·caveat·reminder)은 사람 입력이 아니다 → 스캔 제외.
-SYSTEM_PREFIXES = ("<command-", "<local-command", "Caveat:", "<system-reminder")
+# launch-agent/hook이 stdin push로 주입하는 디렉티브 블록도 user role로 기록되므로 같은 부류다
+# (선두 헤더 prefix만 매칭 — 디렉티브를 '인용'하는 진짜 사람 발화는 계속 잡힌다).
+SYSTEM_PREFIXES = ("<command-", "<local-command", "Caveat:", "<system-reminder",
+                   "■ CYSJavis", "# MASTER ABSOLUTE DIRECTIVE", "# WORKER ABSOLUTE DIRECTIVE",
+                   "# CSO ABSOLUTE DIRECTIVE", "# REVIEWER ABSOLUTE DIRECTIVE",
+                   "# CEO (master of master)", "# RSI 학습 루프")
 
 
 def iter_human_messages(transcript_path):
@@ -258,6 +263,30 @@ def self_test():
         r4 = scan(os.path.join(td, "nope.jsonl"), ledger2, 3)
         if r4["appended"] or r4["reason"] != "transcript 없음":
             failures.append("transcript 부재 처리 오류: %s" % r4["reason"])
+
+        # 5) 디렉티브 stdin-push 주입(선두 헤더)은 마찰 미집계,
+        #    디렉티브를 '인용'하는 진짜 사람 발화는 계속 집계돼야 한다.
+        tpath3 = os.path.join(td, "t3.jsonl")
+        ledger3 = os.path.join(td, "L3.md")
+
+        def urow3(content):
+            return json.dumps({"type": "user", "sessionId": "dirtest01",
+                               "timestamp": "2026-06-13T12:00:00Z",
+                               "message": {"role": "user", "content": content}})
+
+        open(tpath3, "w", encoding="utf-8").write("\n".join([
+            urow3("# WORKER ABSOLUTE DIRECTIVE — 워커 절대지침\n하지 마 · 되돌려 · 틀린 것 금지"),
+            urow3("■ CYSJavis 역할 각성 (CYS_ROLE=worker)\n하지 마 시켰잖"),
+            urow3("WORKER_DIRECTIVE에 하지 마라고 했는데 왜 안 지켜"),  # 인용 사람발화 → 마찰
+            urow3("또 틀렸어 되돌려"),                                  # 마찰
+            urow3("몇 번을 말했잖아"),                                  # 마찰
+        ]) + "\n")
+        r5 = scan(tpath3, ledger3, 3)
+        if r5["friction"] != 3:
+            failures.append("디렉티브 주입 오탐: friction=%d (기대 3) signals=%s"
+                            % (r5["friction"], r5["signals"]))
+        if not r5["appended"]:
+            failures.append("디렉티브 필터가 진짜 마찰까지 억제: %s" % r5["reason"])
 
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False, indent=2))

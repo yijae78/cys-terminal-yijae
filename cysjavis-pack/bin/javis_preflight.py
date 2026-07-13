@@ -633,6 +633,37 @@ class Preflight:
             if self.skipped(cid):
                 continue
             p = os.path.join(pack_dir(), "directives", f)
+            # CEO 승격 상태(F1 보완 · 오너 A안 2026-07-14): cys-dept ceo_promote가 기본 pack의
+            # MASTER를 CEO 규약으로 교체하고 헌법을 .pre-ceo 마커에 보존한다(부서≥1 동안 조정
+            # 루프 유지 — 라이브 복원은 다음 dept 이벤트에 재클로버되므로 여기서 수리 지시 금지).
+            # 이때 표준 핀은 보존본에 강제하고 라이브는 CEO_TEMPLATE byte-exact를 강제한다 —
+            # 검사 약화가 아니라 검사 대상 이관 + 승격 무결 검사 추가.
+            marker = p + ".pre-ceo"
+            if f == "MASTER_DIRECTIVE.md" and os.path.isfile(marker):
+                tpl_path = os.path.join(pack_dir(), "directives", "CEO_TEMPLATE.md")
+                try:
+                    live = open(p, encoding="utf-8", errors="replace").read()
+                    tpl = (open(tpl_path, encoding="utf-8", errors="replace").read()
+                           if os.path.isfile(tpl_path) else None)
+                    text = open(marker, encoding="utf-8", errors="replace").read()
+                except OSError as e:
+                    self.add(cid, FAIL, "CEO 승격 상태 파일 읽기 불가(%s)" % e)
+                    continue
+                if tpl is None or live != tpl:
+                    self.add(cid, FAIL,
+                             "CEO 승격 상태 오염 — 라이브 MASTER_DIRECTIVE.md가 CEO_TEMPLATE와 "
+                             "불일치(수동 편집 의심 · 정상화는 cys-dept 조정 또는 ceo_demote)")
+                    continue
+                lost = [label for pin, label in pins if pin not in text]
+                if lost:
+                    self.add(cid, FAIL,
+                             "보존 헌법(MASTER_DIRECTIVE.md.pre-ceo)에서 소실된 조항: %s — "
+                             "강등(ceo_demote) 시 이 파일이 라이브로 복원된다" % "; ".join(lost))
+                else:
+                    self.add(cid, PASS,
+                             "CEO 승격 상태 — 라이브=CEO 규약 무결 · 보존 헌법(.pre-ceo) 핀 %d개 전부 존재"
+                             % len(pins))
+                continue
             try:
                 text = open(p, encoding="utf-8", errors="replace").read()
             except OSError:
@@ -3605,6 +3636,61 @@ class Preflight:
         n = sum(len(v) for v in BINPIN_MARKERS.values())
         self.add(cid, PASS, "팩 bin 기능 마커 %d/%d 존재 (evidence 게이트·전이표·기각 재주입·불변식 주입)" % (n, n))
 
+    # ── C64 디렉티브 회귀 트립와이어 배선 (directive-bench · 오너 A안 라운드 2026-07-14) ──
+    # javis_directive_bench.py(07-06 도입)가 어디에도 배선되지 않아 회귀(CEO 교체로 인한
+    # master 위임 불변식 소실)가 3일간 미탐지된 실증의 재발 방지 — 부트 ⓪에서 표면화한다.
+    # WARN 전용(FAIL 금지): 정당한 디렉티브 진화도 재핀 전엔 회귀로 보이므로 FAIL이면 모든
+    # 진화가 부트를 막는다(변경 결합). 재핀(--save-baseline)은 오너/master 의례 — 여기서는
+    # 절대 자동 저장하지 않는다(producer≠evaluator · 자기 재핀 은폐 차단). 관찰 전용.
+    def c64_directive_bench(self):
+        cid = "C64.directive-bench"
+        if self.skipped(cid):
+            return
+        tool = os.path.join(pack_dir(), "bin", "javis_directive_bench.py")
+        if not os.path.isfile(tool):
+            self.add(cid, WARN, "javis_directive_bench.py 부재 — 회귀 트립와이어 비활성")
+            return
+        baseline = os.path.join(pack_dir(), "bench", "directive-bench-baseline.json")
+        if not os.path.isfile(baseline):
+            self.add(cid, WARN,
+                     "baseline 미핀(%s) — 트립와이어 비활성. 재핀은 오너/master 의례: 디렉티브 "
+                     "검토 후 `python3 %s score --save-baseline %s`" % (baseline, tool, baseline))
+            return
+        ddir = os.path.join(pack_dir(), "directives")
+        tmp = None
+        try:
+            pre_ceo = os.path.join(ddir, "MASTER_DIRECTIVE.md.pre-ceo")
+            if os.path.isfile(pre_ceo):
+                # CEO 승격 상태: 채점 대상 헌법은 보존본(.pre-ceo)이다 — 라이브(CEO 규약)를
+                # 그대로 채점하면 승격 자체가 영구 회귀로 잡혀 신호가 무뎌진다(C03 A안과 동일
+                # 이관). 관찰 전용 임시 스테이징 — 팩은 절대 쓰지 않는다.
+                tmp = tempfile.mkdtemp(prefix="javis-c64-")
+                for name in DIRECTIVES:
+                    src = os.path.join(ddir, name)
+                    if os.path.isfile(src):
+                        shutil.copy(src, os.path.join(tmp, name))
+                shutil.copy(pre_ceo, os.path.join(tmp, "MASTER_DIRECTIVE.md"))
+                ddir = tmp
+            p = subprocess.run(
+                [sys.executable, tool, "score", "--directive-dir", ddir,
+                 "--compare", baseline],
+                capture_output=True, text=True, timeout=60)
+            if p.returncode == 0:
+                self.add(cid, PASS, "디렉티브 회귀 없음 (baseline 대비 composite 유지)")
+            elif p.returncode == 1:
+                detail = re.sub(r"\s+", " ", (p.stdout or p.stderr or "").strip())[:400]
+                self.add(cid, WARN,
+                         "★디렉티브 회귀/baseline 문제 검출 — 의도된 진화면 오너/master 재핀 "
+                         "의례, 아니면 소실 조항 복원: %s" % detail)
+            else:
+                self.add(cid, WARN, "bench 실행 이상(rc=%d) — 수동 확인: %s"
+                         % (p.returncode, (p.stderr or "")[:200]))
+        except Exception as e:
+            self.add(cid, WARN, "bench 호출 실패(%s) — 트립와이어 미작동, 수동 확인" % e)
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -3635,6 +3721,7 @@ class Preflight:
             self.c54_loc_cap, self.c55_grill_gate, self.c56_dept_hook_leak,
             self.c57_temp_hook_leak, self.c58_trust_harden, self.c59_guard_wiring,
             self.c60_gate_wiring, self.c61_doc_code_sot, self.c63_binpin,
+            self.c64_directive_bench,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             self.c62_pack_heal_ledger,
         ]
