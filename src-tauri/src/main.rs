@@ -7,7 +7,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -51,10 +51,26 @@ async fn connect_to(socket: &std::path::Path) -> Result<Stream, String> {
 #[cfg(windows)]
 async fn connect_to(socket: &std::path::Path) -> Result<Stream, String> {
     use tokio::net::windows::named_pipe::ClientOptions;
-    ClientOptions::new()
-        .open(socket.to_string_lossy().as_ref())
-        .map(|s| Box::new(s) as Stream)
-        .map_err(|e| format!("cannot connect to cysd pipe: {e}"))
+    // ERROR_PIPE_BUSY(os error 231, "모든 파이프 인스턴스가 사용 중") busy-retry — 231은 데몬
+    // 생존·listening 인스턴스 순간 소진(정상 혼잡)이므로 짧게 재시도하면 열린다(tokio 문서
+    // 표준 패턴). 재시도 없는 1회 open 은 앱 기동 fan-out(daemon_status + pane별 attach +
+    // event forwarder 동시 연결)에서 상시 "startup failed … os error 231"이 됐다(2026-07-10
+    // Windows 실사고 — 워크스페이스/pane 렌더 전체 불능). 그 외 오류(파이프 부재 = 데몬
+    // 다운 등)는 즉시 반환한다. 정책 상수는 CLI(cys)와 공용 단일 진실인 lib(cys::PIPE_BUSY_*).
+    let name = socket.to_string_lossy().into_owned();
+    let deadline = std::time::Instant::now() + cys::PIPE_BUSY_RETRY_DEADLINE;
+    loop {
+        match ClientOptions::new().open(&name) {
+            Ok(s) => return Ok(Box::new(s) as Stream),
+            Err(e)
+                if e.raw_os_error() == Some(cys::PIPE_BUSY_ERROR)
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(cys::PIPE_BUSY_RETRY_INTERVAL).await;
+            }
+            Err(e) => return Err(format!("cannot connect to cysd pipe: {e}")),
+        }
+    }
 }
 
 /// 기본 소켓 연결 (하위호환 wrapper).
@@ -493,7 +509,7 @@ fn url_host_allowed(url: &str) -> Result<(), String> {
 
 /// 순수 판정(테스트 핀) — 기본 allowlist + 사용자 확장 도메인, 정확일치 또는 서브도메인.
 fn host_in_allowlist(host: &str, extras: &[String]) -> bool {
-    const ALLOW: &[&str] = &["notebooklm.google.com", "github.com"];
+    const ALLOW: &[&str] = &["notebooklm.google.com", "github.com", "cysinsight.com"];
     ALLOW
         .iter()
         .map(|d| *d)
@@ -905,19 +921,90 @@ fn pending_restore_path() -> std::path::PathBuf {
     cys::home_dir().join(".cys/.pending-restore")
 }
 
-/// 업데이트로 인한 재시작이면(마커 존재) 두 가지를 한다:
+/// (T1) 마지막으로 팩반영·복원을 완료한 앱 버전 스탬프 경로. 홈페이지 수동 설치(.app 번들만 교체·
+/// 복귀 마커 없음)를 '버전변경'으로 감지하는 진실원 — 인앱 업데이트(마커)와 수동 설치(스탬프) 두
+/// 경로 모두에서 재시작 후 팩반영·복원이 돌게 한다. pending_restore_path와 같은 ~/.cys 아래에 둔다.
+fn last_app_version_path() -> std::path::PathBuf {
+    cys::home_dir().join(".cys/.last-app-version")
+}
+
+/// GUI 온보딩 완료 마커 — "이 GUI가 이 바이너리 버전에서 온보딩(팩+hook(+win: schtasks))을
+/// **성공** 완료했는가". writer는 GUI 온보딩 성공 경로 단 하나다 — CLI autostart·잔존 schtasks·
+/// ONLOGON 등 어떤 순서로 cysd가 먼저 돌아도 이 마커를 선점할 수 없다(0.12.52 cys-neo 회귀 시정:
+/// 팩 마커(.pack-version) 기반 게이트를 CLI-선행 cysd 스윕이 선점 → ~/.claude hook 영구 미설치 →
+/// "너는 마스터다" 부트스트랩 무력화). ★.pack-version(팩 최신 여부·install 계층 writer)·
+/// .last-app-version(복원 필요 여부·L2 writer)과 질문·작성자가 전부 다르다 — 통합 금지:
+/// .last-app-version은 --no-install-hook 경로(Apply)가 전진시키므로 "스탬프 있음=hook 있음"이 거짓.
+fn gui_onboarded_path() -> std::path::PathBuf {
+    cys::home_dir().join(".cys/.gui-onboarded")
+}
+
+/// GUI 온보딩 실행 여부 — 부작용 없는 순수 판정(단위테스트 대상). 마커 내용이 현재 바이너리
+/// 버전과 정확히 일치할 때만 스킵. 부재·불일치·읽기 실패 = 실행(fail-open — 치유 방향).
+fn needs_gui_onboard(marker: Option<&str>, current_version: &str) -> bool {
+    marker.map(str::trim) != Some(current_version)
+}
+
+/// (T1) 재시작 후 팩반영·복원을 돌릴지 판정 — 부작용(파일·프로세스) 없는 순수 함수(단위테스트 대상).
+#[derive(Debug, PartialEq, Eq)]
+enum PendingUpdatePlan {
+    /// 마커 없음 + 스탬프가 현재 버전과 일치 → 정상 정상상태, 아무 것도 안 함.
+    Skip,
+    /// 스탬프 부재 + 기존 설치 증거 없음(진짜 최초 설치) → 스탬프만 기록·팩반영·복원 스킵(복원할 topology 없음·온보딩이 팩 처리).
+    RecordStampOnly,
+    /// 마커 존재(인앱 업데이트) OR 스탬프≠현재버전(홈페이지 수동설치) → 팩반영 + 성공 시 조직 복원.
+    Apply,
+}
+
+/// 발동 조건 = 마커 존재 OR 버전변경 감지. 마커가 최우선(구버전이 이 릴리스로 올라올 때 마커를 남김).
+/// prior_state_exists = 기존 설치 증거(~/.cys/pack/.pack-version 존재). 스탬프 부재(≤0.12.50엔 스탬프
+/// 파일 자체가 없다) 시 이 증거로 '전환기 기존 사용자의 홈페이지 수동설치'(Apply)와 '진짜 최초
+/// 설치'(RecordStampOnly)를 가른다 — 오너가 홈페이지 설치본을 배포할 예정이라 이 경로가 실경로다.
+fn decide_pending_update(
+    marker_exists: bool,
+    stamp: Option<&str>,
+    current_version: &str,
+    prior_state_exists: bool,
+) -> PendingUpdatePlan {
+    if marker_exists {
+        return PendingUpdatePlan::Apply;
+    }
+    match stamp {
+        // 스탬프 부재 + 기존 설치 증거 있음 = 전환기 기존 사용자(≤0.12.50)가 홈페이지로 0.12.51+ 설치 → 복원 필요.
+        None if prior_state_exists => PendingUpdatePlan::Apply,
+        None => PendingUpdatePlan::RecordStampOnly,
+        Some(v) if v != current_version => PendingUpdatePlan::Apply,
+        Some(_) => PendingUpdatePlan::Skip,
+    }
+}
+
+/// 업데이트(인앱 재시작 OR 홈페이지 수동설치로 인한 버전변경)이면 두 가지를 한다:
 ///  ① 새 기능 배포 — 새 cys 바이너리에 embed된 팩(pack.rs include_str! + build.rs PACK_SKILLS)을
 ///     `cys init-pack --no-install-hook`으로 ~/.cys/pack에 반영한다. --no-install-hook: hook 등록은
 ///     최초 설치/launch-agent에서 끝나므로 매 업데이트마다 settings.json을 건드리지 않는다(.bak-cys
 ///     백업 파괴·활성 프로필 재직렬화 방지 — 적대검증 serious). force 없이 호출하므로 preserve-gate가
 ///     사용자 수정 파일을 보존하고 비수정·신규만 갱신한다.
-///  ② 자동복귀 — 팩 반영 성공 시에만 `cys restore --include-master`로 노드를 session_id resume
-///     재런칭(작업 무손실). init-pack 실패 시 마커를 보존하고 복원을 보류해, 노드가 구 디렉티브로
-///     조용히 각성하는 침묵 실패를 막는다(적대검증 fatal). restore는 멱등(run_restore cys.rs:3791).
+///  ② 자동복귀 — 팩 반영 성공 시에만 조직 전체(본부+등록 부서) 노드를 복원(T2 spawn_org_restore).
+///     init-pack 실패 시 마커·스탬프를 보존하고 복원을 보류해, 노드가 구 디렉티브로 조용히 각성하는
+///     침묵 실패를 막는다(적대검증 fatal). restore는 멱등(run_restore).
 fn maybe_apply_pending_update(app: &AppHandle) {
     let marker = pending_restore_path();
-    if !marker.exists() {
-        return;
+    let stamp_path = last_app_version_path();
+    let current = env!("CARGO_PKG_VERSION");
+    let marker_exists = marker.exists();
+    let stamp = std::fs::read_to_string(&stamp_path)
+        .ok()
+        .map(|s| s.trim().to_string());
+    // 기존 설치 증거 — 디스크 팩 버전 파일(check_pack_update:1711·install_pack_update:1895와 동일 SOT).
+    let prior_state = cys::pack::pack_dir().join(".pack-version").exists();
+    match decide_pending_update(marker_exists, stamp.as_deref(), current, prior_state) {
+        PendingUpdatePlan::Skip => return,
+        PendingUpdatePlan::RecordStampOnly => {
+            // 최초 설치 — 복원할 topology가 없다. 스탬프만 기록해 다음 재시작을 정상상태로 만든다.
+            let _ = std::fs::write(&stamp_path, current);
+            return;
+        }
+        PendingUpdatePlan::Apply => {}
     }
     // ① 새 팩(새 기능) 반영 — 성공 여부를 검사한다(침묵 실패 차단).
     let mut init_cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
@@ -928,7 +1015,7 @@ fn maybe_apply_pending_update(app: &AppHandle) {
         .map(|s| s.success())
         .unwrap_or(false);
     if !pack_ok {
-        // 실패 — 마커를 보존(다음 재시작에 재시도)하고 노드 복원을 보류한다. 구 디렉티브로
+        // 실패 — 마커·스탬프를 보존(다음 재시작에 재시도)하고 노드 복원을 보류한다. 구 디렉티브로
         // 조용히 각성하는 것을 막고 사용자에게 알린다.
         let _ = app.emit(
             "update-error",
@@ -936,12 +1023,88 @@ fn maybe_apply_pending_update(app: &AppHandle) {
         );
         return;
     }
-    // 성공 후에만 마커 제거 + 자동복귀.
+    // 성공 후에만 마커 제거 + 스탬프 전진 + 조직 복원. (마커 없는 버전변경 경로면 remove_file은 no-op.)
     let _ = std::fs::remove_file(&marker);
-    let mut restore_cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
-    restore_cmd.arg("restore").arg("--include-master");
-    no_console(&mut restore_cmd);
-    let _ = restore_cmd.spawn();
+    let _ = std::fs::write(&stamp_path, current);
+    spawn_org_restore(app.clone());
+}
+
+/// (T2) `cys restore --include-master`를 사이드카로 1회 실행한다. socket=Some이면 그 부서 소켓
+/// 대상(CYS_SOCKET), None이면 기본(본부) 소켓. CYS_NO_AUTOSTART=1로 죽은 소켓에 빈 cysd가
+/// autostart되는 것을 막는다(살아있는 대상에만 호출하므로 평시 무영향인 심층방어). 반환=성공 여부.
+async fn run_sidecar_restore(socket: Option<std::path::PathBuf>) -> bool {
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+        cmd.arg("restore").arg("--include-master");
+        cmd.env("CYS_NO_AUTOSTART", "1"); // 죽은 소켓에 빈 데몬 autostart 금지(사이드카 CLI 가드)
+        if let Some(sock) = socket {
+            cmd.env(cys::ENV_SOCKET, sock);
+        }
+        no_console(&mut cmd);
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// (T2) 업데이트 후 조직 전체 복원 — setup 완료를 막지 않도록 백그라운드 태스크로 순차 실행하며
+/// restore-progress를 emit한다(update-progress emit 스타일 동형). 본부=기본 소켓 사이드카 restore →
+/// list_depts() 순회: 부서 데몬이 살아있으면 사이드카 restore(부서 소켓), 죽었으면 기존 launch 경로
+/// (launch_dept_daemon)로 재기동한다 — 재기동된 부서 데몬은 콜드부트 auto-restore로 노드를 되살린다
+/// (src/bin/cysd/main.rs). run_restore 멱등이라 콜드부트 복원과 겹쳐도 안전.
+fn spawn_org_restore(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let _ = app.emit("restore-progress", json!({"phase": "start"}));
+        // 본부(기본 소켓) — setup의 ensure_daemon으로 이미 가동 확정.
+        let hq_ok = run_sidecar_restore(None).await;
+        // 부서 순회 — 등록 부서(depts.json)만 대상(유령 부서 재-launch 차단).
+        let mut ok = 0usize;
+        let mut fail = 0usize;
+        if let Ok(reg) = list_depts() {
+            if let Some(depts) = reg.get("depts").and_then(|d| d.as_object()) {
+                for (name, meta) in depts {
+                    let sock = meta
+                        .get("socket")
+                        .and_then(|s| s.as_str())
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| dept_socket_path(name));
+                    // 생존확인(org_fleet 동형·2초 timeout) — identify 응답 = 데몬 살아있음.
+                    let alive = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        rpc_oneshot(&sock, "system.identify", json!({})),
+                    )
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false);
+                    let dept_ok = if alive {
+                        run_sidecar_restore(Some(sock.clone())).await
+                    } else {
+                        // 죽은 부서 → 기존 launch 경로 재사용(콜드부트 auto-restore가 노드 부활).
+                        launch_dept_daemon(app.clone(), name.clone()).await.is_ok()
+                    };
+                    if dept_ok {
+                        ok += 1;
+                    } else {
+                        fail += 1;
+                    }
+                }
+            }
+        }
+        if !hq_ok && ok == 0 && fail == 0 {
+            // 본부 복원조차 못 돌고 부서도 없음 = 복원 경로 자체 실패 → 가시화(UI health 토스트).
+            let _ = app.emit(
+                "restore-progress",
+                json!({"phase": "error", "detail": "본부 노드 복원 실행 실패"}),
+            );
+            return;
+        }
+        // hq_ok를 done에 실어 부서가 있을 때도 본부(HQ) 복원 실패가 묻히지 않게 한다(침묵 실패 차단 —
+        // 이 작업의 목적). error 페이즈는 '본부 실패 + 부서 없음' 전면 실패만 담당(위).
+        let _ = app.emit(
+            "restore-progress",
+            json!({"phase": "done", "hq_ok": hq_ok, "ok": ok, "fail": fail}),
+        );
+    });
 }
 
 /// D5/P1: UI 발 키 전송 — surface.send_key RPC 래퍼. send_input(send_text)과 달리 Return 등 키 전송 가능.
@@ -1227,18 +1390,30 @@ async fn maybe_autoregister_launchd() -> bool {
 }
 
 /// 첫 기동 온보딩 공용 단계 — `cys init-pack`으로 팩 파일 + Claude SessionStart hook 등록.
-/// install은 preserve, hook은 중복 dedup(already→skip·.bak-cys 무변경)이라 **멱등** — 매 기동
-/// 실행해도 안전(팩 삭제 시 자가치유). Windows·macOS 온보딩이 공유한다(autostart는 OS별로 분리:
-/// Windows=schtasks·macOS=launchd). best-effort — 실패해도 세션은 진행.
+/// install은 preserve, hook은 중복 dedup(already→skip·.bak-cys 무변경)이라 **멱등** — 반복 실행해도
+/// 안전하다. 호출은 setup의 needs_gui_onboard 게이트(.gui-onboarded 마커)로 조건화된다(v4 · 2026-07-12):
+/// 마커 부재(신선 머신·직전 실패)·버전 불일치(업그레이드)에만 실행 — 평시 부트 비용 제거.
+/// Windows·macOS 온보딩이 공유한다(autostart는 OS별로 분리: Windows=schtasks·macOS=launchd).
+/// 반환 = init-pack 성공 여부(★hook 등록 실패도 rc=1 — cys.rs run_init_pack). false면 호출자가
+/// 마커를 기록하지 않아 다음 부트에 재시도된다(best-effort + 재시도 내장). 실패해도 세션은 진행.
 #[cfg(any(windows, target_os = "macos"))]
-fn onboard_init_pack(cys: &std::path::Path) {
+fn onboard_init_pack(cys: &std::path::Path) -> bool {
     let mut init = std::process::Command::new(cys);
     init.arg("init-pack");
     no_console(&mut init);
     match init.status() {
-        Ok(s) if s.success() => eprintln!("[cys-app] onboarding: init-pack ok"),
-        Ok(s) => eprintln!("[cys-app] onboarding: init-pack exited {s}"),
-        Err(e) => eprintln!("[cys-app] onboarding: init-pack spawn failed: {e}"),
+        Ok(s) if s.success() => {
+            eprintln!("[cys-app] onboarding: init-pack ok");
+            true
+        }
+        Ok(s) => {
+            eprintln!("[cys-app] onboarding: init-pack exited {s}");
+            false
+        }
+        Err(e) => {
+            eprintln!("[cys-app] onboarding: init-pack spawn failed: {e}");
+            false
+        }
     }
 }
 
@@ -1247,18 +1422,29 @@ fn onboard_init_pack(cys: &std::path::Path) {
 /// ① `onboard_init_pack`: 팩 + Claude hook 등록(멱등).
 /// ② `cys daemon install`: 기존 schtasks ONLOGON 자동기동 등록 재사용(cys.rs:3139·/F 멱등).
 #[cfg(windows)]
-fn maybe_windows_onboard() {
+fn maybe_windows_onboard() -> bool {
     let cys = resolve_sidecar("cys.exe");
-    onboard_init_pack(&cys);
+    let init_ok = onboard_init_pack(&cys);
     // ② autostart 등록 (기존 cys daemon install = schtasks ONLOGON 재사용, /F 멱등)
     let mut reg = std::process::Command::new(&cys);
     reg.arg("daemon").arg("install");
     no_console(&mut reg);
-    match reg.status() {
-        Ok(s) if s.success() => eprintln!("[cys-app] windows onboarding: daemon install (schtasks) ok"),
-        Ok(s) => eprintln!("[cys-app] windows onboarding: daemon install exited {s}"),
-        Err(e) => eprintln!("[cys-app] windows onboarding: daemon install spawn failed: {e}"),
-    }
+    let reg_ok = match reg.status() {
+        Ok(s) if s.success() => {
+            eprintln!("[cys-app] windows onboarding: daemon install (schtasks) ok");
+            true
+        }
+        Ok(s) => {
+            eprintln!("[cys-app] windows onboarding: daemon install exited {s}");
+            false
+        }
+        Err(e) => {
+            eprintln!("[cys-app] windows onboarding: daemon install spawn failed: {e}");
+            false
+        }
+    };
+    // 둘 다 성공해야 완료 — 부분 실패는 마커 미기록 → 다음 부트 재시도(멱등이라 안전).
+    init_ok && reg_ok
 }
 
 /// macOS 첫 기동 온보딩 — Windows 온보딩의 대칭(RC-17·T5). macOS DMG 소비자는 launchd
@@ -1266,9 +1452,9 @@ fn maybe_windows_onboard() {
 /// 부트스트랩이 미발동했다. autostart는 launchd가 담당하므로 여기서는 Windows와 대칭으로
 /// 팩+Claude hook만 등록한다. init-pack 멱등 — 기존 사용자에 재실행돼도 무해(already→skip·.bak-cys 불변).
 #[cfg(target_os = "macos")]
-fn maybe_macos_onboard() {
+fn maybe_macos_onboard() -> bool {
     let cys = resolve_sidecar("cys");
-    onboard_init_pack(&cys);
+    onboard_init_pack(&cys)
 }
 
 /// Windows: GUI(windows_subsystem)가 콘솔 바이너리(cys/cysd/python3)를 스폰할 때 콘솔 창이
@@ -1583,18 +1769,28 @@ async fn stop_dept_daemon_by_socket(socket: String) -> Result<(), String> {
     Ok(())
 }
 
+/// A안(2026-07-11 오너 승인): 교대·설치 게이트가 세는 "지킬 세션" = **role 또는 agent 가 붙은
+/// 살아있는 surface**만. 맨 셸 pane(role·agent 모두 없음)은 drain+restore 가 되살리므로 무손실
+/// 자동 교대를 막지 않는다 — 종전 '살아있는 pane 전부' 기준은 기본 pane 1개만으로 자동 교대가
+/// 영영 보류돼, 사용자가 taskkill 로 데몬을 죽여야 업데이트되던 실사고(2026-07-10 Windows)의 근원.
+/// 한계(명시): 맨 pane에서 role 미claim 프로그램을 수동 실행 중이면 그 포그라운드 상태는 교대 시
+/// 복원되지 않는다(pane 자체는 복원됨).
+fn session_blocks_rotation(s: &Value) -> bool {
+    if s["exited"].as_bool().unwrap_or(true) {
+        return false;
+    }
+    let has = |k: &str| s[k].as_str().map(|v| !v.is_empty()).unwrap_or(false);
+    has("role") || has("agent")
+}
+
 /// 부서 소켓의 살아있는 세션 수 — live_session_count(메인 데몬 전용·기본 소켓 하드코딩)의 부서판.
-/// rotate_dept_daemon force 가드용. 판정 규칙은 live_session_count와 동일(exited!=true=live)하되 대상만
-/// 부서 소켓으로 파라미터화(rpc_on). 조회 실패는 호출부에서 0으로 접어 보수적으로 처리.
+/// rotate_dept_daemon force 가드용. 판정 규칙은 live_session_count와 동일(session_blocks_rotation)하되
+/// 대상만 부서 소켓으로 파라미터화(rpc_on). 조회 실패는 호출부에서 0으로 접어 보수적으로 처리.
 async fn dept_live_session_count(sock: &std::path::Path) -> Result<u64, String> {
     let r = rpc_on(sock, "surface.list", json!({})).await?;
     let n = r["surfaces"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter(|s| !s["exited"].as_bool().unwrap_or(true))
-                .count() as u64
-        })
+        .map(|a| a.iter().filter(|s| session_blocks_rotation(s)).count() as u64)
         .unwrap_or(0);
     Ok(n)
 }
@@ -1659,6 +1855,14 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool) -> Result
         {
             obj.insert("rotate_log".into(), json!(l));
         }
+    }
+    // (T3) rotate는 graceful_kill로 노드 PTY를 동반 종료하고 새 데몬은 surface 0개로 뜬다. 콜드부트
+    // auto-restore가 돌지만 실패할 수 있어(2026-07-12 dept-4 실사고: 콜드부트 복원 FAILED·미가시)
+    // 사이드카 restore로 명시 복원한다(방금 rotate로 데몬은 살아있음·run_restore 멱등이라 이미 되살렸으면 no-op).
+    // restore_ok를 반환 info에 실어 UI(manualRotateSkewed)가 복원 실패를 삼키지 않게 한다(dept-4 계열 가시화).
+    let restore_ok = run_sidecar_restore(Some(sock.clone())).await;
+    if let Some(obj) = info.as_object_mut() {
+        obj.insert("restore_ok".into(), json!(restore_ok));
     }
     Ok(info)
 }
@@ -1768,17 +1972,15 @@ async fn live_session_count() -> Result<u64, String> {
     let r = rpc("surface.list", json!({})).await?;
     let n = r["surfaces"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter(|s| !s["exited"].as_bool().unwrap_or(true))
-                .count() as u64
-        })
+        .map(|a| a.iter().filter(|s| session_blocks_rotation(s)).count() as u64)
         .unwrap_or(0);
     Ok(n)
 }
 
 /// 업데이트 다운로드·설치 후 데몬 핸드오프 + 재시작.
 /// force=false: 살아있는 세션이 있으면 설치 전에 거부(UI가 확인 후 force=true로 재호출).
+/// ★v0.12.51+ UI 미사용(후속 제거 예정) — 본체 업데이트는 홈페이지 다운로드로 전환됨(T5). 이 커맨드와
+///   update-progress emit은 미래 재활성화 여지를 위해 유지하나 UI에서 호출되지 않는다(promptBinaryHomepage 대체).
 #[tauri::command]
 async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     // 1) 세션 가드 (오너 정책: 없으면 자동·있으면 확인)
@@ -1825,6 +2027,9 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     let _ = std::fs::write(pending_restore_path(), "");
     stop_running_daemon().await;
     // 4) 앱 재시작 — setup의 ensure_daemon이 새 cysd를 자동 기동, maybe_restore_after_update가 노드 복원
+    // ★재활성화 경고(현재 이 경로는 휴면 — 본체 업데이트는 홈페이지 전용 T5): single-instance 플러그인이
+    // 등록돼 있어 restart()의 신 프로세스가 구 프로세스의 인스턴스 락과 레이스할 수 있다(신 인스턴스가
+    // 죽어가는 구 인스턴스로 포워딩 후 종료 → 앱 미복귀). 이 경로를 되살릴 때 반드시 실기기 검증하라.
     app.restart();
 }
 
@@ -2026,6 +2231,14 @@ async fn stop_running_daemon() {
 
 fn main() {
     tauri::Builder::default()
+        // ★최선두 등록 필수 — 두 번째 인스턴스는 다른 플러그인·setup이 돌기 전에 기존 창 포커스 후
+        // 스스로 종료된다(Win11 cys-app.exe 프로세스 증식 이슈의 증상 차단 · 2026-07-12). 스폰 소스가
+        // 무엇이든(설치기 재실행·바로가기 이중클릭·OS 재기동 복원) 단일 인스턴스가 보장된다.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
@@ -2087,6 +2300,16 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // ★온보딩 게이트(v4) — GUI 전용 완료 마커(.gui-onboarded) 기준. 팩 마커(.pack-version)
+                // 기준이던 v3는 CLI autostart·잔존 schtasks 등으로 cysd가 GUI보다 먼저 돈 머신에서
+                // 게이트가 선점돼 ~/.claude hook이 영구 미설치됐다(0.12.52 cys-neo 실사고 — "너는
+                // 마스터다" 부트스트랩 무력화). 이 마커는 GUI 온보딩 성공 경로만 기록하므로 프로세스
+                // 순서와 무관하게 신선 머신 온보딩이 보장된다. 평시 부트 비용 = 마커 read 1회.
+                #[allow(unused_variables)] // 온보딩 경로가 없는 OS(linux CI 등)에서만 미사용
+                let needs_onboard = needs_gui_onboard(
+                    std::fs::read_to_string(gui_onboarded_path()).ok().as_deref(),
+                    env!("CARGO_PKG_VERSION"),
+                );
                 #[cfg(target_os = "macos")]
                 let launchd_owns = maybe_autoregister_launchd().await;
                 #[cfg(not(target_os = "macos"))]
@@ -2110,11 +2333,23 @@ fn main() {
                 // event-forwarder를 먼저 띄워 init-pack 블로킹이 양방향 이벤트 파이프를 막지 않게 한다(반쪽 부팅 방지).
                 spawn_event_forwarder(handle.clone(), default_socket());
                 // RC-1: Windows 첫 기동 온보딩(팩+hook+autostart schtasks). 멱등.
+                // 게이트(needs_onboard·위 캡처): 마커 부재(신선·직전 실패)·버전 불일치에만 실행 —
+                // 평시 부트의 사이드카 스폰+전량 스윕+schtasks 재등록 비용 제거(Win11 이슈 실측).
+                // 마커는 온보딩 **성공** 시에만 기록 — hook 등록 실패(init-pack rc=1)도 재시도로 수렴.
+                // hook만 사후 유실된 상태(마커 무결)의 치유는 doctor --fix·버전 전이가 담당.
                 #[cfg(windows)]
-                maybe_windows_onboard();
-                // RC-17(T5): macOS 첫 기동 온보딩(팩+hook) — Windows 대칭. autostart는 위 launchd. 멱등.
+                if needs_onboard && maybe_windows_onboard() {
+                    if let Err(e) = std::fs::write(gui_onboarded_path(), env!("CARGO_PKG_VERSION")) {
+                        eprintln!("[cys-app] onboarding marker write failed (다음 부트 재시도): {e}");
+                    }
+                }
+                // RC-17(T5): macOS 첫 기동 온보딩(팩+hook) — Windows 대칭(동일 게이트). autostart는 위 launchd.
                 #[cfg(target_os = "macos")]
-                maybe_macos_onboard();
+                if needs_onboard && maybe_macos_onboard() {
+                    if let Err(e) = std::fs::write(gui_onboarded_path(), env!("CARGO_PKG_VERSION")) {
+                        eprintln!("[cys-app] onboarding marker write failed (다음 부트 재시도): {e}");
+                    }
+                }
                 // 업데이트 재시작 시: 새 팩(새 기능) 반영 + 노드 자동복귀(마커가 있을 때만).
                 maybe_apply_pending_update(&handle);
             });
@@ -2128,11 +2363,60 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// A안 회귀 박제(2026-07-11 오너 승인): 교대 게이트는 role/agent 붙은 세션만 지킨다.
+    /// 맨 셸 pane(role·agent 없음)이 다시 게이트에 잡히면 기본 pane 1개만으로 자동 교대가
+    /// 영영 보류돼 "taskkill 없인 데몬이 안 바뀐다" 실사고가 재발한다 — 그 회귀를 여기서 잡는다.
+    #[test]
+    fn bare_pane_does_not_block_rotation_but_role_or_agent_does() {
+        let bare = json!({"exited": false, "role": null, "agent": null});
+        let exited_agent = json!({"exited": true, "role": "worker", "agent": "claude"});
+        let roled = json!({"exited": false, "role": "master", "agent": null});
+        let agented = json!({"exited": false, "role": null, "agent": "claude"});
+        let empty_strings = json!({"exited": false, "role": "", "agent": ""});
+        assert!(!session_blocks_rotation(&bare), "맨 pane은 자동 교대를 막지 않는다");
+        assert!(!session_blocks_rotation(&exited_agent), "죽은 세션은 세지 않는다");
+        assert!(session_blocks_rotation(&roled), "role claim 세션은 보호");
+        assert!(session_blocks_rotation(&agented), "agent 세션은 보호");
+        assert!(!session_blocks_rotation(&empty_strings), "빈 문자열은 미부착으로 취급");
+    }
+
+    /// (T1) 재시작 후 팩반영·복원 발동 판정 — 마커(인앱 업데이트) OR 버전변경(홈페이지 수동설치).
+    #[test]
+    /// ★v4 GUI 온보딩 게이트 회귀 핀(0.12.52 cys-neo 실사고) — 마커가 현재 버전과 정확히 일치할
+    /// 때만 스킵. 부재(신선 머신·직전 실패)·구버전·손상 = 실행(fail-open 치유 방향). 이 판정이
+    /// .pack-version 등 팩 상태를 일절 보지 않는 것이 요점 — cysd 선행이 게이트를 선점 못 한다.
+    #[test]
+    fn needs_gui_onboard_only_skips_on_exact_version_match() {
+        assert!(needs_gui_onboard(None, "0.12.53"), "마커 부재 = 온보딩(신선·직전 실패)");
+        assert!(!needs_gui_onboard(Some("0.12.53"), "0.12.53"), "정확 일치 = 스킵");
+        assert!(!needs_gui_onboard(Some("0.12.53\n"), "0.12.53"), "개행 trim 후 일치 = 스킵");
+        assert!(needs_gui_onboard(Some("0.12.52"), "0.12.53"), "구버전 = 온보딩(업그레이드)");
+        assert!(needs_gui_onboard(Some("garbage"), "0.12.53"), "손상 = 온보딩(fail-open)");
+    }
+
+    #[test]
+    fn decide_pending_update_marker_or_version_change() {
+        use PendingUpdatePlan::*;
+        // 마커 최우선 — 스탬프·prior_state와 무관하게 Apply(구버전이 이 릴리스로 올라올 때 남긴 마커).
+        assert_eq!(decide_pending_update(true, None, "0.12.51", false), Apply, "마커=Apply(스탬프 부재)");
+        assert_eq!(decide_pending_update(true, Some("0.12.51"), "0.12.51", false), Apply, "마커=Apply(스탬프 동일해도)");
+        // ★결함2: 스탬프 부재 × prior_state — 기존 설치 증거로 전환기 홈페이지 설치 vs 진짜 최초 설치를 가른다.
+        assert_eq!(decide_pending_update(false, None, "0.12.51", true), Apply, "스탬프 부재+기존설치=전환기 홈페이지설치=Apply");
+        assert_eq!(decide_pending_update(false, None, "0.12.51", false), RecordStampOnly, "스탬프 부재+기존설치 없음=진짜 최초설치");
+        // 버전변경/동일은 prior_state와 무관(회귀 핀 — Some(stamp)이면 prior_state를 보지 않는다).
+        assert_eq!(decide_pending_update(false, Some("0.12.50"), "0.12.51", false), Apply, "버전변경(홈페이지 수동설치)=Apply");
+        assert_eq!(decide_pending_update(false, Some("0.12.50"), "0.12.51", true), Apply, "버전변경=Apply(prior_state 무관)");
+        assert_eq!(decide_pending_update(false, Some("0.12.51"), "0.12.51", false), Skip, "동일 버전·마커 없음=Skip");
+        assert_eq!(decide_pending_update(false, Some("0.12.51"), "0.12.51", true), Skip, "동일 버전=Skip(prior_state 무관)");
+    }
+
     // HUD-2: open_url 화이트리스트 — https·허용 도메인만 통과, 위장 host(userinfo/서브도메인 사칭) 차단.
     #[test]
     fn open_url_whitelist_blocks_spoofed_and_nonhttps() {
         assert!(url_host_allowed("https://notebooklm.google.com/notebook/abc").is_ok());
         assert!(url_host_allowed("https://github.com/cys/repo").is_ok());
+        assert!(url_host_allowed("https://www.cysinsight.com/").is_ok(), "홈페이지(본체 다운로드) 허용");
+        assert!(url_host_allowed("https://cysinsight.com/download").is_ok(), "홈페이지 apex 허용");
         assert!(url_host_allowed("http://notebooklm.google.com/").is_err(), "http 차단");
         assert!(url_host_allowed("https://evil.com/notebooklm.google.com").is_err(), "경로 사칭 차단");
         assert!(url_host_allowed("https://notebooklm.google.com.evil.com/").is_err(), "서브도메인 사칭 차단");

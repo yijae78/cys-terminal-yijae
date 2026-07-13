@@ -102,15 +102,22 @@ async fn main() {
         Ok(false) => {}
         Err(e) => eprintln!("[cysd] pack journal recovery skipped: {e}"),
     }
-    // 온보딩②: 신규 머신 첫 기동 시 pack 자동 설치 (보존 모드 — 기존 사용자 파일 불가침).
-    // launch-agent·디렉티브·acl이 "init-pack을 아는 사람"에게만 동작하는 것을 없앤다.
-    match cys::pack::install(false) {
-        Ok((written, _)) if written > 0 => eprintln!(
-            "[cysd] CYSJavis Pack: {written} file(s) installed at {}",
-            cys::pack::pack_dir().display()
-        ),
-        Ok(_) => {}
-        Err(e) => eprintln!("[cysd] pack auto-install skipped: {e}"),
+    // 온보딩②: 팩이 이 바이너리 버전으로 미커밋일 때만 자동 설치 — 신규 머신·바이너리 업그레이드·
+    // 팩 소실(.pack-version/매니페스트 부재 = 게이트 개방)이 실행 조건. launch-agent·디렉티브·acl이
+    // "init-pack을 아는 사람"에게만 동작하는 것을 없앤다는 원목적은 유지된다(보존 모드·사용자 파일 불가침).
+    // ★게이트(pack_current_for): 평시 부트는 stat 2회로 조기 반환 — 부서 데몬 N개·RestartOnFailure
+    // 재기동·로그온 자동기동마다 전량 스윕(320파일 read+해시)이 돌던 비용 제거(2026-07-12 Win11 이슈 실측).
+    // 손상+마커 무결 상태의 치유는 cys init-pack/pack-update/doctor --fix 명시 경로가 담당한다
+    // (매 부트 전량 치유는 seed-once 원복 사고(7-12)의 원인 기전 — 의도적 축소).
+    if !cys::pack::pack_current_for(env!("CARGO_PKG_VERSION")) {
+        match cys::pack::install(false) {
+            Ok((written, _)) if written > 0 => eprintln!(
+                "[cysd] CYSJavis Pack: {written} file(s) installed at {}",
+                cys::pack::pack_dir().display()
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("[cysd] pack auto-install skipped: {e}"),
+        }
     }
     let socket_path = cys::socket_path();
     let daemon = Daemon::new(socket_path.clone());
@@ -122,6 +129,8 @@ async fn main() {
     schedule::spawn_scheduler(Arc::clone(&daemon));
     usage::spawn_usage_collector(Arc::clone(&daemon));
     usage::spawn_agy_collector(Arc::clone(&daemon));
+    // CC "🏢 오피스" 탭의 상시 가용성 — 메타버스 오피스 브리지(127.0.0.1:8642) 자동기동.
+    spawn_office_bridge(crate::state::state_dir(&socket_path));
     // C0: 채널 부팅 재조정(고아 선-kill→새 토큰 재스폰) — 이벤트버스·state 준비 후(§2.1-2).
     // 불사조 복원 프로토콜의 "채널 재조정" 단계. 그 다음 주기 sweep(재배달·타임아웃·재스폰) 등록.
     channels::reconcile(&daemon);
@@ -412,6 +421,87 @@ fn decide_auto_restore(
     }
 }
 
+/// 메타버스 오피스 브리지(팩 javis_hud_bridge.py · 127.0.0.1 한정) 자동기동 — CC "🏢 오피스" 탭이
+/// 수동 python3 기동 없이 항상 열리게 한다. 단일 인스턴스 가드: HUD 포트가 이미 listen 중이면
+/// (선행 cysd·수동 기동) 스폰하지 않는다 — 동일 서버 누적이 구조적으로 0(자원 거버넌스 '누적·미종료' 차단).
+/// 사망·부재는 60s 주기 재확인이 이어받고(KeepAlive), cysd 정상 종료 시 kill_on_drop이 자식을 동반 정리한다.
+/// CYS_NO_OFFICE_BRIDGE=1 opt-out · 팩에 브리지 부재(구팩)면 조용히 skip.
+/// python 해석·PATH·cys 주입은 auto-restore(★B3)와 동일 SOT(bundled_python3·runtime_prefixed_path).
+fn spawn_office_bridge(state_dir: std::path::PathBuf) {
+    if cys::env_compat("CYS_NO_OFFICE_BRIDGE").map(|v| v == "1").unwrap_or(false) {
+        eprintln!("[cysd] office-bridge skipped (CYS_NO_OFFICE_BRIDGE=1)");
+        return;
+    }
+    let script = cys::pack::pack_dir().join("bin").join("javis_hud_bridge.py");
+    if !script.is_file() {
+        return; // 구팩(브리지 미배포) — 다음 팩 업데이트가 채운다.
+    }
+    let port: u16 = std::env::var("HUD_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8642);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    tokio::spawn(async move {
+        let exe_dir_ref = exe_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+        let python = bundled_python3(exe_dir_ref).unwrap_or_else(|| "python3".to_string());
+        let log_path = state_dir.join("office-bridge.log");
+        loop {
+            // 단일 인스턴스 가드 — 이미 서비스 중(선행 데몬·수동 기동)이면 스폰하지 않고 재확인만.
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+            let mut cmd = tokio::process::Command::new(&python);
+            cmd.arg(&script)
+                // 브리지의 cys 호출이 라이벌 데몬을 autostart하는 재귀 차단(auto-restore와 동일 계약).
+                .env("CYS_NO_AUTOSTART", "1")
+                // 런타임 상태는 팩 트리 밖으로(팩 본체 오염 0 — 팩 편입 계약 HUD_STATE_DIR).
+                .env("HUD_STATE_DIR", state_dir.join("office-bridge"))
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true);
+            {
+                // Windows: 콘솔 없는 cysd가 콘솔 자식(python3.exe)을 그냥 스폰하면 새 콘솔 창이
+                // 할당된다(Win11 기본터미널=WT → AppData 경로 제목의 검은 상주 탭). 브리지는
+                // 장수 프로세스라 앱 기동마다 빈 터미널 창이 함께 뜨던 실사고(2026-07-10)의 주범.
+                use crate::state::HideConsole;
+                cmd.hide_console();
+            }
+            if let Some(newp) =
+                cys::runtime_prefixed_path(exe_dir_ref, &std::env::var("PATH").unwrap_or_default())
+            {
+                cmd.env("PATH", newp);
+            }
+            let cys_name = if cfg!(windows) { "cys.exe" } else { "cys" };
+            let cys_path = exe_dir_ref.join(cys_name);
+            if cys_path.is_file() {
+                cmd.env("HUD_CYS_BIN", &cys_path); // 사이드카 cys 절대경로(PHOENIX_CYS 주입과 동일 패턴)
+            }
+            match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                Ok(log) => {
+                    if let Ok(err) = log.try_clone() {
+                        cmd.stderr(err);
+                    }
+                    cmd.stdout(log);
+                }
+                Err(_) => {
+                    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                }
+            }
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    eprintln!("[cysd] office-bridge spawned (127.0.0.1:{port})");
+                    let _ = child.wait().await; // 사망 감지 → 아래 백오프 후 루프가 재스폰 판단
+                    eprintln!("[cysd] office-bridge exited — 60s 후 재확인");
+                }
+                Err(e) => eprintln!("[cysd] office-bridge spawn failed: {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
 /// ★B3: 동봉 runtime python3 절대경로(exe 옆 번들). runtime_bin_dirs(pane 자식과 동일 SOT)에서 python3 실행파일을
 /// 찾는다. 없으면 None(호출측이 "python3" 리터럴로 폴백 — PATH 선두주입이 동봉본을 잡거나 시스템 python3).
 fn bundled_python3(exe_dir: &std::path::Path) -> Option<String> {
@@ -486,7 +576,7 @@ fn spawn_auto_restore(
                         PhoenixResolve::Ready { script, cleanup } => {
                             let mut run_args = vec![script.to_string_lossy().into_owned()];
                             run_args.extend(tail);
-                            loop_auto_restore(&program, &run_args, &env, &log_path);
+                            loop_auto_restore(&daemon, &program, &run_args, &env, &log_path);
                             // temp 누수 0: 추출본은 실행 후 정리(디스크 폴백은 cleanup=None).
                             if let Some(dir) = cleanup {
                                 let _ = std::fs::remove_dir_all(&dir);
@@ -580,11 +670,13 @@ fn extract_phoenix_embed(
 /// ★B1③: 추출된 phoenix self-test — `<python> <script> --selftest` 가 exit 0 + "selftest ok" 응답이면 통과.
 /// 실행성만 확인(데몬·상태 무접촉). 실패=false(호출측이 정리 후 디스크 폴백).
 fn phoenix_self_test(python: &str, script: &std::path::Path) -> bool {
+    use crate::state::HideConsole;
     let out = std::process::Command::new(python)
         .arg(script)
         .arg("--selftest")
         .env("CYS_NO_AUTOSTART", "1")
         .stdin(std::process::Stdio::null())
+        .hide_console()
         .output();
     match out {
         Ok(o) => o.status.success() && String::from_utf8_lossy(&o.stdout).contains("selftest ok"),
@@ -700,17 +792,19 @@ fn autorestore_retry_delay() -> std::time::Duration {
 /// auto-restore 자식을 실행하고 exit 계약에 따라 처리한다. 비0(단 5·6 제외)은 delay 후 정확히 1회 재시도한다
 /// — 재시도의 멱등성은 phoenix 의 lease·liveness 재산정에 맡긴다(수동 복원이 이미 끝났으면 재시도는 NOOP·중복 스폰 0).
 fn loop_auto_restore(
+    daemon: &std::sync::Arc<Daemon>,
     program: &str,
     args: &[String],
     env: &[(String, String)],
     log_path: &std::path::Path,
 ) {
+    let daemon = daemon.clone();
     let program = program.to_string();
     let args = args.to_vec();
     let env = env.to_vec();
     let log_path = log_path.to_path_buf();
     loop_auto_restore_with(
-        |_attempt| run_auto_restore_once(&program, &args, &env, &log_path),
+        |_attempt| run_auto_restore_once(&daemon, &program, &args, &env, &log_path),
         autorestore_retry_delay(),
     );
 }
@@ -821,8 +915,15 @@ fn guard_restore_panic<F: FnOnce()>(log_path: &std::path::Path, body: F) -> bool
     }
 }
 
-/// 자식 1회 실행 — stdout/stderr 를 phoenix-restore.log(폴백 포함)에 append. exit code 반환(None=스폰 실패).
+/// 자식 1회 실행 — stdout/stderr 를 phoenix-restore.log(폴백 포함)에 append. exit code 반환(None=스폰 실패/대기 실패).
+/// ★T6: status()→spawn()+wait() 전환. spawn 직후 무블로킹 최우선으로 pid+start_time 을 확보해,
+/// Some(start_time)일 때만 RestoreRootGuard 로 restore_roots 에 등록한다(자식이 살아있는 동안만
+/// authoritative 면제 창을 연다·게이트=handlers.rs). 관측 실패(None)면 bounded retry 후에도 None 이면
+/// **등록 없이** 진행하고(면제 없음 — phoenix 2회 재시도 경로가 커버) 자식은 반드시 wait/reap 한다(좀비 0).
+/// guard 는 함수 종료(정상·early return·panic unwind)에서 Drop 되어 등록을 해제한다. exit 매핑은
+/// 기존 status().code() 계약과 동형(0/5/6/비0/None).
 fn run_auto_restore_once(
+    daemon: &std::sync::Arc<Daemon>,
     program: &str,
     args: &[String],
     env: &[(String, String)],
@@ -834,6 +935,11 @@ fn run_auto_restore_once(
         cmd.env(k, v);
     }
     cmd.stdin(std::process::Stdio::null());
+    {
+        // Windows: 콜드부트 auto-restore(launch-agent 등)가 수십 초 돌며 콘솔 창을 띄우지 않게.
+        use crate::state::HideConsole;
+        cmd.hide_console();
+    }
     match open_restore_log(log_path) {
         Some(f) => {
             // stderr 는 clone 으로 같은 파일에 합류. clone 실패 시 null 이 아니라 inherit(증거 보존).
@@ -854,10 +960,32 @@ fn run_auto_restore_once(
                 .stderr(std::process::Stdio::inherit());
         }
     }
-    match cmd.status() {
-        Ok(s) => Some(s.code().unwrap_or(-1)),
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("[cysd] auto-restore spawn failed: {e}");
+            return None;
+        }
+    };
+    let pid = child.id();
+    // spawn 직후 다른 blocking 없이 최우선으로 start_time 확보(publication race 최소화·C2).
+    // bounded retry(3회) — 갓 스폰된 자식이 프로세스표에 반영될 짧은 창을 흡수한다.
+    let start_time = {
+        let mut st = None;
+        for _ in 0..3 {
+            if let Some(s) = crate::state::peer_start_time(pid) {
+                st = Some(s);
+                break;
+            }
+        }
+        st
+    };
+    // Some(start_time)일 때만 등록 — None 은 restore_roots 에 저장 금지(면제 없음·fail-safe).
+    let _guard = start_time.map(|s| crate::state::RestoreRootGuard::new(daemon.clone(), pid, s));
+    match child.wait() {
+        Ok(s) => Some(s.code().unwrap_or(-1)),
+        Err(e) => {
+            eprintln!("[cysd] auto-restore wait failed: {e}");
             None
         }
     }
@@ -922,6 +1050,17 @@ fn peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
 ///  비-Windows 테스트가 'spin 방지=non-zero backoff' 불변을 박제하게 한다.)
 #[cfg_attr(not(windows), allow(dead_code))]
 const PIPE_ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Windows named pipe 리스너 풀 크기 — UDS listen backlog 의 대응물. named pipe 엔 backlog 가
+/// 없어 '여분 listening 인스턴스 수'가 곧 동시 접속 수용량이다. 1이면 accept→인스턴스 재생성
+/// 사이 창(tokio 스케줄링 지연 포함)에 도착한 동시 접속이 전부 ERROR_PIPE_BUSY(os error 231,
+/// "모든 파이프 인스턴스가 사용 중")로 튕긴다 — 멀티 노드(master·cso·worker·reviewer 동시 RPC)
+/// + GUI 기동 fan-out(daemon_status·pane attach·event forwarder)에서 상시 재현
+/// (2026-07-10 Windows 실사고: GUI "startup failed … os error 231"). 클라이언트 busy-retry 와
+/// 이중 방어. (Windows arm 은 이 호스트에서 컴파일/실행 불가하므로, 정책 값을 모듈 최상위로 빼
+///  비-Windows 테스트가 '풀 ≥ 2' 불변을 박제하게 한다 — PIPE_ACCEPT_ERROR_BACKOFF 와 같은 방식.)
+#[cfg_attr(not(windows), allow(dead_code))]
+const PIPE_LISTENER_POOL: usize = 8;
 
 /// owner-only DACL의 SDDL: D:P=보호된(상속차단) DACL, FA=full access를
 /// OW(OWNER_RIGHTS=creator)·SY(SYSTEM)·BA(BUILTIN\Administrators)에게만 부여.
@@ -991,12 +1130,17 @@ impl Drop for OwnerOnlySecurity {
     }
 }
 
+/// named pipe listening 인스턴스 1개 생성. owner-only DACL 은 인스턴스마다 새로 변환한다 —
+/// 커널이 CreateNamedPipe 시점에 SD 를 파이프 객체로 복사하므로 SECURITY_ATTRIBUTES 는 이 호출
+/// 동안만 살아있으면 되고(호출 후 drop 안전), 가드를 태스크 간 공유하지 않아 리스너 풀의
+/// spawn(Send 경계)과 충돌하지 않는다. SDDL 변환 실패(이론상 거의 없음)면 null 폴백 + 경고
+/// — 기존 accept_loop 폴백 정책 그대로.
 #[cfg(windows)]
-async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
+fn create_pipe_instance(
+    pipe_name: &str,
+    first: bool,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     use tokio::net::windows::named_pipe::ServerOptions;
-    let pipe_name = socket_path.to_string_lossy().into_owned();
-    // owner-only DACL 보안 디스크립터 — 데몬 수명 동안 보유해 모든 파이프 인스턴스에 적용.
-    // SDDL 변환이 실패하면(이론상 거의 없음) None → null 포인터로 폴백하되 경고를 남긴다.
     let security = OwnerOnlySecurity::new();
     if security.is_none() {
         eprintln!(
@@ -1009,34 +1153,59 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
         .map(|s| s.as_ptr())
         .unwrap_or(std::ptr::null_mut());
     // Safety: sa_ptr는 null이거나 `security` 가드가 소유한 유효한 SECURITY_ATTRIBUTES를 가리키며,
-    // 그 가드는 이 함수(=데몬 수명) 끝까지 살아있어 모든 파이프 생성보다 오래 산다.
-    let mut server = unsafe {
+    // 그 가드는 이 함수 끝까지 살아있어 파이프 생성 호출보다 오래 산다.
+    unsafe {
         ServerOptions::new()
-            .first_pipe_instance(true)
-            .create_with_security_attributes_raw(&pipe_name, sa_ptr)
+            .first_pipe_instance(first)
+            .create_with_security_attributes_raw(pipe_name, sa_ptr)
     }
-    .unwrap_or_else(|e| panic!("create pipe {pipe_name} failed: {e}"));
-    // ★P0-7 최종 층위(D1/W5): 파이프 listening 직후 공통 부트 — unix accept_loop 와 **동일 함수**(prune +
-    //   콜드부트 auto-restore). 과거 이 호출이 Windows 에만 빠져 auto-restore 가 발동조차 안 하고 phoenix-restore.log
-    //   가 빈 파일이던 결함(CI 실경로 스모크 ⑧)을 봉인. state_dir 은 함수 내부 canonical 매핑(Windows 슬러그).
-    post_listen_boot(socket_path, &daemon);
+}
+
+/// listening 인스턴스 재생성 — 실패 시 backoff 후 무한 재시도(리스너 태스크 침묵사 방지).
+/// 과거 `.expect()` panic 은 메인 accept 태스크에선 데몬 전사(fail-fast·Task Scheduler 재기동)
+/// 였지만, 풀의 spawn 태스크에선 tokio 가 panic 을 삼켜 리스너만 조용히 줄어드는 최악
+/// (전 리스너 소진 = 무증상 접속 불능)이 된다 — 로그 + 재시도가 정직하다.
+#[cfg(windows)]
+async fn recreate_pipe_instance(
+    pipe_name: &str,
+) -> tokio::net::windows::named_pipe::NamedPipeServer {
+    loop {
+        match create_pipe_instance(pipe_name, false) {
+            Ok(s) => return s,
+            Err(e) => {
+                eprintln!("recreate pipe {pipe_name} failed: {e} — retrying");
+                tokio::time::sleep(PIPE_ACCEPT_ERROR_BACKOFF).await;
+            }
+        }
+    }
+}
+
+/// 리스너 풀의 태스크 1개 — 자기 listening 인스턴스로 accept 루프를 돈다.
+#[cfg(windows)]
+async fn pipe_listener(
+    daemon: Arc<Daemon>,
+    pipe_name: String,
+    mut server: tokio::net::windows::named_pipe::NamedPipeServer,
+) {
     loop {
         match server.connect().await {
             Ok(()) => {
+                // 접속 완료된 클라이언트를 먼저 서빙한다 — 재생성(recreate)을 앞에 두면 재생성이
+                // 실패를 반복하는 비정상 상태에서 '이미 accept 된' 클라이언트까지 무기한 기아가
+                // 된다(liveness 역전). 재생성 지연으로 listening 정원이 잠깐 N-1이 되는 것은
+                // 나머지 리스너 + 클라이언트 busy-retry 가 흡수한다.
                 let connected = server;
-                server = unsafe {
-                    ServerOptions::new().create_with_security_attributes_raw(&pipe_name, sa_ptr)
-                }
-                .expect("recreate pipe failed");
                 // 발신자 신원: 커널이 보증하는 named pipe 클라이언트 pid (UDS peer_pid와 대칭).
                 // 박는 이유: claim_role·surface.close·status.set 등은 발신 신원이 None이면 무조건
                 // 거부하므로, 미구현(None)이면 Windows에서 자기 surface 자가-claim('cys claim-role
                 // master' 등 launch-agent 밖 직접 기동 노드)이 영영 막힌다. boxing 전에 조회한다.
                 let caller_pid = peer_pid(&connected);
-                let daemon = Arc::clone(&daemon);
+                let handler_daemon = Arc::clone(&daemon);
                 tokio::spawn(async move {
-                    handle_connection(daemon, Box::new(connected) as Stream, caller_pid).await;
+                    handle_connection(handler_daemon, Box::new(connected) as Stream, caller_pid)
+                        .await;
                 });
+                server = recreate_pipe_instance(&pipe_name).await;
             }
             Err(e) => {
                 // connect()가 즉시 Err를 반환하면(broken 핸들 등) 같은 인스턴스에 곧장
@@ -1044,13 +1213,41 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
                 // 플래그를 즉시 해제해 self-throttle도 없음). Unix arm(accept err→다음 await)·
                 // tokio 표준 루프(?로 전파)와 대칭이 되도록: ①로그 ②인스턴스 재생성 ③짧은 backoff.
                 eprintln!("accept error: {e}");
-                server = unsafe {
-                    ServerOptions::new().create_with_security_attributes_raw(&pipe_name, sa_ptr)
-                }
-                .expect("recreate pipe failed");
+                server = recreate_pipe_instance(&pipe_name).await;
                 tokio::time::sleep(PIPE_ACCEPT_ERROR_BACKOFF).await;
             }
         }
+    }
+}
+
+#[cfg(windows)]
+async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
+    let pipe_name = socket_path.to_string_lossy().into_owned();
+    // 첫 인스턴스: first_pipe_instance(true) = 데몬 싱글턴 가드(이름 선점 시 즉사) — 기존 의미 유지.
+    let first = create_pipe_instance(&pipe_name, true)
+        .unwrap_or_else(|e| panic!("create pipe {pipe_name} failed: {e}"));
+    // ★P0-7 최종 층위(D1/W5): 파이프 listening 직후 공통 부트 — unix accept_loop 와 **동일 함수**(prune +
+    //   콜드부트 auto-restore). 과거 이 호출이 Windows 에만 빠져 auto-restore 가 발동조차 안 하고 phoenix-restore.log
+    //   가 빈 파일이던 결함(CI 실경로 스모크 ⑧)을 봉인. state_dir 은 함수 내부 canonical 매핑(Windows 슬러그).
+    post_listen_boot(socket_path, &daemon);
+    // ★리스너 풀(PIPE_LISTENER_POOL): listening 인스턴스 N개를 병렬 대기 — 단일 인스턴스의
+    // accept→재생성 사이 창에서 동시 접속이 ERROR_PIPE_BUSY(231)로 튕기던 결함 봉인(상수 주석 참조).
+    let mut first = Some(first);
+    let mut tasks = Vec::new();
+    for _ in 0..PIPE_LISTENER_POOL {
+        let server = match first.take() {
+            Some(s) => s,
+            None => recreate_pipe_instance(&pipe_name).await,
+        };
+        tasks.push(tokio::spawn(pipe_listener(
+            Arc::clone(&daemon),
+            pipe_name.clone(),
+            server,
+        )));
+    }
+    // accept_loop 는 반환하지 않는 계약(unix arm 대칭) — 리스너 태스크들을 영구 대기한다.
+    for t in tasks {
+        let _ = t.await;
     }
 }
 
@@ -1851,13 +2048,30 @@ mod pipe_security_tests {
              broken pipe instance with no yield → 100% CPU spin: {backoff:?}"
         );
     }
+
+    /// ★회귀 박제 (Windows named pipe 리스너 풀 — ERROR_PIPE_BUSY 231 봉인):
+    /// named pipe 엔 UDS listen backlog 가 없어 '여분 listening 인스턴스 수'가 곧 동시 접속
+    /// 수용량이다. 풀이 1로 돌아가면 accept→인스턴스 재생성 사이 창에 도착한 동시 접속
+    /// (멀티 노드 RPC + GUI 기동 fan-out)이 전부 os error 231("모든 파이프 인스턴스가 사용 중")
+    /// 로 튕긴다 — 2026-07-10 Windows GUI "startup failed" 실사고의 서버측 근원. 누가 풀을
+    /// 다시 1로 줄이면 이 테스트가 깨진다. (Windows arm 은 이 호스트에서 컴파일/실행 불가하므로
+    /// 정책 상수 정합성으로 의도를 박제한다 — PIPE_ACCEPT_ERROR_BACKOFF 박제와 같은 방식.)
+    #[test]
+    fn pipe_listener_pool_absorbs_concurrent_connects() {
+        let pool = super::PIPE_LISTENER_POOL;
+        assert!(
+            pool >= 2,
+            "listener pool must be ≥2, else concurrent connects hit ERROR_PIPE_BUSY(231) \
+             in the accept→recreate window: {pool}"
+        );
+    }
 }
 
 #[cfg(test)]
 mod auto_restore_tests {
     use super::{
         autorestore_retry_delay, decide_auto_restore, guard_restore_panic, loop_auto_restore_with,
-        AutoRestore,
+        run_auto_restore_once, AutoRestore,
     };
 
     /// ★P0-7 회귀 잠금(D1/W5·CI 실경로 ⑧): 양 플랫폼 accept_loop 가 콜드부트 부트 공통 함수를 호출하는지 소스
@@ -2277,5 +2491,95 @@ mod auto_restore_tests {
         std::env::set_var("CYS_AUTORESTORE_RETRY_DELAY_MS", "0");
         assert_eq!(autorestore_retry_delay(), Duration::from_millis(0));
         std::env::remove_var("CYS_AUTORESTORE_RETRY_DELAY_MS");
+    }
+
+    /// ★T6-L1: RestoreRootGuard 수명 계약 — 정상 스코프·panic unwind·loop 다중 attempt 모든 경로에서
+    /// restore_roots 가 정확히 비워진다(등록 해제의 유일 경로가 Drop 임을 고정). guard drop 이 빠지면
+    /// 복원 종료 후 잔존 자손이 authoritative 면제를 얻는 A7 취약이 재발한다.
+    #[test]
+    fn restore_roots_cleared_on_all_paths_l1() {
+        use crate::state::{Daemon, RestoreRootGuard};
+        let dir = std::env::temp_dir().join(format!(
+            "cys-l1-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+
+        // ① 정상 스코프: 등록 중 1개, 스코프 종료(drop) 후 빔.
+        {
+            let _g = RestoreRootGuard::new(daemon.clone(), 4242, 111);
+            assert_eq!(daemon.restore_roots.lock().unwrap().len(), 1, "등록 중 1개여야");
+        }
+        assert!(
+            daemon.restore_roots.lock().unwrap().is_empty(),
+            "정상 drop 후 restore_roots 가 비지 않았다"
+        );
+
+        // ② panic unwind: catch_unwind 안에서 guard 살아있는 채 panic → Drop 이 unwind 중 해제.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = RestoreRootGuard::new(daemon.clone(), 4243, 222);
+            assert_eq!(daemon.restore_roots.lock().unwrap().len(), 1);
+            panic!("unwind through guard");
+        }));
+        assert!(
+            daemon.restore_roots.lock().unwrap().is_empty(),
+            "panic unwind 후 restore_roots 가 비지 않았다 (A7/L1)"
+        );
+
+        // ③ loop 다중 attempt: 각 attempt 가 자기 guard 를 등록·해제 → attempt 중 정확히 1개, 종료 후 빔.
+        let d2 = daemon.clone();
+        let runs = loop_auto_restore_with(
+            move |attempt| {
+                let _g = RestoreRootGuard::new(d2.clone(), 5000 + attempt, 333);
+                assert_eq!(
+                    d2.restore_roots.lock().unwrap().len(),
+                    1,
+                    "attempt 중 정확히 1개여야(누적 0)"
+                );
+                if attempt == 0 { Some(1) } else { Some(0) } // 1차 비0 → 2차 실행
+            },
+            Duration::from_millis(0),
+        );
+        assert_eq!(runs, 2, "1차 비0→2차 실행(정확히 2회)");
+        assert!(
+            daemon.restore_roots.lock().unwrap().is_empty(),
+            "loop 종료 후 restore_roots 가 비지 않았다 (L1)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★T6-L1(실 실행): run_auto_restore_once 가 자식을 spawn·reap(좀비 0)하고 종료 후 restore_roots 를
+    /// 비우며 exit code 를 계약대로 매핑한다(status().code() 동형). sleep 자식으로 등록 창을 실재화한다.
+    #[cfg(unix)]
+    #[test]
+    fn run_auto_restore_once_reaps_and_clears_l1() {
+        use crate::state::Daemon;
+        let dir = std::env::temp_dir().join(format!(
+            "cys-l1run-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let log = dir.join("phoenix-restore.log");
+
+        // sleep 후 특정 코드 종료 — 관측 창 확보 + exit 매핑 검증. wait() 가 reap 한다.
+        let code = run_auto_restore_once(
+            &daemon,
+            "sh",
+            &["-c".to_string(), "sleep 0.2; exit 7".to_string()],
+            &[],
+            &log,
+        );
+        assert_eq!(code, Some(7), "exit code 계약 매핑이 깨졌다(status().code() 동형)");
+        assert!(
+            daemon.restore_roots.lock().unwrap().is_empty(),
+            "run_auto_restore_once 종료 후 guard drop 으로 restore_roots 가 비어야 한다 (L1)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

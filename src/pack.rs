@@ -331,7 +331,44 @@ pub fn content_hash_pub(content: &str) -> String {
 /// P0-4 수리: 과거 `_ =>` catch-all 이 매니페스트 부재·읽기 실패까지 'user 수정'으로 오판해 phoenix(system)를
 /// 영구 동결시켜 배포 스큐를 냈다 — 이 분류가 그 근원을 대체한다(CLAUDE.md.template 은 .template 이라 system).
 pub(crate) fn is_user_owned(rel: &str) -> bool {
-    rel.ends_with("_DIRECTIVE.md")
+    ownership(rel) == Ownership::User
+}
+
+/// ★B2-2(치유 원복 사고 시정 · 2026-07-12): **seed-once 상태 파일** — 팩이 부재 시에만 시드로
+/// 설치하고, 존재하면 force 여도 불가침. memory/(장기기억 색인·시드 본문)·round/SESSION_STATE.md
+/// (복원 단일 진실)·round/RECOVERY.md 는 설치 후 노드가 계속 갱신하는 런타임 상태라 임베드와 항상
+/// 달라지는데, system 등급이면 init-pack 전량 스윕(부트 ⓪ preflight --fix 가 결손 1건에도 호출)마다
+/// vendor 골격으로 원복돼 기억·상태가 주기 소실된다(실측: 로컬 원장 healed 0.12.46~47 3건 + 배포
+/// 사용자 기계 동일 사고 4회차). round/ 의 정적 계약(TOOL_RESULT_VOCAB·catalog·video-archetypes)은
+/// 상태가 아니므로 system 유지 — 상태 파일만 좁게 열거한다. 의도적 초기화 = 파일 삭제 후 init-pack.
+pub(crate) fn is_seed_once(rel: &str) -> bool {
+    ownership(rel) == Ownership::SeedOnce
+}
+
+/// 팩 파일 소유권 3등급 — 분류 SOT는 아래 `ownership()` 단일 함수다(성찰 후속 2026-07-12).
+/// 화이트리스트가 술어 2개(is_user_owned/is_seed_once)로 분산되면 교집합(이중 등급) 시 동작이
+/// 호출 순서에 숨는다 — 단일 match 가 배타 등급 하나만 반환하게 구조로 보장한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ownership {
+    /// 임베드 진실(기본값) — 불일치 시 강제 치유(P0-4)·비수정 자동 갱신·prune 대상.
+    System,
+    /// 사용자 주권(디렉티브·soul·CLAUDE·schedule) — 영구 보존, 임베드 신버전은 `.new` 병치.
+    User,
+    /// 런타임 상태(memory/·round 상태) — 부재 시에만 시드, 존재하면 force 여도 불가침.
+    SeedOnce,
+}
+
+/// 소유권 분류 단일 SOT. 우선순위 **SeedOnce > User > System** — 상태 경로 밑에 user 패턴
+/// 이름이 오는 가상 케이스(예: memory/CLAUDE.md)에서 '상태 보존(불가침)'이 '병합 병치(.new)'보다
+/// 안전측이며, decide_file_action 의 기존 검사 순서(seed-once 조기 반환)와 동형이다.
+pub(crate) fn ownership(rel: &str) -> Ownership {
+    if rel.starts_with("memory/")
+        || rel == "round/SESSION_STATE.md"
+        || rel == "round/RECOVERY.md"
+    {
+        return Ownership::SeedOnce;
+    }
+    if rel.ends_with("_DIRECTIVE.md")
         || rel == "soul.md"
         || rel.ends_with("/soul.md")
         || rel == "CLAUDE.md"
@@ -340,14 +377,10 @@ pub(crate) fn is_user_owned(rel: &str) -> bool {
         // 사용자 잡이 소실(비가역 데이터 손실)된다. user 소유로 보존하고, built-in 잡(phoenix-*)은 데몬 부트 시
         // 코드가 idempotent ensure 한다(cysd schedule::ensure_builtin_jobs). 기본 잡 드리프트(복구 가능) < 사용자 잡 소실.
         || rel == "schedule.json"
-        // ★RC-18: memory/MEMORY.md 는 장기기억 색인 — javis_memory.py add 가 한 줄씩 축적하는 사용자
-        // 데이터다. system 치유가 덮으면 색인이 임베드 골격으로 롤백되어 기억 파일이 고아가 된다
-        // (색인↔파일 정합 FAIL — 비가역 데이터 손실). schedule.json 과 동일한 혼합 파일 원리로 보존.
-        || rel == "memory/MEMORY.md"
-        // ★RC-19: round/SESSION_STATE.md 는 master가 갱신하는 단일 복원 진실 — system 치유가 덮으면
-        // 임베드 골격으로 롤백되어 복원 체인이 끊긴다(2026-07-08 실측: 전 세션 상태가 골격으로 소실된
-        // 이력 확인). 임베드 골격은 최초 설치 시드일 뿐이다 — 이후는 사용자 데이터.
-        || rel == "round/SESSION_STATE.md"
+    {
+        return Ownership::User;
+    }
+    Ownership::System
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -401,6 +434,10 @@ pub(crate) fn decide_file_action(
     manifest_hash: Option<&str>,
     force: bool,
 ) -> FileAction {
+    // ★B2-2 seed-once 상태: 존재하면 불가침(force 여도·읽기 실패여도) — 부재 시에만 아래 시드 설치.
+    if exists && is_seed_once(rel) {
+        return FileAction::Keep { adopt_hash: false, new_pending: false };
+    }
     // ★B2 user-owned 영구 보존 (force 여도) — 읽기 성공 + 내용 상이일 때.
     if exists && is_user_owned(rel) {
         if let Some(d) = disk {
@@ -520,7 +557,7 @@ pub fn plan_install(
             }
             FileAction::Keep { new_pending: true, .. } => plan.merge_new.push(rel.to_string()),
             FileAction::Keep { .. } => {
-                if is_user_owned(rel) && disk.as_deref() != Some(content) {
+                if (is_user_owned(rel) || is_seed_once(rel)) && disk.as_deref() != Some(content) {
                     plan.keep_user.push(rel.to_string());
                 } else {
                     plan.unchanged += 1;
@@ -532,7 +569,7 @@ pub fn plan_install(
     let embedded: std::collections::HashSet<&str> = items.iter().map(|(rel, _)| *rel).collect();
     if !embedded.is_empty() {
         for (rel, mh) in manifest.iter() {
-            if embedded.contains(rel.as_str()) || is_user_owned(rel) {
+            if embedded.contains(rel.as_str()) || is_user_owned(rel) || is_seed_once(rel) {
                 continue;
             }
             match std::fs::read_to_string(dir.join(rel)) {
@@ -577,6 +614,36 @@ pub fn remote_is_newer(remote: &str, disk: &str) -> bool {
         (Some(r), Some(d)) => r > d,
         _ => false, // 파싱 실패 = 신버전 아님 = 반영 거부(fail-CLOSED)
     }
+}
+
+/// 부트 스윕 조기 반환 게이트 — 디스크 팩이 `binary_version` 이상으로 커밋됐고(.pack-version)
+/// 매니페스트가 실재하면 true(스윕 불요). 사용처 = **cysd 부트**(cysd/main.rs 온보딩②) 단독.
+/// (v3에서 GUI 온보딩도 이 술어를 썼으나, cysd가 GUI보다 먼저 돈 머신에서 게이트가 선점돼
+/// hook 미설치 회귀(0.12.52 cys-neo) → GUI는 자체 완료 마커(.gui-onboarded·main.rs)로 분리(v4).
+/// GUI 게이트로 재사용하지 마라 — 팩 최신 ≠ GUI 온보딩(hook·schtasks) 완료.)
+/// - 디스크>바이너리(무중단 pack-update 전진)도 true — 스윕해봐야 install의 다운그레이드
+///   차단에 막히므로 스킵이 동치·저렴하다(lame-duck 스큐의 매 부트 차단 로그 소음도 제거).
+/// - ★안전 방향이 remote_is_newer(fail-CLOSED=반영 거부)와 반대다: 마커 부재·파싱 실패·
+///   매니페스트 부재 = false = **스윕(치유) 실행**. 게이트는 "확실히 최신"일 때만 닫힌다.
+/// - 매니페스트는 존재 stat만 검사한다 — 깊은 파싱 검증은 doctor 소관(매 부트 파싱 = 비용 재유입).
+pub fn pack_current_in(dir: &Path, binary_version: &str) -> bool {
+    if !dir.join(INSTALL_MANIFEST).exists() {
+        return false;
+    }
+    let Ok(disk) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE)) else {
+        return false;
+    };
+    match (parse_semver(disk.trim()), parse_semver(binary_version)) {
+        (Some(d), Some(b)) => d >= b,
+        _ => false,
+    }
+}
+
+/// pack_current_in의 실경로 래퍼 — 호출부(GUI setup·cysd main)가 pack_dir 해석에 재결합하지 않게 한다.
+/// ★게이트는 반드시 **부트 호출부**에 두고 install() 내부에 넣지 마라 — 내부에 넣으면 수동
+/// `cys init-pack`·pack-update·pack-downgrade(치유의 정식 경로)까지 게이트되어 치유가 불구가 된다.
+pub fn pack_current_for(binary_version: &str) -> bool {
+    pack_current_in(&pack_dir(), binary_version)
 }
 
 /// 원자적 파일 쓰기(§7-⑤): 같은 디렉터리 temp 파일에 쓰고 fsync → rename으로 원자 교체 →
@@ -646,7 +713,10 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
 /// prune·매니페스트·다운그레이드 차단·.pack-version 기록·격리 config·exec bit를 수행한다.
 /// embed PACK_ALL iter(기존 경로)와 staged-tree iter(무중단 채널)가 같은 로직을 공유한다(중복 0·회귀 0).
 /// 다운그레이드 가드 비교 기준은 `target_version`(env! 직접 참조 제거 — staged 입력은 자기 버전을 넘김).
-/// force=false: 사용자 수정 파일 불가침 + 비수정 파일은 입력 신버전으로 자동 갱신. 반환: (written, kept).
+/// force=false: user-owned(디렉티브·soul·CLAUDE·schedule)·seed-once(상태·기억) 불가침, **수정된
+/// system 파일은 임베드로 치유**(사용자본 `<rel>.user` 보존), 비수정 파일은 입력 신버전으로 자동 갱신.
+/// ("사용자 수정 파일 불가침" 구 문구는 user-owned 등급에만 참인데 전체로 읽혀 배포 현장의 오판을
+/// 낳았다 — 2026-07-12 치유 원복 사고 시정.) 반환: (written, kept).
 /// `transactional`: false면 embed/cysd/init-pack 경로 — 종전대로 마지막에 `.pack-version`을
 /// best-effort 기록하고 `.install-manifest.json` 영속도 best-effort(외부 동작 불변). true면
 /// 무중단 pack-update 트랜잭션(apply_pack_transactional) 경로 — ⓐ`.pack-version`을 여기서
@@ -821,8 +891,8 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 .collect();
             let mut pruned = 0;
             for rel in stale {
-                if is_user_owned(&rel) {
-                    continue; // ★B2: user 소유(디렉티브·헌법·CLAUDE)는 영구 보존 — prune 대상 제외
+                if is_user_owned(&rel) || is_seed_once(&rel) {
+                    continue; // ★B2: user 소유·seed-once 상태는 영구 보존 — prune 대상 제외
                 }
                 let path = dir.join(&rel);
                 match std::fs::read_to_string(&path) {
@@ -1364,6 +1434,39 @@ mod tests {
         assert_eq!(dir_file("masterful"), None);
     }
 
+    /// ★부트 스윕 게이트 회귀 핀 — 게이트는 "확실히 최신"일 때만 닫힌다(치유 방향 fail-open).
+    /// 안전 방향이 remote_is_newer(fail-CLOSED)와 반대임을 박제한다: 마커 부재·파싱 실패·
+    /// 매니페스트 부재는 전부 false(=스윕 실행)여야 한다.
+    #[test]
+    fn pack_current_gate_only_closes_when_provably_current() {
+        let td = std::env::temp_dir().join(format!("cys-pack-current-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+
+        // ① 완전 부재(신선 머신) → 스윕
+        assert!(!pack_current_in(&td, "0.12.51"), "마커·매니페스트 부재 = 스윕");
+        // ② 마커만 있고 매니페스트 부재(부분 손상) → 스윕
+        std::fs::write(td.join(PACK_VERSION_FILE), "0.12.51").unwrap();
+        assert!(!pack_current_in(&td, "0.12.51"), "매니페스트 부재 = 스윕");
+        // ③ 동일 버전 + 매니페스트 실재 → 게이트 닫힘(평시 부트)
+        std::fs::write(td.join(INSTALL_MANIFEST), "{}").unwrap();
+        assert!(pack_current_in(&td, "0.12.51"), "동일 버전 = 스킵");
+        // ④ 개행·공백 trim(python 도구 CRLF 재직렬화 대비 — 7-12 원복 사고 계열)
+        std::fs::write(td.join(PACK_VERSION_FILE), "0.12.51\r\n").unwrap();
+        assert!(pack_current_in(&td, "0.12.51"), "CRLF trim 후 동일 버전 = 스킵");
+        // ⑤ 디스크 구버전(바이너리 업그레이드 직후) → 스윕
+        std::fs::write(td.join(PACK_VERSION_FILE), "0.12.50").unwrap();
+        assert!(!pack_current_in(&td, "0.12.51"), "디스크 구버전 = 스윕");
+        // ⑥ 디스크 전진(pack-update 스큐) → 스킵(스윕해봐야 다운그레이드 차단 = 동치·저렴)
+        std::fs::write(td.join(PACK_VERSION_FILE), "0.12.52").unwrap();
+        assert!(pack_current_in(&td, "0.12.51"), "디스크 전진 = 스킵");
+        // ⑦ 마커 손상(비semver) → 스윕(fail-open 치유)
+        std::fs::write(td.join(PACK_VERSION_FILE), "garbage").unwrap();
+        assert!(!pack_current_in(&td, "0.12.51"), "마커 손상 = 스윕");
+
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
     #[test]
     fn session_start_hook_command_is_os_aware_shared() {
         // RC-2 회귀 핀: 격리 config dir·init-pack 두 경로가 공유하는 공용 함수.
@@ -1892,6 +1995,56 @@ mod tests {
                   "acl.json", "CLAUDE.md.template", "skills/x/SKILL.md",
                   "directives/CEO_TEMPLATE.md", "sub/schedule.json"] {
             assert!(!is_user_owned(s), "system 여야: {s}");
+        }
+    }
+
+    #[test]
+    fn is_seed_once_classification_and_behavior() {
+        // ★B2-2 분류: 런타임 상태(기억·복원 진실)만 seed-once — round/ 정적 계약은 system 유지.
+        for st in ["memory/MEMORY.md", "memory/feedback_autonomous-pilot-mandate.md",
+                   "round/SESSION_STATE.md", "round/RECOVERY.md"] {
+            assert!(is_seed_once(st), "seed-once 여야: {st}");
+        }
+        for s in ["round/TOOL_RESULT_VOCAB.md", "round/capability_catalog.json",
+                  "round/video-archetypes/cinematic/workflow.json", "bin/javis_memory.py"] {
+            assert!(!is_seed_once(s), "system 여야: {s}");
+        }
+        // ★행동 박제(치유 원복 사고 회귀 핀): 존재하는 seed-once 상태는
+        //   ① 수정돼 있어도 치유(Write) 금지, ② force 여도 불가침, ③ 읽기 실패(disk=None)여도 불가침.
+        let embed = "SKELETON";
+        let keep = FileAction::Keep { adopt_hash: false, new_pending: false };
+        assert_eq!(decide_file_action("memory/MEMORY.md", embed, true, Some("LIVE-STATE"),
+                       Some(content_hash(embed).as_str()), false), keep, "① 수정본 원복 금지");
+        // ①-w(Windows 최다 발생 실측 2026-07-12): 팩 python 도구가 상태 파일을 텍스트 모드
+        // (open("w")·newline 미지정)로 쓰면 Windows 에서 LF→CRLF 자동 변환 — 논리 내용이 같아도
+        // 바이트가 달라져 구버전에서는 매 스윕 '수정됨'→치유(원복)였다. seed-once 는 내용·해시
+        // 비교 **이전**의 조기 반환이라 개행 변형에도 불가침이다.
+        assert_eq!(decide_file_action("memory/MEMORY.md", "A\nB\n", true, Some("A\r\nB\r\n"),
+                       Some(content_hash("A\nB\n").as_str()), false), keep, "①-w CRLF 재직렬화 원복 금지");
+        assert_eq!(decide_file_action("round/SESSION_STATE.md", embed, true, Some("LIVE-STATE"),
+                       None, true), keep, "② force 여도 불가침");
+        assert_eq!(decide_file_action("round/RECOVERY.md", embed, true, None,
+                       Some(content_hash(embed).as_str()), false), keep, "③ 읽기 실패도 불가침");
+        // ④ 부재 시에는 시드 설치(Write) — seed-once 가 신규 설치까지 막으면 안 된다.
+        assert_eq!(decide_file_action("memory/MEMORY.md", embed, false, None, None, false),
+                   FileAction::Write { heal_user_copy: false }, "④ 부재 시 시드 설치");
+    }
+
+    #[test]
+    fn ownership_single_sot_priority_and_exclusivity() {
+        // 우선순위 핀(SeedOnce > User): 상태 경로 밑에 user 패턴 이름이 오는 가상 케이스는
+        // '상태 보존(불가침)'이 '병합 병치(.new)'보다 안전측 — ownership() 문서의 규정을 박제.
+        assert_eq!(ownership("memory/CLAUDE.md"), Ownership::SeedOnce);
+        assert_eq!(ownership("memory/X_DIRECTIVE.md"), Ownership::SeedOnce);
+        // 등급 대표 핀.
+        assert_eq!(ownership("soul.md"), Ownership::User);
+        assert_eq!(ownership("round/SESSION_STATE.md"), Ownership::SeedOnce);
+        assert_eq!(ownership("bin/javis_phoenix.py"), Ownership::System);
+        // 술어 래퍼 배타성: 단일 SOT 의 배타 등급이므로 어떤 rel 에서도 동시 참 불가.
+        for rel in ["memory/CLAUDE.md", "memory/MEMORY.md", "soul.md", "CLAUDE.md",
+                    "round/SESSION_STATE.md", "round/capability_catalog.json",
+                    "schedule.json", "bin/javis_phoenix.py"] {
+            assert!(!(is_user_owned(rel) && is_seed_once(rel)), "이중 등급: {rel}");
         }
     }
 

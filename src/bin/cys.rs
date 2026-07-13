@@ -1065,13 +1065,31 @@ fn connect_raw() -> Result<std::os::unix::net::UnixStream, String> {
         .map_err(|e| format!("cannot connect to cysd at {}: {e}", path.display()))
 }
 
+/// ERROR_PIPE_BUSY(231) 한정 bounded 재시도로 named pipe 를 연다. 그 외 오류(파이프 부재
+/// ERROR_FILE_NOT_FOUND = 데몬 다운 등)는 즉시 반환 — autostart 판단은 호출부 몫.
+/// 231을 데몬 다운으로 오판하면 connect()의 sibling cysd autostart 까지 헛발동한다
+/// (2026-07-10 Windows 실사고). 정책 상수는 GUI(cys-app)와 공용 단일 진실인 lib(cys::PIPE_BUSY_*)
+/// — 근거·계약은 그 정의부 주석 참조. 비-Windows 테스트가 정책 불변을 박제한다.
+#[cfg(windows)]
+fn open_pipe_busy_retry(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let deadline = std::time::Instant::now() + cys::PIPE_BUSY_RETRY_DEADLINE;
+    loop {
+        match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+            Err(e)
+                if e.raw_os_error() == Some(cys::PIPE_BUSY_ERROR)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(cys::PIPE_BUSY_RETRY_INTERVAL);
+            }
+            other => return other,
+        }
+    }
+}
+
 #[cfg(windows)]
 fn connect_raw() -> Result<std::fs::File, String> {
     let path = socket_path();
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
+    open_pipe_busy_retry(&path)
         .map_err(|e| format!("cannot connect to cysd pipe {}: {e}", path.display()))
 }
 
@@ -3747,7 +3765,21 @@ fn run_boot(cwd: Option<String>) -> i32 {
             ok
         };
         if !found {
-            println!("· {agent}: CLI '{bin}' 미설치 — 건너뜀");
+            // 부트스트랩 무력화 사태(2026-07-09) UX 후속: worker·cso가 claude 미설치(또는 PATH 미발견)로
+            // 조용히 skip되면 사용자는 "pane 0개"의 원인을 모른다 — 설치 힌트를 병기해 자가 진단 가능하게.
+            let hint = match *agent {
+                "claude" => {
+                    if cfg!(windows) {
+                        " (설치: PowerShell에서 `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작)"
+                    } else {
+                        " (설치: `curl -fsSL https://claude.ai/install.sh | bash` 후 새 탭)"
+                    }
+                }
+                "codex" => " (설치: `npm i -g @openai/codex` — 선택 리뷰어)",
+                "gemini" => " (Antigravity CLI `agy` — 선택 리뷰어)",
+                _ => " (선택 노드 — 미설치면 건너뜀이 정상)",
+            };
+            println!("· {agent}: CLI '{bin}' 미설치 — 건너뜀{hint}");
             continue;
         }
         if live_roles.contains(*role) {
@@ -4858,10 +4890,8 @@ fn request_on(socket: &std::path::Path, method: &str, params: Value) -> Result<V
 }
 #[cfg(windows)]
 fn request_on(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
-    let stream = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(socket)
+    // busy-retry: 부서 fan-out 도 ERROR_PIPE_BUSY(231)를 다운으로 오판하지 않는다(connect_raw 대칭).
+    let stream = open_pipe_busy_retry(socket)
         .map_err(|e| format!("open {}: {e}", socket.display()))?;
     rpc_over(stream, method, params)
 }
@@ -4871,8 +4901,10 @@ fn request_on(socket: &std::path::Path, method: &str, params: Value) -> Result<V
 fn run_fleet(as_json: bool) -> i32 {
     // RC-7: HOME 미설정(Windows) 함정 회피 — dirs 기반 공용 해소.
     let home = cys::home_dir().to_string_lossy().into_owned();
-    let mut targets: Vec<(std::path::PathBuf, String)> =
-        vec![(socket_path(), "본부 · CEO".to_string())];
+    // v2 부서 한정 키(DESIGN-dept-qualified-keys-v2 §4a): 항목마다 dept(slug=레지스트리 키)·
+    // socket(경로 문자열) additive. 본부는 고정 slug "main"·socket=null(기본 소켓 사용).
+    let mut targets: Vec<(std::path::PathBuf, String, String, Value)> =
+        vec![(socket_path(), "본부 · CEO".to_string(), "main".to_string(), Value::Null)];
     let reg = std::env::var("CYS_DEPTS_JSON")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(&home).join(".cys/depts.json"));
@@ -4886,16 +4918,20 @@ fn run_fleet(as_json: bool) -> i32 {
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| cys::dept_socket_path(name));
                     let disp = meta["display_name"].as_str().unwrap_or(name).to_string();
-                    targets.push((sock, disp));
+                    // 방출 socket = 실제 도달 소켓과 동일 경로 문자열(브리지가 cys --socket 로 재사용).
+                    let sock_str = sock.to_string_lossy().into_owned();
+                    targets.push((sock, disp, name.clone(), Value::String(sock_str)));
                 }
             }
         }
     }
     let mut out: Vec<Value> = Vec::new();
-    for (sock, disp) in &targets {
+    for (sock, disp, dept, emit_sock) in &targets {
         match request_on(sock, "org.status", json!({})) {
-            Ok(r) => out.push(json!({"department": disp, "surfaces": r["surfaces"].clone()})),
-            Err(e) => out.push(json!({"department": disp, "error": e, "surfaces": []})),
+            Ok(r) => out.push(json!({"department": disp, "dept": dept, "socket": emit_sock,
+                                     "surfaces": r["surfaces"].clone()})),
+            Err(e) => out.push(json!({"department": disp, "dept": dept, "socket": emit_sock,
+                                      "error": e, "surfaces": []})),
         }
     }
     if as_json {
@@ -8006,6 +8042,31 @@ mod tests {
         // 비-transient는 재연결 금지(즉시 반환)
         assert!(!is_transient_event_error("invalid_params"));
         assert!(!is_transient_event_error("bad cursor in /tmp/cur"));
+    }
+
+    /// ★회귀 박제 (Windows named pipe busy-retry — ERROR_PIPE_BUSY 231 봉인):
+    /// 231은 데몬 생존·listening 인스턴스 순간 소진(정상 혼잡)이라 재시도 없는 1회 open 은
+    /// 멀티 노드 동시 RPC 에서 상시 실패하고("cannot connect to cysd pipe … os error 231" —
+    /// 2026-07-10 Windows 실사고), 다운 오판이 sibling cysd autostart 헛발동까지 부른다.
+    /// 간격이 0이면 busy spin, 마감 ≤ 간격이면 사실상 무재시도 — 정책 상수로 의도를 박제한다
+    /// (Windows arm 은 이 호스트에서 컴파일/실행 불가 — cysd PIPE_ACCEPT_ERROR_BACKOFF 와 같은 방식).
+    #[test]
+    fn pipe_busy_retry_policy_is_bounded_and_nonzero() {
+        assert_eq!(
+            cys::PIPE_BUSY_ERROR, 231,
+            "ERROR_PIPE_BUSY 는 Win32 상수 231 — 바뀌면 busy 분기가 영영 안 탄다"
+        );
+        assert!(
+            !cys::PIPE_BUSY_RETRY_INTERVAL.is_zero(),
+            "busy-retry 간격이 0이면 100% CPU busy spin: {:?}",
+            cys::PIPE_BUSY_RETRY_INTERVAL
+        );
+        assert!(
+            cys::PIPE_BUSY_RETRY_DEADLINE > cys::PIPE_BUSY_RETRY_INTERVAL,
+            "마감({:?}) ≤ 간격({:?})이면 사실상 재시도 없는 1회 open 으로 회귀한다",
+            cys::PIPE_BUSY_RETRY_DEADLINE,
+            cys::PIPE_BUSY_RETRY_INTERVAL
+        );
     }
 
     /// (3) 회귀 박제: cursor 파일은 write→read 라운드트립으로 seq를 정확히 보존하고,

@@ -8,12 +8,61 @@
 > Windows 인스톨러는 **NSIS**다(`src-tauri/tauri.windows.conf.json targets:["nsis"]`) — 아래 §2·부록의
 > 수동 MSI/WiX 경로는 **legacy(폐기·참고용)**이며 따르지 마라.
 
+## 0-A. 업데이트 발행 이원화 정책 (2026-07-12 오너 확정)
+
+> **두 레인으로 발행한다.**
+> ① **팩-온리 패치 (기본)** — Rust/GUI 코드가 안 바뀐 릴리스는 pack 3종
+> (pack-manifest.json / .minisig / pack.tar.gz)만 발행. 사용자는 인앱 Update 버튼으로
+> **무중단**(재시작 없음 · 세션/부서/직원 유지) 적용.
+> ② **바이너리 릴리스 (드묾)** — 본체(Rust/GUI) 변경 시에만. v0.12.51+부터 인앱 원클릭
+> 본체 설치는 제거되고 배지는 **안내 + 홈페이지(www.cysinsight.com) 다운로드 링크**만
+> 제공한다(본체 교체 = 홈페이지 풀 설치본). v0.12.50 이하 사용자에게는 이 전환 릴리스가
+> **마지막 인앱 바이너리 업데이트**로 배달된다.
+
+**레인 판정 게이트(결정론)**: `git diff <직전태그>..HEAD --stat -- src/ src-tauri/ ui/ build.rs Cargo.toml`
+출력이 비어 있으면(=`cysjavis-pack/`·docs만 변경) 팩-온리 대상. 한 줄이라도 있으면 바이너리 릴리스.
+
+> ⚠ **레거시 도달 예외(2026-07-12 오너 확정)**: 수정이 팩에만 있어도 **구버전(≤0.12.50) 사용자에게
+> 반드시 도달해야 하는 심각한 버그 수정이면 바이너리 릴리스로 발행**한다. 구버전의 유일한 수신
+> 통로는 인앱 바이너리 업데이트(latest.json)뿐이고, 팩-온리는 min_binary 하한이 구버전을 (의도적으로)
+> 차단하기 때문이다. 바이너리 릴리스의 latest.json·업데이터 자산 발행은 계속 유지한다 — 이것이
+> 구버전 사용자의 원클릭 업그레이드 통로다("본체=홈페이지"는 v0.12.51+ 화면 동작이지 채널 폐쇄가 아님).
+
+### 팩-온리 발행 절차 (현행 수동 — CI 자동화는 Phase2 별도 과제)
+
+pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs build_pack_manifest_value`)
+팩만 발행해도 **버전 범프 + cys 재빌드**가 필요하다(§0 전 위치 갱신 — version-check.sh 통과).
+
+1. 버전 범프(§0) → `cargo build --release --bin cys` (Tauri 빌드 불요 — cys 단독).
+2. pack 3종 생성 — release.yml `pack-artifacts` 잡과 동일 파라미터(스캔 게이트 2종 선행 포함):
+   `cys pack-manifest --key-id … --signed-at … --expires-at … --min-binary-version 0.12.48 > pack-manifest.json`
+   → 결정론 tar(`--mtime` 고정) → minisign 서명.
+3. **직전 릴리스의 latest.json + 바이너리 업데이트 자산을 그대로 동봉**해 새 릴리스를 만들고
+   `--latest`로 마킹한다(바이너리 버전은 그대로 → 바이너리 배지 안 뜸).
+4. 검증: 앱 배지 = `↻`(무중단 팩)만 표시, `!`(바이너리) 미표시. 구버전(≤0.12.47) 기기는
+   "바이너리 업데이트 필요" 안내가 뜨는 것이 정상(하한 게이트 동작).
+
+**불변 규칙 (실사고 이력 근거 — 위반 금지)**:
+- `--min-binary-version` **0.12.48 이상 필수**. seed-once 상태 보호(memory/·SESSION_STATE 불가침)는
+  0.12.48+ **바이너리 쪽 코드**다 — 공란이면 ≤0.12.47 사용자의 pack-update가 사용자 상태를 vendor
+  골격으로 클로버한다(2026-07 팩 치유 원복 실사고 계열). 새 팩이 더 새로운 바이너리 기능에 의존하면
+  그 버전으로 상향한다. (release.yml `PACK_MIN_BINARY` env가 CI 기본값.)
+- **직전 latest.json 동봉 필수**. 누락 시 `releases/latest/download/latest.json`이 404가 되어 전체
+  사용자의 바이너리 확인 채널이 파손된다.
+- 팩-온리 적용 후 "디스크 팩 > 바이너리 임베드 팩" 상태가 일상화된다 — 이때 부트 스윕은
+  pack_current_for 게이트(디스크 ≥ 바이너리 = 스킵)로 아예 실행되지 않는 것이 **정상 동작**이다
+  (2026-07-12 도입 — 종전의 "스윕 실행 → 다운그레이드 가드 no-op" 소음 제거). 수동 `cys init-pack`은
+  게이트를 타지 않고 여전히 다운그레이드 가드에 막힌다(동일 최종 상태·이중 방어).
+
 ## 0. 버전 위치 (범프 시 모두 갱신 — 실측 4곳)
 
 - `Cargo.toml` / `src-tauri/Cargo.toml` — `version`
 - `src-tauri/tauri.conf.json` — `version`
 - `ui/package.json` — `version`
 - ~~`dist-win/cys.wxs` / `dist-win/cys-x64.wxs`~~ (legacy MSI — NSIS 전환으로 폐기)
+
+> ⚠ **문서-게이트 드리프트(2026-07-12 기록)**: `scripts/version-check.sh`는 아직 wxs 2곳을 포함한
+> **6곳**을 강제한다. 스크립트가 정리되기 전까지는 wxs 2곳도 함께 범프해야 게이트를 통과한다.
 
 ## 1. macOS 빌드 (DMG + 앱 번들 + 업데이트 아티팩트)
 

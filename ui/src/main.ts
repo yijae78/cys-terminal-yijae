@@ -10,6 +10,9 @@ import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { orderPreservingEqualize, equalizeAdoptedTrees } from "./layout";
 import { deptPlaceholderLabel, ccNodeLabel } from "./deptlabel";
+import { ccEffectiveZoom } from "./ccscale";
+import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
+import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 
 declare global {
   interface Window {
@@ -68,6 +71,7 @@ interface PaneRuntime {
   socket?: string;
   el: HTMLElement;
   termHost: HTMLElement;
+  roleEl: HTMLElement; // 제목 앞 역할 신호 점(깜박임) — refreshPaneTitles가 role로 채색
   titleEl: HTMLElement;
   usageEl: HTMLElement;
   term: Terminal;
@@ -141,7 +145,7 @@ let ccHwTimer: number | null = null;
 let ccClockTimer: number | null = null;
 let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
-let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" | "feed" | "office" = "live";
+let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" | "feed" | "office" = "office";
 let ccEffWindow = "today";
 let ccSkillsWindow = "today";
 let ccSessionsWindow = "7d";
@@ -159,10 +163,7 @@ let ccGlanceFace: "live" | "tasks" =
 // 마지막 org_fleet 스냅샷 — 실시간 이벤트(task.changed/status.changed)가 셀 단위로 패치한다.
 let lastFleet: any = null;
 
-const CC_ROLE_COLOR: Record<string, string> = {
-  master: "#3b82f6", cso: "#8b5cf6", worker: "#00e676",
-  "reviewer-gemini": "#ffa726", "reviewer-codex": "#00d4ff",
-};
+const CC_ROLE_COLOR = ROLE_COLOR; // 역할색 단일 출처 = appearance.ts (pane 역할 점과 공유)
 const CC_STATE: Record<string, { cls: string; label: string }> = {
   working: { cls: "working", label: "작업중" }, idle: { cls: "idle", label: "대기" },
   error: { cls: "error", label: "오류" }, offline: { cls: "offline", label: "오프라인" },
@@ -227,6 +228,9 @@ function setCcOpen(open: boolean) {
   document.getElementById("cc-panel")!.hidden = !open;
   if (open) {
     applyCcDensity(ccDensity); // 저장된 밀도 모드 복원(class·버튼 라벨)
+    // 기본 탭(오피스) 정합: index.html 초기 hidden/active와 ccTab 상태를 열 때마다 동기화.
+    // glance 밀도는 applyCcDensity→applyGlanceFace가 이미 면(live/tasks)을 강제했으므로 건드리지 않는다.
+    if (ccDensity !== "glance") setCcTab(ccTab);
     refreshControlCenter();
     refreshHw();
     tickCc();
@@ -352,6 +356,8 @@ function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "lea
   document.getElementById("cc-view-tasks")!.hidden = view !== "tasks";
   document.getElementById("cc-view-feed")!.hidden = view !== "feed";
   document.getElementById("cc-view-office")!.hidden = view !== "office";
+  // 오피스 탭 전면 모드 — cc-body의 대시보드 폭 상한(780px)을 해제해 3D를 창 크기에 연동(cc-glance 패턴).
+  document.body.classList.toggle("cc-office", view === "office");
   document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
     b.classList.toggle("active", (b as HTMLElement).dataset.view === view),
   );
@@ -378,7 +384,9 @@ async function openOfficeView() {
   const hint = document.getElementById("cc-office-hint");
   if (!frame || !hint) return;
   try {
-    await fetch(OFFICE_URL + "world", { signal: AbortSignal.timeout(1500) });
+    // no-cors: 도달성 프로브만(응답은 opaque). tauri://localhost → http://127.0.0.1 은
+    // 교차출처라 CORS-fetch는 ACAO 없이 reject되어 브리지가 살아있어도 hint에 갇혔다(근본 수리).
+    await fetch(OFFICE_URL + "world", { mode: "no-cors", signal: AbortSignal.timeout(1500) });
     hint.hidden = true;
     if (!frame.src) frame.src = OFFICE_URL;
   } catch {
@@ -1235,14 +1243,38 @@ function applyZoom(delta: number | null) {
   }
 }
 
+// 터미널 폰트 선택(cys-font-face · 오너 요청 2026-07-12) — 선택 폰트를 기본 스택 앞에 합성
+// (composeFontFamily · CJK 폴백 보존), null=기본. 폰트 메트릭 변화 → 셀 재계산(applyZoom과 동일 패턴).
+let fontFace: string | null = localStorage.getItem("cys-font-face");
+function applyFontFace(face: string | null) {
+  fontFace = face && face.trim() ? face : null;
+  if (fontFace === null) localStorage.removeItem("cys-font-face");
+  else localStorage.setItem("cys-font-face", fontFace);
+  for (const rt of panes.values()) {
+    rt.term.options.fontFamily = composeFontFamily(fontFace);
+    fitPane(rt);
+  }
+}
+
 // Control Center 본문 전용 zoom — 터미널 fontSize와 분리(배율 단위).
 // WebKit `zoom`을 #cc-body에만 적용(host #cc-panel은 fixed라 zoom 시 위치/스크롤 회귀 → 본문만 확대,
 // sticky 헤더·탭은 1.0x 유지). 사이드바(ft/feed)는 터미널 작업공간 폭이라 zoom 비대상(터미널 fit 회귀 방지).
 let panelZoom = Math.min(2, Math.max(0.6, Number(localStorage.getItem("cys-panel-zoom")) || 1)); // NaN·범위밖 방어
+// CC 자동 배율 — 창 크기에 CC 본문을 비례 연동(오너 요청 2026-07-12: 모든 버튼·섹션이 창과 함께 커지고 작아지게).
+// 배율 산식·클램프·합성 상한은 ccscale.ts(순수 로직·단위테스트 대상). 수동 Cmd +/-는 곱으로 합성.
+// 오피스 탭은 CSS에서 zoom:1 고정 — 3D는 fit 카메라가 이미 창에 연동되므로 이중 스케일 금지(수동 zoom도 무효, 정책 확정 2026-07-12).
 function applyPanelZoomVar() {
-  document.documentElement.style.setProperty("--panel-zoom", String(panelZoom));
+  document.documentElement.style.setProperty(
+    "--panel-zoom",
+    ccEffectiveZoom(panelZoom, window.innerWidth, window.innerHeight).toFixed(3),
+  );
 }
 applyPanelZoomVar(); // 마운트 시 저장된 배율 복원
+let panelZoomResizeTimer: number | undefined;
+window.addEventListener("resize", () => {
+  clearTimeout(panelZoomResizeTimer);
+  panelZoomResizeTimer = setTimeout(applyPanelZoomVar, 80) as unknown as number;
+});
 function applyPanelZoom(delta: number | null) {
   panelZoom = delta === null ? 1 : Math.min(2, Math.max(0.6, +(panelZoom + delta * 0.1).toFixed(2)));
   localStorage.setItem("cys-panel-zoom", String(panelZoom));
@@ -1394,6 +1426,16 @@ const isAutoTitle = (t: string | null | undefined) => !t || /^surface \d+$/.test
 const paneTitle = (title: string | null | undefined, liveCwd?: string | null) =>
   isAutoTitle(title) ? liveCwd || "…" : (title as string);
 
+// pane 헤더 역할 점 — CC 깜박이 점(cc-blink)을 역할색으로 제목 앞에 표시(무역할 셸·종료 pane은 숨김).
+function setRoleDot(el: HTMLElement, role: string | null) {
+  const color = roleDotColor(role);
+  el.style.display = color ? "" : "none";
+  if (color) {
+    el.style.background = color;
+    el.title = `역할: ${role}`;
+  }
+}
+
 // 주기적으로 데몬에 물어 자동 제목 pane의 현재 디렉토리(cd 추적)를 갱신.
 // + 외부(CLI launch-agent·cys boot)에서 생성된 역할 노드 surface를 pane으로 자동 입양 —
 //   이게 없으면 노드가 데몬 안에서 헤드리스로만 돌고 화면에 보이지 않는다.
@@ -1422,6 +1464,7 @@ async function refreshPaneTitles() {
         const rt = panes.get(paneKey(s.surface_id, sk));
         if (!rt) continue;
         renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
+        setRoleDot(rt.roleEl, s.exited ? null : s.role); // 역할 점도 동일 주기 갱신
         if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
         rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
       }
@@ -1435,7 +1478,7 @@ async function refreshPaneTitles() {
         // !w.pending — 런칭 중 placeholder(socket 미정)에는 입양 금지(타 데몬 surface 오입양 차단).
         const ws = workspaces.find((w) => !w.pending && (w.socket ?? undefined) === (sk ?? undefined));
         if (!ws || collectSids(ws.tree).includes(s.surface_id)) continue;
-        await makePane(s.surface_id, s.title, sk);
+        setRoleDot((await makePane(s.surface_id, s.title, sk)).roleEl, s.role); // 입양 즉시 역할 점 채색(다음 틱 대기 없이)
         ws.tree = ws.tree
           ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
           : { type: "pane", sid: s.surface_id };
@@ -1480,6 +1523,11 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     if ((e.target as HTMLElement).classList?.contains("pane-close")) return;
     startPaneDrag(e, sid);
   });
+  // 역할 신호 점(오너 요청 2026-07-12): Control Center의 깜박이 점을 제목 앞에 — 역할색 구별.
+  // 색·표시 여부는 refreshPaneTitles(3초 주기)의 setRoleDot이 채운다(생성 시점엔 role 미상 → 숨김).
+  const roleEl = document.createElement("span");
+  roleEl.className = "pane-role-dot";
+  roleEl.style.display = "none";
   const titleEl = document.createElement("span");
   titleEl.className = "pane-title-text";
   titleEl.textContent = paneTitle(title);
@@ -1513,7 +1561,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     if (focusedSid === sid) focusedSid = collectSids(ws.tree)[0] ?? null;
     render();
   });
-  header.append(titleEl, usageEl, closeBtn);
+  header.append(roleEl, titleEl, usageEl, closeBtn);
   header.addEventListener("contextmenu", (e) => {
     e.preventDefault();
     showCtxMenu(e.clientX, e.clientY, [
@@ -1554,9 +1602,8 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     // 80폭에서 wrap돼 첫 줄(0,0)에 고립 표시된다. fit.fit()은 첫 프롬프트 뒤라 소급 정정 안 됨.
     cols: 120,
     rows: 35,
-    // ★Windows: Latin 등폭폰트(Cascadia Mono/Consolas)를 CJK 폰트보다 앞에 둔다. 아니면 Menlo/SF Mono
-    //   부재 시 xterm가 셀 폭을 CJK 전각폰트(Noto Sans KR)로 측정해 Latin 글자가 넓게 벌어진다(자간 이상).
-    fontFamily: "Menlo, 'SF Mono', 'Cascadia Mono', Consolas, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', monospace",
+    // 폰트: 기본 스택(Latin 등폭을 CJK보다 앞에 — 셀 폭 측정 왜곡 방지)·선택 폰트 합성 = appearance.ts.
+    fontFamily: composeFontFamily(fontFace),
     fontSize,
     // 배경 테마: 하드코딩 리터럴 대신 현재 색 상태 참조 — 새 pane도 커스텀 색으로 생성된다.
     theme: { background: currentBg(), foreground: readableForeground(currentBg()) },
@@ -1600,6 +1647,20 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     // 브라우저 네이티브 paste 이벤트가 발화되고 아래 paste 리스너가 클립보드를 PTY로 보낸다.
     // (WebView2에서 xterm 기본 붙여넣기가 안 먹던 문제 — permission 불요의 clipboardData 경로.)
     if ((e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V")) return false;
+    // ★Shift+Enter = 줄바꿈(오너 요청 2026-07-12): Option/Alt+Enter가 보내는 것과 동일한
+    // 바이트(ESC+CR)를 PTY로 전송 — claude 등 CLI가 meta-Enter로 해석해 프롬프트에 개행 삽입.
+    // mac·Windows 공통(플랫폼 분기 불요). keydown에서만 전송하고 keypress/keyup은 흡수해 이중 전송 방지.
+    if (e.key === "Enter" && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      if (e.type === "keydown") {
+        // IME 잔여 pending(WKWebView 자모 버퍼)을 개행보다 먼저 확정 — 리듀서 우회 직송이면
+        // ta keydown flush 리스너가 이 핸들러 '뒤'에 돌아 자모가 개행 뒤로 밀린다(순서 역전).
+        // onData 경로의 flush("onData") 선행과 동일한 순서 보장. 뒤따르는 ta keydown 리스너의
+        // 같은 keydown 재디스패치는 pending이 비어 no-op(디버그 계측만 중복).
+        applyIme({ kind: "keydown", keyCode: e.keyCode, key: e.key });
+        sendRaw("\x1b\r");
+      }
+      return false;
+    }
     return true;
   });
 
@@ -1771,7 +1832,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   });
   observer.observe(termHost);
 
-  const rt: PaneRuntime = { sid, socket, el, termHost, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom };
+  const rt: PaneRuntime = { sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom };
   panes.set(paneKey(sid, socket), rt);
   return rt;
 }
@@ -2649,15 +2710,32 @@ function openThemePopover(anchor: HTMLElement) {
   picker.addEventListener("input", () => applyBgColor(picker.value));
   row.appendChild(picker);
 
+  // 폰트 선택(오너 요청 2026-07-12) — 선택지=appearance.ts FONT_CHOICES, 변경 즉시 전 pane 적용.
+  const fontRow = document.createElement("label");
+  fontRow.className = "theme-pop-row";
+  fontRow.textContent = "폰트";
+  const fontSel = document.createElement("select");
+  for (const c of FONT_CHOICES) {
+    const o = document.createElement("option");
+    o.value = c.face ?? "";
+    o.textContent = c.label;
+    fontSel.appendChild(o);
+  }
+  fontSel.value = FONT_CHOICES.some((c) => c.face === fontFace) ? (fontFace ?? "") : "";
+  fontSel.addEventListener("change", () => applyFontFace(fontSel.value || null));
+  fontRow.appendChild(fontSel);
+
   const reset = document.createElement("button");
   reset.className = "theme-pop-reset";
   reset.textContent = "기본값 복원";
   reset.addEventListener("click", () => {
     applyBgColor(null);
     picker.value = DEFAULT_BG;
+    applyFontFace(null);
+    fontSel.value = "";
   });
 
-  pop.append(row, reset);
+  pop.append(row, fontRow, reset);
 
   // 앵커(테마 버튼) 하단에 배치 후 화면 밖으로 나가면 안쪽으로 보정.
   const r = anchor.getBoundingClientRect();
@@ -2681,12 +2759,16 @@ async function addWorkspace(): Promise<Workspace> {
   return ws;
 }
 
-// 부서 socket 경로(~/.local/state/cys-dept-<name>/cys.sock)에서 원래 부서명 역산.
+// 부서 socket 경로에서 원래 부서명 역산 — unix(~/.local/state/cys-dept-<name>/cys.sock)와
+// ★Windows named pipe(\\.\pipe\cys-dept-<name> — RC-4 규약·dept_socket_path 정합) 양쪽 지원(2026-07-10).
 // rename으로 ws.name이 바뀌어도 socket은 불변이므로, 재-launch가 '다른 소켓 새 데몬'을 만들어
-// 원래 데몬을 고아화하는 것을 막는다(시나리오4).
+// 원래 데몬을 고아화하는 것을 막는다(시나리오4). Windows 분기 이전엔 null→ws.name 폴백으로 이 가드가
+// Windows에서 무동작(rename 후 재-launch가 고아 유발)이었다 — 분기 추가로 가드가 비로소 작동한다.
 function deptNameFromSocket(sock: string | undefined): string | null {
   const m = /\/cys-dept-(.+?)\/cys\.sock$/.exec(sock ?? "");
-  return m ? m[1] : null;
+  if (m) return m[1];
+  const w = /^\\\\\.\\pipe\\cys-dept-(.+)$/.exec(sock ?? "");
+  return w ? w[1] : null;
 }
 
 // 멀티마스터 F4: 새 '부서 workspace' 런칭 = 새 부서 데몬 spawn(cys-dept launch 단일 진입점).
@@ -3071,13 +3153,13 @@ async function checkForUpdate(silent: boolean) {
 
   const badge = document.getElementById("update-badge")!;
   if (updateAvailable) {
-    // 바이너리 우선 — 재시작이 팩도 함께 반영(DESIGN '둘 다 → 바이너리 우선').
+    // (T5) 본체(바이너리) 업데이트는 홈페이지 다운로드 전용 — 인앱 재시작 설치 폐지(오너 정책).
     badge.hidden = false;
     badge.textContent = "!";
     badge.classList.remove("ok");
-    badge.title = `새 버전 ${updateAvailable.version} (재시작 필요)`;
-    if (!silent) promptInstall();
-    else toast("feed", "🔄 업데이트 있음", `새 버전 ${updateAvailable.version} — 상단 Update(재시작)`);
+    badge.title = `새 본체 버전 ${updateAvailable.version} (홈페이지에서 다운로드)`;
+    if (!silent) promptBinaryHomepage();
+    else toast("feed", "🔄 새 본체 버전", `새 본체 ${updateAvailable.version} — 홈페이지(www.cysinsight.com)에서 다운로드`);
   } else if (packUpdateAvailable && !packUpdateAvailable.binary_too_old) {
     // 팩만 변경 + 바이너리 호환 → 무중단 가능(세션·데몬 생존).
     badge.hidden = false;
@@ -3088,13 +3170,13 @@ async function checkForUpdate(silent: boolean) {
     else
       toast("feed", "↻ 무중단 팩 업데이트", `팩 ${packUpdateAvailable.pack_version} — 상단 Update(재시작 없음)`);
   } else if (packUpdateAvailable && packUpdateAvailable.binary_too_old) {
-    // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 바이너리 업데이트 필요.
+    // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 본체 업데이트(홈페이지) 필요(T5 정책).
     badge.hidden = false;
     badge.textContent = "!";
     badge.classList.remove("ok");
-    badge.title = `팩 ${packUpdateAvailable.pack_version}: 바이너리 업데이트 필요`;
-    const msg = `새 팩 ${packUpdateAvailable.pack_version}은 더 새로운 바이너리를 요구합니다 — 바이너리 업데이트(재시작) 후 적용됩니다.`;
-    if (!silent) toast("health", "바이너리 업데이트 필요", msg);
+    badge.title = `팩 ${packUpdateAvailable.pack_version}: 본체 업데이트 필요 (홈페이지에서 다운로드)`;
+    const msg = `새 팩 ${packUpdateAvailable.pack_version}은 더 새로운 본체를 요구합니다 — 홈페이지(www.cysinsight.com)에서 본체 업데이트 후 적용됩니다.`;
+    if (!silent) toast("health", "본체 업데이트 필요", msg);
     else toast("feed", "⚠ 업데이트 있음", msg);
   } else {
     // ★fail-safe: 양쪽 체크가 모두 성공적으로 '없음'을 확인했을 때만 상태를 갱신한다. 장애(체크 실패)
@@ -3112,39 +3194,25 @@ async function checkForUpdate(silent: boolean) {
   }
 }
 
-/// 설치 확인 + 데몬 핸드오프 정책(세션 없으면 자동·있으면 확인).
-async function promptInstall() {
+/// (T5) 본체(바이너리) 업데이트 안내 — 인앱 install_update 폐지, 홈페이지 다운로드 전용(오너 정책).
+/// 새 본체 버전을 알리고 확인 시 다운로드 페이지를 시스템 브라우저로 연다(open_url = Rust HARD
+/// 화이트리스트 게이트). 데몬·세션은 건드리지 않는다(재시작 없음 — 팩 경로 promptPackInstall과 별개).
+async function promptBinaryHomepage() {
   if (!updateAvailable) {
     await checkForUpdate(false);
     return;
   }
   const v = updateAvailable.version;
-  const sessions = (await invoke("live_session_count").catch(() => 0)) as number;
-  let force = false;
-  if (sessions > 0) {
-    // WKWebView는 confirm 지원이 불안정 → 커스텀 모달
-    const ok = await confirmModal(
-      `새 버전 ${v} 설치`,
-      `현재 작업 세션 ${sessions}개가 데몬에 물려 있습니다. 업데이트는 데몬을 재시작하므로 ` +
-        `이 세션들이 종료됩니다.\n\n그래도 지금 설치하시겠습니까? (아니오: 세션을 정리한 뒤 다시 시도)`,
-    );
-    if (!ok) return;
-    force = true;
-  }
-  // 지속형 토스트: 다운로드가 8초를 넘겨도 유지되며 update-progress 리스너가 진행률로 갱신한다.
-  stickyToast("upd-bin", "feed", "⬇ 업데이트 설치", `버전 ${v} 다운로드 준비 중… 완료 후 자동 재시작됩니다.`);
+  const ok = await confirmModal(
+    `새 본체 버전 ${v}`,
+    `새 본체(앱) 버전 ${v}이 있습니다. 본체 업데이트는 홈페이지에서 내려받아 설치합니다.\n\n` +
+      `확인을 누르면 다운로드 페이지(www.cysinsight.com)를 엽니다.`,
+  );
+  if (!ok) return;
   try {
-    await invoke("install_update", { force });
-    // 성공 시 app.restart()로 프로세스가 교체되므로 이 줄에 도달하지 않는다(sticky는 그대로 유지된 채 재시작).
+    await invoke("open_url", { url: "https://www.cysinsight.com" });
   } catch (e) {
-    dismissToast("upd-bin"); // 재시작이 일어나지 않았으므로 진행 토스트를 내린다.
-    const msg = String(e);
-    if (msg.includes("live_sessions:")) {
-      // 가드에 막힘(force 미적용 경로) — 다시 확인 흐름으로
-      await promptInstall();
-    } else {
-      toast("health", "업데이트 설치 실패", msg);
-    }
+    toast("health", "홈페이지 열기 실패", String(e));
   }
 }
 
@@ -3247,7 +3315,11 @@ function showSkewBadge(
 
 // 배지 클릭(수동) — 확인 1회 후 force=true로 순차 교대(메인→부서). app.restart 없는 경로라 토스트까지 책임.
 async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: SkewedDept[]) {
-  if (rotatingDaemon) return;
+  if (rotatingDaemon) {
+    // 리뷰 2R MIN-C: 자동 교대·주기 재검 진행 중 클릭이 조용히 무시돼 "안 눌림"으로 보이던 무피드백 해소.
+    toast("feed", "교대 진행 중", "데몬 교대·재검이 진행 중입니다 — 잠시 후 다시 시도하세요.");
+    return;
+  }
   const nodes = (heldMain ? 1 : 0) + heldDepts.length;
   const ok = await confirmModal(
     `데몬 교대 (새 버전 v${appVer})`,
@@ -3259,10 +3331,17 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
   stickyToast("rotate-daemon", "feed", "↻ 데몬 교대", `새 버전 v${appVer}로 교대 중… 저장 후 세션을 복원합니다.`);
   try {
     if (heldMain) await invoke("rotate_daemon", { force: true });
-    for (const d of heldDepts) await invoke("rotate_dept_daemon", { name: d.name, force: true });
+    // 경미2: rotate_dept_daemon이 반환하는 restore_ok=false(교대 후 부서 노드 복원 실패)를 삼키지 않고 승격.
+    let deptRestoreFailed = false;
+    for (const d of heldDepts) {
+      const info = (await invoke("rotate_dept_daemon", { name: d.name, force: true })) as { restore_ok?: boolean };
+      if (info?.restore_ok === false) deptRestoreFailed = true;
+    }
     dismissToast("rotate-daemon");
     clearSkewBadge();
-    toast("watchdog", "✅ 데몬 교대 완료", `데몬이 v${appVer}로 교대됐습니다. 노드 복원이 진행됩니다.`);
+    if (deptRestoreFailed)
+      toast("health", "⚠ 교대 후 부서 복원 실패", `데몬은 v${appVer}로 교대됐으나 일부 부서 노드 복원이 실패했습니다 — 상태를 점검하세요.`);
+    else toast("watchdog", "✅ 데몬 교대 완료", `데몬이 v${appVer}로 교대됐습니다. 노드 복원이 진행됩니다.`);
   } catch (e) {
     dismissToast("rotate-daemon");
     toast("health", "데몬 교대 실패", String(e));
@@ -3341,9 +3420,9 @@ async function promptPackInstall() {
 }
 
 /// Update 버튼 디스패처 — 가용 업데이트 종류에 따라 경로를 고른다.
-/// 바이너리 우선(재시작이 팩 포함) → 무중단 팩 → 미확인/바이너리 필요 시 수동 재확인.
+/// 본체(바이너리)=홈페이지 다운로드 안내(T5·재시작 없음) → 무중단 팩 → 미확인 시 수동 재확인.
 async function onUpdateButton() {
-  if (updateAvailable) return promptInstall();
+  if (updateAvailable) return promptBinaryHomepage();
   if (packUpdateAvailable && !packUpdateAvailable.binary_too_old) return promptPackInstall();
   return checkForUpdate(false);
 }
@@ -3859,7 +3938,8 @@ async function start() {
   });
 
   // 바이너리 업데이트 진행률(install_update가 emit). chunk=이번 청크 바이트(누적 아님), total=전체(Option→null 가능).
-  // UI에서 누적 합산해 지속형 토스트를 갱신한다. 성공 시 app.restart로 프로세스가 교체되므로 dismiss는 실패 경로(promptInstall catch)만.
+  // ★v0.12.51+ 휴면: 본체 업데이트가 홈페이지 다운로드로 전환돼(T5) install_update가 UI에서 호출되지 않으므로
+  //   이 리스너는 발화하지 않는다 — 백엔드 재활성화 여지를 위해 유지(backend install_update 주석과 짝).
   let updDownloaded = 0;
   await listen("update-progress", (e) => {
     const p = (e.payload ?? {}) as { phase?: string; chunk?: number; total?: number };
@@ -3918,6 +3998,31 @@ async function start() {
     const p = (e.payload ?? {}) as { message?: string };
     dismissToast("upd-pack"); // 진행 토스트를 내리고 아래 경고 토스트로 교대.
     toast("health", "⚠ 팩 일부 미각성", p.message ?? "디스크 팩은 갱신됐으나 일부 노드 reinject 보류/실패(라이브 유지).");
+  });
+
+  // (T4) 업데이트 후 조직 복원 진행(restore-progress·spawn_org_restore emit) — '직원 복귀 중' 가시화.
+  await listen("restore-progress", (e) => {
+    const p = (e.payload ?? {}) as { phase?: string; hq_ok?: boolean; ok?: number; fail?: number; detail?: string };
+    if (p.phase === "start") {
+      stickyToast("restore", "feed", "👥 직원 복귀 중", "노드 세션 복원 중… (본부·부서)");
+    } else if (p.phase === "done") {
+      dismissToast("restore");
+      const ok = p.ok ?? 0;
+      const fail = p.fail ?? 0;
+      // 결함1: 부서가 있어도 본부(HQ) 복원 실패가 묻히지 않게 hq_ok===false를 health로 승격.
+      if (p.hq_ok === false) toast("health", "⚠ 본부 복원 실패 포함", `본부 노드 복원 실패 · 부서 성공 ${ok} · 실패 ${fail} — 상태를 점검하세요.`);
+      else if (fail > 0) toast("health", "⚠ 직원 복귀 일부 실패", `부서 복원 성공 ${ok} · 실패 ${fail} — 상태를 점검하세요.`);
+      else toast("watchdog", "✅ 직원 복귀 완료", `노드 세션 복원 완료 (부서 ${ok}).`);
+    } else if (p.phase === "error") {
+      dismissToast("restore");
+      toast("health", "복원 실패", p.detail ?? "노드 복원 실행에 실패했습니다.");
+    }
+  });
+
+  // (T4) init-pack 실패 등 backend update-error 가시화 — 이제껏 UI 리스너 부재로 침묵하던 갭 해소.
+  await listen("update-error", (e) => {
+    const msg = typeof e.payload === "string" ? e.payload : "업데이트 후 처리 중 오류가 발생했습니다.";
+    toast("health", "업데이트 경고", msg);
   });
 
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)
@@ -4225,6 +4330,59 @@ document.getElementById("btn-theme")!.addEventListener("click", (e) =>
 // 새 ws를 master로 선언 시 공유 데몬 claim 충돌은 데몬 레벨 claim_denied(cysd handlers.rs·kill 없음)가
 // 비파괴 방어한다(생태계 죽지 않음·거부만). guard-master-claim(Fix2') 부트 자동발동 배선은 별건(헌법 토큰).
 document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
+
+// ---------- 사이드바 폭 드래그 + 글자 배율 (오너 요청 2026-07-12) ----------
+// 폭·배율은 CSS 변수(--wsbar-w/--wsbar-font)가 진실원, localStorage 영속. 클램프 산식=wsbar.ts.
+// pane 재렌더는 이중 안전: 각 pane의 ResizeObserver(→fitPane)가 폭 변화에 자동 발화하고,
+// 드래그 종료 시 refitAllPanes()로 전 pane 강제 재적합+xterm 재렌더를 한 번 더 보장한다.
+let wsbarW = clampWsbarWidth(Number(localStorage.getItem("cys-wsbar-w")) || WSBAR_W_DEFAULT);
+let wsbarFont = clampWsbarFont(Number(localStorage.getItem("cys-wsbar-font")) || 1);
+function applyWsbarVars() {
+  document.documentElement.style.setProperty("--wsbar-w", `${wsbarW}px`);
+  document.documentElement.style.setProperty("--wsbar-font", String(wsbarFont));
+}
+applyWsbarVars(); // 마운트 시 저장값 복원
+
+function refitAllPanes() {
+  for (const rt of panes.values()) {
+    fitPane(rt); // 숨김/미배치 pane은 fitPane 내부 가드가 거른다
+    rt.term.refresh(0, rt.term.rows - 1); // PTY rows/cols 불변이어도 화면 재렌더 보장
+  }
+}
+
+const wsbarDrag = document.getElementById("wsbar-drag");
+wsbarDrag?.addEventListener("mousedown", (e0: MouseEvent) => {
+  e0.preventDefault();
+  const startX = e0.clientX, startW = wsbarW;
+  document.body.classList.add("wsbar-resizing");
+  const move = (e: MouseEvent) => {
+    wsbarW = clampWsbarWidth(startW + (e.clientX - startX));
+    applyWsbarVars(); // 드래그 중 실시간 반영 — pane ResizeObserver가 연속 refit(60ms 디바운스)
+  };
+  const up = () => {
+    window.removeEventListener("mousemove", move, true);
+    window.removeEventListener("mouseup", up, true);
+    document.body.classList.remove("wsbar-resizing");
+    localStorage.setItem("cys-wsbar-w", String(wsbarW));
+    refitAllPanes();
+  };
+  window.addEventListener("mousemove", move, true);
+  window.addEventListener("mouseup", up, true);
+});
+wsbarDrag?.addEventListener("dblclick", () => {
+  wsbarW = WSBAR_W_DEFAULT;
+  applyWsbarVars();
+  localStorage.setItem("cys-wsbar-w", String(wsbarW));
+  refitAllPanes();
+});
+
+function applyWsbarFontStep(dir: number) {
+  wsbarFont = clampWsbarFont(wsbarFont + dir * WSBAR_FONT_STEP);
+  applyWsbarVars();
+  localStorage.setItem("cys-wsbar-font", String(wsbarFont));
+}
+document.getElementById("btn-ws-font-minus")?.addEventListener("click", () => applyWsbarFontStep(-1));
+document.getElementById("btn-ws-font-plus")?.addEventListener("click", () => applyWsbarFontStep(+1));
 // 멀티마스터 F4 + ＋부서 자동화(패치5): 새 부서(독립 데몬) workspace 런칭. 부서 번호는 백엔드가 확정.
 const deptBtn = document.getElementById("btn-ws-dept") as HTMLButtonElement | null;
 // 부서 런칭 실행(공통) — placeholder 탭·in-flight 버튼 가드. catalogKey=undefined → 레거시 dept-N.

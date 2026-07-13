@@ -49,18 +49,31 @@ html, body {
 
 /* workspace sidebar — 좌측 별도 섹션·항목 가독성(제목 bold + 서브라인 dim) */
 #wsbar {
-  flex: 0 0 216px; min-width: 0;
+  flex: 0 0 var(--wsbar-w, 216px); min-width: 0; /* 폭 = 드래그 핸들(#wsbar-drag)로 조절·영속 */
   display: flex; flex-direction: column;
   background: var(--bar); border-right: 1px solid var(--hairline);
   -webkit-user-select: none; user-select: none;
   overflow: hidden;
 }
+#wsbar-drag {
+  flex: none; width: 5px; cursor: col-resize; margin-left: -2px;
+  background: transparent; z-index: 5;
+}
+#wsbar-drag:hover, body.wsbar-resizing #wsbar-drag { background: rgba(88,166,255,.35); }
+body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select: none; }
+#btn-ws-font-minus, #btn-ws-font-plus {
+  background: none; border: none; color: #8b949e; cursor: pointer; font-size: 11px; padding: 0 2px;
+}
+#btn-ws-font-minus:hover, #btn-ws-font-plus:hover { color: var(--text, #e2e8f0); }
 #wsbar-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 10px 12px 6px;
   font-size: 11px; font-weight: 700; letter-spacing: .04em;
   color: #6e7681; text-transform: uppercase;
 }
+/* 제목이 축소를 흡수(ellipsis) — 좁은 폭에서 헤더가 2단으로 랩되지 않게(폭 불변식: 헤더는 항상 1줄) */
+#wsbar-head > span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#wsbar-head button { flex: none; }
 #ws-tabs {
   flex: 1; display: flex; flex-direction: column; gap: 2px;
   overflow-y: auto; padding: 2px 8px 10px;
@@ -76,13 +89,14 @@ html, body {
 .ws-tab .ws-title-row {
   display: flex; align-items: center; gap: 6px; min-width: 0;
 }
+/* 사이드바 글자 배율(--wsbar-font·A−/A＋ 버튼·영속) — 고정 2배 하드코딩을 배율로 대체(오너 가독성 요청의 상위 호환 2026-07-12) */
 .ws-tab .ws-name {
   flex: 1; min-width: 0;
-  font-size: 13px; font-weight: 600;
+  font-size: calc(13px * var(--wsbar-font, 1)); font-weight: 600;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ws-tab .ws-sub {
-  font-size: 11px; color: #8b949e;
+  font-size: calc(11px * var(--wsbar-font, 1)); color: #8b949e;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ws-tab.active .ws-name { color: #fff; }
@@ -98,7 +112,7 @@ html, body {
 .ws-approve-badge { margin-left: 6px; color: var(--error); font-weight: 700; font-size: 11px; }
 #btn-ws-dept:disabled { opacity: .5; cursor: default; }
 .ws-tab .ws-close {
-  flex: none; opacity: 0; cursor: pointer; color: inherit; font-size: 12px;
+  flex: none; opacity: 0; cursor: pointer; color: inherit; font-size: calc(12px * var(--wsbar-font, 1));
 }
 .ws-tab:hover .ws-close { opacity: .55; }
 .ws-tab .ws-close:hover { opacity: 1; color: var(--error); }
@@ -106,7 +120,7 @@ html, body {
 /* 2-click 삭제 확인 armed 상태 — 위험색 유지(active 탭 hover의 #fff보다 우선), 2.5초 내 hover 이탈해도 노출 유지 */
 .ws-tab .ws-close.close-armed, .ws-tab.active .ws-close.close-armed:hover { opacity: 1; color: var(--error); }
 /* svg가 클릭 target이 되면 mousedown 가드(e.target 비교)가 깨진다 — 이벤트는 span이 받게 */
-.close-armed svg { width: 11px; height: 11px; fill: currentColor; vertical-align: -1.5px; pointer-events: none; }
+.close-armed svg { width: calc(11px * var(--wsbar-font, 1)); height: calc(11px * var(--wsbar-font, 1)); fill: currentColor; vertical-align: -1.5px; pointer-events: none; }
 #btn-ws-new {
   background: none; border: none; color: #8b949e; cursor: pointer; font-size: 14px;
   padding: 0 2px;
@@ -169,6 +183,11 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
   width: 40px; height: 24px; padding: 0; cursor: pointer;
   background: none; border: 1px solid var(--border); border-radius: 4px;
 }
+#theme-pop select {
+  max-width: 150px; padding: 3px 4px; cursor: pointer; font-size: 12px;
+  background: var(--bar); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+}
 #theme-pop .theme-pop-reset {
   padding: 5px 8px; cursor: pointer;
   background: var(--bar); color: var(--text);
@@ -213,6 +232,8 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
   white-space: nowrap;
 }
 .pane .pane-title-text { overflow: hidden; text-overflow: ellipsis; }
+/* 역할 신호 점(제목 앞): Control Center cc-dot의 깜박임(cc-blink) 재사용 — 역할색은 JS(setRoleDot)가 채운다 */
+.pane .pane-role-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; animation: cc-blink 1.4s infinite; }
 /* T5 사용량 관측 배지: CTX(컨텍스트%)·rate limit 윈도우 — 데몬 관측치(usage.rs) 표시 */
 .pane .pane-usage { display: flex; gap: 4px; color: #6e7681; font-variant-numeric: tabular-nums; }
 .pane .pane-usage .warn { color: #d29922; }
@@ -226,7 +247,9 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
   font-family: -apple-system, "Pretendard Variable", system-ui, sans-serif;
 }
 #cc-panel[hidden] { display: none; }
-/* Control Center 본문 zoom (Cmd +/-/0) — host #cc-panel(fixed)·사이드바 제외, #cc-body만 확대 */
+/* Control Center 본문 zoom — 합성값: 수동(Cmd +/-/0) × 창비율 자동 배율(산식=ccscale.ts).
+   host #cc-panel(fixed)·사이드바·헤더·탭 스트립 제외, #cc-body만 확대.
+   오피스 탭은 body.cc-office #cc-body zoom:1 고정(하단 짝 규칙) — 3D는 fit 카메라가 창 연동의 진실. */
 #cc-body { zoom: var(--panel-zoom, 1); }
 #cc-header {
   position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 12px;
@@ -635,6 +658,20 @@ body.cc-glance #cc-view-feed .feed-item button { font-size: 16px; padding: 10px 
   .ws-tab-spinner, .dept-spinner { animation: none; border-top-color: var(--accent); }
 }
 
-/* 메타버스 오피스 탭 (cc-view-office) — 브리지 iframe 전면 채움 */
-#cc-view-office { display: flex; flex-direction: column; height: 100%; }
+/* 메타버스 오피스 탭 (cc-view-office) — 3D를 앱 창 크기에 폭·높이 비례 연동.
+   창 높이를 아는 유일한 조상은 #cc-panel(fixed·inset 39px 0 0 0)이다 — 그 아래는 전부
+   auto 사슬이라 %/calc 매직넘버로는 연동 불가(실사고 2회). 오피스 탭 한정(body.cc-office)으로
+   panel을 flex column으로 전환해 잔여 높이를 header/tabs를 제외하고 iframe까지 flex로 전달한다.
+   min-height:0 = flex 기본 min-height:auto 수축 함정 차단. 타 탭은 기존 스크롤 문서 모델 불변. */
+body.cc-office #cc-panel { display: flex; flex-direction: column; }
+/* 짝 규칙(Directive): display 명시가 [hidden](display:none·specificity 열세)을 무력화 —
+   오피스 탭에서 CC 닫기 버튼이 안 듣던 회귀의 원인. display를 명시하면 반드시 이 짝을 단다. */
+body.cc-office #cc-panel[hidden] { display: none; }
+/* zoom:1 — 오피스 3D는 fit 카메라가 창에 이미 연동. 자동 배율(--panel-zoom×창비율)이 겹치면 이중 스케일. */
+body.cc-office #cc-body { flex: 1; min-height: 0; max-width: none; width: 100%; zoom: 1; }
+body.cc-office #cc-view-office { flex: 1; min-height: 0; }
+#cc-view-office { display: flex; flex-direction: column; }
+/* hidden 속성 복원 — author display:flex가 UA hidden(display:none)을 덮어 타 탭에서도
+   오피스가 상시 렌더되던 leak 봉인(CORS 수정으로 3D가 실로드되며 가시화된 잠복 버그). */
+#cc-view-office[hidden] { display: none; }
 #cc-view-office iframe { flex: 1; width: 100%; min-height: 480px; border: 0; background: #05080f; }
