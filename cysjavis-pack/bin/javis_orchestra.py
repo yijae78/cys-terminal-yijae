@@ -312,6 +312,75 @@ def extract_constraints():
     return bullets or None
 
 
+def harvest_rejected(handoffs_dir, slug=None, max_items=12, max_chars=1200):
+    """handoff 기각 결정 수확(T1/P0-1 attention-p0 · 순수 함수 — self-test 밀폐 검증).
+
+    양형식 파싱(실물 21건 포맷 드리프트 실측 2026-07-13): '## Rejected' H2 섹션과
+    '**Rejected**:' 인라인 둘 다 수용 — H2만 파싱하면 기록 절반이 무음 누락된다.
+    면역 자격은 master 기록 handoff만(A1 — 워커 자기 기각의 리뷰어 포획 차단).
+    상한(max_items·max_chars)은 워커/리뷰어 컨텍스트 60% 계약 보호. 커버리지 동반(무음 상한 금지).
+    반환: (kept, coverage) — 디렉토리 부재 시 ([], None) = 호출부 라인 생략(회귀 0).
+    """
+    try:
+        names = [n for n in os.listdir(handoffs_dir) if n.endswith(".md")]
+    except OSError:
+        return [], None
+    # 최근 우선(mtime 내림차순) + slug 접두 우선
+    names.sort(key=lambda n: -os.path.getmtime(os.path.join(handoffs_dir, n)))
+    if slug:
+        names = [n for n in names if n.startswith(slug)] + \
+                [n for n in names if not n.startswith(slug)]
+    items, hits = [], 0
+    for name in names:
+        try:
+            text = open(os.path.join(handoffs_dir, name),
+                        encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        # 기록자는 파일 '첫 줄' 헤더에서만 — 본문 괄호 오매칭이 거짓 면역(false immunity)을
+        # 만드는 위험 방향 차단(성찰 D2). 첫 줄이 규격 밖이면 '?' = 비면역(fail-safe).
+        _first = text.split("\n", 1)[0]
+        m = re.search(r"^#\s*\S+.*\(([^)]*)\)", _first)
+        recorder = (m.group(1).split("·")[-1].strip() if m else "?")
+        found = []
+        sec = re.search(r"(?m)^##\s*Rejected[^\n]*\n(.*?)(?=\n##\s|\Z)", text, re.S)
+        if sec:
+            body = " ".join(sec.group(1).split())
+            if body and body != "없음":
+                found.append(body)
+        for im in re.finditer(r"(?m)^\s*(?:[-*]\s*)?\*\*Rejected\*\*:?\s*(.+)$", text):
+            found.append(" ".join(im.group(1).split()))
+        if not found:
+            continue
+        hits += 1
+        for f in found:
+            items.append({"src": name[:-3], "recorder": recorder,
+                          "immune": "master" in recorder.lower(), "text": f})
+    total, kept = 0, []
+    for it in items:
+        if len(kept) >= max_items:
+            break
+        t = it["text"][:200]
+        if total + len(t) > max_chars:
+            break
+        total += len(t)
+        kept.append(dict(it, text=t))
+    coverage = {"files": len(names), "with_rejected": hits,
+                "kept": len(kept), "dropped": max(0, len(items) - len(kept))}
+    return kept, coverage
+
+
+def load_invariants(path, max_lines=20):
+    """_round/INVARIANTS.md 불변식 불릿 로드(T1/P0-3 · 순수 함수). 부재·공백 시 None
+    = 호출부 라인 생략(회귀 0). writer=master 단독(계약 헤더) — 여기선 읽기만."""
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    bullets = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("- ")]
+    return bullets[:max_lines] or None
+
+
 def cmd_review_prompt(args):
     bullets = extract_constraints()
     if not bullets:
@@ -343,6 +412,30 @@ def cmd_review_prompt(args):
     lines.append("")
     lines.append("엄격 제약 (REVIEWER_DIRECTIVE §2 — 위반 금지):")
     lines.extend("  " + b for b in bullets)
+    # T1(attention-p0 · 2026-07-13): 기각 재주입(P0-1) + 불변식 주입(P0-3).
+    # 소스 부재 시 아무것도 덧붙이지 않는다(기존 출력 바이트 동일 = 회귀 0 관례).
+    # 역할 차등(A2): reviewer2(감사)에는 면역이 아니라 감사 자료로 제공 — 감사 독립성 보존.
+    _root = os.environ.get("JAVIS_ROOT") or os.getcwd()
+    _role = getattr(args, "reviewer_role", None) or "reviewer1"
+    _rej, _cov = harvest_rejected(os.path.join(_root, "_round", "handoffs"),
+                                  slug=getattr(args, "slug", None))
+    if _rej:
+        lines.append("")
+        if _role == "reviewer2":
+            lines.append("과거 기각 이력 (면역 아님 — 감사 자료: 기각 자체의 정당성까지 감사하라):")
+        else:
+            lines.append("이미 기각된 지적 (master 확정 기각만 면역 — 재제기하려면 당시 기각 근거를 반박하라):")
+        for _it in _rej:
+            _tag = "면역후보" if _it["immune"] else "참고(비면역 — 워커 자기기각은 면역 없음)"
+            lines.append("  - [%s · %s · %s] %s" % (_it["src"], _it["recorder"], _tag, _it["text"]))
+        lines.append("  (커버리지: handoff %d건 · 기각기록 %d건 · 주입 %d · 상한제외 %d)"
+                     % (_cov["files"], _cov["with_rejected"], _cov["kept"], _cov["dropped"]))
+    _inv = load_invariants(os.path.join(_root, "_round", "INVARIANTS.md"))
+    if _inv:
+        lines.append("")
+        lines.append("프로젝트 불변식 (_round/INVARIANTS.md — 이와 충돌하는 지적은 불변식 반박 근거 필수. "
+                     "불변식 뒤에 숨는 무지적도 금지):")
+        lines.extend("  " + b for b in _inv)
     lines.append("")
     lines.append("리뷰 형식: [문제점] [논쟁점] [다음 단계 조언] — 각 지적에 파일:라인 또는 구체 근거.")
     lines.append("근거 없는 인상비평·칭찬만 하는 리뷰 금지. 결함을 찾는 것이 직무다.")
@@ -1302,6 +1395,56 @@ def cmd_self_test(args):
         out = buf.getvalue()
         for must in ("엄격 제약", "배회 금지", "문제점", "회신", "+10%"):
             assert must in out, "review-prompt에 '%s' 누락" % must
+        # T1(attention-p0) 밀폐 검증: 기각 재주입·불변식 — env 격리·복원(preflight C19 호출 안전)
+        import tempfile as _tf
+        _prev_root = os.environ.get("JAVIS_ROOT")
+        try:
+            with _tf.TemporaryDirectory() as _td:
+                os.environ["JAVIS_ROOT"] = _td
+                # (a) 소스 부재 = 주입 0 (회귀 0)
+                _b0 = io.StringIO()
+                with contextlib.redirect_stdout(_b0):
+                    cmd_review_prompt(_A())
+                _o0 = _b0.getvalue()
+                assert "기각" not in _o0 and "불변식" not in _o0, "소스 부재인데 주입 발생(회귀)"
+                # (b) 양형식 fixture → 수확·면역 판정·커버리지
+                _hd = os.path.join(_td, "_round", "handoffs")
+                os.makedirs(_hd)
+                open(os.path.join(_hd, "a-gate.md"), "w", encoding="utf-8").write(
+                    "# a-gate (2026-07-13 · master)\n## Rejected\n대안X | 이유Y\n## Files\n없음\n")
+                open(os.path.join(_hd, "b-done.md"), "w", encoding="utf-8").write(
+                    "# b-done (2026-07-13 · 워커)\n**Rejected**: 대안Z 기각.\n")
+                _k, _c = harvest_rejected(_hd)
+                assert _c["files"] == 2 and _c["with_rejected"] == 2, "양형식 수확 실패: %s" % _c
+                _imm = {i["src"]: i["immune"] for i in _k}
+                assert _imm.get("a-gate") is True and _imm.get("b-done") is False, \
+                    "면역 판정 오류(A1): %s" % _imm
+                # (c) 주입문·역할 차등(A2)
+                _b1 = io.StringIO()
+                with contextlib.redirect_stdout(_b1):
+                    cmd_review_prompt(_A())
+                assert "이미 기각된 지적" in _b1.getvalue() and "커버리지" in _b1.getvalue(), \
+                    "reviewer1 주입 누락"
+
+                class _A2(_A):
+                    reviewer_role = "reviewer2"
+                _b2 = io.StringIO()
+                with contextlib.redirect_stdout(_b2):
+                    cmd_review_prompt(_A2())
+                assert "감사 자료" in _b2.getvalue(), "reviewer2 차등 주입 누락"
+                # (d) 불변식 로드·주입 + 부재 시 None
+                assert load_invariants(os.path.join(_td, "없음.md")) is None
+                open(os.path.join(_td, "_round", "INVARIANTS.md"), "w", encoding="utf-8").write(
+                    "# 불변식\n- 이 파일은 런타임에 불변이다.\n")
+                _b3 = io.StringIO()
+                with contextlib.redirect_stdout(_b3):
+                    cmd_review_prompt(_A())
+                assert "프로젝트 불변식" in _b3.getvalue(), "불변식 주입 누락"
+        finally:
+            if _prev_root is None:
+                os.environ.pop("JAVIS_ROOT", None)
+            else:
+                os.environ["JAVIS_ROOT"] = _prev_root
         # live_roles 파싱
         lr = live_roles({"surfaces": [
             {"role": "cso", "agent_alive": True},
@@ -1613,6 +1756,12 @@ def main():
     rp.add_argument("--manifest", default=None,
                     help="워크플로우 매니페스트 경로 — 단계 평가기준·review_focus를 리뷰 프롬프트에 주입(D4·명시 --success 우선)")
     rp.add_argument("--phase", default=None, help="매니페스트 단계 id (--manifest와 함께·D4)")
+    rp.add_argument("--reviewer-role", dest="reviewer_role",
+                    choices=["reviewer1", "reviewer2"], default="reviewer1",
+                    help="앵커 역할(T1·A2): reviewer1=적대검증(기각 이력=반박 조건부 필터) · "
+                         "reviewer2=감사(기각 이력=면역 아닌 감사 자료)")
+    rp.add_argument("--slug", default=None,
+                    help="handoff 슬러그 접두 우선 필터(T1 기각 재주입 — 같은 작업 우선)")
 
     tp = sub.add_parser("task-prompt", help="생존 게이트 + 절대 강조 4규칙 포함 위임 티켓 생성")
     tp.add_argument("--task", required=True)
