@@ -2438,6 +2438,7 @@ function buildTab(ws: Workspace): HTMLElement {
           "앱을 재시작해도 부활하지 않습니다."
         : "이 워크스페이스의 pane(에이전트 세션)이 전부 종료되고 탭이 제거됩니다.") +
         "\n\n완전히 삭제하시겠습니까?",
+      "삭제",
     );
     if (!ok) return;
     // ★WP-3 의도 선기록(제1행위): teardown 이전에 base 데몬에 dept 묘비 기록 — 이후 체인이
@@ -3226,6 +3227,7 @@ async function promptBinaryPatch() {
     `새 본체(앱) ${v}을 패치 방식으로 설치합니다: 저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 ` +
       `재시작합니다. 부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 ` +
       `있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)`,
+    "설치",
   );
   if (!ok) return;
   try {
@@ -3346,6 +3348,7 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
     `데몬 교대 (새 버전 v${appVer})`,
     `작업 세션이 물려 있는 데몬 ${nodes}개를 새 버전으로 순차 교대(메인→부서)합니다. 저장(drain) 신호 후 ` +
       `교대하고 세션을 복원합니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 교대하시겠습니까?`,
+    "교대",
   );
   if (!ok) return;
   rotatingDaemon = true;
@@ -3385,6 +3388,7 @@ async function manualRestartAllDaemons() {
     "데몬 재시작",
     "데몬(메인+부서)을 다시 시작합니다. 진행 중인 노드에 저장(drain) 신호를 보낸 뒤 데몬을 새로 켜고, " +
       "부서·노드는 대화 기억까지 자동 복원됩니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 재시작하시겠습니까?",
+    "재시작",
   );
   if (!ok) return;
   rotatingDaemon = true;
@@ -3794,16 +3798,19 @@ async function openPalette() {
   input.focus();
 }
 
-function confirmModal(title: string, body: string): Promise<boolean> {
+// ★확인 버튼 라벨 매개변수화(오너 2026-07-15 실보고): 업데이트 창용 "설치" 하드코딩이 모든
+// 확인 창에 노출(완전 삭제 창의 확인 버튼이 "설치"로 표시). 호출부가 동작 동사를 지정한다.
+function confirmModal(title: string, body: string, yesLabel = "확인"): Promise<boolean> {
   return new Promise((resolve) => {
     const ov = document.createElement("div");
     ov.className = "modal-overlay";
     ov.innerHTML =
       `<div class="modal"><h3></h3><p></p>` +
       `<div class="modal-btns"><button class="modal-no">아니오</button>` +
-      `<button class="modal-yes">설치</button></div></div>`;
+      `<button class="modal-yes"></button></div></div>`;
     (ov.querySelector("h3") as HTMLElement).textContent = title;
     (ov.querySelector("p") as HTMLElement).textContent = body;
+    (ov.querySelector(".modal-yes") as HTMLElement).textContent = yesLabel;
     const done = (v: boolean) => {
       ov.remove();
       resolve(v);
