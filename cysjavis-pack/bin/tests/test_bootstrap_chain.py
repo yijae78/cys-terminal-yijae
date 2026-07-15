@@ -175,9 +175,10 @@ check("5c 거부 후 boot 미호출", "cys boot" not in calls(tmp))
 check("5d 인계 지시 출력", "인계" in err)
 shutil.rmtree(tmp)
 
-# ── 6. 선행 단계 실패 exit 매핑: preflight=2 · ping=3 · boot=4 ──
-for name, kw, want in (("preflight", {"preflight_exit": 1}, 2),
-                       ("ping", {"ping_exit": 1}, 3),
+# ── 6. 선행 단계 실패 exit 매핑: ping=3 · boot=4 (부팅-치명 전제 위반) ──
+# ★preflight는 제외(오너 2026-07-15 적대검증 adv#1): preflight FAIL은 팀 부팅을 abort하지 않는다
+# (60+ 체크 중 하나만 FAIL이어도 팀 0개였던 "100% 완료" 위반 수리). 진짜 게이트는 ⑤ check. → 6b 참조.
+for name, kw, want in (("ping", {"ping_exit": 1}, 3),
                        ("boot", {"boot_exit": 1}, 4)):
     tmp = tempfile.mkdtemp(prefix="boot-t6-")
     env, home = make_env(tmp, **kw)
@@ -185,6 +186,14 @@ for name, kw, want in (("preflight", {"preflight_exit": 1}, 2),
     check("6 %s 실패 exit %d" % (name, want), code == want, "exit=%d" % code)
     check("6 %s 실패 시 마커 무" % name, not os.path.exists(marker_path(home)))
     shutil.rmtree(tmp)
+
+# ── 6b. preflight 비치명 계약(adv#1 전사): preflight FAIL이어도 이후 단계가 green이면 부트 완료 ──
+tmp = tempfile.mkdtemp(prefix="boot-t6b-")
+env, home = make_env(tmp, preflight_exit=1)   # preflight만 실패, ping/claim/boot/check는 green
+code, out, err = run(env)
+check("6b preflight FAIL 비치명 — 체인 계속 exit 0", code == 0, "exit=%d" % code)
+check("6b preflight FAIL이어도 부트 완료 마커 생성", os.path.exists(marker_path(home)))
+shutil.rmtree(tmp)
 
 # ── 7. assert-ready: 부재=5 · warn=0 · off=0 · 버전 불일치=5 · 일치=0 ──
 tmp = tempfile.mkdtemp(prefix="boot-t7-")

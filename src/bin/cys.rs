@@ -1878,20 +1878,8 @@ fn run(command: Command) -> i32 {
         }),
 
         Command::ClaimRole { role, surface } => target_surface(&surface, &None).and_then(|sid| {
-            request("system.claim_role", json!({"role": role, "surface_id": sid})).map(|r| {
-                let claimed = r["role"].as_str().unwrap_or("?");
-                println!("registered: {claimed} → surface:{sid}");
-                // ★절대규칙(오너 2026-07-15): 마스터는 반드시 4노드 팀(CSO·워커·리뷰어2)을 갖는다.
-                // 종전 팀 스폰은 마스터 LLM의 `cys boot`(디렉티브 §0④) 실행에 의존했는데, dept-master가
-                // "부서장=단독 대기"를 환각해 boot를 건너뛰는 실사고 발생. 고전 타이핑 경로(`너는 마스터다`
-                // → 이 CLI가 claim-role 수행)에서 claim 성공 직후 boot를 결정론으로 트리거한다 —
-                // 환각으로 ④를 건너뛰어도 팀이 뜬다. 버튼·복원은 surface.create 경유라 이 경로를 안 타
-                // (복원 중복 스폰 없음). boot는 현재 env(부서면 CYS_SOCKET=부서소켓)를 상속해 올바른
-                // 데몬을 대상하고, 이미 가동 중인 역할을 건너뛴다(멱등). fire-and-forget(최대 300s).
-                if claimed == "master" {
-                    trigger_orchestra_boot_inherit();
-                }
-            })
+            request("system.claim_role", json!({"role": role, "surface_id": sid}))
+                .map(|r| println!("registered: {} → surface:{}", r["role"].as_str().unwrap_or("?"), sid))
         }),
 
         Command::LaunchAgent { role, agent, cwd } => return run_launch_agent(&role, &agent, cwd),
@@ -3790,23 +3778,13 @@ fn acquire_boot_lock() -> BootLock {
     }
 }
 
-/// ★고전 경로 팀 스폰(claim-role master 트리거·D-6): 현재 env(부서면 CYS_SOCKET=부서소켓)를 상속해
-/// `cys boot`를 fire-and-forget. boot 락이 중복을 흡수하므로 버튼 경로 spawn_orchestra_boot와 겹쳐도 안전.
-fn trigger_orchestra_boot_inherit() {
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("cys"));
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("boot");
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let _ = cmd.spawn(); // 부모 종료와 무관하게 계속(fire-and-forget)
-}
-
 fn run_boot(cwd: Option<String>) -> i32 {
-    // ★이중 boot 직렬화(오너 2026-07-15 적대검증 D-7): 마스터 팀 스폰 트리거가 3중(버튼 Rust·
-    // claim-role CLI·마스터 LLM 디렉티브 §0④)이 되면서 두 boot가 겹치면 각자 "역할 미가동" 스냅샷을
+    // ★이중 boot 직렬화(오너 2026-07-15 적대검증 D-7 + 아키텍트 성찰): 마스터 팀 스폰 트리거가
+    // 겹칠 수 있다(고전 경로=UserPromptSubmit 훅이 javis_bootstrap.py ④ boot 발화 · 버튼 경로=GUI
+    // spawn_orchestra_boot · 마스터 LLM이 스스로 boot). 두 boot가 겹치면 각자 "역할 미가동" 스냅샷을
     // 보고 리뷰어(데몬 특권 가드 없음)를 중복 스폰할 수 있다. 소켓별 boot 락을 비차단 획득 —
     // 이미 다른 boot가 진행 중이면 즉시 성공 반환(그 boot가 팀을 세운다·이 호출은 멱등 no-op).
+    // (claim-role의 boot 부작용은 아키텍트 성찰로 제거 — 레지스트리 op가 프로세스 스폰하는 결합 차단.)
     let _boot_lock = match acquire_boot_lock() {
         BootLock::Acquired(g) => g,
         BootLock::Busy => {

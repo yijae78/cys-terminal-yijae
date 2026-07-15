@@ -42,8 +42,11 @@ MARKER = os.path.join(CYS_DIR, ".master-bootstrapped")
 STATE_DIR = os.path.join(CYS_DIR, "state")
 BOOT_LAST = os.path.join(STATE_DIR, "boot-last.json")
 # ⑤ bounded retry — 무한 대기 금지(자원 거버넌스). env 오버라이드는 테스트 하네스 전용.
-CHECK_RETRIES = max(1, int(os.environ.get("CYS_BOOT_CHECK_RETRIES", "10")))
-CHECK_INTERVAL_S = float(os.environ.get("CYS_BOOT_CHECK_INTERVAL_S", "3"))  # 총 상한 ≈ 30초
+# ★예산 확대(오너 2026-07-15 적대검증 adv#4): 냉시작 claude는 모델 로드+MCP init로 30초 내
+# agent_alive/set-status ack가 안 나 check가 조기 실패(팀은 아직 뜨는 중)했다. 노드 기동은 비동기라
+# 넉넉히 기다린다 — 24×5s ≈ 120초 상한(무한 아님·자원 거버넌스 유지).
+CHECK_RETRIES = max(1, int(os.environ.get("CYS_BOOT_CHECK_RETRIES", "24")))
+CHECK_INTERVAL_S = float(os.environ.get("CYS_BOOT_CHECK_INTERVAL_S", "5"))  # 총 상한 ≈ 120초
 
 
 def _atomic_write_json(path, obj):
@@ -140,10 +143,52 @@ class _Log:
         self.data["result"] = {"ok": False, "failed_step": name, "exit": exit_code}
         _atomic_write_json(BOOT_LAST, self.data)
         sys.stderr.write("[bootstrap] 단계 실패: %s (exit %d)\n%s\n" % (name, code, detail.strip()))
+        # ★실패 가시화(오너 2026-07-15 적대검증 adv#5): 훅이 배경 실행이라 stderr가 화면에 안 보인다.
+        # 훅 NOTE는 "팀이 뜬다"고 알렸는데 부트가 조용히 실패하면 사용자는 원인을 모른다 — feed 알림으로
+        # 승격(best-effort·데몬 다운 등 실패 무해). ②ping 실패(데몬 자체 부재)는 feed도 불가라 skip.
+        if name != "②ping":
+            hint = {"③claim-role": "다른 pane이 이미 master입니다 — 기존 master 탭을 쓰세요(조직당 master 1명).",
+                    "④boot": "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
+                    "⑤check": "팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 재선언하세요."
+                    }.get(name, "부트스트랩이 %s 단계에서 실패했습니다 — cys list·boot-last.json 확인." % name)
+            try:
+                subprocess.run(["cys", "feed", "push", "--kind", "bootstrap-fail",
+                                "--title", "부트스트랩 미완(%s)" % name, "--body", hint],
+                               capture_output=True, timeout=10)
+            except Exception:
+                pass
         return exit_code
 
 
+def _acquire_singleflight():
+    """부트스트랩 전체 단일 실행 락(오너 2026-07-15 적대검증·아키텍트: preflight 300s는 boot 락으로
+    직렬화되지 않아 중복 fire가 settings.json read-modify-write를 경쟁하고 300s 프리플라이트를 중복
+    실행했다). 소켓별 flock 비차단 — 이미 진행 중이면 None 반환(호출부가 no-op 종료). unix 전용
+    실효(windows는 항상 락 획득=직렬화 없음, boot 락이 최종 방어). 반환 fd를 프로세스 수명동안 보유."""
+    sock = os.environ.get("CYS_SOCKET", "base")
+    key = os.path.basename(sock.replace("\\", "/")) or "base"
+    lock_path = os.path.join(STATE_DIR, "bootstrap-%s.lock" % key)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return True  # 락 못 열면 직렬화 없이 진행(보수적 허용)
+    if os.name == "posix":
+        import fcntl
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None  # 다른 부트스트랩 진행 중 — no-op
+    _acquire_singleflight._fd = fd  # GC로 fd 닫혀 락 풀리지 않게 프로세스 수명동안 보유
+    return True
+
+
 def cmd_run():
+    # ★단일 실행 게이트 — 진행 중이면 즉시 성공 반환(중복 preflight/boot 방지·pile-up 차단).
+    if _acquire_singleflight() is None:
+        _progress("부트스트랩 이미 진행 중(단일 실행 락) — 중복 실행 skip. 진행은 cys list로 확인.")
+        return 0
     log = _Log()
     py = sys.executable or "python3"
 
@@ -158,14 +203,25 @@ def cmd_run():
         except OSError:
             pass
 
-    # ① preflight --fix — READY 판정은 preflight exit code가 사실(자연어 재추론 금지)
+    # ① preflight --fix — ★비치명화(오너 2026-07-15 적대검증 adv#1 CRITICAL): 종전엔 preflight가
+    # 완전-green(exit 0)이 아니면 여기서 abort해 ④ 팀 부팅이 영영 안 됐다. preflight는 60+ 체크
+    # 표면이라 자동수리 불가 FAIL 하나(구 hook·수동 디렉티브 핀·git 부재)만 있어도 팀 0개 — "5노드
+    # 100%" 요구와 정면 충돌(이 기계도 잔여 FAIL 존재). 팀 부팅의 진짜 게이트는 ⑤ check다. 따라서
+    # preflight FAIL은 경고로 강등하고 ④로 계속한다. 부팅-치명 전제(데몬·claude)는 ②ping·cys boot가
+    # 각자 검증하므로 preflight와 분리해도 안전. 마커가 현재 pack_version이면 300s preflight 자체를
+    # 생략(재선언 fast path — pile-up·재실행 비용 제거).
     preflight = os.path.join(PACK, "bin", "javis_preflight.py")
-    if os.path.isfile(preflight):
-        _progress("① preflight --fix 실행 중(최대 300s)…")
+    _marker = _read_json(MARKER) or {}
+    _marker_fresh = (_is_base_socket() and _marker.get("pack_version") == _pack_version()
+                     and _marker.get("pack_version") not in (None, "unknown"))
+    if _marker_fresh:
+        log.step("①preflight", 0, "base 마커가 현재 pack_version — preflight 생략(fast path)")
+    elif os.path.isfile(preflight):
+        _progress("① preflight --fix 실행 중(최대 300s · 비치명 — FAIL이어도 팀 부팅 계속)…")
         code, out = _run([py, preflight, "--fix"], timeout=300)
         log.step("①preflight", code, out)
         if code != 0:
-            return log.fail("①preflight", code, out, 2)
+            _progress("⚠ preflight 잔여 FAIL(비치명) — 팀 부팅 계속·진짜 게이트는 ⑤ check. 상세 boot-last.json")
     else:
         log.step("①preflight", 0, "preflight 부재 — 생략(팩 불완전 가능·계속)")
 
