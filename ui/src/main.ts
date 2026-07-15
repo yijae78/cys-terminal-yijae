@@ -4060,6 +4060,12 @@ async function purgeDept(ws: Workspace) {
     exists: !!info.exists,
   });
   if (!ok) return;
+  // ★[F3-R TOCTOU] 진입 가드는 모달 '전'이라, 부서명 타이핑 모달이 열려 있던 수초간 checkVersionSkew
+  // 타이머/수동 restart가 rotatingDaemon을 잡았을 수 있다. 모달 확인 직후·집행 직전에 재확인한다.
+  if (rotatingDaemon) {
+    toast("feed", "작업 진행 중", "데몬 재시작이 진행 중입니다 — 잠시 후 다시 시도하세요.");
+    return;
+  }
   // ★[F3] 데몬 폐역 구간 동안 restart를 배제(manualRestartAllDaemons·checkVersionSkew가 purgingDept 존중).
   purgingDept = true;
   try {
