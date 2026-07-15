@@ -5075,26 +5075,41 @@ fn canonical_checkpoint_file(live_cwd: &str) -> std::path::PathBuf {
 }
 
 /// 전달확정 게이트 판정 — 제출되면 주입 텍스트가 위로 스크롤되고 하단 입력창엔 스피너/빈 프롬프트만 남는다.
-/// Return 미발화(known bug)면 주입 텍스트가 하단 입력창에 잔류하므로 마지막 몇 줄에서 sentinel이 검출된다.
-/// (read-screen grep은 미제출 입력창 텍스트도 매치하므로 '텍스트 존재'가 아니라 '하단 잔류'로 wedge를 본다.)
+/// Return 미발화(known bug)면 주입 텍스트가 입력창에 잔류하므로 sentinel이 화면에 남는다.
+/// ★[F1 수리] 실터미널은 긴 지시문을 물리적으로 줄바꿈(래핑)하고, 입력창 하단에 프롬프트 테두리·단축키·
+/// 토큰카운터 등 UI 행이 따라붙어 sentinel이 화면 최하단에서 여러 행 위로 밀린다. 구 tail-4행 스캔은
+/// 이를 놓쳐(false negative) Return 재전송이 안 발화하고 저장이 유실됐다. 이제 ①read 전체 행을 대상으로,
+/// ②공백·개행을 제거한 뒤 매치한다(래핑이 sentinel을 물리 행 경계에서 쪼개도 재결합 검출). 트레이드오프:
+/// 제출 직후 트랜스크립트 에코가 read 범위에 남으면 false-positive(여분 Return·timeout→delivery_failed
+/// 오표기) 가능하나, 여분 Return은 무해하고 저장 판정의 진실원천은 파일 nonce다(wedge 플래그는 파일
+/// 미검출 시의 라벨링에만 관여) — 안전 방향(놓친 wedge=저장 유실 ≫ 과검출).
 fn delivery_wedged(screen: &str, sentinel: &str) -> bool {
-    screen.lines().rev().take(4).any(|l| l.contains(sentinel))
+    let flat: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+    let needle: String = sentinel.chars().filter(|c| !c.is_whitespace()).collect();
+    !needle.is_empty() && flat.contains(&needle)
 }
 
-/// phoenix 복원이 이 소켓의 이 역할에 대해 진행 중(저널 stage < g2_ack)인가[A3-F2].
-/// 저널 = <소켓 부모 디렉토리>/phoenix/journal-*.json (phoenix.py state_dir_for=realpath(dirname(socket)) 정합).
-/// 최근(mtime 신선도 창) 저널에서 대상 역할의 stage가 기록됐고 g2_ack 미완료면 복원 중으로 본다 —
-/// 디렉티브 재주입과 "작업 중단" 주입의 교차(각성 파손)를 차단. stale 저널(오래된 실패 복원)이 영구
-/// 차단하지 않도록 mtime 창으로 한정(fail 방향=검증 허용).
-fn restore_active_for_role(socket: &std::path::Path, role: &str, _now: u64) -> bool {
+/// phoenix 복원이 이 소켓의 이 역할에 대해 진행 중인가 — 진행 중이면 Some(사유), 아니면 None.
+/// 저널 = <소켓 부모 디렉토리(realpath)>/phoenix/journal-*.json
+/// (phoenix.py state_dir_for=realpath(dirname(socket))[:389] 정합 — ★[F4] canonicalize 적용, 실패 시 원경로).
+/// 판정: 신선한(mtime 최근) 저널에서 대상 역할 stage가 기록됐고 g2_ack 미완료 → 복원 중(해당 role skip).
+/// ★[F2 수리] fail-CLOSED: 신선한 저널이 존재하는데 판독/파싱 실패, 또는 기대 스키마(roles 객체·해당
+///   role의 stages 객체) 부재면 '복원 중'으로 취급한다 — pack과 바이너리 릴리스 라인이 달라 저널 스키마
+///   스큐가 실재 위험이고, 각성 파손(디렉티브 재주입 × "작업 중단" 주입 교차)은 비가역이라 안전 방향=주입
+///   보류. 단 저널이 대상 role을 언급하지 않으면 이 role의 복원이 아니므로 다른 저널을 계속 본다(무관
+///   role over-skip 금지). 저널 파일 자체가 없으면(디렉토리 부재·비-저널) None(복원 아님 — 무해).
+/// ★[F3] EPOCH_GATE divergence: phoenix stage_done(javis_phoenix.py:1283-1296)은 완료 마킹의 epoch가
+///   현재 세대와 일치할 때만 done으로 인정한다(재부팅 넘긴 stale done 무효화). 이 가드는 phoenix 런타임
+///   epoch(_ACTIVE_EPOCH)를 알 수 없어 epoch 대조 없이 done 표기만 본다. 방향 차이: ①started&&!g2_ack
+///   분기는 over-skip(안전) ②g2_ack done 분기의 stale-epoch under-skip 위험은 mtime 신선도 창(≤RECENCY)이
+///   흡수한다 — stale-epoch done은 이전 세대(재부팅 전) 저널이라 대개 창 밖(무시)이므로 실질 발산 없음.
+fn restore_guard_reason(socket: &std::path::Path, role: &str) -> Option<String> {
     const RESTORE_RECENCY_SECS: u64 = 300;
-    let Some(dir) = socket.parent() else {
-        return false;
-    };
+    let dir = socket.parent()?;
+    // [F4] phoenix state_dir_for와 정렬 — 심링크 소켓 디렉토리 대응(실패 시 원경로 폴백).
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let phoenix = dir.join("phoenix");
-    let Ok(entries) = std::fs::read_dir(&phoenix) else {
-        return false;
-    };
+    let entries = std::fs::read_dir(&phoenix).ok()?; // 디렉토리 부재 = 저널 없음 = 복원 아님(None)
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if !(name.starts_with("journal-") && name.ends_with(".json")) {
@@ -5108,27 +5123,41 @@ fn restore_active_for_role(socket: &std::path::Path, role: &str, _now: u64) -> b
             .map(|d| d.as_secs() <= RESTORE_RECENCY_SECS)
             .unwrap_or(false);
         if !fresh {
-            continue;
+            continue; // stale 저널(오래된 실패 복원)은 영구 차단 방지 위해 무시
         }
+        // [F2] 신선한 저널 — 여기서부터 판독/파싱/스키마 실패는 fail-CLOSED(복원 중 취급).
         let Ok(txt) = std::fs::read_to_string(e.path()) else {
-            continue;
+            return Some(format!("신선한 저널 판독 실패({name}) — fail-closed(복원 중 취급)"));
         };
         let Ok(j) = serde_json::from_str::<Value>(&txt) else {
-            continue;
+            return Some(format!(
+                "신선한 저널 파손(JSON 파싱 실패, {name}) — fail-closed(복원 중 취급)"
+            ));
         };
-        let stages = &j["roles"][role]["stages"];
+        if !j["roles"].is_object() {
+            return Some(format!(
+                "신선한 저널 스키마 이상(roles 비객체, {name}) — fail-closed(복원 중 취급)"
+            ));
+        }
+        let role_entry = &j["roles"][role];
+        if role_entry.is_null() {
+            continue; // 이 저널은 대상 role 무관 — over-skip 금지, 다음 저널 확인
+        }
+        let stages = &role_entry["stages"];
         if !stages.is_object() {
-            continue;
+            return Some(format!(
+                "신선한 저널 role '{role}' stages 스키마 이상({name}) — fail-closed(복원 중 취급)"
+            ));
         }
         let done = |s: &str| stages[s]["done"].as_bool() == Some(true);
         let started = ["spawn", "ready", "resume", "reinject"]
             .iter()
             .any(|s| done(s));
         if started && !done("g2_ack") {
-            return true;
+            return Some(format!("phoenix 복원 진행 중(stage<g2_ack, {name})"));
         }
     }
-    false
+    None
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -5266,12 +5295,9 @@ fn verify_one_node(
     now: u64,
 ) -> (VerifyOutcome, String) {
     use std::time::{Duration, Instant};
-    // 1) 복원 중 가드 — 각성 파손 방지(디렉티브 재주입과 "작업 중단"의 교차 차단)
-    if restore_active_for_role(&t.socket, &t.role, now) {
-        return (
-            VerifyOutcome::SkippedRestoring,
-            "phoenix 복원 진행 중(stage<g2_ack) — 각성 파손 방지 skip".into(),
-        );
+    // 1) 복원 중 가드 — 각성 파손 방지(디렉티브 재주입과 "작업 중단"의 교차 차단). 사유를 JSON에 전달.
+    if let Some(reason) = restore_guard_reason(&t.socket, &t.role) {
+        return (VerifyOutcome::SkippedRestoring, reason);
     }
     // 2) canonical 경로 — live_cwd 미제공(구버전 부서 데몬)이면 검증불가(무음 cwd 폴백 금지)[A1-F6]
     let Some(cwd) = t.live_cwd.as_deref() else {
@@ -5290,9 +5316,10 @@ fn verify_one_node(
             format!("nonce 마커 확인: {}", file.display()),
         );
     }
-    // 3) 저장 지시 주입 — nonce 마커 기입 + 작업 중단
+    // 3) 저장 지시 주입 — nonce 마커 기입 + 작업 중단. ★[F1] 마커를 지시문 맨 끝에 둔다 — 래핑 시
+    // sentinel(nonce)이 입력창 마지막 물리 행에 오도록 해 wedge 검출을 견고하게 한다.
     let instr = format!(
-        "[DRAIN-VERIFY] 재시작 전 체크포인트 검증. 지금 즉시: ① _round/SESSION_STATE.md에 현재 작업 상태·미해결 게이트·다음 액션을 최신화해 저장하라. ② 그 파일 맨 끝에 정확히 이 한 줄을 추가하라(문자 그대로·수정 금지): {marker} ③ 저장 후 작업을 멈추고 재시작·복원을 기다려라. (승인 프롬프트 대기 중이면 이 메시지는 무시하라.)"
+        "[DRAIN-VERIFY] 재시작 전 체크포인트 검증. 지금 즉시: ① _round/SESSION_STATE.md에 현재 작업 상태·미해결 게이트·다음 액션을 최신화해 저장하라. ② 저장 후 작업을 멈추고 재시작·복원을 기다려라(승인 프롬프트 대기 중이면 이 메시지는 무시하라). ③ 마지막으로 그 파일 맨 끝에 정확히 이 한 줄만 추가하라(문자 그대로·수정 금지): {marker}"
     );
     let io_to = std::cmp::min(timeout, Duration::from_secs(8));
     if io.inject(&t.socket, t.surface_id, &instr, io_to).is_err() {
@@ -5304,15 +5331,16 @@ fn verify_one_node(
     }
     // 4) 전달확정 게이트 — 빈 프롬프트+스피너 확인, wedge(하단 입력창 잔류)면 Return 재전송
     std::thread::sleep(Duration::from_millis(600));
+    // ★[F1] 24행 읽기 — 래핑된 지시문 전체 + 하단 입력창 UI 행을 포괄(구 6행은 래핑 시 sentinel 유실).
     let mut wedged = io
-        .read_screen(&t.socket, t.surface_id, 6, io_to)
+        .read_screen(&t.socket, t.surface_id, 24, io_to)
         .map(|s| delivery_wedged(&s, &nonce))
         .unwrap_or(false);
     if wedged {
         let _ = io.send_return(&t.socket, t.surface_id, io_to);
         std::thread::sleep(Duration::from_millis(800));
         wedged = io
-            .read_screen(&t.socket, t.surface_id, 6, io_to)
+            .read_screen(&t.socket, t.surface_id, 24, io_to)
             .map(|s| delivery_wedged(&s, &nonce))
             .unwrap_or(wedged);
     }
@@ -10022,6 +10050,17 @@ mod tests {
         let end = rest.find("-->")? + 3;
         Some(rest[..end].to_string())
     }
+    /// 문자열을 cols 문자마다 물리 줄바꿈(실터미널 래핑 모사 — 멀티바이트 안전, char 단위).
+    fn wrap_cols(s: &str, cols: usize) -> String {
+        let mut out = String::new();
+        for (i, c) in s.chars().enumerate() {
+            if i > 0 && i % cols == 0 {
+                out.push('\n');
+            }
+            out.push(c);
+        }
+        out
+    }
     impl VerifyIo for FakeVerifyIo {
         fn inject(
             &self,
@@ -10060,13 +10099,22 @@ mod tests {
             let scen = self.nodes.lock().unwrap().get(&sid).map(|(s, _)| *s);
             match scen {
                 Some(FakeScenario::Hung) => Err("hung socket".into()),
-                Some(FakeScenario::Wedge) => Ok(self
-                    .last_inject
-                    .lock()
-                    .unwrap()
-                    .get(&sid)
-                    .cloned()
-                    .unwrap_or_default()),
+                Some(FakeScenario::Wedge) => {
+                    // ★실터미널 모사(비-tautology): 미제출 주입 텍스트를 40자 폭으로 물리 래핑하고
+                    // 하단에 입력창 테두리·단축키·토큰카운터 UI 행을 덧붙인다 — sentinel(nonce)이 최하단에서
+                    // 여러 행 위로 밀리고 래핑 경계에서 쪼개진다(구 tail-4 단일행 스캔이면 놓쳐 FAIL).
+                    let raw = self
+                        .last_inject
+                        .lock()
+                        .unwrap()
+                        .get(&sid)
+                        .cloned()
+                        .unwrap_or_default();
+                    Ok(format!(
+                        "{}\n╰────────────────────╯\n  ⏵⏵ 6 lines · esc to clear\n  ? for shortcuts        (auto)\n  context: 12k tokens\n  ",
+                        wrap_cols(&raw, 40)
+                    ))
+                }
                 // 협조·미저장: 제출됨 — 하단은 스피너·빈 프롬프트(주입 텍스트 잔류 없음)
                 _ => Ok("...이전 대화...\n✻ Working… (esc to interrupt)\n> ".into()),
             }
@@ -10252,17 +10300,17 @@ mod tests {
         )
         .unwrap();
         let socket = deptdir.join("cys.sock");
-        assert!(restore_active_for_role(&socket, "worker", 100));
-        // g2_ack 완료면 복원 끝 → false
+        assert!(restore_guard_reason(&socket, "worker").is_some());
+        // g2_ack 완료면 복원 끝 → None
         let j2 = json!({"roles": {"worker": {"stages": {"reinject": {"done": true}, "g2_ack": {"done": true}}}}});
         std::fs::write(
             phoenix.join("journal-default.json"),
             serde_json::to_string(&j2).unwrap(),
         )
         .unwrap();
-        assert!(!restore_active_for_role(&socket, "worker", 100));
-        // 다른 역할은 무관 → false
-        assert!(!restore_active_for_role(&socket, "master", 100));
+        assert!(restore_guard_reason(&socket, "worker").is_none());
+        // 다른 역할은 무관 → None(over-skip 금지)
+        assert!(restore_guard_reason(&socket, "master").is_none());
 
         // verify_one_node 통합: 복원 중이면 IO 이전에 skip
         std::fs::write(
@@ -10275,6 +10323,65 @@ mod tests {
         let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
         let _ = std::fs::remove_dir_all(&td);
         assert_eq!(o, VerifyOutcome::SkippedRestoring);
+    }
+
+    /// [F2] 신선한 저널이 파손 JSON이면 fail-CLOSED(복원 중 취급·skip) — 스키마 스큐/부분쓰기에 안전.
+    #[test]
+    fn drain_verify_restore_guard_fail_closed_on_corrupt_journal() {
+        let td = std::env::temp_dir().join(format!("cys-dv-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let deptdir = td.join("cys-dept-y");
+        let phoenix = deptdir.join("phoenix");
+        std::fs::create_dir_all(&phoenix).unwrap();
+        let socket = deptdir.join("cys.sock");
+        // ① 파손 JSON(신선 mtime) → Some(skip)
+        std::fs::write(phoenix.join("journal-default.json"), "{ this is not json ").unwrap();
+        assert!(
+            restore_guard_reason(&socket, "worker").is_some(),
+            "파손 신선 저널은 fail-closed여야 함"
+        );
+        // ② roles 비객체(신선) → Some(skip)
+        std::fs::write(
+            phoenix.join("journal-default.json"),
+            serde_json::to_string(&json!({"roles": "oops"})).unwrap(),
+        )
+        .unwrap();
+        assert!(restore_guard_reason(&socket, "worker").is_some());
+        // ③ role의 stages 스키마 이상(신선) → Some(skip)
+        std::fs::write(
+            phoenix.join("journal-default.json"),
+            serde_json::to_string(&json!({"roles": {"worker": {"stages": 5}}})).unwrap(),
+        )
+        .unwrap();
+        assert!(restore_guard_reason(&socket, "worker").is_some());
+        // ④ 저널 디렉토리 자체가 없으면 None(복원 아님 — 무해)
+        let empty = td.join("cys-dept-z").join("cys.sock");
+        assert!(restore_guard_reason(&empty, "worker").is_none());
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// [F1] 실터미널 래핑+하단 UI로 sentinel이 최하단에서 밀리고 경계에서 쪼개진 wedge를 검출한다.
+    /// ★비-tautology 증명: 동일 fixture를 구 로직(tail-4행 단일행 스캔)에 넣으면 놓친다(FAIL).
+    #[test]
+    fn drain_verify_wedge_survives_wrapping_and_trailing_ui() {
+        let nonce = "1700000000-88-7";
+        // 래핑으로 nonce가 물리 행 경계에서 쪼개지고("...1700000000-" / "88-7 ..."), 그 아래로 입력창
+        // 테두리·단축키·토큰카운터 UI 4행이 붙어 nonce가 하단에서 여러 행 위로 밀린다.
+        let screen = "\
+> [DRAIN-VERIFY] 재시작 전 체크포인트 검증. 지금 즉시\n\
+  ① _round/SESSION_STATE.md 저장 ② 작업 멈춤\n\
+  ③ 파일 끝에 이 한 줄: <!-- cys-checkpoint: 1700000000-\n\
+88-7 1700000000 -->\n\
+╰──────────────────────────────╯\n\
+  ⏵⏵ 5 lines · esc to clear\n\
+  ? for shortcuts                  (auto)\n\
+  context: 12k tokens\n\
+  ";
+        // 구 로직: 하단 4행에서 온전한 nonce 매치 → 놓침(FAIL). fixture가 tautology가 아님을 증명.
+        let old_tail4 = screen.lines().rev().take(4).any(|l| l.contains(nonce));
+        assert!(!old_tail4, "fixture가 구 tail-4 로직도 통과 — tautology");
+        // 신 로직: 전체 행·공백제거 매치 → 래핑·경계쪼갬·trailing UI에도 wedge 검출.
+        assert!(delivery_wedged(screen, nonce), "신 로직이 래핑된 wedge를 검출해야 함");
     }
 
     /// ⑥ 0-노드 → 우아한 no-op(all_saved=true, exit 0 대응).
