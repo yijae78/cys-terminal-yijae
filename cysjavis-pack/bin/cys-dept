@@ -442,7 +442,9 @@ ceo_promote(){  # $1: "consented"면 동의 게이트 생략(오너 지명 promo
   if [ ! -f "$md.pre-ceo" ] && [ "${1:-}" != "consented" ]; then
     # deny/timeout/feed불가 = 승격 보류(표준 master 유지·다음 부서 이벤트에 재질의) — fail-safe는 '승격 안 함'.
     # env -u CYS_SOCKET: 승격 대상은 기본 데몬이므로 승인 요청도 기본 데몬 feed로(ceo_reinject_master와 동형).
-    if env -u CYS_SOCKET "$CYS" feed push --wait --kind ceo-promote-request --title "CEO 승격 승인 요청" \
+    # ★GUI 오퍼레이터 승인(오너 2026-07-15): 기본 120초는 오너가 GUI feed 패널을 열어 판단하기에
+    # 짧아 timeout(보류)로 흘렀다 — 600초로 연장(데몬 상한 3600초 이내·이 push 경로 한정).
+    if env -u CYS_SOCKET "$CYS" feed push --wait --timeout-secs 600 --kind ceo-promote-request --title "CEO 승격 승인 요청" \
          --body "부서 생성 감지 — 기본 데몬 master를 CEO(master of master)로 승격합니까? (MASTER_DIRECTIVE→CEO 규약 교체·헌법은 .pre-ceo 보존·ceo_demote로 가역)"; then
       echo "[cys-dept] CEO 승격 오너 승인됨"
     else

@@ -208,7 +208,9 @@ fn hex_sha256(bytes: &[u8]) -> String {
 /// L2: unix=/dev/urandom·windows=CNG BCryptGenRandom. **실패 시 예측가능 폴백(sha256(pid,now))
 /// 금지 — hard-fail(Err)** 로 예측가능 토큰/nonce를 원천 차단한다(브리지 인가·승인 nonce의 무결성
 /// 근거). R-CLI-1: windows 시드 폴백을 실 CSPRNG(BCryptGenRandom·시스템 선호 RNG)로 대체.
-fn random_token_hex() -> Result<String, String> {
+/// ★GUI 오퍼레이터 승인(오너 2026-07-15): 오퍼레이터 토큰 발급(state.rs Daemon::new)이 재사용 —
+/// pub(crate) 승격(동일 CSPRNG 정책 공유·중복 구현 금지).
+pub(crate) fn random_token_hex() -> Result<String, String> {
     #[cfg(unix)]
     {
         use std::io::Read;

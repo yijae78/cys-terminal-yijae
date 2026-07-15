@@ -756,6 +756,14 @@ pub struct Daemon {
     pub master_claimed_at: Mutex<Option<f64>>,
     pub feed_items: Mutex<Vec<FeedItem>>,
     pub feed_waiters: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
+    /// ★GUI 오퍼레이터 승인(오너 2026-07-15): 기동 시 재발급되는 오퍼레이터 토큰 —
+    /// state_dir의 `operator.token`(unix 0600) 파일과 동일 값. feed.reply가 이 값과 일치하는
+    /// `operator_token` 파라미터를 받으면 §3.2 자기승인 가드를 면제한다(GUI Allow가 pgid 각인·
+    /// surface 미귀속 fail-closed에 오탐 차단되던 결함 수리). 첨부 주체는 GUI Tauri 백엔드
+    /// 유일 — 공용 cys CLI 무첨부는 워커의 **우발적** 면제만 차단한다(의도적 동일사용자
+    /// 프로세스는 토큰 파일을 읽어 raw RPC로 우회 가능 — M11 수준·사고 방지용, 암호학적 방어
+    /// 아님). 발급·기록 실패 시 None(면제 경로 비활성=기존 동작) — 부트체인 비치명.
+    pub operator_token: Option<String>,
     /// feed.jsonl append 직렬화 락 — write_all이 짧은 write로 쪼개져도 한 줄 전체가
     /// 한 임계영역에서 쓰이게 보장한다. O_APPEND의 원자성은 단일 write() 콜 단위라,
     /// 대용량 body가 분할 write되면 다른 동시 appender의 라인이 끼어들어 JSONL이
@@ -1056,6 +1064,33 @@ pub fn state_dir(socket_path: &std::path::Path) -> PathBuf {
     }
 }
 
+/// ★GUI 오퍼레이터 승인(오너 2026-07-15): 오퍼레이터 토큰 파일 기록 — unix는 0600(소유자 전용)을
+/// 생성·기존 파일 양쪽에 강제한다(mode()는 생성 시에만 적용되므로 set_permissions로 재강제 —
+/// 이전 실행이 넓은 권한으로 남긴 파일도 조인다). Windows는 %LOCALAPPDATA%(사용자 프로필 경계)
+/// 하위라 별도 ACL 없이 기록 — named pipe owner-only DACL과 동일한 단일-사용자 신뢰경계(M11 수준).
+/// 이 토큰은 "데몬 state 디렉토리를 읽을 수 있는 오퍼레이터(사람) 세션" 증명이지 암호학적 방어가
+/// 아니다 — 동일 사용자 프로세스는 누구나 읽을 수 있다(정직한 한계 = DESIGN-ko.md §3.2).
+fn write_operator_token(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(token.as_bytes())?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(token.as_bytes())
+    }
+}
+
 /// 데몬과 같은 디렉터리에 놓인 형제 `cys` CLI 경로.
 /// Windows에서는 실행파일명이 `cys.exe`이므로 플랫폼별 확장자를 붙인다
 /// Windows: 데몬(cysd)이 스폰하는 콘솔 자식(CLI·셸·taskkill 등)이 콘솔 창을 띄우지 않게
@@ -1191,6 +1226,22 @@ impl Daemon {
                     v["reason"].as_str().unwrap_or("").to_string(),
                 )
             });
+        // ★GUI 오퍼레이터 승인(오너 2026-07-15): 오퍼레이터 토큰 발급 — 소켓 listen 전(new 내부)에
+        // 기동마다 재발급·덮어쓰기해 파일=메모리 정합을 데몬 재시작(churn)에도 유지한다. GUI(Tauri)가
+        // 이 파일을 매 호출 신선 재독해 feed.reply에 첨부. 실패는 비치명(로그만) — 부트체인 차단 금지.
+        let operator_token = match crate::channels::random_token_hex() {
+            Ok(tok) => match write_operator_token(&dir.join("operator.token"), &tok) {
+                Ok(()) => Some(tok),
+                Err(e) => {
+                    eprintln!("cysd: operator.token 기록 실패(GUI 오퍼레이터 승인 면제 비활성): {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("cysd: 오퍼레이터 토큰 발급 실패(GUI 오퍼레이터 승인 면제 비활성): {e}");
+                None
+            }
+        };
         // T7 E1-3: 영속 분석 DB는 socket_path가 struct로 move되기 전에 연다.
         let analytics_conn = crate::analytics::open(&socket_path);
         // C0: 채널 계층 DB(channels.db)도 move 전에 연다. 무결 필수 — open 실패 시 None(모듈 비활성).
@@ -1231,6 +1282,7 @@ impl Daemon {
             master_claimed_at: Mutex::new(None),
             feed_items: Mutex::new(restored),
             feed_waiters: Mutex::new(HashMap::new()),
+            operator_token,
             feed_persist_lock: Mutex::new(()),
             // 큐 WAL 복원: queue-state.json을 mid로 dedup해 replay (미배달 큐 재기동 생존·P7)
             restored_queue: Mutex::new(load_queue_state(&dir)),

@@ -1901,16 +1901,34 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // resolve_caller_surface는 내부에서 surfaces 락을 잡으므로 위 임계영역 밖에서 호출한다.
             let caller_pgid = caller_pid.and_then(crate::state::pgid_of);
             let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
-            if crate::state::is_self_approval(
-                pub_pid,
-                pub_pgid,
-                pub_sid,
-                caller_pid,
-                caller_pgid,
-                caller_sid,
-                &decision,
-            ) && crate::state::deny_self_approve_policy()
+            // ★GUI 오퍼레이터 승인(오너 2026-07-15): GUI(Tauri 백엔드)가 state_dir의 operator.token을
+            // 읽어 첨부한 토큰이 데몬 보관본과 일치하면 §3.2 가드 검사 전체를 건너뛴다(정상 resolve
+            // 직행). GUI는 부서 생성 체인을 자기 pgid로 spawn해 발행자로 각인되고(pgid_match), 어떤
+            // surface에도 귀속되지 않아(caller_sid=None) 미귀속 fail-closed 분기에도 걸려 사실상 전
+            // 항목 Allow 불능이었다 — 토큰은 "오퍼레이터(사람) 세션" 증명(M11 수준·사고 방지용).
+            // 불일치·부재=아래 기존 로직 그대로(하위호환: 구 GUI+신 데몬=현행 동작·CLI 첨부 금지).
+            let operator_ok = param_str(&params, "operator_token")
+                .zip(daemon.operator_token.as_deref())
+                .map(|(t, d)| !d.is_empty() && t == d)
+                .unwrap_or(false);
+            if !operator_ok
+                && crate::state::is_self_approval(
+                    pub_pid,
+                    pub_pgid,
+                    pub_sid,
+                    caller_pid,
+                    caller_pgid,
+                    caller_sid,
+                    &decision,
+                )
+                && crate::state::deny_self_approve_policy()
             {
+                // 거부를 데몬 로그에 남긴다 — 무로그 거부가 GUI Allow 먹통 사건의 진단을 지연시켰다.
+                eprintln!(
+                    "cysd: feed.reply 거부(self_approval_denied) — request_id={request_id} \
+                     caller pid={caller_pid:?} pgid={caller_pgid:?} sid={caller_sid:?} / \
+                     publisher pid={pub_pid:?} pgid={pub_pgid:?} sid={pub_sid:?}"
+                );
                 return Reply::Single(err_response(
                     &id,
                     "self_approval_denied",
@@ -5910,6 +5928,72 @@ mod tests {
         }
         let r4 = reply("f_anon", "allow", publisher);
         assert_eq!(r4["ok"], json!(true), "발행 pid 미상인데 자기승인 판정이 걸림: {r4}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ★GUI 오퍼레이터 승인(오너 2026-07-15): operator_token 일치 → §3.2 가드 면제,
+    // 불일치·부재 → 기존 거부 유지. 회귀 핀은 위 feed_reply_blocks_self_approval(무수정 green).
+    #[test]
+    fn feed_reply_operator_token_bypasses_self_approval() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-opertoken-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        // Daemon::new가 토큰을 발급·기록했어야 한다(state_dir = 소켓 부모 = dir).
+        let mem_tok = daemon.operator_token.clone().expect("기동 시 토큰 발급돼야");
+        let file_tok = std::fs::read_to_string(dir.join("operator.token"))
+            .expect("operator.token 파일 기록돼야");
+        assert_eq!(mem_tok, file_tok.trim(), "메모리 토큰 ≠ 파일 토큰(GUI가 읽는 값과 불일치)");
+        assert_eq!(mem_tok.len(), 64, "32바이트 hex = 64자여야");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("operator.token")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "operator.token은 0600(소유자 전용)이어야");
+        }
+
+        let publisher: u32 = 4242;
+        let push = |rid: &str| {
+            let req = Request {
+                id: json!(1),
+                method: "feed.push".into(),
+                params: json!({"kind":"permission","title":"t","body":"b","request_id":rid}),
+            };
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(publisher)) else {
+                panic!("push single expected");
+            };
+            assert_eq!(resp["ok"], json!(true), "push 실패: {resp}");
+        };
+        let reply = |rid: &str, token: Option<&str>| -> Value {
+            let mut params = json!({"request_id": rid, "decision": "allow"});
+            if let Some(t) = token {
+                params["operator_token"] = json!(t);
+            }
+            let req = Request {
+                id: json!(2),
+                method: "feed.reply".into(),
+                params,
+            };
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(publisher)) else {
+                panic!("reply single expected");
+            };
+            resp
+        };
+
+        // ① 토큰 부재(같은 pid 자기승인) → 기존 거부 유지
+        push("f_op");
+        let r1 = reply("f_op", None);
+        assert_eq!(r1["error"]["code"], json!("self_approval_denied"), "부재인데 통과: {r1}");
+        // ② 불일치 토큰 → 여전히 거부(면제 아님)
+        let r2 = reply("f_op", Some("wrong-token"));
+        assert_eq!(r2["error"]["code"], json!("self_approval_denied"), "불일치인데 통과: {r2}");
+        // ③ 일치 토큰 → 가드 면제·resolve 성공
+        let r3 = reply("f_op", Some(&mem_tok));
+        assert_eq!(r3["ok"], json!(true), "일치 토큰이 거부됨: {r3}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

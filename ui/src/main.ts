@@ -3067,6 +3067,18 @@ async function buildDirNodes(dir: string, depth: number): Promise<DocumentFragme
   return frag;
 }
 
+// ★GUI 오퍼레이터 승인(오너 2026-07-15): feed_reply 실패 사유를 사용자 문구로 분류 — 기존
+// `.catch(() => {})` 은폐가 "버튼이 죽은 것처럼" 보이게 해 진단을 지연시킨 결함의 수리.
+// 백엔드가 "코드: 메시지" 형식으로 코드를 보존해 주므로 코드 문자열로 분류한다.
+function feedReplyErrorText(e: unknown): string {
+  const s = String(e);
+  if (s.includes("self_approval_denied"))
+    return "자기승인 차단(§3.2) — 발행자와 같은 프로세스의 승인은 거부됩니다. 데몬이 구버전이면 업데이트 후 다시 시도하세요.";
+  if (s.includes("not_found")) return "항목을 찾을 수 없습니다(만료·삭제되었을 수 있음).";
+  if (s.includes("already resolved")) return "이미 처리된 항목입니다.";
+  return `전송 오류: ${s}`;
+}
+
 async function refreshFeed() {
   const r = (await invoke("feed_list", { status: null }).catch(() => null)) as
     | { items: FeedItem[] }
@@ -3099,33 +3111,53 @@ async function refreshFeed() {
     if (item.status === "pending") {
       const actions = document.createElement("div");
       actions.className = "fi-actions";
+      const btns: HTMLButtonElement[] = [];
       for (const [label, decision, cls] of [["Allow", "allow", "allow"], ["Deny", "deny", "deny"]] as const) {
         const btn = document.createElement("button");
         btn.className = cls;
         btn.textContent = label;
         btn.addEventListener("click", async () => {
-          // ★CEO 승격 Allow 결함 수리(오너 2026-07-15 + 적대검증 D-2/3/4): 이 요청을 만든 cys-dept
-          // 대기자는 데몬 재시작 등으로 죽어 pending 고아가 되며, feed_reply만으론 승격이 집행되지
-          // 않았다(먹통). ①머신 kind(ceo-promote-request)로만 라우팅 — 제목 정규식은 정보성 알림
-          // ("보류/대기")에도 매칭돼 오탐(D-3). ②승격을 feed_reply보다 **먼저** 집행 — 실패 시 항목을
-          // pending으로 남겨 재시도 가능(D-4). ③promote-ceo가 미승격 PENDING이면 exit 5→Err→실패
-          // 표시(가짜 "완료" 토스트 차단·D-2).
-          const isCeoPromote = item.kind === "ceo-promote-request";
-          if (isCeoPromote && decision === "allow") {
-            try {
-              const r = (await invoke("approve_ceo_promotion")) as string;
-              await invoke("feed_reply", { requestId: item.request_id, decision }).catch(() => {});
-              toast("watchdog", "✅ CEO 승격 완료", r || "기본 데몬 master를 CEO로 승격했습니다.");
-            } catch (e) {
-              // 승격 실패 — feed_reply 하지 않음(항목 pending 유지·재시도 가능). 실패 사유 표시.
-              toast("health", "CEO 승격 실패", String(e));
+          // ★GUI 오퍼레이터 승인(오너 2026-07-15 · 리뷰어1 R1 반영): in-flight 동안 두 버튼 비활성
+          // (이중클릭·상반 결정 경합 차단), finally에서 전 경로(성공 포함) 재활성 후 재렌더로 일원화
+          // — 기존 .catch(() => {}) 은폐 제거 + 실패 시 사유 토스트.
+          btns.forEach((b) => (b.disabled = true));
+          try {
+            // ★CEO 승격 Allow 결함 수리(오너 2026-07-15 + 적대검증 D-2/3/4): 이 요청을 만든 cys-dept
+            // 대기자는 데몬 재시작 등으로 죽어 pending 고아가 되며, feed_reply만으론 승격이 집행되지
+            // 않았다(먹통). ①머신 kind(ceo-promote-request)로만 라우팅 — 제목 정규식은 정보성 알림
+            // ("보류/대기")에도 매칭돼 오탐(D-3). ②승격을 feed_reply보다 **먼저** 집행 — 실패 시 항목을
+            // pending으로 남겨 재시도 가능(D-4). ③promote-ceo가 미승격 PENDING이면 exit 5→Err→실패
+            // 표시(가짜 "완료" 토스트 차단·D-2).
+            const isCeoPromote = item.kind === "ceo-promote-request";
+            if (isCeoPromote && decision === "allow") {
+              try {
+                const r = (await invoke("approve_ceo_promotion")) as string;
+                try {
+                  await invoke("feed_reply", { requestId: item.request_id, decision });
+                  toast("watchdog", "✅ CEO 승격 완료", r || "기본 데몬 master를 CEO로 승격했습니다.");
+                } catch (e) {
+                  // 승격은 성공, feed 항목 해소만 실패(pending 잔존) — 두 사실을 모두 표시.
+                  toast("health", "CEO 승격 완료 · feed 해소 실패",
+                    `승격: ${r || "완료"} / feed: ${feedReplyErrorText(e)}`);
+                }
+              } catch (e) {
+                // 승격 실패 — feed_reply 하지 않음(항목 pending 유지·재시도 가능). 실패 사유 표시.
+                toast("health", "CEO 승격 실패", String(e));
+              }
+            } else {
+              try {
+                await invoke("feed_reply", { requestId: item.request_id, decision });
+              } catch (e) {
+                toast("health", decision === "allow" ? "승인 실패" : "거부 실패", feedReplyErrorText(e));
+              }
             }
-          } else {
-            await invoke("feed_reply", { requestId: item.request_id, decision }).catch(() => {});
+          } finally {
+            btns.forEach((b) => (b.disabled = false));
+            refreshFeed();
+            refreshSidebarStatus(); // 결정 직후 집계 배지 즉시 갱신
           }
-          refreshFeed();
-          refreshSidebarStatus(); // 결정 직후 집계 배지 즉시 갱신
         });
+        btns.push(btn);
         actions.appendChild(btn);
       }
       el.appendChild(actions);

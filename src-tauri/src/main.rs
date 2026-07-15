@@ -136,6 +136,22 @@ async fn rpc(method: &str, params: Value) -> Result<Value, String> {
 
 /// 소켓 지정 RPC — 풀의 소켓별 연결을 잠가 직렬화(다른 데몬 RPC를 막지 않음).
 async fn rpc_on(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
+    let resp = rpc_full(socket, method, params).await?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(resp["error"]["message"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string())
+    }
+}
+
+/// rpc_on의 전송·파싱 본체 — 데몬 응답 **전체**(ok/result/error.code)를 반환한다.
+/// ★GUI 오퍼레이터 승인(오너 2026-07-15): feed_reply가 error.code(self_approval_denied 등)로
+/// 재시도·UI 분류를 해야 하는데 rpc_on은 message만 올려 코드가 유실됐다 — 기존 호출부의 문자열
+/// 계약(message만)은 rpc_on 래퍼로 그대로 보존하고, 코드가 필요한 곳만 이 함수를 직접 쓴다.
+async fn rpc_full(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
     let req = json!({"id": 1, "method": method, "params": params});
     let mut line = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
     line.push(b'\n');
@@ -161,15 +177,7 @@ async fn rpc_on(socket: &std::path::Path, method: &str, params: Value) -> Result
             return Err(e);
         }
     };
-    let resp: Value = serde_json::from_str(resp_line.trim()).map_err(|e| e.to_string())?;
-    if resp["ok"].as_bool() == Some(true) {
-        Ok(resp["result"].clone())
-    } else {
-        Err(resp["error"]["message"]
-            .as_str()
-            .unwrap_or("unknown error")
-            .to_string())
-    }
+    serde_json::from_str(resp_line.trim()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1161,14 +1169,51 @@ async fn feed_list(status: Option<String>) -> Result<Value, String> {
     rpc("feed.list", json!({"status": status})).await
 }
 
+/// ★GUI 오퍼레이터 승인(오너 2026-07-15): 기본 데몬 state 디렉토리의 operator.token을 읽는다 —
+/// cysd state_dir(RC-13)의 기본 데몬 매핑과 동형(unix=기본 소켓의 부모 디렉토리,
+/// windows=%LOCALAPPDATA%\cys). feed_reply는 기본 데몬 전용(rpc 기본 소켓)이라 부서 pipe 슬러그
+/// 분기는 불필요. 매 호출 신선 재독(캐시 금지) — 데몬 재시작(churn)마다 토큰이 재발급되기 때문.
+/// 부재·빈 파일=None(구 데몬 호환 — 첨부 없이 기존대로 호출).
+fn read_operator_token() -> Option<String> {
+    #[cfg(windows)]
+    let dir = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").ok()?).join("cys");
+    #[cfg(not(windows))]
+    let dir = default_socket().parent()?.to_path_buf();
+    let tok = std::fs::read_to_string(dir.join("operator.token")).ok()?;
+    let tok = tok.trim().to_string();
+    (!tok.is_empty()).then_some(tok)
+}
+
 #[tauri::command]
 async fn feed_reply(request_id: String, decision: String) -> Result<(), String> {
-    rpc(
-        "feed.reply",
-        json!({"request_id": request_id, "decision": decision}),
-    )
-    .await
-    .map(|_| ())
+    // ★GUI 오퍼레이터 승인(오너 2026-07-15): operator.token을 첨부해 §3.2 자기승인 가드의 GUI 오탐
+    // (부서 생성 체인 pgid 각인 + surface 미귀속 fail-closed)을 면제한다. 첨부 지점은 이 Tauri 백엔드
+    // 단 한 곳 — 공용 cys CLI 무첨부는 워커의 **우발적** 면제만 차단한다(의도적 동일사용자
+    // 프로세스는 토큰 파일을 읽어 raw RPC로 우회 가능 — M11 수준·사고 방지용).
+    async fn call(request_id: &str, decision: &str) -> Result<Value, String> {
+        let mut params = json!({"request_id": request_id, "decision": decision});
+        if let Some(tok) = read_operator_token() {
+            params["operator_token"] = json!(tok);
+        }
+        rpc_full(&default_socket(), "feed.reply", params).await
+    }
+    let mut resp = call(&request_id, &decision).await?;
+    if resp["ok"].as_bool() != Some(true)
+        && resp["error"]["code"].as_str() == Some("self_approval_denied")
+    {
+        // 첫 호출의 파일 읽기와 데몬 재시작(토큰 회전)이 겹친 좁은 창 — 신선 재독으로 1회만 재시도.
+        resp = call(&request_id, &decision).await?;
+    }
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        // UI가 사유를 분류·표시할 수 있게 코드를 보존해 반환(에러 은폐 제거의 짝).
+        Err(format!(
+            "{}: {}",
+            resp["error"]["code"].as_str().unwrap_or("error"),
+            resp["error"]["message"].as_str().unwrap_or("unknown error")
+        ))
+    }
 }
 
 /// Attach: 부서 소켓의 surface PTY 출력을 base64 이벤트로 webview에 스트리밍.
