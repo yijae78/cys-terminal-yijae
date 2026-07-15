@@ -4365,6 +4365,16 @@ fn run_todo_path() -> i32 {
     0
 }
 
+/// 루트 cwd("/"·"\\"·"C:\\" 류)를 home으로 교정 — 순수 함수(진리표 테스트 가능).
+/// 근거: launchd/Finder 상속으로 루트에서 태어난 노드·roster 오염 실사고(2026-07-15).
+fn sanitize_launch_cwd(cwd: String) -> String {
+    let trimmed = cwd.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() || (trimmed.len() == 2 && trimmed.ends_with(':')) {
+        return cys::home_dir().to_string_lossy().into_owned();
+    }
+    cwd
+}
+
 fn run_launch_agent(role: &str, agent: &str, cwd: Option<String>) -> i32 {
     run_launch_agent_opts(role, agent, cwd, false, None, false, None)
 }
@@ -4400,11 +4410,18 @@ fn run_launch_agent_opts(
     // 워크플로우 폴더다 (데몬 기본값 home에 맡기지 않는다. 명시 --cwd는 그대로 우선).
     // 빈 문자열은 None으로 정규화 — 구버전 topology의 "cwd": "" 가 PTY 생성을 깨거나
     // 잘못된 타이틀을 만드는 것을 차단(restore 경로 방어).
-    let cwd = cwd.filter(|s| !s.is_empty()).or_else(|| {
-        std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
-    });
+    // ★루트 cwd 교정(오너 2026-07-15 실사고): Finder 런칭 GUI·launchd 소유 cysd의 cwd는 "/"라
+    // ▶CEO/▶부서장 버튼·cys boot 경유 노드가 루트에서 태어나고, 그 값이 phoenix roster에
+    // "진실"로 영속돼 이후 복원까지 오염시켰다. 루트는 이 제품에서 워크플로우 폴더일 수 없다
+    // — home으로 교정한다(명시 --cwd "/"도 교정 대상 · restore가 넘기는 오염 roster 값도 치유).
+    let cwd = cwd
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .map(sanitize_launch_cwd);
     // 기동 실패 시 정리용 — 만들어 둔 surface가 role을 점유한 채 남으면 재기동이 차단된다
     let mut created: Option<u64> = None;
     let result = (|| -> Result<(), String> {
@@ -7304,6 +7321,18 @@ extern "C" fn scoped_cleanup_handler(sig: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ★루트 cwd 교정(2026-07-15 실사고): 루트류는 home으로, 정상 경로는 불변.
+    #[test]
+    fn sanitize_launch_cwd_truth_table() {
+        let home = cys::home_dir().to_string_lossy().into_owned();
+        assert_eq!(sanitize_launch_cwd("/".into()), home);
+        assert_eq!(sanitize_launch_cwd("\\".into()), home);
+        assert_eq!(sanitize_launch_cwd("C:\\".into()), home);
+        assert_eq!(sanitize_launch_cwd("/Users/x".into()), "/Users/x");
+        assert_eq!(sanitize_launch_cwd("/Users/x/".into()), "/Users/x/");
+        assert_eq!(sanitize_launch_cwd("C:\\work".into()), "C:\\work");
+    }
 
     // pack-update·compose 통합테스트는 동일 전역 env(ENV_PACK_DIR/ENV_CONFIG_DIR/ENV_SOCKET)를
     // set/remove하므로 단일 뮤텍스로 직렬화한다. 옛 PACK_UPDATE_ENV_LOCK·COMPOSE_ENV_LOCK가 별개라
