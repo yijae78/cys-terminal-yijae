@@ -1813,7 +1813,7 @@ async fn dept_live_session_count(sock: &std::path::Path) -> Result<u64, String> 
 /// rotate_daemon 동형이되 대상이 부서 소켓이라 세션 카운트를 dept_live_session_count(부서소켓 surface.list)로
 /// 산출한다(live_session_count는 메인 전용이라 재사용 불가). 반환=새 데몬 identify(+rotate_log) — UI 스큐 해소 판정.
 #[tauri::command]
-async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool) -> Result<Value, String> {
+async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool, skip_drain: bool) -> Result<Value, String> {
     let sock = dept_socket_path(&name);
     // 세션 가드(rotate_daemon 동형). ★F1(리뷰): force=false는 카운트 실패를 0으로 접지 않고
     // Err("live_sessions:unknown")로 보류한다 — 세션 보유 부서를 무확인 교대할 위험 차단(UI가 held 분류·다음
@@ -1827,15 +1827,18 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool) -> Result
     }
     // drain(best-effort): 교대 전 부서 노드에 저장 신호. 부서 소켓 대상(CYS_SOCKET)으로 cys drain 실행
     // (메인 rotate_daemon의 drain 동형·spawn_blocking 패턴 일치). cys drain 자체 watchdog로 hang 시에도 종료.
-    let dsock = sock.to_string_lossy().into_owned();
-    let _ = tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
-        cmd.env(cys::ENV_SOCKET, &dsock);
-        cmd.arg("drain");
-        no_console(&mut cmd);
-        cmd.status()
-    })
-    .await;
+    // ★skip_drain: verified 재시작은 사전 `cys drain --verify`로 저장 확인됨 → 이중 drain 생략(회귀 0=false).
+    if !skip_drain {
+        let dsock = sock.to_string_lossy().into_owned();
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+            cmd.env(cys::ENV_SOCKET, &dsock);
+            cmd.arg("drain");
+            no_console(&mut cmd);
+            cmd.status()
+        })
+        .await;
+    }
     // cys-dept rotate <name> — 프로세스 정지→새 바이너리 재기동(reg_upsert 메타보존·묘비 불변).
     // launch_dept_daemon의 bash+inject_runtime_path+no_console+spawn_blocking 패턴 동형.
     let tool = dept_tool();
@@ -2082,7 +2085,7 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
 /// 만드는데 이 경로엔 재시작이 없어 영구 잔류한다. 진행 표시는 UI(checkVersionSkew/manualRotateSkewed) 토스트 담당.
 /// force=false: 살아있는 세션이 있으면 거부(UI가 확인 후 force=true로 재호출) — install_update 가드 동형.
 #[tauri::command]
-async fn rotate_daemon(app: AppHandle, force: bool) -> Result<(), String> {
+async fn rotate_daemon(app: AppHandle, force: bool, skip_drain: bool) -> Result<(), String> {
     // ★F1(리뷰): force=false는 UI checkVersionSkew(무손실 자동 교대)만 호출한다 — 세션 카운트 실패를 0으로
     // 접으면 세션 보유 노드를 무확인 교대할 위험 → Err("live_sessions:unknown")로 보류(UI가 "held" 분류·다음
     // tick 재시도). Ok(0)만 진행. force=true(사용자 확인 완료 수동 경로)는 카운트 자체를 건너뛴다(무영향).
@@ -2094,13 +2097,17 @@ async fn rotate_daemon(app: AppHandle, force: bool) -> Result<(), String> {
         }
     }
     // drain(best-effort): 교대 전 살아있는 노드에 저장 신호 + 유예 (install_update 3단계 동형).
-    let _ = tokio::task::spawn_blocking(|| {
-        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
-        cmd.arg("drain");
-        no_console(&mut cmd);
-        cmd.status()
-    })
-    .await;
+    // ★skip_drain: verified 재시작 경로는 사전에 `cys drain --verify`로 저장을 확인했으므로 여기서
+    // 이중 drain을 생략한다. 기존 무손실 자동교대·수동 '바로 재시작'은 skip_drain=false로 거동 불변(회귀 0).
+    if !skip_drain {
+        let _ = tokio::task::spawn_blocking(|| {
+            let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+            cmd.arg("drain");
+            no_console(&mut cmd);
+            cmd.status()
+        })
+        .await;
+    }
     let _ = std::fs::write(pending_restore_path(), "");
     stop_running_daemon().await;
     ensure_daemon().await?;
@@ -2108,6 +2115,38 @@ async fn rotate_daemon(app: AppHandle, force: bool) -> Result<(), String> {
     let app2 = app.clone();
     let _ = tokio::task::spawn_blocking(move || maybe_apply_pending_update(&app2)).await;
     Ok(())
+}
+
+/// GUI verified 재시작용 — `cys drain --verify`를 실행해 노드별 체크포인트(SESSION_STATE) 저장 검증
+/// 결과 JSON을 반환한다(all_saved·summary·nodes·pending_loss_warning). 구 바이너리(--verify 미지원)는
+/// clap 파싱 에러로 JSON을 못 내므로 Err("unsupported:…")로 신호 → UI가 feature-detect 후 plain drain 폴백.
+/// ★재시작하지 않는다(저장 검증만) — 재시작은 UI가 결과를 보고 rotate_daemon(skip_drain=true)로 진행.
+#[tauri::command]
+async fn drain_verify(timeout: u64) -> Result<Value, String> {
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd =
+            std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+        cmd.arg("drain")
+            .arg("--verify")
+            .arg("--timeout")
+            .arg(timeout.to_string());
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    // 결과 JSON은 exit code(전원 saved=0/아니면 1)와 무관하게 stdout에 방출된다 — JSON 파싱 성공이 진실원천.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) {
+        return Ok(v);
+    }
+    // JSON 부재 = 구 바이너리 --verify 미지원(clap 에러) 또는 하드캡 크래시 → 폴백 신호(UI가 plain drain).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Err(format!(
+        "unsupported: drain --verify 미지원 또는 실패 (stderr: {})",
+        stderr.trim()
+    ))
 }
 
 /// P5: 무중단 팩 업데이트 UI 브리지(DESIGN-noshutdown-pack-update §2-②·§7-③/④).
@@ -2331,6 +2370,7 @@ fn main() {
             install_update,
             autotest_patch_install,
             rotate_daemon,
+            drain_verify,
             install_pack_update,
             launch_dept_daemon,
             allocate_dept_daemon,

@@ -546,7 +546,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | surface | `new-surface` `list` `attach` `read-screen` `resize` `close-surface` `quiesce` `tombstone` | 세션 생성·목록·미러링·화면 읽기·크기·닫기(자식 트리 전멸)·주입 보류·묘비 |
 | 통신 | `send` `send-key` `events` `watch` | stdin 주입·키 주입·이벤트 구독·regex 완료 대기 |
 | 역할·함대 | `launch-agent` `boot` `claim-role` `surface-role` `status` `fleet` `set-status` `todo-path` | 역할 노드 기동·일괄 부트·역할 등록/조회·관제 보드·자기보고·역할별 TODO 경로 |
-| 사이클·복구 | `cycle-agent` `node-recover` `restore` `reinject` `drain` | 컨텍스트 사이클·재기동·조직 복원·지침 재주입·업데이트 전 저장 신호 |
+| 사이클·복구 | `cycle-agent` `node-recover` `restore` `reinject` `drain` | 컨텍스트 사이클·재기동·조직 복원·지침 재주입·업데이트 전 저장 신호(`drain --verify`=노드별 체크포인트 저장을 nonce 마커로 결정론 검증 후 JSON+exit code) |
 | 거버넌스 | `run` `ps` `kill` `add-health-rule` `health-rules` `pause` `resume` `gate-check` `queue` | scoped 실행·원장·강제 종료·헬스룰·kill-switch·큐 관리 |
 | 승인 | `feed` `approval` | 승인 요청함(push/list/reply)·HMAC signed-prefix 서명(check/sign) |
 | 팩·업데이트 | `init-pack` `pack-update` `pack-manifest` `license` `pack-repair-channel` `pack-downgrade-to-free` `persona` | 팩 설치·무중단 업데이트·매니페스트 방출·pro 라이선스·채널 복구·강등·페르소나 |

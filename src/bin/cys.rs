@@ -137,7 +137,15 @@ enum Command {
     /// kill-switch 해제 — 동결된 큐·스케줄 재개
     Resume,
     /// 업데이트 재시작 전 살아있는 노드에 저장 신호 + 유예 (best-effort drain)
-    Drain,
+    Drain {
+        /// 저장 검증 모드: 노드별 체크포인트(SESSION_STATE) nonce 마커 기입을 결정론 확인 후
+        /// 결과 JSON+exit code 반환 (기존 무인자 plain drain은 거동 불변 — best-effort 저장 신호만).
+        #[arg(long)]
+        verify: bool,
+        /// verify 모드 노드별 검증 대기(초) — 전역 하드캡=timeout+마진. plain drain은 무영향.
+        #[arg(long, default_value_t = 20)]
+        timeout: u64,
+    },
     /// preflight 게이트: exit 0 = running, 4 = paused (자율주행 매 action 전 확인용)
     GateCheck,
     /// 미배달 큐 검사·철회 (kill-switch의 짝)
@@ -1545,7 +1553,11 @@ fn run(command: Command) -> i32 {
         Command::Resume => request("system.resume", json!({}))
             .map(|_| println!("RESUMED — 동결된 큐·스케줄 재개")),
 
-        Command::Drain => {
+        Command::Drain { verify, timeout } if verify => {
+            return run_drain_verify(timeout);
+        }
+
+        Command::Drain { .. } => {
             // 업데이트 재시작 전 살아있는 역할 노드에 저장 신호를 보내고 짧게 유예한다(best-effort).
             // 노드(LLM) 협조 의존이라 무손실 보장은 아니며, 주 복원 경로는 재시작 후 resume이다.
             // ★hard watchdog: 데몬 무응답으로 RPC(read_line)가 hang해도 12s 내 무조건 종료해,
@@ -4931,6 +4943,522 @@ fn request_on(socket: &std::path::Path, method: &str, params: Value) -> Result<V
     let stream = open_pipe_busy_retry(socket)
         .map_err(|e| format!("open {}: {e}", socket.display()))?;
     rpc_over(stream, method, params)
+}
+
+/// request_on의 타임아웃판 — connect 후 read/write 타임아웃을 강제한다. drain --verify fan-out은
+/// hung 소켓(데몬이 accept 후 무응답)에서 request_on의 무타임아웃 read가 영구 정지[A1-F2]하므로 필수.
+#[cfg(unix)]
+fn request_on_timeout(
+    socket: &std::path::Path,
+    method: &str,
+    params: Value,
+    timeout: std::time::Duration,
+) -> Result<Value, String> {
+    let stream = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    rpc_over(stream, method, params)
+}
+#[cfg(windows)]
+fn request_on_timeout(
+    socket: &std::path::Path,
+    method: &str,
+    params: Value,
+    _timeout: std::time::Duration,
+) -> Result<Value, String> {
+    // Windows named pipe read 타임아웃은 별도 API(SetCommTimeouts/OVERLAPPED)라 현 1차 플랫폼(darwin/unix)
+    // 밖. busy-retry 경로(request_on)로 위임한다 — hung 방어는 unix에서 완전(범위 한정).
+    request_on(socket, method, params)
+}
+
+// ============================ drain --verify (기능 1) ============================
+// 재시작 전 전 노드의 증류 체크포인트(SESSION_STATE)를 nonce 마커로 결정론 확인한다. 무인자 plain drain은
+// best-effort 저장 신호(거동 불변)이고, --verify만 이 경로로 분기해 노드별 결과 JSON+exit code를 낸다.
+// ★설계 v3: 소켓별 병렬 fan-out + connect/read 타임아웃 + 전역 하드캡(=timeout+마진), nonce 마커
+// (HTML 주석형 — 체크박스/denylist 토큰 회피), 복원 중 가드, live_cwd canonical 경로(무음 폴백 금지).
+
+/// 체크포인트 nonce 마커 한 줄 — HTML 주석형 전용. 체크박스 문법(`- [ ]`) 금지(javis_report.py 진행% 오염),
+/// session-start.sh denylist 토큰 회피. 신선도 판정은 mtime이 아니라 이 nonce 존재/일치로 한다[A1-F5]
+/// (마커 쓰기가 mtime 소비자에게 '실작업'으로 오인되는 드리프트 회피).
+fn checkpoint_marker(nonce: &str, ts: u64) -> String {
+    format!("<!-- cys-checkpoint: {nonce} {ts} -->")
+}
+
+/// 파일에 지정 nonce의 체크포인트 마커가 존재하는가(존재/일치 — mtime 아님).
+fn file_has_checkpoint_nonce(path: &std::path::Path, nonce: &str) -> bool {
+    let needle = format!("cys-checkpoint: {nonce}");
+    std::fs::read_to_string(path)
+        .map(|s| s.contains(&needle))
+        .unwrap_or(false)
+}
+
+/// 노드 canonical 체크포인트 파일 = <live_cwd>/_round/SESSION_STATE.md (단일 복원 진실).
+fn canonical_checkpoint_file(live_cwd: &str) -> std::path::PathBuf {
+    std::path::Path::new(live_cwd)
+        .join("_round")
+        .join("SESSION_STATE.md")
+}
+
+/// 전달확정 게이트 판정 — 제출되면 주입 텍스트가 위로 스크롤되고 하단 입력창엔 스피너/빈 프롬프트만 남는다.
+/// Return 미발화(known bug)면 주입 텍스트가 하단 입력창에 잔류하므로 마지막 몇 줄에서 sentinel이 검출된다.
+/// (read-screen grep은 미제출 입력창 텍스트도 매치하므로 '텍스트 존재'가 아니라 '하단 잔류'로 wedge를 본다.)
+fn delivery_wedged(screen: &str, sentinel: &str) -> bool {
+    screen.lines().rev().take(4).any(|l| l.contains(sentinel))
+}
+
+/// phoenix 복원이 이 소켓의 이 역할에 대해 진행 중(저널 stage < g2_ack)인가[A3-F2].
+/// 저널 = <소켓 부모 디렉토리>/phoenix/journal-*.json (phoenix.py state_dir_for=realpath(dirname(socket)) 정합).
+/// 최근(mtime 신선도 창) 저널에서 대상 역할의 stage가 기록됐고 g2_ack 미완료면 복원 중으로 본다 —
+/// 디렉티브 재주입과 "작업 중단" 주입의 교차(각성 파손)를 차단. stale 저널(오래된 실패 복원)이 영구
+/// 차단하지 않도록 mtime 창으로 한정(fail 방향=검증 허용).
+fn restore_active_for_role(socket: &std::path::Path, role: &str, _now: u64) -> bool {
+    const RESTORE_RECENCY_SECS: u64 = 300;
+    let Some(dir) = socket.parent() else {
+        return false;
+    };
+    let phoenix = dir.join("phoenix");
+    let Ok(entries) = std::fs::read_dir(&phoenix) else {
+        return false;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("journal-") && name.ends_with(".json")) {
+            continue;
+        }
+        let fresh = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() <= RESTORE_RECENCY_SECS)
+            .unwrap_or(false);
+        if !fresh {
+            continue;
+        }
+        let Ok(txt) = std::fs::read_to_string(e.path()) else {
+            continue;
+        };
+        let Ok(j) = serde_json::from_str::<Value>(&txt) else {
+            continue;
+        };
+        let stages = &j["roles"][role]["stages"];
+        if !stages.is_object() {
+            continue;
+        }
+        let done = |s: &str| stages[s]["done"].as_bool() == Some(true);
+        let started = ["spawn", "ready", "resume", "reinject"]
+            .iter()
+            .any(|s| done(s));
+        if started && !done("g2_ack") {
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VerifyOutcome {
+    Saved,
+    Timeout,
+    DeliveryFailed,
+    Unverifiable,
+    SkippedRestoring,
+}
+impl VerifyOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            VerifyOutcome::Saved => "saved",
+            VerifyOutcome::Timeout => "timeout",
+            VerifyOutcome::DeliveryFailed => "delivery_failed",
+            VerifyOutcome::Unverifiable => "unverifiable",
+            VerifyOutcome::SkippedRestoring => "skipped_restoring",
+        }
+    }
+}
+
+/// verify 대상 1노드 — 소켓별 org.status에서 추출(surface_id는 데몬별 네임스페이스라 socket과 쌍으로 보유).
+#[derive(Clone)]
+struct VerifyTarget {
+    socket: std::path::PathBuf,
+    dept: String,
+    display: String,
+    surface_id: u64,
+    surface_ref: String,
+    role: String,
+    live_cwd: Option<String>,
+    pending_undelivered: u64,
+}
+
+/// drain --verify 소켓 I/O 추상화 — 프로덕션은 request_on_timeout, 테스트는 노드 상태(saved/no-save/
+/// wedge/hung)를 모사하는 fake로 주입한다(producer≠evaluator 검증 용이).
+trait VerifyIo {
+    fn inject(
+        &self,
+        socket: &std::path::Path,
+        sid: u64,
+        text: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String>;
+    fn read_screen(
+        &self,
+        socket: &std::path::Path,
+        sid: u64,
+        lines: u64,
+        timeout: std::time::Duration,
+    ) -> Result<String, String>;
+    fn send_return(
+        &self,
+        socket: &std::path::Path,
+        sid: u64,
+        timeout: std::time::Duration,
+    ) -> Result<(), String>;
+}
+
+/// 소켓 지정 주입(inject_text의 socket+timeout판): bracketed paste → 0.8s → Return. 기본 소켓 하드바인딩인
+/// inject_text와 달리 부서 소켓 대상[A1-F1] · request_on_timeout으로 hung 방어.
+fn inject_text_on(
+    socket: &std::path::Path,
+    sid: u64,
+    text: &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let wrapped = format!("\x1b[200~{text}\x1b[201~");
+    request_on_timeout(
+        socket,
+        "surface.send_text",
+        json!({"surface_id": sid, "text": wrapped, "quiet": true, "authoritative": true}),
+        timeout,
+    )?;
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    request_on_timeout(
+        socket,
+        "surface.send_key",
+        json!({"surface_id": sid, "key": "Return", "authoritative": true}),
+        timeout,
+    )?;
+    Ok(())
+}
+
+struct RealVerifyIo;
+impl VerifyIo for RealVerifyIo {
+    fn inject(
+        &self,
+        socket: &std::path::Path,
+        sid: u64,
+        text: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        inject_text_on(socket, sid, text, timeout)
+    }
+    fn read_screen(
+        &self,
+        socket: &std::path::Path,
+        sid: u64,
+        lines: u64,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        request_on_timeout(
+            socket,
+            "surface.read_text",
+            json!({"surface_id": sid, "lines": lines}),
+            timeout,
+        )
+        .map(|r| r["text"].as_str().unwrap_or("").to_string())
+    }
+    fn send_return(
+        &self,
+        socket: &std::path::Path,
+        sid: u64,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        request_on_timeout(
+            socket,
+            "surface.send_key",
+            json!({"surface_id": sid, "key": "Return", "authoritative": true}),
+            timeout,
+        )
+        .map(|_| ())
+    }
+}
+
+/// 1노드 검증: 복원 가드 → canonical 경로 → 저장 지시 주입 → 전달확정 게이트 → nonce 파일 폴링.
+/// 반환=(결과, 상세). 소켓 hung은 timeout(파일 폴링은 로컬 FS라 소켓 무관)·미제출 wedge는 delivery_failed로 구분.
+fn verify_one_node(
+    io: &dyn VerifyIo,
+    t: &VerifyTarget,
+    nonce_prefix: &str,
+    timeout: std::time::Duration,
+    now: u64,
+) -> (VerifyOutcome, String) {
+    use std::time::{Duration, Instant};
+    // 1) 복원 중 가드 — 각성 파손 방지(디렉티브 재주입과 "작업 중단"의 교차 차단)
+    if restore_active_for_role(&t.socket, &t.role, now) {
+        return (
+            VerifyOutcome::SkippedRestoring,
+            "phoenix 복원 진행 중(stage<g2_ack) — 각성 파손 방지 skip".into(),
+        );
+    }
+    // 2) canonical 경로 — live_cwd 미제공(구버전 부서 데몬)이면 검증불가(무음 cwd 폴백 금지)[A1-F6]
+    let Some(cwd) = t.live_cwd.as_deref() else {
+        return (
+            VerifyOutcome::Unverifiable,
+            "live_cwd 미제공(구버전 데몬) — 검증불가(무음 폴백 금지)".into(),
+        );
+    };
+    let file = canonical_checkpoint_file(cwd);
+    let nonce = format!("{nonce_prefix}-{}", t.surface_id);
+    let marker = checkpoint_marker(&nonce, now);
+    // 이미 이 nonce가 있으면 즉시 통과(프로세스 내 재호출 idempotent)
+    if file_has_checkpoint_nonce(&file, &nonce) {
+        return (
+            VerifyOutcome::Saved,
+            format!("nonce 마커 확인: {}", file.display()),
+        );
+    }
+    // 3) 저장 지시 주입 — nonce 마커 기입 + 작업 중단
+    let instr = format!(
+        "[DRAIN-VERIFY] 재시작 전 체크포인트 검증. 지금 즉시: ① _round/SESSION_STATE.md에 현재 작업 상태·미해결 게이트·다음 액션을 최신화해 저장하라. ② 그 파일 맨 끝에 정확히 이 한 줄을 추가하라(문자 그대로·수정 금지): {marker} ③ 저장 후 작업을 멈추고 재시작·복원을 기다려라. (승인 프롬프트 대기 중이면 이 메시지는 무시하라.)"
+    );
+    let io_to = std::cmp::min(timeout, Duration::from_secs(8));
+    if io.inject(&t.socket, t.surface_id, &instr, io_to).is_err() {
+        // 소켓 hung(RPC 타임아웃) — delivery_failed(노드 wedge)와 구분해 timeout으로 분류
+        return (
+            VerifyOutcome::Timeout,
+            "소켓 hung — 저장 지시 RPC 타임아웃(전역 캡 내)".into(),
+        );
+    }
+    // 4) 전달확정 게이트 — 빈 프롬프트+스피너 확인, wedge(하단 입력창 잔류)면 Return 재전송
+    std::thread::sleep(Duration::from_millis(600));
+    let mut wedged = io
+        .read_screen(&t.socket, t.surface_id, 6, io_to)
+        .map(|s| delivery_wedged(&s, &nonce))
+        .unwrap_or(false);
+    if wedged {
+        let _ = io.send_return(&t.socket, t.surface_id, io_to);
+        std::thread::sleep(Duration::from_millis(800));
+        wedged = io
+            .read_screen(&t.socket, t.surface_id, 6, io_to)
+            .map(|s| delivery_wedged(&s, &nonce))
+            .unwrap_or(wedged);
+    }
+    // 5) nonce 파일 폴링(로컬 FS — 소켓 hung과 무관하게 저장 검출)
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if file_has_checkpoint_nonce(&file, &nonce) {
+            return (
+                VerifyOutcome::Saved,
+                format!("nonce 마커 확인: {}", file.display()),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    if wedged {
+        (
+            VerifyOutcome::DeliveryFailed,
+            "입력 미제출(wedge) — Return 재전송에도 저장 미검출".into(),
+        )
+    } else {
+        (
+            VerifyOutcome::Timeout,
+            format!(
+                "{}s 내 nonce 마커 미검출: {}",
+                timeout.as_secs(),
+                file.display()
+            ),
+        )
+    }
+}
+
+/// 소켓별 병렬 fan-out — 총 소요 ≈ 1×timeout(직렬 누적 아님). 노드별 detached 스레드로 verify를 스폰하고
+/// 전역 하드캡(=timeout+마진) 내 결과를 수집한다. 미도착 노드는 timeout으로 분류(캡 초과=hung 방어).
+fn drain_verify_fanout(
+    io: std::sync::Arc<dyn VerifyIo + Send + Sync>,
+    targets: Vec<VerifyTarget>,
+    timeout: std::time::Duration,
+    now: u64,
+) -> Value {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    let global_cap = timeout + Duration::from_secs(5);
+    let nonce_prefix = format!("{now}-{}", std::process::id());
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, VerifyOutcome, String)>();
+    let total = targets.len();
+    // surface_id는 데몬별 네임스페이스라 소켓 간 충돌 가능 → 인덱스로 키잉.
+    let mut meta: HashMap<usize, VerifyTarget> = HashMap::new();
+    for (idx, t) in targets.iter().enumerate() {
+        meta.insert(idx, t.clone());
+    }
+    for (idx, t) in targets.into_iter().enumerate() {
+        let tx = tx.clone();
+        let io = io.clone();
+        let np = nonce_prefix.clone();
+        std::thread::spawn(move || {
+            let (o, d) = verify_one_node(io.as_ref(), &t, &np, timeout, now);
+            let _ = tx.send((idx, o, d));
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + global_cap;
+    let mut results: HashMap<usize, (VerifyOutcome, String)> = HashMap::new();
+    while results.len() < total {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok((idx, o, d)) => {
+                results.insert(idx, (o, d));
+            }
+            Err(_) => break,
+        }
+    }
+    // 결과 JSON(원래 순서 안정) — 미도착 노드는 전역 캡 초과 timeout.
+    let mut nodes: Vec<Value> = Vec::new();
+    let mut pending_loss: Vec<Value> = Vec::new();
+    let (mut c_saved, mut c_timeout, mut c_deliv, mut c_unver, mut c_skip) = (0, 0, 0, 0, 0);
+    let mut all_saved = true;
+    for idx in 0..total {
+        let t = &meta[&idx];
+        let (outcome, detail) = results.get(&idx).cloned().unwrap_or((
+            VerifyOutcome::Timeout,
+            "전역 하드캡 초과 — 결과 미도착(timeout)".into(),
+        ));
+        match outcome {
+            VerifyOutcome::Saved => c_saved += 1,
+            VerifyOutcome::Timeout => c_timeout += 1,
+            VerifyOutcome::DeliveryFailed => c_deliv += 1,
+            VerifyOutcome::Unverifiable => c_unver += 1,
+            VerifyOutcome::SkippedRestoring => c_skip += 1,
+        }
+        if outcome != VerifyOutcome::Saved {
+            all_saved = false;
+        }
+        if t.pending_undelivered > 0 {
+            pending_loss.push(json!({
+                "role": t.role, "surface": t.surface_ref, "dept": t.dept,
+                "pending_undelivered": t.pending_undelivered,
+            }));
+        }
+        nodes.push(json!({
+            "dept": t.dept,
+            "department": t.display,
+            "role": t.role,
+            "surface": t.surface_ref,
+            "socket": t.socket.to_string_lossy(),
+            "live_cwd": t.live_cwd,
+            "checkpoint_file": t.live_cwd.as_deref().map(|c| canonical_checkpoint_file(c).to_string_lossy().into_owned()),
+            "outcome": outcome.as_str(),
+            "detail": detail,
+            "pending_undelivered": t.pending_undelivered,
+        }));
+    }
+    json!({
+        "mode": "drain-verify",
+        "timeout_secs": timeout.as_secs(),
+        "total": total,
+        "nodes": nodes,
+        "summary": {
+            "saved": c_saved, "timeout": c_timeout, "delivery_failed": c_deliv,
+            "unverifiable": c_unver, "skipped_restoring": c_skip,
+        },
+        // ★재시작 창 큐 보존[A3-F3]: 인메모리 pending_queue는 데몬 재시작에 소실된다(handlers.rs). 디스크
+        // flush는 데몬 RPC가 필요해(handlers 무접촉 목표) 대신 유실 예정분을 정직하게 가시화한다(무음 유실 금지).
+        "pending_loss_warning": pending_loss,
+        "all_saved": all_saved,
+    })
+}
+
+/// depts.json + 본부 소켓을 순회해 verify 대상(살아있는 AI 역할 노드)을 수집한다(run_fleet 소스 동형).
+/// 도달불가(다운) 부서·본부는 스킵(정상 정보). live_cwd는 org.status의 노드별 cd 추적값을 그대로 쓴다.
+fn drain_verify_targets() -> Vec<VerifyTarget> {
+    let home = cys::home_dir().to_string_lossy().into_owned();
+    let mut sockets: Vec<(std::path::PathBuf, String, String)> =
+        vec![(socket_path(), "main".to_string(), "본부 · CEO".to_string())];
+    let reg = std::env::var("CYS_DEPTS_JSON")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&home).join(".cys/depts.json"));
+    if let Ok(s) = std::fs::read_to_string(&reg) {
+        if let Ok(v) = serde_json::from_str::<Value>(&s) {
+            if let Some(depts) = v["depts"].as_object() {
+                for (name, meta) in depts {
+                    let sock = meta["socket"]
+                        .as_str()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| cys::dept_socket_path(name));
+                    let disp = meta["display_name"].as_str().unwrap_or(name).to_string();
+                    sockets.push((sock, name.clone(), disp));
+                }
+            }
+        }
+    }
+    let mut targets = Vec::new();
+    for (sock, dept, disp) in sockets {
+        let r = match request_on_timeout(
+            &sock,
+            "org.status",
+            json!({}),
+            std::time::Duration::from_secs(4),
+        ) {
+            Ok(r) => r,
+            Err(_) => continue, // 다운·전이 중 소켓 스킵(무해)
+        };
+        for s in r["surfaces"].as_array().cloned().unwrap_or_default() {
+            if s["exited"].as_bool() == Some(true) {
+                continue;
+            }
+            let Some(role) = s["role"].as_str() else {
+                continue;
+            };
+            if s["agent"].is_null() {
+                continue; // AI 노드만(agent 메타 존재)
+            }
+            let Some(sid) = s["surface_id"].as_u64() else {
+                continue;
+            };
+            targets.push(VerifyTarget {
+                socket: sock.clone(),
+                dept: dept.clone(),
+                display: disp.clone(),
+                surface_id: sid,
+                surface_ref: s["surface_ref"].as_str().unwrap_or("").to_string(),
+                role: role.to_string(),
+                live_cwd: s["live_cwd"].as_str().map(String::from),
+                pending_undelivered: s["queue_depth"].as_u64().unwrap_or(0),
+            });
+        }
+    }
+    targets
+}
+
+/// `cys drain --verify` 진입점 — 결정론 JSON을 stdout에, exit code로 전원 저장 여부를 반환한다
+/// (전원 saved=0, 아니면 1). 0-노드는 우아한 no-op(exit 0)[A3-F5].
+fn run_drain_verify(timeout: u64) -> i32 {
+    // 백스톱 하드 워치독 — 메인 로직이 어떤 이유로든 멈춰도 프로세스가 영구 정지하지 않게(plain drain 12s 패턴).
+    // fan-out은 timeout+5s 안에 반환하므로 정상 경로에선 절대 발화하지 않는다.
+    let cap = timeout + 10;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(cap));
+        std::process::exit(3);
+    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let targets = drain_verify_targets();
+    let io: std::sync::Arc<dyn VerifyIo + Send + Sync> = std::sync::Arc::new(RealVerifyIo);
+    let report = drain_verify_fanout(io, targets, std::time::Duration::from_secs(timeout), now);
+    let all_saved = report["all_saved"].as_bool() == Some(true);
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    if all_saved {
+        0
+    } else {
+        1
+    }
 }
 
 /// Tasks Control Center(CLI) — depts.json을 읽어 본부+각 부서 소켓에 org.status를 순회 집계한다.
@@ -9388,5 +9916,366 @@ mod tests {
         // agent 등록됐으나 아직 미관측(agent_alive=false) → skip.
         let unseen = json!({"agent": "claude", "exited": false, "agent_alive": false});
         assert!(reinject_check_should_skip_bare_shell(&unseen), "미관측 agent인데 진행");
+    }
+
+    // ============================ drain --verify (기능 1) 테스트 ============================
+
+    /// 노드 협조 상태를 모사하는 fake I/O. 협조 노드는 지시받은 마커를 파일에 기입하고, 미저장·wedge·
+    /// hung은 각각 거동을 흉내낸다(producer≠evaluator — negative fixture 검증).
+    #[derive(Clone, Copy, PartialEq)]
+    enum FakeScenario {
+        Cooperative,
+        NonSaving,
+        Wedge,
+        Hung,
+    }
+
+    struct FakeVerifyIo {
+        nodes: std::sync::Mutex<std::collections::HashMap<u64, (FakeScenario, std::path::PathBuf)>>,
+        last_inject: std::sync::Mutex<std::collections::HashMap<u64, String>>,
+    }
+    impl FakeVerifyIo {
+        fn new() -> Self {
+            FakeVerifyIo {
+                nodes: std::sync::Mutex::new(std::collections::HashMap::new()),
+                last_inject: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+        fn add(&self, sid: u64, scen: FakeScenario, file: std::path::PathBuf) {
+            self.nodes.lock().unwrap().insert(sid, (scen, file));
+        }
+    }
+    /// 주입 텍스트에서 마커 한 줄을 추출(협조 노드가 '지시대로 기입'하는 것을 모사).
+    fn extract_marker(text: &str) -> Option<String> {
+        let start = text.find("<!-- cys-checkpoint:")?;
+        let rest = &text[start..];
+        let end = rest.find("-->")? + 3;
+        Some(rest[..end].to_string())
+    }
+    impl VerifyIo for FakeVerifyIo {
+        fn inject(
+            &self,
+            _socket: &std::path::Path,
+            sid: u64,
+            text: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<(), String> {
+            let scen = self.nodes.lock().unwrap().get(&sid).map(|(s, _)| *s);
+            let file = self.nodes.lock().unwrap().get(&sid).map(|(_, f)| f.clone());
+            self.last_inject
+                .lock()
+                .unwrap()
+                .insert(sid, text.to_string());
+            match scen {
+                Some(FakeScenario::Hung) => return Err("hung socket".into()),
+                Some(FakeScenario::Cooperative) => {
+                    if let (Some(marker), Some(f)) = (extract_marker(text), file) {
+                        let mut cur = std::fs::read_to_string(&f).unwrap_or_default();
+                        cur.push_str(&marker);
+                        cur.push('\n');
+                        let _ = std::fs::write(&f, cur);
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        fn read_screen(
+            &self,
+            _socket: &std::path::Path,
+            sid: u64,
+            _lines: u64,
+            _timeout: std::time::Duration,
+        ) -> Result<String, String> {
+            let scen = self.nodes.lock().unwrap().get(&sid).map(|(s, _)| *s);
+            match scen {
+                Some(FakeScenario::Hung) => Err("hung socket".into()),
+                Some(FakeScenario::Wedge) => Ok(self
+                    .last_inject
+                    .lock()
+                    .unwrap()
+                    .get(&sid)
+                    .cloned()
+                    .unwrap_or_default()),
+                // 협조·미저장: 제출됨 — 하단은 스피너·빈 프롬프트(주입 텍스트 잔류 없음)
+                _ => Ok("...이전 대화...\n✻ Working… (esc to interrupt)\n> ".into()),
+            }
+        }
+        fn send_return(
+            &self,
+            _socket: &std::path::Path,
+            _sid: u64,
+            _timeout: std::time::Duration,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn mk_target(sid: u64, socket: std::path::PathBuf, live_cwd: Option<String>) -> VerifyTarget {
+        VerifyTarget {
+            socket,
+            dept: "main".into(),
+            display: "본부".into(),
+            surface_id: sid,
+            surface_ref: format!("surface:{sid}"),
+            role: "worker".into(),
+            live_cwd,
+            pending_undelivered: 0,
+        }
+    }
+
+    /// 무회귀 증명: `cys drain`(기존 3 호출자 invocation)은 verify=false로 파싱돼 plain drain 경로로
+    /// 라우팅된다(거동 diff 0). `--verify`만 신규 경로로 분기.
+    #[test]
+    fn drain_flag_parsing_defaults_to_plain() {
+        use clap::Parser;
+        match Cli::parse_from(["cys", "drain"]).command {
+            Command::Drain { verify, timeout } => {
+                assert!(!verify, "무인자 drain은 plain(verify=false)이어야 함 — 회귀");
+                assert_eq!(timeout, 20);
+            }
+            _ => panic!("drain이 Drain으로 파싱되지 않음"),
+        }
+        match Cli::parse_from(["cys", "drain", "--verify", "--timeout", "7"]).command {
+            Command::Drain { verify, timeout } => {
+                assert!(verify);
+                assert_eq!(timeout, 7);
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// 마커 포맷 — HTML 주석형·체크박스 문법 금지·denylist 토큰 회피.
+    #[test]
+    fn drain_verify_marker_avoids_checkbox_and_denylist() {
+        let m = checkpoint_marker("run17-42", 1_700_000_000);
+        assert_eq!(m, "<!-- cys-checkpoint: run17-42 1700000000 -->");
+        assert!(!m.contains("- [ ]") && !m.contains("- [x]") && !m.contains("- [X]"));
+        for tok in [
+            "denylist", "recovery", "kill-switch", "soul.md", "autopilot", "자율주행", "안전핵",
+            "eval-driven", "헌법",
+        ] {
+            assert!(!m.contains(tok), "denylist 토큰 '{tok}' 포함");
+        }
+    }
+
+    /// wedge 판정 — 하단 잔류 텍스트만 wedge, 스피너·빈 프롬프트는 전달됨.
+    #[test]
+    fn drain_verify_delivery_wedged_detection() {
+        let sentinel = "run1-9";
+        assert!(delivery_wedged(
+            "위쪽\n[DRAIN-VERIFY] ... run1-9 ... 마커 <!-- cys-checkpoint: run1-9 1 -->",
+            sentinel
+        ));
+        assert!(!delivery_wedged(
+            "...이전 대화...\n✻ Working…\n> ",
+            sentinel
+        ));
+    }
+
+    /// ② 협조 노드 → saved (지시대로 마커 기입).
+    #[test]
+    fn drain_verify_saved_on_cooperative() {
+        let td = std::env::temp_dir().join(format!("cys-dv-coop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("SESSION_STATE.md"), "# 상태\n").unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(
+            7,
+            FakeScenario::Cooperative,
+            round.join("SESSION_STATE.md"),
+        );
+        let t = mk_target(7, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(2), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::Saved);
+    }
+
+    /// ②(변형) 이미 정확한 nonce 마커가 있으면 즉시 saved(idempotent 선통과).
+    #[test]
+    fn drain_verify_pass_when_already_marked() {
+        let td = std::env::temp_dir().join(format!("cys-dv-pre-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        // verify_one_node의 nonce = "{prefix}-{sid}" = "run1-7"
+        let marker = checkpoint_marker("run1-7", 100);
+        std::fs::write(round.join("SESSION_STATE.md"), format!("# 상태\n{marker}\n")).unwrap();
+        let io = FakeVerifyIo::new(); // 노드 미등록 — 주입해도 무동작(하지만 선통과라 무관)
+        let t = mk_target(7, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(2), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::Saved);
+    }
+
+    /// ① 저장 안 하는 노드 → timeout(FAIL).
+    #[test]
+    fn drain_verify_timeout_on_no_save() {
+        let td = std::env::temp_dir().join(format!("cys-dv-nosave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("SESSION_STATE.md"), "# 상태\n").unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(3, FakeScenario::NonSaving, round.join("SESSION_STATE.md"));
+        let t = mk_target(3, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::Timeout);
+    }
+
+    /// ③ 미제출 wedge → delivery_failed(timeout과 구분).
+    #[test]
+    fn drain_verify_delivery_failed_on_wedge() {
+        let td = std::env::temp_dir().join(format!("cys-dv-wedge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("SESSION_STATE.md"), "# 상태\n").unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(5, FakeScenario::Wedge, round.join("SESSION_STATE.md"));
+        let t = mk_target(5, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::DeliveryFailed);
+    }
+
+    /// ④ hung 소켓(RPC 에러) → timeout(전역 캡 내 — 개별 스레드는 즉시 반환).
+    #[test]
+    fn drain_verify_timeout_on_hung() {
+        let td = std::env::temp_dir().join(format!("cys-dv-hung-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(9, FakeScenario::Hung, round.join("SESSION_STATE.md"));
+        let t = mk_target(9, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::Timeout);
+    }
+
+    /// ⑥(변형) live_cwd 미제공 → unverifiable(무음 폴백 금지).
+    #[test]
+    fn drain_verify_unverifiable_without_live_cwd() {
+        let io = FakeVerifyIo::new();
+        let t = mk_target(1, std::path::PathBuf::from("/nonexistent/cys.sock"), None);
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        assert_eq!(o, VerifyOutcome::Unverifiable);
+    }
+
+    /// ⑤ 복원 중(phoenix 저널 stage<g2_ack) → skipped_restoring.
+    #[test]
+    fn drain_verify_skipped_when_restoring() {
+        let td = std::env::temp_dir().join(format!("cys-dv-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let deptdir = td.join("cys-dept-x");
+        let phoenix = deptdir.join("phoenix");
+        std::fs::create_dir_all(&phoenix).unwrap();
+        // reinject 완료·g2_ack 미완료 = 복원 in-flight
+        let j = json!({"roles": {"worker": {"stages": {"reinject": {"done": true}}}}});
+        std::fs::write(
+            phoenix.join("journal-default.json"),
+            serde_json::to_string(&j).unwrap(),
+        )
+        .unwrap();
+        let socket = deptdir.join("cys.sock");
+        assert!(restore_active_for_role(&socket, "worker", 100));
+        // g2_ack 완료면 복원 끝 → false
+        let j2 = json!({"roles": {"worker": {"stages": {"reinject": {"done": true}, "g2_ack": {"done": true}}}}});
+        std::fs::write(
+            phoenix.join("journal-default.json"),
+            serde_json::to_string(&j2).unwrap(),
+        )
+        .unwrap();
+        assert!(!restore_active_for_role(&socket, "worker", 100));
+        // 다른 역할은 무관 → false
+        assert!(!restore_active_for_role(&socket, "master", 100));
+
+        // verify_one_node 통합: 복원 중이면 IO 이전에 skip
+        std::fs::write(
+            phoenix.join("journal-default.json"),
+            serde_json::to_string(&j).unwrap(),
+        )
+        .unwrap();
+        let io = FakeVerifyIo::new();
+        let t = mk_target(2, socket, Some(deptdir.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::SkippedRestoring);
+    }
+
+    /// ⑥ 0-노드 → 우아한 no-op(all_saved=true, exit 0 대응).
+    #[test]
+    fn drain_verify_zero_nodes_noop() {
+        let io: std::sync::Arc<dyn VerifyIo + Send + Sync> = std::sync::Arc::new(FakeVerifyIo::new());
+        let report = drain_verify_fanout(io, vec![], std::time::Duration::from_secs(1), 100);
+        assert_eq!(report["total"], json!(0));
+        assert_eq!(report["all_saved"], json!(true));
+    }
+
+    /// 전 노드 verify 총 소요 ≤ 전역 캡(직렬 누적 금지) — N개 미저장 노드를 병렬로 돌려 직렬 시간보다
+    /// 뚜렷이 빠름을 확인한다(timeout=1s·4노드 → 직렬 ≥4s, 병렬 ~timeout).
+    #[test]
+    fn drain_verify_fanout_is_parallel_not_serial() {
+        let td = std::env::temp_dir().join(format!("cys-dv-par-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let fake = FakeVerifyIo::new();
+        let n = 4u64;
+        let mut targets = Vec::new();
+        for i in 0..n {
+            let round = td.join(format!("n{i}")).join("_round");
+            std::fs::create_dir_all(&round).unwrap();
+            std::fs::write(round.join("SESSION_STATE.md"), "# s\n").unwrap();
+            fake.add(i, FakeScenario::NonSaving, round.join("SESSION_STATE.md"));
+            targets.push(mk_target(
+                i,
+                td.join(format!("n{i}")).join("cys.sock"),
+                Some(td.join(format!("n{i}")).to_string_lossy().into_owned()),
+            ));
+        }
+        let io: std::sync::Arc<dyn VerifyIo + Send + Sync> = std::sync::Arc::new(fake);
+        let t0 = std::time::Instant::now();
+        let report = drain_verify_fanout(io, targets, std::time::Duration::from_secs(1), 100);
+        let elapsed = t0.elapsed();
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(report["summary"]["timeout"], json!(4));
+        assert_eq!(report["all_saved"], json!(false));
+        // 직렬이면 ≥ 4s. 병렬이면 ~1.x s. 3s 미만이면 병렬 확정.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "fan-out이 직렬로 보임: {elapsed:?}"
+        );
+    }
+
+    /// 집계·pending 유실 가시화 — 혼합 결과에서 summary·all_saved·pending_loss_warning 정합.
+    #[test]
+    fn drain_verify_aggregation_and_pending_visibility() {
+        let td = std::env::temp_dir().join(format!("cys-dv-agg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let fake = FakeVerifyIo::new();
+        // 노드0=협조(saved), 노드1=미저장(timeout, pending 2건)
+        let r0 = td.join("n0").join("_round");
+        let r1 = td.join("n1").join("_round");
+        std::fs::create_dir_all(&r0).unwrap();
+        std::fs::create_dir_all(&r1).unwrap();
+        std::fs::write(r0.join("SESSION_STATE.md"), "# s\n").unwrap();
+        std::fs::write(r1.join("SESSION_STATE.md"), "# s\n").unwrap();
+        fake.add(0, FakeScenario::Cooperative, r0.join("SESSION_STATE.md"));
+        fake.add(1, FakeScenario::NonSaving, r1.join("SESSION_STATE.md"));
+        let mut t0 = mk_target(0, td.join("n0").join("cys.sock"), Some(td.join("n0").to_string_lossy().into_owned()));
+        t0.role = "worker".into();
+        let mut t1 = mk_target(1, td.join("n1").join("cys.sock"), Some(td.join("n1").to_string_lossy().into_owned()));
+        t1.pending_undelivered = 2;
+        let io: std::sync::Arc<dyn VerifyIo + Send + Sync> = std::sync::Arc::new(fake);
+        let report = drain_verify_fanout(io, vec![t0, t1], std::time::Duration::from_secs(1), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(report["summary"]["saved"], json!(1));
+        assert_eq!(report["summary"]["timeout"], json!(1));
+        assert_eq!(report["all_saved"], json!(false));
+        assert_eq!(report["pending_loss_warning"].as_array().unwrap().len(), 1);
+        assert_eq!(report["pending_loss_warning"][0]["pending_undelivered"], json!(2));
     }
 }

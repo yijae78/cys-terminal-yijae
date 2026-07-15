@@ -3254,17 +3254,18 @@ interface SkewedDept {
 }
 
 // rotate_daemon/rotate_dept_daemon 래퍼 — force=false면 백엔드가 세션>0 시 "live_sessions:N"로 거부(=보류).
-async function rotateMainDaemon(force: boolean): Promise<"ok" | "held" | "err"> {
+// skipDrain: verified 재시작 경로만 true(사전 drain --verify로 저장 확인됨) — 기본 false는 plain drain(회귀 0).
+async function rotateMainDaemon(force: boolean, skipDrain = false): Promise<"ok" | "held" | "err"> {
   try {
-    await invoke("rotate_daemon", { force });
+    await invoke("rotate_daemon", { force, skipDrain });
     return "ok";
   } catch (e) {
     return String(e).includes("live_sessions:") ? "held" : "err";
   }
 }
-async function rotateDeptDaemon(name: string, force: boolean): Promise<"ok" | "held" | "err"> {
+async function rotateDeptDaemon(name: string, force: boolean, skipDrain = false): Promise<"ok" | "held" | "err"> {
   try {
-    await invoke("rotate_dept_daemon", { name, force });
+    await invoke("rotate_dept_daemon", { name, force, skipDrain });
     return "ok";
   } catch (e) {
     return String(e).includes("live_sessions:") ? "held" : "err";
@@ -3354,11 +3355,11 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
   rotatingDaemon = true;
   stickyToast("rotate-daemon", "feed", "↻ 데몬 교대", `새 버전 v${appVer}로 교대 중… 저장 후 세션을 복원합니다.`);
   try {
-    if (heldMain) await invoke("rotate_daemon", { force: true });
+    if (heldMain) await invoke("rotate_daemon", { force: true, skipDrain: false });
     // 경미2: rotate_dept_daemon이 반환하는 restore_ok=false(교대 후 부서 노드 복원 실패)를 삼키지 않고 승격.
     let deptRestoreFailed = false;
     for (const d of heldDepts) {
-      const info = (await invoke("rotate_dept_daemon", { name: d.name, force: true })) as { restore_ok?: boolean };
+      const info = (await invoke("rotate_dept_daemon", { name: d.name, force: true, skipDrain: false })) as { restore_ok?: boolean };
       if (info?.restore_ok === false) deptRestoreFailed = true;
     }
     dismissToast("rotate-daemon");
@@ -3374,11 +3375,87 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
   }
 }
 
-// ── 상시 "↻ 재시작" 버튼(초보자용) — 수동 "데몬 kill + 앱 재실행" 루틴의 원클릭 대체 ──
-// 스큐 여부와 무관하게 메인→살아있는 부서 데몬을 force 순차 교대한다(drain 저장 → 종료 → 새 데몬 기동 →
-// 피닉스·resume 복원). manualRotateSkewed와 동일 백엔드(rotate_daemon/rotate_dept_daemon force=true) 재사용.
-// 앱 재시작 없음 — install_update의 app.restart()는 single-instance 레이스 경고 경로(휴면)라 배제,
-// GUI는 새 데몬에 자동 재연결된다. 죽은 부서 소켓은 skip(detectSkew 동형 — 부서 부활은 CSO·피닉스 소유).
+// ── drain --verify 결과 타입(cys 코어 결정론 JSON) ──
+type DrainVerifyNode = {
+  role: string;
+  department?: string;
+  surface: string;
+  outcome: string; // saved | timeout | delivery_failed | unverifiable | skipped_restoring
+  detail: string;
+  pending_undelivered?: number;
+};
+type DrainVerifyReport = {
+  all_saved: boolean;
+  total: number;
+  summary: { saved: number; timeout: number; delivery_failed: number; unverifiable: number; skipped_restoring: number };
+  nodes: DrainVerifyNode[];
+  pending_loss_warning?: { role: string; surface: string; pending_undelivered: number }[];
+};
+
+const OUTCOME_LABEL: Record<string, string> = {
+  saved: "저장 확인",
+  timeout: "저장 미확인(시간초과)",
+  delivery_failed: "지시 전달 실패(입력 미제출)",
+  unverifiable: "검증 불가(구버전 데몬)",
+  skipped_restoring: "복원 중 — 건너뜀",
+};
+
+// 부분 실패 노드를 사람이 읽을 리포트로. 저장 확인된 노드는 생략, 미확인만 나열한다.
+function drainVerifyReportText(r: DrainVerifyReport): string {
+  const bad = r.nodes.filter((n) => n.outcome !== "saved");
+  const lines = bad.map(
+    (n) => `• ${n.department ? n.department + " / " : ""}${n.role} (${n.surface}): ${OUTCOME_LABEL[n.outcome] ?? n.outcome}`,
+  );
+  return (
+    `${r.total}개 노드 중 ${r.summary.saved}개만 체크포인트(SESSION_STATE) 저장이 확인됐습니다.\n\n` +
+    `${lines.join("\n")}\n\n` +
+    "대화 원문은 재시작 후 트랜스크립트로 복원되지만, 위 노드의 증류 체크포인트(SESSION_STATE·TODO)는 최신이 아닐 수 있습니다.\n\n" +
+    "그래도 지금 재시작하시겠습니까?"
+  );
+}
+
+// 데몬 재시작 코어 — 메인 + 살아있는 부서를 force 순차 교대한다(종료 → 새 데몬 기동 → 피닉스·resume 복원).
+// skipDrain=true면 rotate가 이중 drain을 생략(verified 경로: 사전 drain --verify로 저장 확인됨),
+// false면 rotate가 plain drain(기존 거동·폴백). 앱 재시작 없음 — GUI는 새 데몬에 자동 재연결.
+// 죽은 부서 소켓은 skip(detectSkew 동형 — 부서 부활은 CSO·피닉스 소유).
+async function restartAllDaemons(skipDrain: boolean): Promise<{ failedDepts: string[]; deptRestoreFailed: boolean }> {
+  await invoke("rotate_daemon", { force: true, skipDrain });
+  // 부서 열거=list_depts(레지스트리 SOT) + daemon_status 생존 확인 — detectSkew 동형(죽은 등재 skip).
+  const reg = (await invoke("list_depts").catch(() => ({ depts: {} }))) as {
+    depts?: Record<string, { socket?: string }>;
+  };
+  let deptRestoreFailed = false;
+  const failedDepts: string[] = [];
+  for (const [name, meta] of Object.entries(reg.depts ?? {})) {
+    if (!meta.socket) continue;
+    try {
+      await invoke("daemon_status", { socket: meta.socket });
+    } catch {
+      continue; // 죽은/전이 중 부서 소켓 skip(무해)
+    }
+    try {
+      const info = (await invoke("rotate_dept_daemon", { name, force: true, skipDrain })) as { restore_ok?: boolean };
+      if (info?.restore_ok === false) deptRestoreFailed = true;
+    } catch {
+      failedDepts.push(name);
+    }
+  }
+  return { failedDepts, deptRestoreFailed };
+}
+
+function restartResultToast(failedDepts: string[], deptRestoreFailed: boolean) {
+  if (failedDepts.length)
+    toast("health", "⚠ 일부 부서 재시작 실패", `메인 데몬은 재시작됐으나 부서 교대가 실패했습니다: ${failedDepts.join(", ")} — 상태를 점검하세요.`);
+  else if (deptRestoreFailed)
+    toast("health", "⚠ 재시작 후 부서 복원 실패", "데몬은 재시작됐으나 일부 부서 노드 복원이 실패했습니다 — 상태를 점검하세요.");
+  else toast("watchdog", "✅ 데몬 재시작 완료", "데몬이 다시 시작됐습니다. 부서·노드 복원이 진행됩니다.");
+}
+
+// ── 상시 "↻ 재시작" 버튼(초보자용) — "저장 검증 후 자동 재시작" 흐름 ──
+// 1) 확인 모달[저장 후 재시작/취소] → 2) drain --verify(feature-detect)로 노드별 체크포인트 저장 검증
+// → 3) green(all_saved)이면 자동 진행(skipDrain=true), 부분 실패면 노드별 리포트+[그래도 재시작/취소].
+// cys 코어가 --verify를 미지원하면(구버전) plain drain 폴백(skipDrain=false)+경고. '무손실' 표현 금지 —
+// 대화 원문은 트랜스크립트 복원, 이 기능은 증류 체크포인트(SESSION_STATE·TODO) 최신성만 보증한다.
 async function manualRestartAllDaemons() {
   if (rotatingDaemon) {
     toast("feed", "재시작 진행 중", "데몬 교대·재검이 진행 중입니다 — 잠시 후 다시 시도하세요.");
@@ -3386,41 +3463,51 @@ async function manualRestartAllDaemons() {
   }
   const ok = await confirmModal(
     "데몬 재시작",
-    "데몬(메인+부서)을 다시 시작합니다. 진행 중인 노드에 저장(drain) 신호를 보낸 뒤 데몬을 새로 켜고, " +
-      "부서·노드는 대화 기억까지 자동 복원됩니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 재시작하시겠습니까?",
-    "재시작",
+    "재시작 전에 각 노드의 체크포인트(SESSION_STATE·TODO) 저장을 먼저 검증합니다. 검증이 끝나면 데몬(메인+부서)을 " +
+      "다시 켜고 부서·노드의 대화 기억을 트랜스크립트로 복원합니다.\n\n지금 저장을 검증하고 재시작하시겠습니까?",
+    "저장 후 재시작",
   );
   if (!ok) return;
   rotatingDaemon = true;
-  stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 후 데몬을 다시 시작하는 중… 부서·노드를 자동 복원합니다.");
   try {
-    await invoke("rotate_daemon", { force: true });
-    // 부서 열거=list_depts(레지스트리 SOT) + daemon_status 생존 확인 — detectSkew 동형(죽은 등재 skip).
-    const reg = (await invoke("list_depts").catch(() => ({ depts: {} }))) as {
-      depts?: Record<string, { socket?: string }>;
-    };
-    let deptRestoreFailed = false;
-    const failedDepts: string[] = [];
-    for (const [name, meta] of Object.entries(reg.depts ?? {})) {
-      if (!meta.socket) continue;
-      try {
-        await invoke("daemon_status", { socket: meta.socket });
-      } catch {
-        continue; // 죽은/전이 중 부서 소켓 skip(무해)
-      }
-      try {
-        const info = (await invoke("rotate_dept_daemon", { name, force: true })) as { restore_ok?: boolean };
-        if (info?.restore_ok === false) deptRestoreFailed = true;
-      } catch {
-        failedDepts.push(name);
+    // 1) 저장 검증(drain --verify) — feature-detect. 미지원/실패 시 plain drain 폴백.
+    stickyToast("restart-daemon", "feed", "↻ 저장 검증", "재시작 전 노드 체크포인트(SESSION_STATE)를 검증하는 중…");
+    let verify: DrainVerifyReport | null = null;
+    let unsupported = false;
+    try {
+      verify = (await invoke("drain_verify", { timeout: 20 })) as DrainVerifyReport;
+    } catch (e) {
+      if (String(e).includes("unsupported")) unsupported = true;
+      else throw e;
+    }
+    if (unsupported) {
+      // 폴백: 현재 cys 버전은 --verify 미지원 → 기존 best-effort 저장(plain drain, skipDrain=false)으로 재시작.
+      dismissToast("restart-daemon");
+      toast("health", "⚠ 저장 검증 미지원", "현재 cys 버전은 저장 검증을 지원하지 않습니다 — 기존 방식(best-effort 저장)으로 재시작합니다.");
+      stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 후 데몬을 다시 시작하는 중… 부서·노드를 자동 복원합니다.");
+      const { failedDepts, deptRestoreFailed } = await restartAllDaemons(false);
+      dismissToast("restart-daemon");
+      restartResultToast(failedDepts, deptRestoreFailed);
+      return;
+    }
+    // 2) 부분 실패면 노드별 리포트 + [그래도 재시작/취소]. green(all_saved)이면 자동 진행.
+    if (verify && !verify.all_saved) {
+      dismissToast("restart-daemon");
+      const proceed = await confirmModal("일부 노드 저장 미확인", drainVerifyReportText(verify), "그래도 재시작");
+      if (!proceed) {
+        rotatingDaemon = false;
+        return;
       }
     }
+    // 3) verified 재시작 — 사전 검증했으므로 rotate는 이중 drain 생략(skipDrain=true).
+    stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 검증 완료 — 데몬을 다시 시작하고 노드를 복원하는 중…");
+    const { failedDepts, deptRestoreFailed } = await restartAllDaemons(true);
     dismissToast("restart-daemon");
-    if (failedDepts.length)
-      toast("health", "⚠ 일부 부서 재시작 실패", `메인 데몬은 재시작됐으나 부서 교대가 실패했습니다: ${failedDepts.join(", ")} — 상태를 점검하세요.`);
-    else if (deptRestoreFailed)
-      toast("health", "⚠ 재시작 후 부서 복원 실패", "데몬은 재시작됐으나 일부 부서 노드 복원이 실패했습니다 — 상태를 점검하세요.");
-    else toast("watchdog", "✅ 데몬 재시작 완료", "데몬이 다시 시작됐습니다. 부서·노드 복원이 진행됩니다.");
+    // 재시작 창 큐 보존[A3-F3]: 인메모리 미배달 push는 재시작에 유실된다 — 정직하게 고지(무음 유실 금지).
+    const pendingLost = (verify?.pending_loss_warning ?? []).reduce((a, p) => a + (p.pending_undelivered || 0), 0);
+    if (pendingLost > 0)
+      toast("health", "미배달 push 유실", `재시작으로 미배달 큐 ${pendingLost}건이 유실됩니다(대화 원문은 트랜스크립트로 복원).`);
+    restartResultToast(failedDepts, deptRestoreFailed);
   } catch (e) {
     dismissToast("restart-daemon");
     toast("health", "데몬 재시작 실패", String(e));
