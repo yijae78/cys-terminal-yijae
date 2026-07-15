@@ -1683,7 +1683,7 @@ async fn dept_tombstones() -> Result<Vec<String>, String> {
 /// 동일 메커니즘(앵커 준수: 시스템은 노드만 띄우고 지휘하지 않는다). CYS_SOCKET 제거로 항상
 /// base 데몬 대상(부서 오염 불가 — 소켓 격리와 동일 축). 생성된 surface는 GUI 자동입양이 수용.
 #[tauri::command]
-async fn start_master() -> Result<(), String> {
+async fn start_master(app: AppHandle) -> Result<(), String> {
     let cys = resolve_sidecar("cys");
     let out = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&cys);
@@ -1697,10 +1697,54 @@ async fn start_master() -> Result<(), String> {
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
     if out.status.success() {
+        spawn_orchestra_boot(app, None); // ★절대규칙: 마스터=4노드 팀 결정론 스폰(LLM 환각 무관)
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
+}
+
+/// ★절대규칙(오너 2026-07-15): 모든 마스터(본부·부서장)는 CSO·워커·리뷰어2 팀을 반드시 갖는다.
+/// 종전에는 이 팀 스폰이 마스터 LLM의 `cys boot`(디렉티브 §0 ④) 실행에 의존했는데, dept-master가
+/// "부서장 스코프=단독 대기"를 **환각**해 boot를 건너뛰는 치명 실사고가 발생했다(2026-07-15). 산문
+/// 의존을 제거하고 버튼 경로에서 `cys boot`를 코드 결정론으로 강제한다 — cys boot는 이미 가동 중인
+/// 역할을 건너뛰고(멱등·boot 락으로 동시 boot 직렬화) 마스터가 나중에 스스로 boot해도 중복 없음.
+/// ★관측성(적대검증 D-8): 종전 `let _ = status()`는 실패를 삼켜 claude 미설치 등으로 팀이 0개여도
+/// 사용자가 몰랐다(원 증상 재현·더 나쁨). exit≠0이거나 신규 기동 0이면 boot-warning 이벤트로 승격.
+/// fire-and-forget(최대 300s라 UI 무블록). socket=Some이면 그 부서 소켓 대상, None이면 본부.
+fn spawn_orchestra_boot(app: AppHandle, socket: Option<String>) {
+    let cys = resolve_sidecar("cys");
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&cys);
+        inject_runtime_path(&mut cmd);
+        match &socket {
+            Some(s) => {
+                cmd.env("CYS_SOCKET", s);
+            }
+            None => {
+                cmd.env_remove("CYS_SOCKET");
+            }
+        }
+        cmd.arg("boot");
+        no_console(&mut cmd);
+        match cmd.output() {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                // "boot 완료: 신규 기동 0" + "미설치" 힌트 = 팀이 안 떴다(claude 미설치 등) → 경고.
+                let launched_zero = stdout.contains("신규 기동 0");
+                let has_missing = stdout.contains("미설치");
+                if !o.status.success() || (launched_zero && has_missing) {
+                    let _ = app.emit(
+                        "boot-warning",
+                        "마스터는 시작됐으나 팀(CSO·워커·리뷰어) 기동에 실패했습니다 — claude CLI가 설치돼 있는지 확인하세요(설치: curl -fsSL https://claude.ai/install.sh | bash 후 재시도). 팀 없이도 마스터 단독 사용은 가능합니다.",
+                    );
+                }
+            }
+            Err(e) => {
+                let _ = app.emit("boot-warning", format!("팀 기동(cys boot) 실행 실패: {e}"));
+            }
+        }
+    });
 }
 
 /// ★R8(WP-2·적대검증 W2): CEO 승격 대기(PENDING) 여부 — cys-dept가 기록한 상태 파일 존재 검사.
@@ -1740,13 +1784,46 @@ async fn promote_pending_ceo() -> Result<String, String> {
     }
 }
 
+/// ★CEO 승격 Allow 결함 수리(오너 2026-07-15): 승격 요청은 cys-dept가 `feed push --wait`로 만드는
+/// 단명 프로세스인데, 오너가 Allow를 누를 무렵 그 대기자는 이미 timeout으로 죽어 있어 승격 행위가
+/// 실행되지 않았다(버튼이 먹통). 결정을 대기자에서 분리 — Allow 시 GUI가 이 커맨드로 승격을 **직접**
+/// 집행한다. `cys-dept promote-ceo`(오너 지명=consented 경로)는 feed 재질의 없이 directive를 교체한다.
+/// role-less(CYS_ROLE 제거)로 단일소유 가드 통과·base 소켓(CYS_SOCKET 제거) 대상.
+#[tauri::command]
+async fn approve_ceo_promotion() -> Result<String, String> {
+    let tool = dept_tool();
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("bash");
+        inject_runtime_path(&mut cmd);
+        cmd.env_remove("CYS_SOCKET");
+        cmd.env_remove("CYS_ROLE");
+        cmd.arg(&tool).arg("promote-ceo");
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    let txt = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() {
+        Ok(txt.trim().to_string())
+    } else {
+        Err(txt.trim().to_string())
+    }
+}
+
 /// ★조직 모델(오너 2026-07-15): 부서 탭의 "▶부서장" — 해당 부서 데몬에 master(부서장) 노드 기동.
 /// start_master(base=CEO 자리)와 대칭·동일 메커니즘(launch-agent). CYS_SOCKET=부서 소켓으로
 /// 그 부서 데몬이 pane을 spawn하므로 부서 팩 디렉티브(MASTER_DIRECTIVE)가 자동 주입되고,
 /// claim도 그 부서 레지스트리 대상(데몬당 살아있는 마스터 1명 규칙은 부서별 독립 적용).
 #[tauri::command]
-async fn start_dept_master(socket: String) -> Result<(), String> {
+async fn start_dept_master(app: AppHandle, socket: String) -> Result<(), String> {
     let cys = resolve_sidecar("cys");
+    let socket_boot = socket.clone(); // 아래 orchestra boot용(첫 클로저가 socket을 move)
     let out = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&cys);
         inject_runtime_path(&mut cmd);
@@ -1759,6 +1836,7 @@ async fn start_dept_master(socket: String) -> Result<(), String> {
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
     if out.status.success() {
+        spawn_orchestra_boot(app, Some(socket_boot)); // ★절대규칙: 부서장도 4노드 팀 결정론 스폰(환각 무관)
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
@@ -2328,6 +2406,7 @@ fn main() {
             start_dept_master,
             ceo_pending,
             promote_pending_ceo,
+            approve_ceo_promotion,
             daemon_status,
             list_surfaces,
             org_status,

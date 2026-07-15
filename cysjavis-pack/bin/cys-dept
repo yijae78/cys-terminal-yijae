@@ -42,6 +42,14 @@ dept_sock(){
   esac
 }
 dept_pack(){ echo "$HOME/.cys/pack-dept-$1"; }
+# ★기능2: 부서 state 디렉토리(대화기억 transcripts.db 보관·실측 최대 324MB) = 소켓의 부모.
+# discover_depts(javis_phoenix.py:1082 glob `state_root/cys-dept-*`)와 동일 규약 — 이 경로가 사라지면
+# 재발견이 끊겨 부활이 영구 차단된다(rm 아닌 격리가 유일 복구 경로 · javis_backup default_roots 무포함).
+# Windows named pipe엔 형제 디렉토리 개념이 없어 unix 한정(named pipe면 dirname 무의미 → purge_state skip).
+dept_state(){ dirname "$(dept_sock "$1")"; }
+# ★기능2: 격리(휴지통) 루트 — 삭제는 전부 mv로 통일(백업 없는 rm 금지). discover_depts glob은
+# `cys-dept-*`만 매치하므로 `cys-trash/`는 무매치 = 재발견 절단(격리=부활 차단·복구 가능 양립).
+TRASH_ROOT="$HOME/.local/state/cys-trash"
 
 # ★W2a-4 의도삭제 → phoenix dept 묘비: 부서 전체 폐기(down/down-sock=의도적 teardown)를 phoenix
 # 보호집합(base dept_roster)에 명시적 폐역으로 기록해, 부활 보고가 폐기된 부서를 '부활 필요'로
@@ -377,7 +385,7 @@ ceo_promote(){  # $1: "consented"면 동의 게이트 생략(오너 지명 promo
   if [ ! -f "$md.pre-ceo" ] && [ "${1:-}" != "consented" ]; then
     # deny/timeout/feed불가 = 승격 보류(표준 master 유지·다음 부서 이벤트에 재질의) — fail-safe는 '승격 안 함'.
     # env -u CYS_SOCKET: 승격 대상은 기본 데몬이므로 승인 요청도 기본 데몬 feed로(ceo_reinject_master와 동형).
-    if env -u CYS_SOCKET "$CYS" feed push --wait --title "CEO 승격 승인 요청" \
+    if env -u CYS_SOCKET "$CYS" feed push --wait --kind ceo-promote-request --title "CEO 승격 승인 요청" \
          --body "부서 생성 감지 — 기본 데몬 master를 CEO(master of master)로 승격합니까? (MASTER_DIRECTIVE→CEO 규약 교체·헌법은 .pre-ceo 보존·ceo_demote로 가역)"; then
       echo "[cys-dept] CEO 승격 오너 승인됨"
     else
@@ -385,8 +393,15 @@ ceo_promote(){  # $1: "consented"면 동의 게이트 생략(오너 지명 promo
       return 0
     fi
   fi
-  [ -f "$md.pre-ceo" ] || cp "$md" "$md.pre-ceo"
-  cp "$ceo" "$md"
+  # ★동시 승격 직렬화(오너 2026-07-15 적대검증 D-5): 두 promote가 겹치면 두 번째가 "pre-ceo 없음"을
+  # 읽은 뒤 첫 번째의 cp(ceo→md) 이후 실행돼 CEO 템플릿을 .pre-ceo로 복사→ceo_demote 원복 불능.
+  # flock으로 백업+교체를 원자화(flock 미설치 환경은 그대로 진행 — 인간 페이스 더블클릭은 저위험).
+  _swap(){ [ -f "$md.pre-ceo" ] || cp "$md" "$md.pre-ceo"; cp "$ceo" "$md"; }
+  if command -v flock >/dev/null 2>&1; then
+    ( flock 9; _swap ) 9>"$md.promote.lock"
+  else
+    _swap
+  fi
   rm -f "$CEO_PENDING" 2>/dev/null || true   # 승격 완료 = PENDING 해소
   echo "[cys-dept] 기본 데몬 CEO 승격(directives 교체·백업 .pre-ceo)"
   ceo_reinject_master "CEO 승격"
@@ -836,6 +851,17 @@ EOF
     n=$(reg_count)
     [ "$n" -ge 1 ] || { echo "[cys-dept] 부서 0개 — CEO는 최소 1개 마스터(부서) 존재 후 단계다(승격 안 함)"; exit 4; }
     ceo_promote consented
+    # ★진짜 승격 검증(오너 2026-07-15 적대검증 D-2): consented는 동의 게이트만 우회할 뿐 boot-marker
+    # PENDING 게이트(부트 미완)는 못 뚫어 ceo_promote가 미승격인데 return 0 할 수 있다. GUI가 그 exit 0을
+    # "✅ 승격 완료"로 오보하지 않게, 실제 승격 여부(md==CEO 템플릿 또는 .pre-ceo 백업 존재)를 post-verify해
+    # 미승격이면 exit 5로 truthful 실패를 반환한다(approve_ceo_promotion→Err→GUI 실패 표시).
+    _md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"; _ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
+    if cmp -s "$_md" "$_ceo" 2>/dev/null || [ -f "$_md.pre-ceo" ]; then
+      :   # 승격 확정(directive=CEO 또는 백업 존재)
+    else
+      echo "[cys-dept] CEO 승격 미완(보류) — base master 미부트(.master-bootstrapped 부재) 등. base 부트 완료 후 재시도." >&2
+      exit 5
+    fi
     ;;
   promote-if-pending)
     # BOOTSTRAP_HARDENING WP-2: 부트 게이트로 보류된 승격의 해소 경로.

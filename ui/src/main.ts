@@ -3101,7 +3101,25 @@ async function refreshFeed() {
         btn.className = cls;
         btn.textContent = label;
         btn.addEventListener("click", async () => {
-          await invoke("feed_reply", { requestId: item.request_id, decision }).catch(() => {});
+          // ★CEO 승격 Allow 결함 수리(오너 2026-07-15 + 적대검증 D-2/3/4): 이 요청을 만든 cys-dept
+          // 대기자는 데몬 재시작 등으로 죽어 pending 고아가 되며, feed_reply만으론 승격이 집행되지
+          // 않았다(먹통). ①머신 kind(ceo-promote-request)로만 라우팅 — 제목 정규식은 정보성 알림
+          // ("보류/대기")에도 매칭돼 오탐(D-3). ②승격을 feed_reply보다 **먼저** 집행 — 실패 시 항목을
+          // pending으로 남겨 재시도 가능(D-4). ③promote-ceo가 미승격 PENDING이면 exit 5→Err→실패
+          // 표시(가짜 "완료" 토스트 차단·D-2).
+          const isCeoPromote = item.kind === "ceo-promote-request";
+          if (isCeoPromote && decision === "allow") {
+            try {
+              const r = (await invoke("approve_ceo_promotion")) as string;
+              await invoke("feed_reply", { requestId: item.request_id, decision }).catch(() => {});
+              toast("watchdog", "✅ CEO 승격 완료", r || "기본 데몬 master를 CEO로 승격했습니다.");
+            } catch (e) {
+              // 승격 실패 — feed_reply 하지 않음(항목 pending 유지·재시도 가능). 실패 사유 표시.
+              toast("health", "CEO 승격 실패", String(e));
+            }
+          } else {
+            await invoke("feed_reply", { requestId: item.request_id, decision }).catch(() => {});
+          }
           refreshFeed();
           refreshSidebarStatus(); // 결정 직후 집계 배지 즉시 갱신
         });
@@ -4235,6 +4253,13 @@ async function start() {
   await listen("update-error", (e) => {
     const msg = typeof e.payload === "string" ? e.payload : "업데이트 후 처리 중 오류가 발생했습니다.";
     toast("health", "업데이트 경고", msg);
+  });
+
+  // ★팀 기동 경고(적대검증 D-8): 마스터는 떴으나 cys boot가 팀(CSO·워커·리뷰어)을 못 세운 경우
+  // (claude 미설치 등) 침묵하지 않고 안내 — 종전엔 실패를 삼켜 "팀 0개"를 사용자가 몰랐다.
+  await listen("boot-warning", (e) => {
+    const msg = typeof e.payload === "string" ? e.payload : "팀 기동에 실패했습니다.";
+    stickyToast("boot-warn", "health", "팀 기동 경고", msg);
   });
 
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)
