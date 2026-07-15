@@ -5052,19 +5052,46 @@ fn canonical_checkpoint_file(live_cwd: &str) -> std::path::PathBuf {
         .join("SESSION_STATE.md")
 }
 
+/// 화면에서 '현재 입력창 영역'만 잘라낸다 — 마지막 입력 앵커(입력 박스 상단 '╭' 또는 줄 시작 '> ' 프롬프트)
+/// 이후 끝까지. 제출된 텍스트는 이 영역 **위**(스크롤백)에 렌더되고, 미제출 입력은 이 영역 **안**에 잔류한다.
+/// 앵커가 없으면(구/미지 TUI) 전체 화면을 반환한다(보수적 — 놓친 wedge=저장 유실이 과검출보다 위험).
+fn input_region(screen: &str) -> &str {
+    let box_top = screen.rfind('╭');
+    let prompt = if screen.starts_with("> ") {
+        Some(0)
+    } else {
+        screen.rfind("\n> ").map(|i| i + 1)
+    };
+    match box_top.into_iter().chain(prompt).max() {
+        Some(i) => &screen[i..],
+        None => screen,
+    }
+}
+
 /// 전달확정 게이트 판정 — 제출되면 주입 텍스트가 위로 스크롤되고 하단 입력창엔 스피너/빈 프롬프트만 남는다.
-/// Return 미발화(known bug)면 주입 텍스트가 입력창에 잔류하므로 sentinel이 화면에 남는다.
-/// ★[F1 수리] 실터미널은 긴 지시문을 물리적으로 줄바꿈(래핑)하고, 입력창 하단에 프롬프트 테두리·단축키·
-/// 토큰카운터 등 UI 행이 따라붙어 sentinel이 화면 최하단에서 여러 행 위로 밀린다. 구 tail-4행 스캔은
-/// 이를 놓쳐(false negative) Return 재전송이 안 발화하고 저장이 유실됐다. 이제 ①read 전체 행을 대상으로,
-/// ②공백·개행을 제거한 뒤 매치한다(래핑이 sentinel을 물리 행 경계에서 쪼개도 재결합 검출). 트레이드오프:
-/// 제출 직후 트랜스크립트 에코가 read 범위에 남으면 false-positive(여분 Return·timeout→delivery_failed
-/// 오표기) 가능하나, 여분 Return은 무해하고 저장 판정의 진실원천은 파일 nonce다(wedge 플래그는 파일
-/// 미검출 시의 라벨링에만 관여) — 안전 방향(놓친 wedge=저장 유실 ≫ 과검출).
+/// Return 미발화(known bug)면 주입 텍스트가 입력창에 잔류하므로 sentinel이 입력창에 남는다.
+/// ★[F1] 실터미널은 긴 지시문을 물리적으로 줄바꿈(래핑)하고 입력창 하단에 테두리·단축키·토큰카운터 UI가
+///   따라붙어 sentinel이 최하단에서 밀리거나 물리 행 경계에서 쪼개진다 — 그래도 검출하려 공백·개행을
+///   제거하고 매치한다(구 tail-4행 스캔은 놓쳐 Return 재전송 미발화·저장 유실).
+/// ★[R2·R3 수리] 단 '화면 어디든'이 아니라 **입력창 영역(input_region)** 안에서만 매치한다 — 제출된
+///   스크롤백 에코(nonce 포함)를 wedge로 오검출하면 ①승인 프롬프트 대기 노드에 잉여 Return을 쏘아 의도외
+///   확정 위험(R2), ②delivery_failed↔timeout 라벨 변별 소실(R3). 미제출 입력은 입력창 영역에·제출 에코는
+///   그 위(스크롤백)에 있으므로 영역 한정 매치가 둘을 가른다. 앵커 부재 TUI는 전체 매치로 폴백(F1 보존).
 fn delivery_wedged(screen: &str, sentinel: &str) -> bool {
-    let flat: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+    let region = input_region(screen);
+    let flat: String = region.chars().filter(|c| !c.is_whitespace()).collect();
     let needle: String = sentinel.chars().filter(|c| !c.is_whitespace()).collect();
     !needle.is_empty() && flat.contains(&needle)
+}
+
+/// 저장 지시문 생성 — ★[R1 수리] 마커 기입을 '정지' 지시보다 **앞**(단계 ①)에 둔다. 지시문을 순서대로
+/// 리터럴 실행하는 노드가 '정지'를 먼저 만나면 이후 마커 기입을 건너뛰어 '저장했으나 timeout' 오판정이
+/// 났다(직전 F1 수리가 마커를 끝으로 옮기며 역전됨). F1의 wedge 검출은 위치 무관 전체 매치라 마커가
+/// 지시문 끝일 필요가 없으므로, 마커를 ①로 되돌려도 F1은 유지된다.
+fn drain_verify_instruction(marker: &str) -> String {
+    format!(
+        "[DRAIN-VERIFY] 재시작 전 체크포인트 검증. 지금 즉시 순서대로: ① _round/SESSION_STATE.md에 현재 작업 상태·미해결 게이트·다음 액션을 최신화해 저장하고, 이어서 그 파일 맨 끝에 정확히 이 한 줄을 추가하라(문자 그대로·수정 금지): {marker} ② ①의 저장·기입을 모두 마친 뒤에 작업을 멈추고 재시작·복원을 기다려라(승인 프롬프트 대기 중이면 이 메시지는 무시하라)."
+    )
 }
 
 /// phoenix 복원이 이 소켓의 이 역할에 대해 진행 중인가 — 진행 중이면 Some(사유), 아니면 None.
@@ -5104,6 +5131,10 @@ fn restore_guard_reason(socket: &std::path::Path, role: &str) -> Option<String> 
             continue; // stale 저널(오래된 실패 복원)은 영구 차단 방지 위해 무시
         }
         // [F2] 신선한 저널 — 여기서부터 판독/파싱/스키마 실패는 fail-CLOSED(복원 중 취급).
+        // ★[R4 INFO] 판독·파싱 불능인 신선 저널은 그것이 '이 role'의 복원인지조차 알 수 없다 — 그래도
+        //   보수적으로 skip한다(무관 role까지 over-skip 가능). 근거: over-skip의 대가는 verify 1회 보류(그
+        //   노드는 이번 재시작 창에서 저장 미검증으로 표기)뿐이나, under-skip은 복원 중 노드에 "작업 중단"을
+        //   주입해 각성을 비가역 파손시킨다 — 비대칭 위험이라 안전 방향(skip)을 택한다. 코드 변경 불요.
         let Ok(txt) = std::fs::read_to_string(e.path()) else {
             return Some(format!("신선한 저널 판독 실패({name}) — fail-closed(복원 중 취급)"));
         };
@@ -5294,11 +5325,8 @@ fn verify_one_node(
             format!("nonce 마커 확인: {}", file.display()),
         );
     }
-    // 3) 저장 지시 주입 — nonce 마커 기입 + 작업 중단. ★[F1] 마커를 지시문 맨 끝에 둔다 — 래핑 시
-    // sentinel(nonce)이 입력창 마지막 물리 행에 오도록 해 wedge 검출을 견고하게 한다.
-    let instr = format!(
-        "[DRAIN-VERIFY] 재시작 전 체크포인트 검증. 지금 즉시: ① _round/SESSION_STATE.md에 현재 작업 상태·미해결 게이트·다음 액션을 최신화해 저장하라. ② 저장 후 작업을 멈추고 재시작·복원을 기다려라(승인 프롬프트 대기 중이면 이 메시지는 무시하라). ③ 마지막으로 그 파일 맨 끝에 정확히 이 한 줄만 추가하라(문자 그대로·수정 금지): {marker}"
-    );
+    // 3) 저장 지시 주입 — nonce 마커 기입 + 작업 중단.
+    let instr = drain_verify_instruction(&marker);
     let io_to = std::cmp::min(timeout, Duration::from_secs(8));
     if io.inject(&t.socket, t.surface_id, &instr, io_to).is_err() {
         // 소켓 hung(RPC 타임아웃) — delivery_failed(노드 wedge)와 구분해 timeout으로 분류
@@ -10001,6 +10029,9 @@ mod tests {
     #[derive(Clone, Copy, PartialEq)]
     enum FakeScenario {
         Cooperative,
+        /// [R1] 지시문을 순서대로 리터럴 실행하는 협조 노드 — '정지' 지시를 마커 기입보다 먼저 만나면
+        /// halt해 마커를 기입하지 못한다(구 지시문 순서면 '저장했으나 timeout' 오판정).
+        LiteralOrdered,
         NonSaving,
         Wedge,
         Hung,
@@ -10009,16 +10040,22 @@ mod tests {
     struct FakeVerifyIo {
         nodes: std::sync::Mutex<std::collections::HashMap<u64, (FakeScenario, std::path::PathBuf)>>,
         last_inject: std::sync::Mutex<std::collections::HashMap<u64, String>>,
+        // [R2] 노드별 send_return 호출 횟수 — 제출 완료 노드에 잉여 Return이 안 나가는지 검증.
+        returns: std::sync::Mutex<std::collections::HashMap<u64, u32>>,
     }
     impl FakeVerifyIo {
         fn new() -> Self {
             FakeVerifyIo {
                 nodes: std::sync::Mutex::new(std::collections::HashMap::new()),
                 last_inject: std::sync::Mutex::new(std::collections::HashMap::new()),
+                returns: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         }
         fn add(&self, sid: u64, scen: FakeScenario, file: std::path::PathBuf) {
             self.nodes.lock().unwrap().insert(sid, (scen, file));
+        }
+        fn return_count(&self, sid: u64) -> u32 {
+            *self.returns.lock().unwrap().get(&sid).unwrap_or(&0)
         }
     }
     /// 주입 텍스트에서 마커 한 줄을 추출(협조 노드가 '지시대로 기입'하는 것을 모사).
@@ -10027,6 +10064,18 @@ mod tests {
         let rest = &text[start..];
         let end = rest.find("-->")? + 3;
         Some(rest[..end].to_string())
+    }
+    /// [R1] 지시문을 순서대로 리터럴 실행하는 노드가 마커 기입에 '도달'하는가 — 마커 지시가 '정지'
+    /// 지시보다 앞에 있으면 도달(true), 정지를 먼저 만나면 halt해 미도달(false). 이 판정이 곧
+    /// drain_verify_instruction의 단계 순서 정확성을 규정한다(정지<마커면 저장 유실).
+    fn literal_reaches_marker(text: &str) -> bool {
+        let marker = text.find("<!-- cys-checkpoint:");
+        let stop = text.find("멈추").or_else(|| text.find("정지"));
+        match (marker, stop) {
+            (Some(m), Some(s)) => m < s,
+            (Some(_), None) => true,
+            _ => false,
+        }
     }
     /// 문자열을 cols 문자마다 물리 줄바꿈(실터미널 래핑 모사 — 멀티바이트 안전, char 단위).
     fn wrap_cols(s: &str, cols: usize) -> String {
@@ -10038,6 +10087,14 @@ mod tests {
             out.push(c);
         }
         out
+    }
+    fn fake_write_marker(text: &str, file: Option<std::path::PathBuf>) {
+        if let (Some(marker), Some(f)) = (extract_marker(text), file) {
+            let mut cur = std::fs::read_to_string(&f).unwrap_or_default();
+            cur.push_str(&marker);
+            cur.push('\n');
+            let _ = std::fs::write(&f, cur);
+        }
     }
     impl VerifyIo for FakeVerifyIo {
         fn inject(
@@ -10055,15 +10112,14 @@ mod tests {
                 .insert(sid, text.to_string());
             match scen {
                 Some(FakeScenario::Hung) => return Err("hung socket".into()),
-                Some(FakeScenario::Cooperative) => {
-                    if let (Some(marker), Some(f)) = (extract_marker(text), file) {
-                        let mut cur = std::fs::read_to_string(&f).unwrap_or_default();
-                        cur.push_str(&marker);
-                        cur.push('\n');
-                        let _ = std::fs::write(&f, cur);
+                Some(FakeScenario::Cooperative) => fake_write_marker(text, file),
+                // [R1] 순서대로 리터럴 실행 — 마커 지시에 도달할 때만 기입(정지가 먼저면 halt·미기입).
+                Some(FakeScenario::LiteralOrdered) => {
+                    if literal_reaches_marker(text) {
+                        fake_write_marker(text, file);
                     }
                 }
-                _ => {}
+                _ => {} // NonSaving·Wedge: 기입 안 함
             }
             Ok(())
         }
@@ -10075,34 +10131,44 @@ mod tests {
             _timeout: std::time::Duration,
         ) -> Result<String, String> {
             let scen = self.nodes.lock().unwrap().get(&sid).map(|(s, _)| *s);
+            let raw = self
+                .last_inject
+                .lock()
+                .unwrap()
+                .get(&sid)
+                .cloned()
+                .unwrap_or_default();
             match scen {
                 Some(FakeScenario::Hung) => Err("hung socket".into()),
                 Some(FakeScenario::Wedge) => {
-                    // ★실터미널 모사(비-tautology): 미제출 주입 텍스트를 40자 폭으로 물리 래핑하고
-                    // 하단에 입력창 테두리·단축키·토큰카운터 UI 행을 덧붙인다 — sentinel(nonce)이 최하단에서
-                    // 여러 행 위로 밀리고 래핑 경계에서 쪼개진다(구 tail-4 단일행 스캔이면 놓쳐 FAIL).
-                    let raw = self
-                        .last_inject
-                        .lock()
-                        .unwrap()
-                        .get(&sid)
-                        .cloned()
-                        .unwrap_or_default();
+                    // ★미제출 wedge 모사(비-tautology): 주입 텍스트가 입력 박스 안에 40자 래핑으로 잔류하고
+                    // 하단에 박스 테두리·단축키·토큰카운터 UI가 붙는다(sentinel이 최하단에서 밀리고 경계에서
+                    // 쪼개짐). input_region은 박스 상단 '╭' 이후를 보므로 이 잔류 입력을 검출한다.
                     Ok(format!(
-                        "{}\n╰────────────────────╯\n  ⏵⏵ 6 lines · esc to clear\n  ? for shortcuts        (auto)\n  context: 12k tokens\n  ",
+                        "...이전 대화...\n╭────────────────────╮\n│ (미제출)\n{}\n╰────────────────────╯\n  ⏵⏵ 6 lines · esc to clear\n  ? for shortcuts\n  ",
                         wrap_cols(&raw, 40)
                     ))
                 }
-                // 협조·미저장: 제출됨 — 하단은 스피너·빈 프롬프트(주입 텍스트 잔류 없음)
+                Some(FakeScenario::NonSaving) => {
+                    // ★[R2·R3 모사] 제출 완료 + 스크롤백 에코: 주입 텍스트(nonce 포함)가 스크롤백 상단에
+                    // 남고, 하단 입력창은 비어 있다(제출됨). input_region(마지막 '╭' 이후)엔 nonce가 없어야
+                    // wedge=false — 구 전체화면 매치면 에코의 nonce로 오검출(잉여 Return·라벨 오표기).
+                    Ok(format!(
+                        "...이전 대화...\n{}\n\n좋아, 확인했다. 재시작을 기다린다.\n╭────────────────────╮\n│ > \n╰────────────────────╯\n  ? for shortcuts\n  ",
+                        raw
+                    ))
+                }
+                // 협조·리터럴: 제출됨 — 하단은 스피너·빈 프롬프트(주입 텍스트 잔류 없음)
                 _ => Ok("...이전 대화...\n✻ Working… (esc to interrupt)\n> ".into()),
             }
         }
         fn send_return(
             &self,
             _socket: &std::path::Path,
-            _sid: u64,
+            sid: u64,
             _timeout: std::time::Duration,
         ) -> Result<(), String> {
+            *self.returns.lock().unwrap().entry(sid).or_insert(0) += 1;
             Ok(())
         }
     }
@@ -10234,8 +10300,65 @@ mod tests {
         io.add(5, FakeScenario::Wedge, round.join("SESSION_STATE.md"));
         let t = mk_target(5, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
         let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        let rc = io.return_count(5);
         let _ = std::fs::remove_dir_all(&td);
         assert_eq!(o, VerifyOutcome::DeliveryFailed);
+        assert!(rc >= 1, "실 wedge엔 Return 재전송이 발화해야 함(rc={rc})"); // [R2] 정상 경로
+    }
+
+    /// [R2·R3] 제출 완료 + 스크롤백 에코 노드 → wedge 오검출 없음: 잉여 Return 0(R2)·라벨 timeout 정확(R3).
+    /// 구 전체화면 매치면 에코의 nonce로 delivery_failed 오표기 + 승인대기 노드 잉여 Return 위험이었다.
+    #[test]
+    fn drain_verify_no_spurious_wedge_on_submitted_echo() {
+        let td = std::env::temp_dir().join(format!("cys-dv-echo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("SESSION_STATE.md"), "# 상태\n").unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(6, FakeScenario::NonSaving, round.join("SESSION_STATE.md")); // 제출 에코 모사(read_screen)
+        let t = mk_target(6, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        let rc = io.return_count(6);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::Timeout, "제출됐으나 미저장=timeout(delivery_failed 아님·R3)");
+        assert_eq!(rc, 0, "제출 완료 노드엔 잉여 Return 0이어야 함(R2·rc={rc})");
+    }
+
+    /// [R2·R3 단위] delivery_wedged가 입력창 영역만 본다 — 미제출 wedge(박스 안)=검출, 제출 에코(스크롤백)=비검출.
+    #[test]
+    fn drain_verify_delivery_wedged_input_region_only() {
+        let nonce = "run9-42";
+        // ① 미제출: 박스 안에 잔류(래핑) → 검출
+        let wedged = "...대화...\n╭────────╮\n│ (미제출)\n<!-- cys-check\npoint: run9-42 1 -->\n╰────────╯\n  ? shortcuts";
+        assert!(delivery_wedged(wedged, nonce), "입력 박스 내 미제출 텍스트는 wedge");
+        // ② 제출 에코: nonce가 스크롤백(박스 위)에만, 하단 박스는 빔 → 비검출
+        let echoed = "...대화...\n<!-- cys-checkpoint: run9-42 1 -->\n좋아, 확인.\n╭────────╮\n│ > \n╰────────╯\n  ? shortcuts";
+        assert!(!delivery_wedged(echoed, nonce), "제출된 스크롤백 에코는 wedge 아님");
+    }
+
+    /// [R1] 지시문 단계 순서 정확성 — 마커 기입이 '정지'보다 앞이라 리터럴 실행 노드가 저장한다.
+    /// ★비-tautology: 구 순서(정지<마커)면 리터럴 노드가 마커 미기입→timeout 오판정임을 명시 증명.
+    #[test]
+    fn drain_verify_literal_ordered_node_saves_and_old_order_would_fail() {
+        // 현 지시문: 마커가 '정지'보다 앞 → 리터럴 노드 도달(true)
+        let cur = drain_verify_instruction("<!-- cys-checkpoint: n-1 1 -->");
+        assert!(literal_reaches_marker(&cur), "현 지시문은 마커가 정지보다 앞이어야 함(R1)");
+        // 구 순서(①저장 ②정지 ③마커) 재구성 → 리터럴 노드가 정지를 먼저 만나 미도달(false)=저장 유실
+        let old = "① 저장하라. ② 작업을 멈추고 기다려라. ③ 마지막으로 <!-- cys-checkpoint: n-1 1 --> 추가";
+        assert!(!literal_reaches_marker(old), "구 순서면 리터럴 노드가 마커 미기입(FAIL 증명)");
+        // 통합: LiteralOrdered 노드가 현 지시문으로 실제 저장→saved
+        let td = std::env::temp_dir().join(format!("cys-dv-lit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("SESSION_STATE.md"), "# 상태\n").unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(4, FakeScenario::LiteralOrdered, round.join("SESSION_STATE.md"));
+        let t = mk_target(4, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(2), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::Saved, "리터럴 순서 노드가 현 지시문으로 저장→saved");
     }
 
     /// ④ hung 소켓(RPC 에러) → timeout(전역 캡 내 — 개별 스레드는 즉시 반환).

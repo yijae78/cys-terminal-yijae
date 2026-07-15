@@ -82,6 +82,63 @@ dept_tombstone_remove(){
   python3 "$ph" tombstone "$1" --dept --remove >/dev/null 2>&1 || true
 }
 
+# ★기능2 프리미티브: 부서 state 디렉토리(대화기억 transcripts.db) 격리(mv→trash). down 기본 체인 뒤
+# --purge-state에서만 호출. 삭제(rm) 아닌 격리라 왕복 복원 가능(mv 역방향). 반환 0=격리 완료 또는
+# 대상 없음(우아·no-op), 비0=부적격명·경로 불일치·사용 중·mv 실패·잔존(강행 금지). preflight stop-and-report 내장.
+dept_purge_state(){
+  local name="$1"
+  # ★F2(reviewer1): traversal 차단 — 부서명에 / 또는 .. 가 있으면 pwd -P가 네임스페이스 밖 실경로를
+  # 산출(문자열 동등 가드는 통과)→mv 대참사. 진입부에서 거부한다(빈 이름·경로구분자·상위참조 불허).
+  case "$name" in
+    */*|*..*|"") echo "[cys-dept] purge-state: 부적격 부서명('"'"'$name'"'"') — 경로 구분자·상위참조 불허" >&2; return 2 ;;
+  esac
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      echo "[cys-dept] purge-state: Windows named pipe 부서는 state 형제 디렉토리 없음 — skip($name)" >&2
+      return 0 ;;
+  esac
+  local sd; sd="$(dept_state "$name")"
+  local expect="$HOME/.local/state/cys-dept-$name"
+  if [ "$sd" != "$expect" ]; then
+    echo "[cys-dept] purge-state: state 경로 불일치(got=$sd expect=$expect) — 중단(오해석 방지)" >&2
+    return 3
+  fi
+  if [ ! -d "$sd" ]; then
+    echo "[cys-dept] purge-state: state 디렉토리 없음($sd) — 격리 대상 없음(no-op)"
+    return 0
+  fi
+  local rp; rp="$(cd "$sd" 2>/dev/null && pwd -P)" || rp="$sd"
+  # ★F2 belt: realpath 재대조 — 심링크·경합으로 rp가 cys-dept-<name> 밖이면 거부(mv 전 최종 방어).
+  if [ "$(basename "$rp")" != "cys-dept-$name" ]; then
+    echo "[cys-dept] purge-state: realpath 이탈($rp) — cys-dept-$name 아님, 중단" >&2
+    return 3
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof +D "$rp" >/dev/null 2>&1; then
+      echo "[cys-dept] purge-state: $rp 사용 중(열린 파일 존재) — 격리 중단(데몬 잔존 의심·강행 금지). down 재확인 후 재시도." >&2
+      return 4
+    fi
+  fi
+  local sz mt
+  sz="$(du -sh "$rp" 2>/dev/null | cut -f1)"
+  mt="$(stat -c '%y' "$rp" 2>/dev/null || stat -f '%Sm' "$rp" 2>/dev/null || echo '?')"
+  echo "[cys-dept] purge-state: 대상=$name 경로=$rp 크기=${sz:-?} 최종수정=${mt}"
+  local ts trash
+  ts="${CYS_TRASH_STAMP:-$(date +%s)}"
+  trash="$TRASH_ROOT/$name-$ts"
+  mkdir -p "$trash" || { echo "[cys-dept] purge-state: trash 생성 실패($trash)" >&2; return 5; }
+  if ! mv "$rp" "$trash/state" 2>/dev/null; then
+    echo "[cys-dept] purge-state: 격리 mv 실패($rp → $trash/state)" >&2
+    return 5
+  fi
+  if [ -d "$sd" ]; then
+    echo "[cys-dept] purge-state: 원위치 잔존($sd) — 격리 미완(FAIL)" >&2
+    return 6
+  fi
+  echo "[cys-dept] purge-state: $name state 격리 완료 → $trash/state (복구=mv 역방향·${CYS_TRASH_TTL_DAYS:-14}일 후 reap 소거)"
+  return 0
+}
+
 # RC-15(D7): 부서 로그·상태 디렉토리 — Windows named pipe 소켓(\\.\pipe\...)은 dirname/디렉토리 개념이
 # 없어(RC-4 파생) mkdir·로그 경로가 깨진다. 실 디렉토리로 분리:
 #   Windows = %LOCALAPPDATA%\cys\cys-dept-<name> — ★RC-13 state_dir 슬러그와 **동일 규약**(pipe_slug
@@ -695,7 +752,19 @@ PY
     echo "$name"   # stdout 마지막 = 확정 name(Tauri 파싱)
     ;;
   down)
-    name="${2:?usage: cys-dept down <name>}"
+    # ★기능2 인자 파싱 하드닝: 플래그를 위치 무관 파싱하고 미지 플래그는 usage exit한다. 종전
+    # `name="${2:?}"; $3 무시`는 오순서(`down --purge-state dept-3`)에서 "--purge-state"를 부서명으로
+    # 흡수해 유령 부서를 down하는 무음 사고가 났다. 2인자 plain 호출(down <name>)은 거동 불변.
+    name=""; purge_state=0
+    shift  # "down" 제거
+    for _a in "$@"; do
+      case "$_a" in
+        --purge-state) purge_state=1 ;;
+        --*) echo "[cys-dept] down: 미지 플래그 '"'"'$_a'"'"' (usage: cys-dept down <name> [--purge-state])" >&2; exit 2 ;;
+        *) if [ -z "$name" ]; then name="$_a"; else echo "[cys-dept] down: 인자 과다 '"'"'$_a'"'"' (usage: cys-dept down <name> [--purge-state])" >&2; exit 2; fi ;;
+      esac
+    done
+    [ -n "$name" ] || { echo "usage: cys-dept down <name> [--purge-state]" >&2; exit 2; }
     sock="$(dept_sock "$name")"
     # ★NO_AUTOSTART(감사 2026-07-10): 죽은 부서 down 시 identify가 cysd를 되살려 그걸 kill하던 낭비 spawn 제거
     # — 실패 시 pid 빈값이면 아래가 kill을 건너뛰고 rm+reg_remove로 진행(종국 상태 동일).
@@ -711,6 +780,11 @@ PY
     dept_tombstone "$name"
     reg_remove "$name"
     [ "$(reg_count)" = "0" ] && ceo_demote || true
+    # ★기능2: --purge-state면 기본 teardown 체인 뒤 state 디렉토리(transcripts.db) 격리(mv→trash).
+    # 묘비는 영구 존치(위 dept_tombstone) — purge는 재발견 경로(state dir)를 끊어 부활을 봉인한다.
+    if [ "$purge_state" = 1 ]; then
+      dept_purge_state "$name" || { echo "[cys-dept] $name state 격리 실패(위 사유·teardown은 완료)" >&2; exit 3; }
+    fi
     echo "[cys-dept] $name 종료·정리 완료. 부서 수=$(reg_count)"
     ;;
   down-sock)
@@ -844,7 +918,19 @@ PY
     done <<EOF
 $snap
 EOF
-    echo "[cys-dept] reap 완료(dry=$dry): DEAD=$nd IDLE=$ni SKIP=$ns. 부서 수=$(reg_count)"
+    # ★기능2 trash 만료 소거: N일(기본 14·CYS_TRASH_TTL_DAYS) 경과 격리분을 영구 소거한다. 방치 시
+    # transcripts.db(부서당 최대 324MB)가 무한 누적되는데 resource_gate는 디스크 크기를 측정하지 않아
+    # 신호가 없다 — 이 sweep가 유일한 회수 경로. 소유·주기는 CSO_DIRECTIVE 참조. --dry면 판정만.
+    nt=0
+    if [ -d "$TRASH_ROOT" ]; then
+      ttl="${CYS_TRASH_TTL_DAYS:-14}"
+      while IFS= read -r _td; do
+        [ -n "$_td" ] || continue
+        if [ "$dry" = 1 ]; then echo "[cys-dept] reap(dry): TRASH-EXPIRE $_td (>${ttl}d)"
+        else rm -rf "$_td" && nt=$((nt+1)) && echo "[cys-dept] reap: TRASH-EXPIRE $_td (>${ttl}d)"; fi
+      done < <(find "$TRASH_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +"$ttl" 2>/dev/null)
+    fi
+    echo "[cys-dept] reap 완료(dry=$dry): DEAD=$nd IDLE=$ni SKIP=$ns TRASH-EXPIRE=$nt. 부서 수=$(reg_count)"
     ;;
   promote-ceo)
     # 오너 지명 경로(오너 2026-07-14): 오너/CSO가 기본 데몬 master를 CEO로 직접 지명 — 호출 자체가 동의.

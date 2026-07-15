@@ -3551,6 +3551,44 @@ class Preflight:
                             " 외 %d건" % (len(newp) - 8) if len(newp) > 8 else ""))
         self.add(cid, WARN, "; ".join(parts) + " — `cys pack-merge`로 검토(가치 있는 수정은 vendor 승격 제보)")
 
+    # ── C65 cys drain --verify 능력 체크 (기능1 이월분 · 재시작 전 저장검증 feature-detect) ──
+    # GUI 저장후재시작 흐름이 `cys drain --verify`에 의존한다. 번들 cys가 미지원(구버전 스큐)이면 GUI가
+    # plain drain 으로 폴백해야 하며 그 스큐를 부트에서 표면화한다. ★F4(reviewer1): shutil.which("cys")만
+    # 쓰면 PATH 바이너리와 GUI 번들 sidecar 가 달라 오진할 수 있어, **번들 sidecar 후보를 우선 탐지**하고
+    # PATH 는 폴백으로 두며, **실제 검사한 경로를 메시지에 명시**한다(스큐 시 진단 가능). WARN 전용(차단 금지).
+    def c65_drain_verify(self):
+        cid = "C65.drain-verify"
+        if self.skipped(cid):
+            return
+        # 번들 sidecar 우선(GUI 실제 사용 바이너리) → CYS_BIN(env) → PATH 순 후보. 첫 존재 파일 채택.
+        candidates = []
+        if os.environ.get("CYS_BIN"):
+            candidates.append(os.environ["CYS_BIN"])
+        candidates += [
+            "/Applications/cys.app/Contents/MacOS/cys",
+            os.path.expanduser("~/Applications/cys.app/Contents/MacOS/cys"),
+            os.path.expanduser("~/.local/bin/cys"),
+            "/opt/homebrew/bin/cys",
+        ]
+        w = shutil.which("cys")
+        if w:
+            candidates.append(w)
+        cys = next((c for c in candidates if c and os.path.isfile(c)), None)
+        if not cys:
+            self.add(cid, WARN, "cys 바이너리 미발견(번들 sidecar·CYS_BIN·PATH 모두) — drain --verify 능력 확인 불가")
+            return
+        try:
+            r = subprocess.run([cys, "drain", "--help"], capture_output=True, text=True, timeout=15)
+            help_text = (r.stdout or "") + (r.stderr or "")
+            if "--verify" in help_text:
+                self.add(cid, PASS, "cys drain --verify 지원 (GUI 저장후재시작 검증 흐름 가용 · 검사=%s)" % cys)
+            else:
+                self.add(cid, WARN,
+                         "cys drain --verify 미지원(구버전 스큐) — GUI가 plain drain 으로 폴백. "
+                         "최신 cys 로 갱신 권장(rotate/재설치) · 검사=%s" % cys)
+        except Exception as e:
+            self.add(cid, WARN, "cys drain --help 실행 실패(%s) — 능력 확인 불가 · 검사=%s" % (e, cys))
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -3580,7 +3618,7 @@ class Preflight:
             self.c51_cleanroom_vendor, self.c52_license_gate, self.c53_idempotency,
             self.c54_loc_cap, self.c55_grill_gate, self.c56_dept_hook_leak,
             self.c57_temp_hook_leak, self.c58_trust_harden, self.c59_guard_wiring,
-            self.c60_gate_wiring, self.c61_doc_code_sot,
+            self.c60_gate_wiring, self.c61_doc_code_sot, self.c65_drain_verify,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             self.c62_pack_heal_ledger,
         ]

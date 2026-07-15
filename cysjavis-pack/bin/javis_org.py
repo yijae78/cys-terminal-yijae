@@ -272,31 +272,71 @@ def _snapshot_gate(name, workdir):
         return False, ("abort_no_snapshot", workdir)
     return True, ("snapshot", snap)
 
-def destroy_dept(name, mission_key, purge=False, purge_workdir=False):
+# ★기능2: 격리(휴지통) 루트 — 삭제는 전부 mv로 통일(백업 없는 rm 금지). cys-dept의 TRASH_ROOT와 동일
+# 규약 · discover_depts glob(`cys-dept-*`)은 `cys-trash/`를 무매치 = 재발견 절단(부활 차단·복구 양립).
+TRASH_ROOT = f"{HOME}/.local/state/cys-trash"
+
+def _quarantine(src, trash_dir, label):
+    """삭제 대신 격리(mv → trash_dir/label). 대상(디렉토리) 없으면 None, 격리하면 action 튜플."""
+    if not (src and os.path.isdir(src)):
+        return None
+    os.makedirs(trash_dir, exist_ok=True)
+    dest = os.path.join(trash_dir, label)
+    shutil.move(src, dest)
+    return (f"quarantine_{label}", dest)
+
+def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_state=False):
     require_cso()  # 게이트를 효과 함수에 (R1 REVISE-1) — import 직접호출 우회 차단
     actions = []
+    # ★기능2 단일 진입점(오케스트레이터): pack-dept·workdir는 여기서 격리, state 디렉토리는 하위
+    # 프리미티브(cys-dept down --purge-state)에 위임한다 — 세 디렉토리 모두 동일 trash 하위(같은 ts).
+    ts = os.environ.get("CYS_TRASH_STAMP", str(int(time.time())))
+    trash_dir = f"{TRASH_ROOT}/{name}-{ts}"
+    # workdir 경로는 down(레지스트리 해제) **전에** 포착한다 — down 이후엔 depts.json 엔트리가 사라져
+    # 조회가 빈값이 된다(종전 post-down 재조회 rmtree는 이 때문에 실운영에서 no-op이던 잠복결함).
+    reg = load_json(DEPTS, {"depts":{}}); e = reg["depts"].get(name, {})
+    workdir = expand(e.get("cwd",""))
     # 1) 작업물 삭제는 의무 스냅샷 뒤에만 — 단 workdir 부재면 skip(no-op·abort 금지)
     if purge_workdir:
-        reg = load_json(DEPTS, {"depts":{}}); e = reg["depts"].get(name, {})
-        workdir = expand(e.get("cwd",""))
         proceed, action = _snapshot_gate(name, workdir)
         actions.append(action)
         if not proceed:
             return actions  # abort_no_snapshot (workdir 존재+스냅샷 실패만)
-    # 2) cys-dept down 위임 — 부모 role 상속(require_cso로 이미 cso 보장·하류 가드 무력화 방지·R1 REVISE-1)
-    r = subprocess.run(["cys-dept", "down", name], capture_output=True, text=True,
-                       env={**os.environ})
+    # 2) cys-dept down 위임 — purge_state면 --purge-state 전달(state 격리도 프리미티브에 위임·단일소유).
+    #    CYS_TRASH_STAMP 공유로 프리미티브도 동일 trash 하위(<name>-<ts>/state)에 격리.
+    down_cmd = ["cys-dept", "down", name] + (["--purge-state"] if purge_state else [])
+    r = subprocess.run(down_cmd, capture_output=True, text=True,
+                       env={**os.environ, "CYS_TRASH_STAMP": ts})
     actions.append(("down", r.returncode))
-    # 3) pack-dept rm (결정론) — forwarder는 self-reap(직접 회수 안 함)
+    # ★F1(reviewer1): down 실패(특히 --purge-state의 state 격리 실패=exit 3)를 삼키지 않는다 —
+    #   사유를 stderr로 정직 보고하고 최종 exit는 cmd_destroy가 비0으로 판정한다. 부분 실패라도
+    #   pack/workdir 격리는 best-effort로 진행(사용자 회수 표면 최대화).
+    if r.returncode != 0:
+        sys.stderr.write("[destroy] %s: cys-dept down 실패(rc=%d) — %s\n"
+                         % (name, r.returncode, (r.stderr or "").strip()[:300]))
+    # 3) pack-dept 격리(백업 없는 rmtree → mv 정합화) — forwarder는 self-reap(직접 회수 안 함)
     if purge:
         pack = f"{HOME}/.cys/pack-dept-{name}"
-        if os.path.isdir(pack):
-            shutil.rmtree(pack, ignore_errors=True); actions.append(("rm_pack", pack))
+        a = _quarantine(pack, trash_dir, "pack")
+        if a: actions.append(a)
+    # 4) workdir 격리(down 전 포착 경로 사용)
     if purge_workdir:
-        reg = load_json(DEPTS, {"depts":{}}); e = reg["depts"].get(name, {})
-        wd = expand(e.get("cwd",""))
-        if wd and os.path.isdir(wd):
-            shutil.rmtree(wd, ignore_errors=True); actions.append(("rm_workdir", wd))
+        a = _quarantine(workdir, trash_dir, "workdir")
+        if a: actions.append(a)
+    # ★F1(reviewer1): purge_state 성공 경로에 사후 결정론 검증기를 배선한다 — 라이브에서도 재등재0·
+    #   묘비생존·형제무오염을 확인하고, 검증 실패도 비0로 전파(격리 미완/부활창을 "done"으로 오보하지
+    #   않는다). down이 이미 실패면 검증 skip(중복 보고 회피 — cmd_destroy가 down 실패로 이미 비0).
+    if purge_state and r.returncode == 0:
+        verifier = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_purge_verify.py")
+        state_root = expand("~/.local/state")
+        dept_roster = expand("~/.local/state/cys/phoenix/dept_roster.json")
+        vr = subprocess.run(["python3", verifier, "--dept", name,
+                             "--state-root", state_root, "--depts-json", DEPTS,
+                             "--dept-roster", dept_roster], capture_output=True, text=True)
+        actions.append(("verify", vr.returncode))
+        if vr.returncode != 0:
+            sys.stderr.write("[destroy] %s: 사후 검증 실패(rc=%d) — %s\n"
+                             % (name, vr.returncode, (vr.stdout or vr.stderr or "").strip()[:400]))
     return actions
 
 def cmd_destroy(args):
@@ -305,15 +345,21 @@ def cmd_destroy(args):
     targets = list(reg.get("depts", {}).keys()) if args.all else ([args.dept] if args.dept else [])
     if not targets: sys.stderr.write("[destroy] 대상 없음(--dept 또는 --all)\n"); return 4
     allres = {}
+    failed = False   # ★F1: down·검증 실패 누적 — 최종 exit 판정
     for name in targets:
         mk = reg["depts"].get(name, {}).get("mission_key")
-        res = destroy_dept(name, mk, purge=args.purge, purge_workdir=args.purge_workdir)
+        res = destroy_dept(name, mk, purge=args.purge, purge_workdir=args.purge_workdir,
+                           purge_state=args.purge_state)
         allres[name] = res
         if any(a[0]=="abort_no_snapshot" for a in res):
             sys.stderr.write(f"[destroy] {name}: 스냅샷 실패 → 작업물 삭제 중단(fail-closed)\n"); return 1
-    print(json.dumps({"destroy": "done", "targets": allres,
+        # ★F1(reviewer1): down·사후검증 실패는 최종 exit 비0 — 부분 성공을 "done"·0으로 오보 금지
+        #   (state 잔존→재발견→부활 차단 붕괴를 조용히 통과시키던 결함 봉인).
+        if any(a[0]=="down" and a[1]!=0 for a in res) or any(a[0]=="verify" and a[1]!=0 for a in res):
+            failed = True
+    print(json.dumps({"destroy": "done" if not failed else "incomplete", "targets": allres,
                       "note": "forwarder는 소켓 소멸 후 ~30s self-reap(직접 회수 안 함)"}, ensure_ascii=False))
-    return 0
+    return 1 if failed else 0
 
 def classify_dept(alive, intake):
     if not alive: return "redeploy"   # 소켓 死 → 멱등 apply 재실행(cys-dept REUSE_DEAD 재spawn)
@@ -557,6 +603,8 @@ def main():
     d.add_argument("--dept"); d.add_argument("--all", action="store_true")
     d.add_argument("--purge", action="store_true")
     d.add_argument("--purge-workdir", action="store_true")
+    d.add_argument("--purge-state", action="store_true",
+                   help="★기능2: 부서 state 디렉토리(대화기억)까지 격리(cys-dept down --purge-state 위임)")
     args = ap.parse_args()
     if args.self_test: return self_test()
     if not args.cmd: ap.print_help(); return 2

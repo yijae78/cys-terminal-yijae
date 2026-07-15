@@ -1859,6 +1859,93 @@ async fn stop_dept_daemon_by_socket(socket: String) -> Result<(), String> {
     Ok(())
 }
 
+/// ★기능2(2026-07-15): 부서 완전 폐역(purge) — teardown을 넘어 대화기억(state·transcripts.db)까지
+/// 격리해 부활을 영구 차단한다. javis_org.py destroy 오케스트레이터에 일임(state·pack-dept·workdir
+/// 3디렉토리를 ~/.local/state/cys-trash/ 로 격리·묘비 영구 존치·재발견 glob 절단). CSO 전용 게이트라
+/// CYS_ROLE=cso 로 호출하고, base 레지스트리 대상이므로 CYS_SOCKET 은 제거한다(부서 소켓 오염 방지).
+/// 실패는 Err 로 GUI 에 정직 표기(무음 삼킴 금지). stop_dept_daemon_by_socket 과 socket→name 규약 공유.
+#[tauri::command]
+async fn purge_dept_daemon_by_socket(socket: String) -> Result<String, String> {
+    let name = dept_name_from_socket(&socket)
+        .ok_or_else(|| format!("부서명 파생 실패(비표준 소켓): {socket}"))?;
+    let script = cys::pack::pack_dir().join("bin").join("javis_org.py");
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("python3");
+        inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(python3.exe) PATH 주입
+        cmd.env_remove("CYS_SOCKET"); // base 레지스트리 대상(부서 소켓 오염 방지)
+        cmd.env("CYS_ROLE", "cso"); // destroy 는 CSO 전용 게이트(require_cso)
+        cmd.arg(&script)
+            .arg("destroy")
+            .args(["--dept", &name])
+            .arg("--purge")
+            .arg("--purge-workdir")
+            .arg("--purge-state");
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("javis_org destroy 실행 실패: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// ★기능2: 완전 삭제 확인 다이얼로그 프리뷰 — 격리될 state 디렉토리(대화기억)의 크기·최종 수정시각과
+/// "이 부서가 마지막인가(→CEO 강등)"를 반환한다. 사용자가 무엇을 삭제하는지 읽고 결정하도록 하는 근거.
+/// 읽기 전용(stat·registry 조회) — 부작용 없음.
+#[tauri::command]
+fn dept_purge_preview_by_socket(socket: String) -> Result<Value, String> {
+    let name = dept_name_from_socket(&socket)
+        .ok_or_else(|| format!("부서명 파생 실패(비표준 소켓): {socket}"))?;
+    // state 디렉토리 = 부서 소켓의 부모(dept_socket_path 규약과 동일).
+    let state_dir = dept_socket_path(&name)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| dept_socket_path(&name));
+    fn dir_size(p: &std::path::Path) -> u64 {
+        let mut total = 0u64;
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                match e.file_type() {
+                    Ok(ft) if ft.is_dir() => total += dir_size(&e.path()),
+                    Ok(_) => total += e.metadata().map(|m| m.len()).unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        total
+    }
+    let (size_bytes, mtime_secs, exists) = match std::fs::metadata(&state_dir) {
+        Ok(m) => {
+            let mt = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (dir_size(&state_dir), mt, true)
+        }
+        Err(_) => (0, 0, false),
+    };
+    // 부서 수(depts.json) — 1이면 이 삭제가 마지막 → CEO 강등 고지.
+    let dept_count = list_depts()
+        .ok()
+        .and_then(|r| r.get("depts").and_then(|d| d.as_object()).map(|o| o.len()))
+        .unwrap_or(0);
+    Ok(json!({
+        "name": name,
+        "state_dir": state_dir.to_string_lossy(),
+        "exists": exists,
+        "size_bytes": size_bytes,
+        "mtime_secs": mtime_secs,
+        "dept_count": dept_count,
+        "is_last": dept_count <= 1,
+    }))
+}
+
 /// A안(2026-07-11 오너 승인): 교대·설치 게이트가 세는 "지킬 세션" = **role 또는 agent 가 붙은
 /// 살아있는 surface**만. 맨 셸 pane(role·agent 모두 없음)은 drain+restore 가 되살리므로 무손실
 /// 자동 교대를 막지 않는다 — 종전 '살아있는 pane 전부' 기준은 기본 pane 1개만으로 자동 교대가
@@ -2195,10 +2282,35 @@ async fn rotate_daemon(app: AppHandle, force: bool, skip_drain: bool) -> Result<
     Ok(())
 }
 
+/// [F5] drain --verify JSON 부재 시 실패 원인 분류 — ①구버전 미지원(clap unknown-flag) vs ②크래시/하드캡
+/// 백스톱을 구분해 UI가 정직한 문구를 고르게 한다(거동=plain drain 폴백은 양쪽 동일, 문구만 다름).
+/// 반환 Err 문자열 접두: "unsupported:"(①) / "verify_failed:"(②).
+/// - ① 판정: clap은 미지의 인자에 exit 2 + stderr에 "unexpected argument"/usage를 낸다(run_drain_verify는
+///   정상=0/1·백스톱=3만 내므로 exit 2는 clap 파싱 에러=미지원의 강신호).
+/// - ② 그 외(백스톱 exit 3·시그널 사망·부분 stdout 등): 실행은 됐으나 결과를 못 냄 = 검증 실패(원인 미상).
+fn classify_drain_verify_failure(exit_code: Option<i32>, stderr: &str) -> String {
+    let unsupported = exit_code == Some(2)
+        || stderr.contains("unexpected argument")
+        || stderr.contains("unrecognized")
+        || (stderr.contains("Usage:") && stderr.contains("--verify"));
+    if unsupported {
+        format!(
+            "unsupported: cys drain --verify 미지원(구버전 바이너리) (stderr: {})",
+            stderr.trim()
+        )
+    } else {
+        format!(
+            "verify_failed: drain --verify 실행 실패(exit={exit_code:?}, 크래시/하드캡 백스톱 가능) (stderr: {})",
+            stderr.trim()
+        )
+    }
+}
+
 /// GUI verified 재시작용 — `cys drain --verify`를 실행해 노드별 체크포인트(SESSION_STATE) 저장 검증
-/// 결과 JSON을 반환한다(all_saved·summary·nodes·pending_loss_warning). 구 바이너리(--verify 미지원)는
-/// clap 파싱 에러로 JSON을 못 내므로 Err("unsupported:…")로 신호 → UI가 feature-detect 후 plain drain 폴백.
-/// ★재시작하지 않는다(저장 검증만) — 재시작은 UI가 결과를 보고 rotate_daemon(skip_drain=true)로 진행.
+/// 결과 JSON을 반환한다(all_saved·summary·nodes·pending_loss_warning). JSON 부재 시 [F5] 원인을 분류해
+/// Err("unsupported:…"=구버전 미지원 / "verify_failed:…"=크래시·하드캡)로 신호 → UI가 문구를 분기하고
+/// 양쪽 모두 plain drain 폴백(거동 동일). ★재시작하지 않는다(저장 검증만) — 재시작은 UI가 결과를 보고
+/// rotate_daemon(skip_drain=true)로 진행.
 #[tauri::command]
 async fn drain_verify(timeout: u64) -> Result<Value, String> {
     let out = tokio::task::spawn_blocking(move || {
@@ -2219,12 +2331,9 @@ async fn drain_verify(timeout: u64) -> Result<Value, String> {
     if let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) {
         return Ok(v);
     }
-    // JSON 부재 = 구 바이너리 --verify 미지원(clap 에러) 또는 하드캡 크래시 → 폴백 신호(UI가 plain drain).
+    // JSON 부재 = 구 바이너리 미지원(clap 에러) 또는 크래시/하드캡 → [F5] 원인 분류해 정직한 폴백 신호.
     let stderr = String::from_utf8_lossy(&out.stderr);
-    Err(format!(
-        "unsupported: drain --verify 미지원 또는 실패 (stderr: {})",
-        stderr.trim()
-    ))
+    Err(classify_drain_verify_failure(out.status.code(), &stderr))
 }
 
 /// P5: 무중단 팩 업데이트 UI 브리지(DESIGN-noshutdown-pack-update §2-②·§7-③/④).
@@ -2455,6 +2564,8 @@ fn main() {
             allocate_dept_daemon,
             stop_dept_daemon,
             stop_dept_daemon_by_socket,
+            purge_dept_daemon_by_socket,
+            dept_purge_preview_by_socket,
             rotate_dept_daemon,
             list_depts,
             read_dept_catalog,
@@ -2555,6 +2666,30 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [F5] drain --verify 실패 분류 — 구버전 미지원(clap unknown-flag)과 크래시/하드캡을 구분한다.
+    /// UI 문구 정직성: ①→"미지원" ②→"검증 실패(원인 미상)". 거동(plain drain 폴백)은 양쪽 동일.
+    #[test]
+    fn drain_verify_failure_classification() {
+        // ① 구버전: clap exit 2 + unexpected argument → unsupported
+        let e1 = classify_drain_verify_failure(
+            Some(2),
+            "error: unexpected argument '--verify' found\n\nUsage: cys drain [OPTIONS]",
+        );
+        assert!(e1.starts_with("unsupported:"), "구버전 미지원은 unsupported: {e1}");
+        // ① exit 코드 미상이어도 stderr usage+--verify 패턴이면 unsupported
+        let e1b = classify_drain_verify_failure(None, "Usage: cys drain --verify ...");
+        assert!(e1b.starts_with("unsupported:"), "usage+--verify는 unsupported: {e1b}");
+        // ② 하드캡 백스톱(exit 3) → verify_failed
+        let e2 = classify_drain_verify_failure(Some(3), "");
+        assert!(e2.starts_with("verify_failed:"), "exit3 백스톱은 verify_failed: {e2}");
+        // ② 시그널 사망(code=None)·usage 무관 stderr → verify_failed
+        let e2b = classify_drain_verify_failure(None, "thread 'main' panicked at ...");
+        assert!(e2b.starts_with("verify_failed:"), "크래시는 verify_failed: {e2b}");
+        // 정상 exit 1(부분 실패)은 JSON 경로라 여기 안 오지만, 분류가 오면 verify_failed(안전)
+        let e2c = classify_drain_verify_failure(Some(1), "");
+        assert!(e2c.starts_with("verify_failed:"), "exit1 무JSON은 verify_failed: {e2c}");
+    }
 
     /// A안 회귀 박제(2026-07-11 오너 승인): 교대 게이트는 role/agent 붙은 세션만 지킨다.
     /// 맨 셸 pane(role·agent 없음)이 다시 게이트에 잡히면 기본 pane 1개만으로 자동 교대가

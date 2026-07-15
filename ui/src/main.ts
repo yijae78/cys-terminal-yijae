@@ -9,6 +9,7 @@ import { shellQuote, shellQuoteJoin } from "./shellquote";
 import { updatePlan } from "./updateplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
+import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
 import { deptPlaceholderLabel } from "./deptlabel";
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
@@ -2424,6 +2425,8 @@ function buildTab(ws: Workspace): HTMLElement {
     showCtxMenu(e.clientX, e.clientY, [
       { label: "이름 변경", action: startRename },
       ...wsGroupCtxItems(ws), // 06: 그룹 만들기/넣기/빼기
+      // ★기능2: 부서 탭에만 — 대화기억까지 격리하고 부활을 영구 차단하는 완전 삭제(기존 2-click close 무접촉).
+      ...(ws.socket ? [{ label: "완전 삭제(부활 차단)", action: () => purgeDept(ws) }] : []),
     ]);
   });
   close.addEventListener("click", async () => {
@@ -3491,17 +3494,19 @@ async function manualRestartAllDaemons() {
     // 1) 저장 검증(drain --verify) — feature-detect. 미지원/실패 시 plain drain 폴백.
     stickyToast("restart-daemon", "feed", "↻ 저장 검증", "재시작 전 노드 체크포인트(SESSION_STATE)를 검증하는 중…");
     let verify: DrainVerifyReport | null = null;
-    let unsupported = false;
+    // [F5] 폴백 사유 분기: "unsupported"(구버전 미지원) vs "verify_failed"(크래시/하드캡). 둘 다 plain
+    // drain 폴백(skipDrain=false)이나 UI 문구는 정직하게 다르게 표기한다("무손실" 표현 없음).
+    let fallback: ReturnType<typeof classifyDrainVerifyFallback> = null;
     try {
       verify = (await invoke("drain_verify", { timeout: 20 })) as DrainVerifyReport;
     } catch (e) {
-      if (String(e).includes("unsupported")) unsupported = true;
-      else throw e;
+      fallback = classifyDrainVerifyFallback(String(e));
+      if (!fallback) throw e; // 알 수 없는 에러는 상위 catch로
     }
-    if (unsupported) {
-      // 폴백: 현재 cys 버전은 --verify 미지원 → 기존 best-effort 저장(plain drain, skipDrain=false)으로 재시작.
+    if (fallback) {
       dismissToast("restart-daemon");
-      toast("health", "⚠ 저장 검증 미지원", "현재 cys 버전은 저장 검증을 지원하지 않습니다 — 기존 방식(best-effort 저장)으로 재시작합니다.");
+      const t = drainVerifyFallbackToast(fallback);
+      toast("health", t.title, t.body);
       stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 후 데몬을 다시 시작하는 중… 부서·노드를 자동 복원합니다.");
       const { failedDepts, deptRestoreFailed } = await restartAllDaemons(false);
       dismissToast("restart-daemon");
@@ -3957,6 +3962,118 @@ function inputModal(title: string, label: string, placeholder: string): Promise<
     document.body.appendChild(ov);
     setTimeout(() => ta.focus(), 50);
   });
+}
+
+// ★기능2: 부서 완전 폐역 확인 — 부서명 타이핑 일치 시에만 "완전 삭제" 활성. 크기·최종 mtime·CEO 강등·
+// 격리 복구를 정직 고지한다(비가역처럼 보이나 실제는 격리 후 약 14일 소거 — 오도 금지). teardown-only 인
+// 기존 탭 삭제(2-click 대체 close)와 별개 경로. resolve(true)=진행.
+function purgeConfirmModal(
+  name: string,
+  info: { sizeHuman: string; mtime: string; isLast: boolean; exists: boolean },
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const ov = document.createElement("div");
+    ov.className = "modal-overlay";
+    const notice = [
+      info.exists
+        ? `대화기억(state) 크기 ${info.sizeHuman} · 최종 수정 ${info.mtime}`
+        : "대화기억(state) 디렉토리 없음(격리 대상 없음)",
+      "삭제되는 것: 부서 데몬 종료 + 대화기억·pack·작업물 격리 + 재시작 부활 영구 차단(묘비 존치).",
+      info.isLast ? "⚠ 이 부서가 마지막입니다 — 삭제 시 CEO가 표준 master로 강등됩니다." : "",
+      "복구: 즉시 삭제가 아니라 ~/.local/state/cys-trash/ 로 격리 보관되어 되돌릴 수 있고, 약 14일 후 자동 소거됩니다.",
+      `계속하려면 아래에 부서명 "${name}" 을 정확히 입력하세요.`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    ov.innerHTML =
+      `<div class="modal"><h3></h3><p class="modal-label" style="white-space:pre-wrap"></p>` +
+      `<input class="modal-input" type="text" />` +
+      `<div class="modal-btns"><button class="modal-no">취소</button>` +
+      `<button class="modal-yes" disabled>완전 삭제</button></div></div>`;
+    (ov.querySelector("h3") as HTMLElement).textContent = `부서 "${name}" 완전 삭제(부활 차단)`;
+    (ov.querySelector(".modal-label") as HTMLElement).textContent = notice;
+    const inp = ov.querySelector(".modal-input") as HTMLInputElement;
+    const yes = ov.querySelector(".modal-yes") as HTMLButtonElement;
+    inp.placeholder = name;
+    inp.addEventListener("input", () => {
+      yes.disabled = inp.value.trim() !== name;
+    });
+    const done = (v: boolean) => {
+      ov.remove();
+      resolve(v);
+    };
+    yes.addEventListener("click", () => {
+      if (!yes.disabled) done(true);
+    });
+    ov.querySelector(".modal-no")!.addEventListener("click", () => done(false));
+    ov.addEventListener("click", (e) => {
+      if (e.target === ov) done(false);
+    });
+    document.body.appendChild(ov);
+    setTimeout(() => inp.focus(), 50);
+  });
+}
+
+// ★기능2: 부서 완전 폐역 실행 — 프리뷰(크기·mtime·마지막여부) 조회 → 타이핑 확인 → purge → 탭 제거.
+// 기존 close(2-click 대체) 경로와 별개: 이건 대화기억까지 격리하고 부활을 영구 차단한다(javis_org destroy).
+async function purgeDept(ws: Workspace) {
+  if (!ws.socket) return;
+  let info: {
+    name?: string;
+    size_bytes?: number;
+    mtime_secs?: number;
+    is_last?: boolean;
+    exists?: boolean;
+  } = {};
+  try {
+    info = (await invoke("dept_purge_preview_by_socket", { socket: ws.socket })) as typeof info;
+  } catch (e) {
+    toast("watchdog", "삭제 프리뷰 실패", `${e} — 삭제를 중단합니다. 다시 시도해 주세요.`);
+    return;
+  }
+  const nm = info.name || ws.name || UNTITLED;
+  const bytes = Number(info.size_bytes || 0);
+  const sizeHuman =
+    bytes >= 1e9
+      ? (bytes / 1e9).toFixed(1) + " GB"
+      : bytes >= 1e6
+        ? (bytes / 1e6).toFixed(1) + " MB"
+        : bytes >= 1e3
+          ? (bytes / 1e3).toFixed(1) + " KB"
+          : bytes + " B";
+  const mtime = info.mtime_secs ? new Date(info.mtime_secs * 1000).toLocaleString() : "?";
+  const ok = await purgeConfirmModal(nm, {
+    sizeHuman,
+    mtime,
+    isLast: !!info.is_last,
+    exists: !!info.exists,
+  });
+  if (!ok) return;
+  try {
+    await invoke("purge_dept_daemon_by_socket", { socket: ws.socket });
+  } catch (e) {
+    toast("watchdog", "부서 완전 삭제 실패", `${e} — 삭제되지 않았습니다.`);
+    return;
+  }
+  toast("watchdog", "부서 완전 삭제 완료", `${nm} — 대화기억은 격리 보관(복구 가능)·재시작 부활 차단.`);
+  // 프론트 pane·탭 정리(데몬은 이미 down — close_surface 실패는 관용).
+  for (const sid of collectSids(ws.tree)) {
+    await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
+    destroyPaneRuntime(sid, ws.socket);
+  }
+  const i = workspaces.indexOf(ws);
+  if (i < 0) {
+    render();
+    return;
+  }
+  workspaces.splice(i, 1);
+  if (workspaces.length === 0) {
+    await addWorkspace();
+  } else {
+    if (i < activeWs) activeWs -= 1;
+    activeWs = Math.min(activeWs, workspaces.length - 1);
+  }
+  render();
 }
 
 // ---------- toasts (daemon push events) ----------
