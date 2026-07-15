@@ -3266,6 +3266,9 @@ async function promptBinaryPatch() {
 // ★거버넌스: 부서 교대는 '재기동'일 뿐 CSO 단일소유 생성/폐기 권한을 건드리지 않는다
 // (rotate_dept_daemon=cys-dept rotate=데몬 프로세스만 재기동·레지스트리·묘비·CEO 불변).
 let rotatingDaemon = false;
+// ★[F3] 부서 완전 폐역(purge) 진행 플래그 — purge와 데몬 교대(restart)는 같은 부서 데몬을 동시에 건드리면
+// 경합한다. purge는 rotatingDaemon을, restart는 purgingDept를 서로 존중해 상호 배제한다.
+let purgingDept = false;
 let verSkewBadge: HTMLElement | null = null;
 let skewNoticeShown = false; // C: 세션당 1회 능동 안내 플래그(스큐 해소 시 리셋)
 
@@ -3413,24 +3416,26 @@ type DrainVerifyReport = {
   pending_loss_warning?: { role: string; surface: string; pending_undelivered: number }[];
 };
 
+// ★[F2] 검증은 nonce '마커 기입'만 확인한다 — 노드가 마커 앞에서 SESSION_STATE 내용을 실제로 최신화했는지는
+// 보증하지 못한다(형식적 순응 한계·내용 최신성은 노드 책임). 라벨을 "마커 확인"으로 완화해 과대주장 금지.
 const OUTCOME_LABEL: Record<string, string> = {
-  saved: "저장 확인",
-  timeout: "저장 미확인(시간초과)",
+  saved: "체크포인트 마커 확인",
+  timeout: "마커 미확인(시간초과)",
   delivery_failed: "지시 전달 실패(입력 미제출)",
   unverifiable: "검증 불가(구버전 데몬)",
   skipped_restoring: "복원 중 — 건너뜀",
 };
 
-// 부분 실패 노드를 사람이 읽을 리포트로. 저장 확인된 노드는 생략, 미확인만 나열한다.
+// 부분 실패 노드를 사람이 읽을 리포트로. 마커 확인된 노드는 생략, 미확인만 나열한다.
 function drainVerifyReportText(r: DrainVerifyReport): string {
   const bad = r.nodes.filter((n) => n.outcome !== "saved");
   const lines = bad.map(
     (n) => `• ${n.department ? n.department + " / " : ""}${n.role} (${n.surface}): ${OUTCOME_LABEL[n.outcome] ?? n.outcome}`,
   );
   return (
-    `${r.total}개 노드 중 ${r.summary.saved}개만 체크포인트(SESSION_STATE) 저장이 확인됐습니다.\n\n` +
+    `${r.total}개 노드 중 ${r.summary.saved}개만 체크포인트 마커가 확인됐습니다.\n\n` +
     `${lines.join("\n")}\n\n` +
-    "대화 원문은 재시작 후 트랜스크립트로 복원되지만, 위 노드의 증류 체크포인트(SESSION_STATE·TODO)는 최신이 아닐 수 있습니다.\n\n" +
+    "대화 원문은 재시작 후 트랜스크립트로 복원됩니다. 이 확인은 마커 기입만 보증하며, 위 노드를 포함해 각 노드의 증류 체크포인트(SESSION_STATE·TODO) 내용 최신성은 노드 책임입니다.\n\n" +
     "그래도 지금 재시작하시겠습니까?"
   );
 }
@@ -3478,8 +3483,9 @@ function restartResultToast(failedDepts: string[], deptRestoreFailed: boolean) {
 // cys 코어가 --verify를 미지원하면(구버전) plain drain 폴백(skipDrain=false)+경고. '무손실' 표현 금지 —
 // 대화 원문은 트랜스크립트 복원, 이 기능은 증류 체크포인트(SESSION_STATE·TODO) 최신성만 보증한다.
 async function manualRestartAllDaemons() {
-  if (rotatingDaemon) {
-    toast("feed", "재시작 진행 중", "데몬 교대·재검이 진행 중입니다 — 잠시 후 다시 시도하세요.");
+  if (rotatingDaemon || purgingDept) {
+    // ★[F3] 부서 완전 폐역(purge) 진행 중이면 같은 부서 데몬 경합을 피해 재시작을 보류·안내.
+    toast("feed", "작업 진행 중", "데몬 교대 또는 부서 완전 삭제가 진행 중입니다 — 잠시 후 다시 시도하세요.");
     return;
   }
   const ok = await confirmModal(
@@ -3541,7 +3547,7 @@ async function manualRestartAllDaemons() {
 
 // 시작 시 1회 + 5분 주기(B) — 스큐 재검·배지 멱등 갱신·무손실 자동 교대·1회 능동 안내(C).
 async function checkVersionSkew() {
-  if (rotatingDaemon) return; // 교대 진행 중 중복 발동 방지(주기 타이머·수동 클릭)
+  if (rotatingDaemon || purgingDept) return; // 교대·purge 진행 중 중복 발동 방지(주기 타이머·수동 클릭) [F3]
   let appVer = "";
   try {
     appVer = (await invoke("app_version")) as string;
@@ -4018,6 +4024,11 @@ function purgeConfirmModal(
 // 기존 close(2-click 대체) 경로와 별개: 이건 대화기억까지 격리하고 부활을 영구 차단한다(javis_org destroy).
 async function purgeDept(ws: Workspace) {
   if (!ws.socket) return;
+  // ★[F3] 데몬 교대(restart)나 다른 purge가 진행 중이면 같은 부서 데몬 경합을 피해 거부·안내.
+  if (rotatingDaemon || purgingDept) {
+    toast("feed", "작업 진행 중", "데몬 재시작 또는 다른 완전 삭제가 진행 중입니다 — 잠시 후 다시 시도하세요.");
+    return;
+  }
   let info: {
     name?: string;
     size_bytes?: number;
@@ -4049,31 +4060,37 @@ async function purgeDept(ws: Workspace) {
     exists: !!info.exists,
   });
   if (!ok) return;
+  // ★[F3] 데몬 폐역 구간 동안 restart를 배제(manualRestartAllDaemons·checkVersionSkew가 purgingDept 존중).
+  purgingDept = true;
   try {
-    await invoke("purge_dept_daemon_by_socket", { socket: ws.socket });
-  } catch (e) {
-    toast("watchdog", "부서 완전 삭제 실패", `${e} — 삭제되지 않았습니다.`);
-    return;
-  }
-  toast("watchdog", "부서 완전 삭제 완료", `${nm} — 대화기억은 격리 보관(복구 가능)·재시작 부활 차단.`);
-  // 프론트 pane·탭 정리(데몬은 이미 down — close_surface 실패는 관용).
-  for (const sid of collectSids(ws.tree)) {
-    await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
-    destroyPaneRuntime(sid, ws.socket);
-  }
-  const i = workspaces.indexOf(ws);
-  if (i < 0) {
+    try {
+      await invoke("purge_dept_daemon_by_socket", { socket: ws.socket });
+    } catch (e) {
+      toast("watchdog", "부서 완전 삭제 실패", `${e} — 삭제되지 않았습니다.`);
+      return;
+    }
+    toast("watchdog", "부서 완전 삭제 완료", `${nm} — 대화기억은 격리 보관(복구 가능)·재시작 부활 차단.`);
+    // 프론트 pane·탭 정리(데몬은 이미 down — close_surface 실패는 관용).
+    for (const sid of collectSids(ws.tree)) {
+      await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
+      destroyPaneRuntime(sid, ws.socket);
+    }
+    const i = workspaces.indexOf(ws);
+    if (i < 0) {
+      render();
+      return;
+    }
+    workspaces.splice(i, 1);
+    if (workspaces.length === 0) {
+      await addWorkspace();
+    } else {
+      if (i < activeWs) activeWs -= 1;
+      activeWs = Math.min(activeWs, workspaces.length - 1);
+    }
     render();
-    return;
+  } finally {
+    purgingDept = false;
   }
-  workspaces.splice(i, 1);
-  if (workspaces.length === 0) {
-    await addWorkspace();
-  } else {
-    if (i < activeWs) activeWs -= 1;
-    activeWs = Math.min(activeWs, workspaces.length - 1);
-  }
-  render();
 }
 
 // ---------- toasts (daemon push events) ----------

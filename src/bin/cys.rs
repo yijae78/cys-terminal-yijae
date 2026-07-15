@@ -5038,6 +5038,9 @@ fn checkpoint_marker(nonce: &str, ts: u64) -> String {
 }
 
 /// 파일에 지정 nonce의 체크포인트 마커가 존재하는가(존재/일치 — mtime 아님).
+/// ★[F2] 이 검증은 '마커 기입'만 확인한다 — 노드가 마커 앞에서 SESSION_STATE 내용을 실제로 최신화했는지는
+/// 보증하지 못한다(형식적 순응 한계). Saved 결과·UI 라벨은 그래서 "저장 확인"이 아니라 "마커 확인"으로
+/// 표기한다. 내용 최신성은 노드(LLM) 협조 책임이며, 이 도구가 낼 수 있는 결정론 신호는 마커 존재까지다.
 fn file_has_checkpoint_nonce(path: &std::path::Path, nonce: &str) -> bool {
     let needle = format!("cys-checkpoint: {nonce}");
     std::fs::read_to_string(path)
@@ -5050,6 +5053,18 @@ fn canonical_checkpoint_file(live_cwd: &str) -> std::path::PathBuf {
     std::path::Path::new(live_cwd)
         .join("_round")
         .join("SESSION_STATE.md")
+}
+
+/// [F1] 소켓 경로별 안정 구별자(FNV-1a) — nonce에 섞어 크로스소켓(같은 sid) 충돌을 막는다. 결정론(런타임
+/// 무관)이라 같은 소켓은 항상 같은 값·다른 소켓은 사실상 다른 값(충돌 확률 무시 가능). 단일 run 내
+/// 유일성만 필요하므로 짧은 64bit로 충분.
+fn socket_discriminator(socket: &std::path::Path) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in socket.to_string_lossy().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// 화면에서 '현재 입력창 영역'만 잘라낸다 — 마지막 입력 앵커(입력 박스 상단 '╭' 또는 줄 시작 '> ' 프롬프트)
@@ -5084,13 +5099,15 @@ fn delivery_wedged(screen: &str, sentinel: &str) -> bool {
     !needle.is_empty() && flat.contains(&needle)
 }
 
-/// 저장 지시문 생성 — ★[R1 수리] 마커 기입을 '정지' 지시보다 **앞**(단계 ①)에 둔다. 지시문을 순서대로
+/// 저장 지시문 생성 — ★[R1] 마커 기입을 '정지' 지시보다 **앞**(단계 ①)에 둔다. 지시문을 순서대로
 /// 리터럴 실행하는 노드가 '정지'를 먼저 만나면 이후 마커 기입을 건너뛰어 '저장했으나 timeout' 오판정이
 /// 났다(직전 F1 수리가 마커를 끝으로 옮기며 역전됨). F1의 wedge 검출은 위치 무관 전체 매치라 마커가
 /// 지시문 끝일 필요가 없으므로, 마커를 ①로 되돌려도 F1은 유지된다.
+/// ★[F4 위생] 기존 `<!-- cys-checkpoint:` 마커 라인은 지우고 새 1줄만 남기게 지시한다 — append-only면
+/// 재시작마다 죽은 마커가 무한 증식한다. 검증 로직은 무변경(새 nonce 존재 확인이라 옛 마커 잔존과 무관).
 fn drain_verify_instruction(marker: &str) -> String {
     format!(
-        "[DRAIN-VERIFY] 재시작 전 체크포인트 검증. 지금 즉시 순서대로: ① _round/SESSION_STATE.md에 현재 작업 상태·미해결 게이트·다음 액션을 최신화해 저장하고, 이어서 그 파일 맨 끝에 정확히 이 한 줄을 추가하라(문자 그대로·수정 금지): {marker} ② ①의 저장·기입을 모두 마친 뒤에 작업을 멈추고 재시작·복원을 기다려라(승인 프롬프트 대기 중이면 이 메시지는 무시하라)."
+        "[DRAIN-VERIFY] 재시작 전 체크포인트 검증. 지금 즉시 순서대로: ① _round/SESSION_STATE.md에 현재 작업 상태·미해결 게이트·다음 액션을 최신화해 저장하고, 그 파일에 이미 있는 `<!-- cys-checkpoint:` 로 시작하는 옛 마커 라인은 모두 삭제한 뒤, 맨 끝에 정확히 이 한 줄만 추가하라(문자 그대로·수정 금지): {marker} ② ①의 저장·기입을 모두 마친 뒤에 작업을 멈추고 재시작·복원을 기다려라(승인 프롬프트 대기 중이면 이 메시지는 무시하라)."
     )
 }
 
@@ -5316,7 +5333,15 @@ fn verify_one_node(
         );
     };
     let file = canonical_checkpoint_file(cwd);
-    let nonce = format!("{nonce_prefix}-{}", t.surface_id);
+    // ★[F1 수리] 크로스소켓 nonce 충돌 방지: surface_id는 데몬별 네임스페이스라 서로 다른 소켓의 두 노드가
+    // 같은 sid + 같은 live_cwd(전 부서 cwd 수렴 실측 있음)면 nonce·파일이 동일해져, 주입 안 한 노드가 타
+    // 노드 마커를 자기 것으로 오인해 Saved 위양성(→재시작 체크포인트 유실)이 났다. results가 idx 키잉으로
+    // sid 충돌을 이미 회피했는데 nonce만 sid에 남아 불일치였다. 소켓 안정 구별자를 nonce에 추가해 정합화.
+    let nonce = format!(
+        "{nonce_prefix}-{:x}-{}",
+        socket_discriminator(&t.socket),
+        t.surface_id
+    );
     let marker = checkpoint_marker(&nonce, now);
     // 이미 이 nonce가 있으면 즉시 통과(프로세스 내 재호출 idempotent)
     if file_has_checkpoint_nonce(&file, &nonce) {
@@ -5392,7 +5417,7 @@ fn drain_verify_fanout(
     let nonce_prefix = format!("{now}-{}", std::process::id());
     let (tx, rx) = std::sync::mpsc::channel::<(usize, VerifyOutcome, String)>();
     let total = targets.len();
-    // surface_id는 데몬별 네임스페이스라 소켓 간 충돌 가능 → 인덱스로 키잉.
+    // surface_id는 데몬별 네임스페이스라 소켓 간 충돌 가능 → 인덱스로 키잉(nonce도 [F1] 소켓 구별자로 정합).
     let mut meta: HashMap<usize, VerifyTarget> = HashMap::new();
     for (idx, t) in targets.iter().enumerate() {
         meta.insert(idx, t.clone());
@@ -10262,11 +10287,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&td);
         let round = td.join("_round");
         std::fs::create_dir_all(&round).unwrap();
-        // verify_one_node의 nonce = "{prefix}-{sid}" = "run1-7"
-        let marker = checkpoint_marker("run1-7", 100);
+        let sock = td.join("cys.sock");
+        // verify_one_node의 nonce = "{prefix}-{socket_disc:x}-{sid}" ([F1] 소켓 구별자 포함).
+        let nonce = format!("run1-{:x}-7", socket_discriminator(&sock));
+        let marker = checkpoint_marker(&nonce, 100);
         std::fs::write(round.join("SESSION_STATE.md"), format!("# 상태\n{marker}\n")).unwrap();
         let io = FakeVerifyIo::new(); // 노드 미등록 — 주입해도 무동작(하지만 선통과라 무관)
-        let t = mk_target(7, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let t = mk_target(7, sock, Some(td.to_string_lossy().into_owned()));
         let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(2), 100);
         let _ = std::fs::remove_dir_all(&td);
         assert_eq!(o, VerifyOutcome::Saved);
@@ -10374,6 +10401,51 @@ mod tests {
         let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
         let _ = std::fs::remove_dir_all(&td);
         assert_eq!(o, VerifyOutcome::Timeout);
+    }
+
+    /// [F1] 크로스소켓 nonce 충돌 위양성 — 같은 sid + 같은 live_cwd(부서 cwd 수렴)인 두 소켓에서, 한 노드가
+    /// 남긴 마커를 다른 소켓의 (주입 실패) 노드가 자기 것으로 오인해 Saved 위양성이 나던 결함.
+    /// ★비-tautology: 구 nonce("{prefix}-{sid}", 소켓 구별자 없음)면 매치=위양성임을 명시 증명, 신 로직은 Timeout.
+    #[test]
+    fn drain_verify_cross_socket_nonce_collision_false_positive() {
+        let td = std::env::temp_dir().join(format!("cys-dv-xsock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        let file = round.join("SESSION_STATE.md");
+        let cwd = td.to_string_lossy().into_owned();
+        let (prefix, sid) = ("runX", 7u64);
+        let sock_a = std::path::PathBuf::from("/x/cys-dept-a/cys.sock");
+        let sock_b = std::path::PathBuf::from("/x/cys-dept-b/cys.sock");
+        // 소켓 구별자는 결정론이고 서로 달라야 한다(같은 소켓은 안정, 다른 소켓은 상이).
+        assert_eq!(socket_discriminator(&sock_a), socket_discriminator(&sock_a));
+        assert_ne!(socket_discriminator(&sock_a), socket_discriminator(&sock_b));
+
+        // 구 로직 재현: A(sock_a)가 구 스킴 nonce("{prefix}-{sid}")로 공유 파일에 마커를 남겼다.
+        let a_old_nonce = format!("{prefix}-{sid}");
+        std::fs::write(
+            &file,
+            format!("# 상태\n{}\n", checkpoint_marker(&a_old_nonce, 100)),
+        )
+        .unwrap();
+        // 구 로직 B의 nonce도 sid만 쓰므로 A 마커를 자기 것으로 매치 → Saved 위양성(수정 전 FAIL 경로).
+        assert!(
+            file_has_checkpoint_nonce(&file, &a_old_nonce),
+            "구 로직: 같은 sid의 B가 A(타 소켓) 마커를 매치 → Saved 위양성"
+        );
+
+        // 신 로직: B(Hung=주입 전부 Err, sock_b)를 verify_one_node로 — 소켓 구별자로 nonce가 달라 파일의
+        // A 마커를 무시 → idempotent 미통과 → 주입(Hung Err) → Timeout(위양성 회피).
+        let io = FakeVerifyIo::new();
+        io.add(sid, FakeScenario::Hung, file.clone());
+        let tb = mk_target(sid, sock_b, Some(cwd));
+        let (ob, _d) = verify_one_node(&io, &tb, prefix, std::time::Duration::from_secs(1), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(
+            ob,
+            VerifyOutcome::Timeout,
+            "신 로직: 크로스소켓 nonce 충돌 위양성 회피 → Timeout"
+        );
     }
 
     /// ⑥(변형) live_cwd 미제공 → unverifiable(무음 폴백 금지).
