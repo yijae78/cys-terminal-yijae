@@ -2347,7 +2347,7 @@ function wsnOrb(sig: NodeSig): "w" | "i" | "a" {
 }
 function wsnRoleCat(role: string | null): "master" | "cso" | "worker" | "reviewer" | "other" {
   const r = (role ?? "").toLowerCase();
-  if (r === "master") return "master";
+  if (r === "master" || r === "dept-master" || r.endsWith("-master")) return "master"; // 부서장(dept-master)도 대표 카드
   if (r === "cso") return "cso";
   if (r.startsWith("worker")) return "worker";
   if (r.startsWith("reviewer")) return "reviewer";

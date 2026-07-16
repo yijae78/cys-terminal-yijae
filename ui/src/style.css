@@ -685,7 +685,7 @@ body.cc-office #cc-view-office { flex: 1; min-height: 0; }
    ──────────────────────────────────────────────────────────────────────── */
 .wsn-expand {
   --wsn-cyan:#00d4ff; --wsn-green:#2ee6a0; --wsn-amber:#ffb020; --wsn-violet:#a78bfa; --wsn-blue:#5b8cff;
-  --wsn-green-rgb:46,230,160; --wsn-amber-rgb:255,176,32;
+  --wsn-green-rgb:46,230,160; --wsn-amber-rgb:255,176,32; --wsn-cyan-rgb:0,212,255;
   --wsn-t1:#eef2ff; --wsn-t2:#9aa6c4; --wsn-mut:#5d6785;
   margin: 8px -4px 2px; padding: 4px 4px 6px; border-radius: 14px;
   background: linear-gradient(160deg, rgba(12,16,28,.92), rgba(8,10,18,.96));
@@ -734,18 +734,30 @@ body.cc-office #cc-view-office { flex: 1; min-height: 0; }
   background: linear-gradient(160deg, rgba(255,255,255,.05), rgba(255,255,255,.015));
   box-shadow: inset 0 0 0 1px rgba(255,255,255,.07), 0 6px 16px rgba(0,0,0,.3);
 }
+/* 헤더 = 큰 클릭영역 토글 바(신교수님: 한눈에 접었다 폈다 인지) — chevron 버튼·색 대비·hover 피드백 강화 */
 .wsn-nodehead {
-  display: flex; align-items: center; gap: 7px; cursor: pointer; padding: 9px 11px;
-  -webkit-user-select: none; user-select: none;
+  display: flex; align-items: center; gap: 10px; cursor: pointer; padding: 12px;
+  -webkit-user-select: none; user-select: none; transition: background .12s ease;
 }
-.wsn-nodehead:hover { background: rgba(255,255,255,.03); }
-.wsn-chev { color: var(--wsn-cyan); font-size: calc(9px * var(--wsbar-font,1)); width: 11px; flex: none; text-align: center; }
+.wsn-nodehead:hover { background: rgba(var(--wsn-cyan-rgb),.08); }
+.wsn-nodehead:active { background: rgba(var(--wsn-cyan-rgb),.14); }
+/* chevron = 눈에 띄는 사각 버튼 글리프(시안 틴트·테두리·hover 밝기↑) */
+.wsn-chev {
+  width: calc(24px * var(--wsbar-font,1)); height: calc(24px * var(--wsbar-font,1)); flex: none;
+  display: flex; align-items: center; justify-content: center; border-radius: 7px;
+  font-size: calc(13px * var(--wsbar-font,1)); line-height: 1; color: var(--wsn-cyan);
+  background: rgba(var(--wsn-cyan-rgb),.14); box-shadow: inset 0 0 0 1px rgba(var(--wsn-cyan-rgb),.35);
+  transition: background .12s ease, color .12s ease, box-shadow .12s ease;
+}
+.wsn-nodehead:hover .wsn-chev {
+  background: rgba(var(--wsn-cyan-rgb),.26); color: #cdf3ff; box-shadow: inset 0 0 0 1px rgba(var(--wsn-cyan-rgb),.55);
+}
 .wsn-label {
   flex: 1; min-width: 0;
-  font-size: calc(9.5px * var(--wsbar-font,1)); font-weight: 700; letter-spacing: .14em; text-transform: uppercase;
-  color: var(--wsn-mut); display: flex; align-items: center; gap: 6px;
+  font-size: calc(11px * var(--wsbar-font,1)); font-weight: 800; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--wsn-t2); display: flex; align-items: center; gap: 6px;
 }
-.wsn-label b { color: var(--wsn-cyan); }
+.wsn-label b { color: var(--wsn-cyan); font-size: calc(12px * var(--wsbar-font,1)); }
 .wsn-nodelist { padding: 2px 4px 6px; }
 .wsn-nodelist.collapsed { display: none; }
 
