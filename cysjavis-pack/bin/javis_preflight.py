@@ -3618,6 +3618,69 @@ class Preflight:
         except Exception as e:
             self.add(cid, WARN, "cys drain --help 실행 실패(%s) — 능력 확인 불가 · 검사=%s" % (e, cys))
 
+    # ── C66 스킬보드 카탈로그 무결성 (WARN-only·부트 비차단·--fix 무동작=카탈로그는 오너 주권) ──
+    def c66_board_catalog(self):
+        cid = "C66.board-catalog"
+        if self.skipped(cid):
+            return
+        try:
+            data = json.load(open(os.path.join(pack_dir(), "board-catalog.json"), encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            self.add(cid, WARN, "board-catalog.json 읽기/파싱 실패(%s) — 카탈로그 무결성 확인 불가" % e)
+            return
+        if not isinstance(data, dict):
+            self.add(cid, WARN, "board-catalog.json 스키마 예상 밖(객체 아님) — 무결성 확인 불가")
+            return
+        names = []
+        for dom in data.get("domains", []):
+            if isinstance(dom, dict):
+                for s in dom.get("skills", []):
+                    if isinstance(s, dict) and s.get("name"):
+                        names.append(s["name"])
+        for act in data.get("actions", []):
+            if isinstance(act, dict) and act.get("name"):
+                names.append(act["name"])
+        names = list(dict.fromkeys(names))  # 중복 제거·순서 보존
+        # 설치 루트 = pack/skills + ~/.claude*/skills — 보드 카탈로그 스킬은 claude 프로필
+        # skills에 설치돼 있다(실측 2026-07-16: pack 단일 루트는 설치 스킬을 미설치로 오탐).
+        roots = [os.path.join(pack_dir(), "skills")]
+        home = os.path.expanduser("~")
+        try:
+            for nm in sorted(os.listdir(home)):
+                if nm == ".claude" or nm.startswith(".claude-"):
+                    d = os.path.join(home, nm, "skills")
+                    if os.path.isdir(d):
+                        roots.append(d)
+        except OSError:
+            pass
+        missing = [n for n in names
+                   if not any(os.path.isdir(os.path.join(r, n)) for r in roots)]
+        if missing:
+            self.add(cid, WARN, "카탈로그 참조 스킬 미설치(전 루트 부재 %d종): %s"
+                     % (len(missing), ", ".join(missing)))
+        else:
+            self.add(cid, PASS, "board-catalog 참조 스킬 %d종 전부 설치됨" % len(names))
+
+    # ── C67 학습 기록 배선 (WARN-only·부트 비차단·--fix 무동작) ──
+    def c67_learn_wiring(self):
+        cid = "C67.learn-wiring"
+        if self.skipped(cid):
+            return
+        p = os.path.join(os.path.expanduser("~"), ".cys", "state", "learn", "state.json")
+        msg = "학습 기록 미배선 — RSI 라운드가 cys learn-checkpoint로 push하면 CC 학습 탭에 표시"
+        if not os.path.isfile(p):
+            self.add(cid, WARN, "%s (%s 없음)" % (msg, p))
+            return
+        try:
+            age_days = (time.time() - os.path.getmtime(p)) / 86400.0
+        except OSError as e:
+            self.add(cid, WARN, "%s (mtime 조회 실패: %s)" % (msg, e))
+            return
+        if age_days > 30:
+            self.add(cid, WARN, "%s (마지막 갱신 %.0f일 전)" % (msg, age_days))
+        else:
+            self.add(cid, PASS, "학습 기록 배선됨 (마지막 갱신 %.1f일 전)" % age_days)
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -3648,6 +3711,7 @@ class Preflight:
             self.c54_loc_cap, self.c55_grill_gate, self.c56_dept_hook_leak,
             self.c57_temp_hook_leak, self.c58_trust_harden, self.c59_guard_wiring,
             self.c60_gate_wiring, self.c61_doc_code_sot, self.c65_drain_verify,
+            self.c66_board_catalog, self.c67_learn_wiring,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             self.c62_pack_heal_ledger,
         ]

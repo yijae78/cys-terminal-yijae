@@ -119,6 +119,14 @@ enum Command {
         #[arg(long)]
         surface: Option<String>,
     },
+    /// CC v2: 계정 단위 rate limit 뷰(로컬 데몬) — 자원 게이트·스크립트 소비용
+    UsageAccounts {
+        #[arg(long)]
+        json: bool,
+    },
+    /// CC v2: RSI 학습 체크포인트 push — stdin JSON({round, verdict, stored, harness, discovery})을
+    /// learn.checkpoint RPC로 전달 (javis_learn.py 전용 plumbing · 데몬 부재 시 exit 1)
+    LearnCheckpoint,
     /// T1-2 통합 관제 보드: 전 노드 상태를 1콜로 (read-screen 폴링 대체)
     Status {
         #[arg(long)]
@@ -750,6 +758,9 @@ enum SkillAction {
         /// fresh surface TTL(초). 미지정=schedule.rs 기본 TTL
         #[arg(long)]
         close_after: Option<u64>,
+        /// CC v2: 보드 run 생애주기 추적 id(make_ticket이 발급·산출물 dir과 동일). 미지정=추적 없음
+        #[arg(long)]
+        run_id: Option<String>,
     },
 }
 
@@ -1543,6 +1554,51 @@ fn run(command: Command) -> i32 {
         }
 
         Command::UsageEventStdin { surface } => return run_usage_event_stdin(&surface),
+
+        Command::UsageAccounts { json: as_json } => request("usage.accounts", json!({}))
+            .map(|r| {
+                if as_json {
+                    println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+                } else {
+                    for a in r["accounts"].as_array().into_iter().flatten() {
+                        let label = a["label"].as_str().unwrap_or("?");
+                        let provider = a["provider"].as_str().unwrap_or("?");
+                        let rate: Vec<String> = a["rate"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|w| {
+                                format!(
+                                    "{} {:.0}%",
+                                    w["label"].as_str().unwrap_or("?"),
+                                    w["used_pct"].as_f64().unwrap_or(0.0)
+                                )
+                            })
+                            .collect();
+                        let obs = if a["updated_at"].is_null() {
+                            "관측 없음".to_string()
+                        } else {
+                            rate.join(" · ")
+                        };
+                        println!("{provider:<12} {label:<32} {obs}");
+                    }
+                }
+            }),
+
+        Command::LearnCheckpoint => {
+            let mut buf = String::new();
+            if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+                eprintln!("error: stdin JSON 필요 ({{round, verdict, …}})");
+                return 1;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&buf) else {
+                eprintln!("error: stdin JSON 파싱 실패");
+                return 1;
+            };
+            request("learn.checkpoint", v).map(|r| {
+                println!("OK round={}", r["round"].as_str().unwrap_or("?"));
+            })
+        }
 
         Command::Status { json: as_json } => return run_status(as_json),
         Command::Fleet { json: as_json } => return run_fleet(as_json),
@@ -2588,12 +2644,21 @@ fn run_skill(action: SkillAction) -> i32 {
             println!("{content}");
             Ok(())
         })(),
-        SkillAction::Run { name, ticket, agent, close_after } => (|| {
+        SkillAction::Run { name, ticket, agent, close_after, run_id } => (|| {
             if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
                 return Err("name must be kebab-case ascii (a-z0-9-)".into());
             }
             if ticket.trim().is_empty() {
                 return Err("ticket 비어 있음 — 무계약 실행 금지(task-prompt 경유 필수)".into());
+            }
+            // CC v2 WS-B: run 생애주기 등록(best-effort — 실패해도 실행은 막지 않는다).
+            // ttl은 아래 close_after 기본(600)과 동일 값 — 데몬이 deadline 산출에 쓴다.
+            if let Some(rid) = run_id.as_ref() {
+                let _ = request(
+                    "skill.run_started",
+                    json!({"run_id": rid, "name": name,
+                           "ttl_secs": close_after.unwrap_or(600)}),
+                );
             }
             // 일회용 격리 실행 = schedule add --fresh 잡(즉발 원샷 + fresh + worker 디렉티브 주입 + 자동 close).
             // invisible `claude -p` 맹목복제 금지(PROMPT_RUNNER_ABSENT) — 보이는 surface + 원장 강제종료.
@@ -4837,6 +4902,11 @@ fn statusline_to_report_params(v: &Value) -> Value {
     }
     if let Some(w) = ctx_window {
         params["ctx_window"] = json!(w);
+    }
+    // CC v2 WS-A: statusline stdin의 transcript_path → session_file(기존 usage.report 파라미터).
+    // 데몬이 프로필 dir→계정(accountUuid) 귀속에 쓴다. 부재 시 생략(하위호환·필드 없는 구버전 무해).
+    if let Some(t) = v.get("transcript_path").and_then(|x| x.as_str()) {
+        params["session_file"] = json!(t);
     }
     params
 }
@@ -9198,6 +9268,21 @@ mod tests {
         assert_eq!(p["ctx_window"].as_u64(), Some(1000000));
         assert_eq!(p["rate"].as_array().unwrap().len(), 0);
         assert!(p.get("ctx_tokens").is_none(), "current_usage·total 없으면 ctx_tokens 생략");
+        assert!(p.get("session_file").is_none(), "transcript_path 없으면 session_file 생략");
+    }
+
+    /// CC v2 WS-A: transcript_path → session_file 동봉 — 데몬의 계정(accountUuid) 귀속 경로.
+    #[test]
+    fn statusline_params_transcript_path() {
+        let v = json!({
+            "transcript_path": "/Users/x/.claude/projects/-a/s.jsonl",
+            "context_window": {"used_percentage": 3.0}
+        });
+        let p = statusline_to_report_params(&v);
+        assert_eq!(
+            p["session_file"],
+            json!("/Users/x/.claude/projects/-a/s.jsonl")
+        );
     }
 
     /// 사람용 statusline 한 줄 포맷 — rate는 있을 때만, 모델명 부재 시 "claude" 폴백.

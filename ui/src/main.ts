@@ -153,6 +153,15 @@ let ccSessionsWindow = "7d";
 let ccSessionsStarOnly = false;
 let ccSessionsRedact = false;
 let ccSessionSelected: string | null = null;
+// 계정 Rate Limit(전 조직 병합 뷰) — usage_accounts_all 최신 스냅샷. Live KPI/게이지가 이 데이터를 폴백보다 우선.
+let ccAccounts: any[] = [];
+// 계정 라벨(이메일) 가림 토글 — 스크린샷 공유용. 결정론 해시 6자로 치환.
+let ccAcctRedact = localStorage.getItem("cys-cc-acct-redact") === "1";
+// 스킬 보드 카탈로그 캐시 + 검색어 — 검색은 재fetch 없이 renderBoardDomains 재렌더(깜빡임 방지).
+let ccBoardCatalog: any = { domains: [], actions: [] };
+let ccBoardSearch = "";
+// 보드 버튼 호출수 뱃지(B2) — control_skills 7d by_skill 캐시(스킬명→호출수).
+let ccBoardCalls: Record<string, number> = {};
 
 // HUD-5: 밀도 모드 — 비기술자 Glance(오늘 큰 글씨) ↔ 엔지니어 Ops(6탭). body class 1개가 진실원.
 type CcDensity = "ops" | "glance";
@@ -202,6 +211,77 @@ function ccAggRate(fleet: any[]): Record<string, { used: number; reset: number |
     }
   }
   return agg;
+}
+
+// 시:분(epoch 초) — 계정 소진 예상·최근 실행 시작시각의 간단 표기.
+function ccHHMM(epoch: number): string {
+  if (!Number.isFinite(epoch) || epoch <= 0) return "";
+  const d = new Date(epoch * 1000);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+// 자산 mtime(epoch 초) → YYYY.MM.DD — 자산 칩 툴팁.
+function ccAssetDate(mtime: any): string {
+  const n = Number(mtime);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const d = new Date(n * 1000);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}.${p(d.getMonth() + 1)}.${p(d.getDate())}`;
+}
+// 결정론 해시 6자(djb2) — 계정 라벨 가림(스크린샷용). 같은 라벨은 항상 같은 해시.
+function ccHash6(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return h.toString(16).padStart(8, "0").slice(0, 6);
+}
+const ccAcctLabel = (label: string): string => (ccAcctRedact ? `#${ccHash6(label)}` : label);
+// 지정 rate 라벨(5h/7d)에서 사용률 최고 계정 — Live KPI/게이지의 "최고 사용 계정 기준" 값.
+function ccAcctMax(label: string): { used: number; reset: number | null; acct: string } | null {
+  let best: { used: number; reset: number | null; acct: string } | null = null;
+  for (const a of ccAccounts) {
+    for (const r of a.rate ?? []) {
+      if (r.label !== label) continue;
+      const used = Number(r.used_pct);
+      if (!Number.isFinite(used)) continue;
+      if (!best || used > best.used)
+        best = { used, reset: r.resets_at ?? null, acct: String(a.label ?? a.account_id ?? "?") };
+    }
+  }
+  return best;
+}
+
+// 계정 Rate Limit 섹션 — 전 조직 병합 계정을 provider·라벨·plan·5h/7d 게이지·리셋·관측 뱃지로 렌더.
+function renderAccounts() {
+  const host = document.getElementById("cc-accounts");
+  if (!host) return;
+  if (!ccAccounts.length) {
+    host.innerHTML = `<div class="cc-empty">관측된 계정 없음</div>`;
+    return;
+  }
+  host.innerHTML = ccAccounts
+    .map((a) => {
+      const prov = ccEsc(String(a.provider ?? "?"));
+      const label = ccEsc(ccAcctLabel(String(a.label ?? a.account_id ?? "?")));
+      const plan = a.plan ? `<span class="cc-acct-plan">${ccEsc(String(a.plan))}</span>` : "";
+      // 게이지 — rate limit 임계(70/90)로 sevClass. cc-tbar 재사용.
+      const gauges = ["5h", "7d"]
+        .map((lab) => {
+          const r = (a.rate ?? []).find((x: any) => x.label === lab);
+          const used = r ? Math.round(Number(r.used_pct)) : 0;
+          const reset = r && r.resets_at != null ? ccReset(lab, r.resets_at) : "";
+          const fill = r ? `<span class="cc-tbar-fill ${sevClass(used, 70, 90)}" style="width:${Math.min(100, used)}%"></span>` : "";
+          return `<div class="cc-tbar"><span class="cc-tbar-lab">${lab}</span><span class="cc-tbar-track">${fill}</span><span class="cc-tbar-pct">${r ? used + "%" : "—"}</span><span class="cc-tbar-reset">${reset}</span></div>`;
+        })
+        .join("");
+      const badges: string[] = [];
+      if (a.updated_at == null) badges.push(`<span class="cc-acct-badge">관측 없음</span>`);
+      if (a.adapter === false) badges.push(`<span class="cc-acct-badge">관측 어댑터 없음</span>`);
+      const stale = Number(a.stale_secs);
+      if (Number.isFinite(stale) && stale > 120) badges.push(`<span class="cc-acct-badge">${Math.round(stale / 60)}분 전 관측</span>`);
+      if (a.exhaust_at != null) badges.push(`<span class="cc-acct-badge warn">이 속도면 ${ccHHMM(Number(a.exhaust_at))} 소진</span>`);
+      return `<div class="cc-acct-row"><span class="cc-acct-prov">[${prov}]</span><span class="cc-acct-label">${label}</span>${plan}<div class="cc-acct-gauges">${gauges}</div><span class="cc-acct-badges">${badges.join("")}</span></div>`;
+    })
+    .join("");
 }
 
 // HUD-5: 밀도 전환 — 순수 CSS(body class)가 진실원. JS는 class 토글 + 영속 + 버튼 라벨만.
@@ -260,6 +340,14 @@ function tickCc() {
 
 async function refreshControlCenter() {
   if (!ccOpen) return;
+  // 계정 Rate Limit(전 조직 병합) — Live KPI/게이지가 이 데이터를 쓰므로 대시보드 렌더 전에 최신화.
+  if (ccTab === "live") {
+    try {
+      ccAccounts = ((await invoke("usage_accounts_all")) as any)?.accounts ?? [];
+    } catch {
+      /* 데몬 일시 부재 — 직전 스냅샷 유지, 다음 틱 재시도 */
+    }
+  }
   try {
     renderControlCenter(await invoke("control_dashboard"));
     ccFailStreak = 0;
@@ -282,6 +370,8 @@ async function refreshControlCenter() {
   // Tasks 안전망 reconcile: 이벤트 누락·부서 신규 기동을 5초 폴링으로 보정(평시는 이벤트 드리븐).
   if (ccTab === "tasks") refreshTasks();
   if (ccTab === "feed") refreshFeed();
+  // 보드는 카탈로그 전체 재렌더 없이 최근 실행 카드만 5초 갱신(깜빡임 방지).
+  if (ccTab === "board") refreshBoardRuns();
 }
 
 // B-11: 연속 실패 표면화 — 3틱(15초) 연속 실패면 footer를 경고로 전환(조용한 stale 오인 차단)
@@ -398,53 +488,17 @@ async function openOfficeView() {
 
 // D5: 스킬 버튼 보드 — 카탈로그 큐레이션 렌더 + 일회용 워커 실행 + 산출물 회수(터미널 입력 0회).
 async function refreshBoard() {
-  const cat = (await invoke("read_board_catalog").catch(() => ({ domains: [], actions: [] }))) as any;
-  const host = document.getElementById("cc-board-domains")!;
-  host.innerHTML = "";
-  for (const d of cat.domains ?? []) {
-    const sec = document.createElement("div");
-    sec.className = "cc-board-domain";
-    sec.innerHTML = `<div class="cc-board-domain-h">${ccEsc(d.label ?? d.id ?? "")}</div>`;
-    const wrap = document.createElement("div");
-    wrap.className = "cc-board-btns";
-    for (const s of d.skills ?? []) {
-      if ((s.acl ?? 1) > 1) continue; // 비기술자: acl≤1만 (민감/위험 스킬은 카탈로그 미포함=암묵 차단)
-      const b = document.createElement("button");
-      b.className = "cc-board-btn";
-      b.textContent = s.label ?? s.name;
-      b.title = `${s.scope ?? ""}${s.gate === "hitl" ? " · 미리보기 확인 필요" : ""}`;
-      b.onclick = () => runSkillButton(s);
-      wrap.appendChild(b);
-    }
-    sec.appendChild(wrap);
-    host.appendChild(sec);
+  ccBoardCatalog = (await invoke("read_board_catalog").catch(() => ({ domains: [], actions: [] }))) as any;
+  // 호출수 뱃지 데이터(7d) — 실패는 뱃지 생략(보드 본기능 무영향).
+  try {
+    const sk = (await invoke("control_skills", { window: "7d" })) as any;
+    ccBoardCalls = {};
+    for (const x of sk?.summary?.by_skill ?? []) if (x?.name) ccBoardCalls[String(x.name)] = Number(x.calls) || 0;
+  } catch {
+    /* graceful */
   }
-  // SB-4: actions(write-a-skill 등) 1급 노출 — 도메인과 동일 실행 경로(신규 인프라 0)
-  const actions = cat.actions ?? [];
-  if (actions.length) {
-    const sec = document.createElement("div");
-    sec.className = "cc-board-domain";
-    sec.innerHTML = `<div class="cc-board-domain-h">도구</div>`;
-    const wrap = document.createElement("div");
-    wrap.className = "cc-board-btns";
-    for (const a of actions) {
-      if ((a.acl ?? 1) > 1) continue;
-      const b = document.createElement("button");
-      b.className = "cc-board-btn";
-      b.textContent = a.label ?? a.name;
-      b.onclick = () =>
-        runSkillButton({
-          name: a.name,
-          label: a.label ?? a.name,
-          scope: "새 스킬 만들기 (write-a-skill — 일상 워크플로우를 스킬로 codify)",
-          success: "SKILL.md 4칸 본문 생성·트리거 명확",
-          gate: "hitl",
-        });
-      wrap.appendChild(b);
-    }
-    sec.appendChild(wrap);
-    host.appendChild(sec);
-  }
+  renderBoardDomains();
+  refreshBoardRuns();
   // 회수 패널 — list_dir 재사용(결정론 위치 skill_out_dir)
   const outHost = document.getElementById("cc-board-out")!;
   let dirs: any[] = [];
@@ -465,6 +519,119 @@ async function refreshBoard() {
           })
           .join("");
   outHost.querySelectorAll<HTMLElement>(".cc-board-out-item").forEach((b) =>
+    b.addEventListener("click", () => invoke("open_path", { path: b.dataset.path }).catch(() => {})),
+  );
+}
+
+// 오너 즐겨찾기 pin — localStorage "cys-board-pins"(name 배열). 설계(board-pins.json) 대비 의도적 로컬 축소.
+function boardPins(): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem("cys-board-pins") || "[]");
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+function toggleBoardPin(name: string) {
+  const pins = boardPins();
+  const i = pins.indexOf(name);
+  if (i >= 0) pins.splice(i, 1);
+  else pins.push(name);
+  localStorage.setItem("cys-board-pins", JSON.stringify(pins));
+  renderBoardDomains();
+}
+// actions(write-a-skill 등)를 스킬 객체로 정규화 — 도메인 스킬과 동일 실행 경로.
+function boardActionSkill(a: any): any {
+  return {
+    name: a.name,
+    label: a.label ?? a.name,
+    scope: "새 스킬 만들기 (write-a-skill — 일상 워크플로우를 스킬로 codify)",
+    success: "SKILL.md 4칸 본문 생성·트리거 명확",
+    gate: "hitl",
+  };
+}
+// 보드 버튼 1개 — 클릭=실행, 우클릭=즐겨찾기 토글, pin이면 ★ 표시.
+function makeBoardBtn(s: any): HTMLButtonElement {
+  const b = document.createElement("button");
+  b.className = "cc-board-btn";
+  const pinned = boardPins().includes(s.name);
+  if (pinned) b.classList.add("pinned");
+  const calls = ccBoardCalls[String(s.name)] ?? 0;
+  const callChip = calls > 0 ? `<span class="cc-board-calls" title="최근 7일 호출수">${Math.floor(calls)}</span>` : "";
+  b.innerHTML = `${pinned ? `<span class="cc-board-pin">★</span>` : ""}${ccEsc(String(s.label ?? s.name ?? ""))}${callChip}`;
+  b.title = `${s.scope ?? ""}${s.gate === "hitl" ? " · 미리보기 확인 필요" : ""} · 우클릭=즐겨찾기`;
+  b.onclick = () => runSkillButton(s);
+  b.oncontextmenu = (e) => {
+    e.preventDefault();
+    toggleBoardPin(String(s.name));
+  };
+  return b;
+}
+// 카탈로그 도메인·actions 렌더 — 검색어(name/label/scope 부분일치) 필터 + 즐겨찾기 상단 그룹.
+// 검색은 재fetch 없이 이 함수만 재호출(깜빡임 방지).
+function renderBoardDomains() {
+  const cat = ccBoardCatalog;
+  const q = ccBoardSearch.trim().toLowerCase();
+  const match = (s: any) => !q || [s.name, s.label, s.scope].some((x) => String(x ?? "").toLowerCase().includes(q));
+  const host = document.getElementById("cc-board-domains");
+  if (!host) return;
+  host.innerHTML = "";
+  // 카탈로그 전체 스킬(acl≤1) 색인 — 즐겨찾기 복제용. actions는 정규화.
+  const all = new Map<string, any>();
+  for (const d of cat.domains ?? []) for (const s of d.skills ?? []) if ((s.acl ?? 1) <= 1) all.set(s.name, s);
+  for (const a of cat.actions ?? []) if ((a.acl ?? 1) <= 1) all.set(a.name, boardActionSkill(a));
+
+  const appendGroup = (title: string, skills: any[]) => {
+    if (!skills.length) return;
+    const sec = document.createElement("div");
+    sec.className = "cc-board-domain";
+    sec.innerHTML = `<div class="cc-board-domain-h">${ccEsc(title)}</div>`;
+    const wrap = document.createElement("div");
+    wrap.className = "cc-board-btns";
+    for (const s of skills) wrap.appendChild(makeBoardBtn(s));
+    sec.appendChild(wrap);
+    host.appendChild(sec);
+  };
+
+  // ★ 즐겨찾기(오너 pin) — 카탈로그 스킬 복제, 상단 그룹.
+  const pinned = boardPins().map((n) => all.get(n)).filter((s) => s && match(s));
+  appendGroup("★ 즐겨찾기", pinned);
+  // 비기술자: acl≤1만 (민감/위험 스킬은 카탈로그 미포함=암묵 차단)
+  for (const d of cat.domains ?? [])
+    appendGroup(d.label ?? d.id ?? "", (d.skills ?? []).filter((s: any) => (s.acl ?? 1) <= 1 && match(s)));
+  // SB-4: actions(write-a-skill 등) 1급 노출 — 도메인과 동일 실행 경로(신규 인프라 0)
+  appendGroup("도구", (cat.actions ?? []).filter((a: any) => (a.acl ?? 1) <= 1 && match(a)).map(boardActionSkill));
+}
+
+// 최근 실행 카드 — skill_runs 폴링 렌더. 상태칩·시작시각·산출물 열기(open_path).
+async function refreshBoardRuns() {
+  const host = document.getElementById("cc-board-runs");
+  if (!host) return;
+  let runs: any[] = [];
+  try {
+    runs = ((await invoke("skill_runs", { limit: 20 })) as any)?.runs ?? [];
+  } catch {
+    /* 데몬 일시 부재 — 다음 틱 재시도 */
+  }
+  host.innerHTML = runs.length
+    ? runs
+        .map((r) => {
+          const status = String(r.status ?? "");
+          const chip =
+            status === "done"
+              ? `<span class="cc-run-status done">✅ 완료</span>`
+              : status === "failed"
+                ? `<span class="cc-run-status failed">❌ 실패${r.exit_note ? ` (${ccEsc(String(r.exit_note))})` : ""}</span>`
+                : `<span class="cc-run-status launched">⏳ 진행중</span>`;
+          const when = r.started_at ? ccHHMM(Number(r.started_at)) : "";
+          const art = r.artifact_dir
+            ? `<button class="cc-run-art" data-path="${ccEsc(String(r.artifact_dir))}">📂 산출물</button>`
+            : "";
+          return `<div class="cc-run-card"><span class="cc-run-label">${ccEsc(String(r.label ?? r.name ?? "?"))}</span><span class="cc-run-when">${ccEsc(when)}</span>${chip}${art}</div>`;
+        })
+        .join("")
+    : `<div class="cc-empty">최근 실행 없음</div>`;
+  host.querySelectorAll<HTMLElement>(".cc-run-art").forEach((b) =>
     b.addEventListener("click", () => invoke("open_path", { path: b.dataset.path }).catch(() => {})),
   );
 }
@@ -615,26 +782,48 @@ async function runSkillButton(s: any) {
   boardBusy = true;
   setTimeout(() => (boardBusy = false), 2000); // 연타 디바운스(surface 누적 방지)
   try {
+    // 착수 전 자원 게이트 — hard(2)=차단, soft(1)=비차단 경고 toast 후 진행(이 조직 머신은
+    // nodes 축이 상시 soft라 모달이면 매 실행이 막힌다 — 실측 2026-07-16). 조회 실패=통과(관측 부재).
+    let gate: any = { exit_code: 0 };
+    try {
+      gate = await invoke("resource_gate_check");
+    } catch {
+      /* 게이트 조회 실패 — 통과 취급 */
+    }
+    if (Number(gate?.exit_code) === 2) {
+      toast("watchdog", "자원 한계", "watchdog 차단 — 자원(서버·부하)을 정리한 뒤 다시 실행하세요");
+      return;
+    }
+    if (Number(gate?.exit_code) === 1) {
+      toast("watchdog", "자원 경고", "시스템 부하가 높은 상태에서 실행합니다(soft)");
+    }
     let userInput = "";
     if (s.gate === "hitl") {
-      // D6 제품 모드: 본문 원고/주제 입력 모달(HITL 보존·신뢰선 라벨·게이트 건너뛰기 금지)
-      const got = await inputModal(
-        s.label ?? s.name,
-        s.scope ?? "내용을 입력하세요",
-        "여기에 본문 원고나 주제를 붙여넣으세요…",
-      );
-      if (got === null) return; // 취소
-      userInput = got;
+      // D6 제품 모드: HITL 입력(신뢰선 라벨·게이트 건너뛰기 금지). fields 있으면 다중 필드, 없으면 단일 원고.
+      if (Array.isArray(s.fields) && s.fields.length) {
+        const got = await fieldsModal(s.label ?? s.name, s.scope ?? "내용을 입력하세요", s.fields);
+        if (got === null) return; // 취소
+        userInput = got;
+      } else {
+        const got = await inputModal(
+          s.label ?? s.name,
+          s.scope ?? "내용을 입력하세요",
+          "여기에 본문 원고나 주제를 붙여넣으세요…",
+        );
+        if (got === null) return; // 취소
+        userInput = got;
+      }
     }
-    // ★무계약 차단: task-prompt 티켓을 먼저 생성(javis_orchestra 경유). UI는 ticket 텍스트만 받는다.
+    // ★무계약 차단: task-prompt 티켓을 먼저 생성(javis_orchestra 경유). 반환은 {ticket, run_id} 객체.
     const scope = userInput ? `${s.scope ?? ""} · 입력 원고: ${userInput}` : s.scope ?? "";
-    const ticket = (await invoke("make_ticket", {
+    const t = (await invoke("make_ticket", {
       task: s.label ?? s.name,
       scope,
       success: s.success ?? "",
       to: "worker",
-    })) as string;
-    await invoke("run_skill", { name: s.name, ticket, agent: "claude", closeAfter: null });
+      slug: s.name,
+    })) as any;
+    await invoke("run_skill", { name: s.name, ticket: t.ticket, agent: "claude", closeAfter: null, runId: t.run_id });
     // 일회용 워커 pane은 CC 오버레이(z-index 1500) **아래** 작업공간에 뜬다 — CC를 닫아야
     // 보인다(오너 실증 2026-07-03: "CC를 종료해야 나타난다"). 실행 성공 시 자동으로 닫는다.
     setCcOpen(false);
@@ -687,10 +876,42 @@ async function refreshLearn() {
     : `<div class="cc-empty">학습 라운드 기록 없음 — RSI 라운드(javis_rsi.py checkpoint)가 기록을 남기면 여기 표시됩니다</div>`;
 
   const ribbons: string[] = [];
-  for (const k of keys) for (const h of rounds[k]?.harness ?? []) ribbons.push(`${k}: ${h.retention ?? "?"}`);
+  for (const k of keys)
+    for (const h of rounds[k]?.harness ?? []) {
+      // eval:{before,after} 있으면 개선 델타(%p)를 리본에 부기 — 없으면 기존 그대로.
+      let delta = "";
+      if (h.eval) {
+        const bef = Number(h.eval.before), aft = Number(h.eval.after);
+        if (Number.isFinite(bef) && Number.isFinite(aft)) {
+          const dv = Math.round(aft - bef);
+          delta = ` (${dv >= 0 ? "+" : ""}${dv}%p)`;
+        }
+      }
+      ribbons.push(`${k}: ${h.retention ?? "?"}${delta}`);
+    }
   document.getElementById("cc-learn-retention")!.innerHTML = ribbons.length
     ? ribbons.map((t) => `<span class="cc-learn-ribbon ${t.includes("keep") ? "keep" : "rollback"}" title="retention: keep=개선 채택 유지 / rollback=회귀로 되돌림">${ccEsc(t)}</span>`).join("")
     : `<div class="cc-empty">채택/롤백 기록 없음</div>`;
+
+  // 📚 자산 성장 — 기억·스킬 개수(+7d 증가)·directives 개정, 각 행에 recent 이름 칩(클릭=open_path).
+  const assets = state?.assets ?? {};
+  const mem = assets.memory ?? {}, sk = assets.skills ?? {}, dir = assets.directives ?? {};
+  const assetChip = (r: any) =>
+    `<span class="cc-chip cc-asset-chip" data-path="${ccEsc(String(r.path ?? ""))}" title="${ccEsc(ccAssetDate(r.mtime))}">${ccEsc(String(r.name ?? "?"))}</span>`;
+  const assetRows: string[] = [
+    `<div class="cc-asset-row"><span class="cc-asset-lab">기억</span><span class="cc-asset-v"><span class="cc-asset-n">${discNum(mem.total)}개</span><span class="cc-dim">+${discNum(mem.added_7d)}/7d</span>${(mem.recent ?? []).map(assetChip).join("")}</span></div>`,
+    `<div class="cc-asset-row"><span class="cc-asset-lab">스킬</span><span class="cc-asset-v"><span class="cc-asset-n">${discNum(sk.total)}개</span><span class="cc-dim">+${discNum(sk.added_7d)}/7d</span>${(sk.recent ?? []).map(assetChip).join("")}</span></div>`,
+    `<div class="cc-asset-row"><span class="cc-asset-lab">directives</span><span class="cc-asset-v"><span class="cc-dim">최근 7d 개정 ${discNum(dir.changed_7d)}건</span>${(dir.recent ?? []).map(assetChip).join("")}</span></div>`,
+  ];
+  const assetsHost = document.getElementById("cc-learn-assets");
+  if (assetsHost) {
+    assetsHost.innerHTML = assetRows.join("");
+    assetsHost.querySelectorAll<HTMLElement>(".cc-asset-chip").forEach((c) =>
+      c.addEventListener("click", () => {
+        if (c.dataset.path) invoke("open_path", { path: c.dataset.path }).catch(() => {});
+      }),
+    );
+  }
 
   document.getElementById("cc-learn-discovery")!.innerHTML = (
     [
@@ -1116,13 +1337,21 @@ function renderControlCenter(d: any) {
 
 function renderLiveBody(d: any, fleet: any[]) {
   const agg = ccAggRate(fleet);
+  renderAccounts();
+  // KPI 5h/7d = 계정 병합 데이터의 "최고 사용 계정" max. 서브텍스트=그 계정 라벨. 계정 부재 시 ccAggRate 폴백.
   document.getElementById("cc-kpi")!.innerHTML = ["5h", "7d"]
     .map((lab) => {
+      const m = ccAcctMax(lab);
       const w = agg[lab];
-      const used = w ? Math.round(w.used) : 0;
+      const used = m ? Math.round(m.used) : w ? Math.round(w.used) : 0;
       const name = lab === "5h" ? "세션 (5h)" : "주간 (7d)";
-      const tip = lab === "5h" ? "최근 5시간 rate limit 사용률 (전 노드 최대값)" : "최근 7일 rate limit 사용률 (전 노드 최대값)";
-      return `<div class="cc-card ${sevClass(used, 60, 80)}" title="${tip}"><div class="cc-card-val">${used}%</div><div class="cc-card-reset">${w ? ccReset(lab, w.reset) : ""}</div><div class="cc-card-name">${name}</div></div>`;
+      const sub = m ? ccAcctLabel(m.acct) : w ? ccReset(lab, w.reset) : "";
+      const tip = m
+        ? "최고 사용 계정 기준"
+        : lab === "5h"
+          ? "최근 5시간 rate limit 사용률 (전 노드 최대값)"
+          : "최근 7일 rate limit 사용률 (전 노드 최대값)";
+      return `<div class="cc-card ${sevClass(used, 60, 80)}" title="${ccEsc(tip)}"><div class="cc-card-val">${used}%</div><div class="cc-card-reset">${ccEsc(sub)}</div><div class="cc-card-name">${name}</div></div>`;
     })
     .join("");
 
@@ -1138,10 +1367,12 @@ function renderLiveBody(d: any, fleet: any[]) {
 
   document.getElementById("cc-token-bars")!.innerHTML = ["5h", "7d"]
     .map((lab) => {
+      const m = ccAcctMax(lab);
       const w = agg[lab];
-      const used = w ? Math.round(w.used) : 0;
+      const used = m ? Math.round(m.used) : w ? Math.round(w.used) : 0;
+      const reset = m ? m.reset : w ? w.reset : null;
       const name = lab === "5h" ? "세션" : "주간";
-      return `<div class="cc-tbar"><span class="cc-tbar-lab">${name}</span><span class="cc-tbar-track"><span class="cc-tbar-fill ${sevClass(used, 60, 80)}" style="width:${Math.min(100, used)}%"></span></span><span class="cc-tbar-pct">${used}%</span><span class="cc-tbar-reset">${w ? ccReset(lab, w.reset) : ""}</span></div>`;
+      return `<div class="cc-tbar"><span class="cc-tbar-lab">${name}</span><span class="cc-tbar-track"><span class="cc-tbar-fill ${sevClass(used, 60, 80)}" style="width:${Math.min(100, used)}%"></span></span><span class="cc-tbar-pct">${used}%</span><span class="cc-tbar-reset">${reset != null ? ccReset(lab, reset) : ""}</span></div>`;
     })
     .join("");
 
@@ -4002,6 +4233,51 @@ function inputModal(title: string, label: string, placeholder: string): Promise<
   });
 }
 
+// 다중 필드 HITL 모달 — 카탈로그 entry.fields([{key,label,placeholder,multiline}])를 각 입력으로 렌더.
+// 결과는 "key: value" 줄들로 합쳐 기존 userInput 자리에 사용(빈 필드 생략). 취소·전부 빈값=null.
+function fieldsModal(title: string, label: string, fields: any[]): Promise<string | null> {
+  return new Promise((resolve) => {
+    const ov = document.createElement("div");
+    ov.className = "modal-overlay";
+    const rows = fields
+      .map((f, i) => {
+        const ph = ccEsc(String(f.placeholder ?? ""));
+        const lb = ccEsc(String(f.label ?? f.key ?? ""));
+        const inp = f.multiline
+          ? `<textarea class="modal-input cc-field" data-i="${i}" rows="4" placeholder="${ph}"></textarea>`
+          : `<input class="modal-input cc-field" data-i="${i}" type="text" placeholder="${ph}" style="min-height:auto" />`;
+        return `<p class="modal-label">${lb}</p>${inp}`;
+      })
+      .join("");
+    ov.innerHTML =
+      `<div class="modal"><h3></h3><p class="modal-label modal-head"></p>${rows}` +
+      `<div class="modal-trust">⚠ 산출물은 "AI 보조 생성 · 오너 검수 전"입니다. 외부 공유 전 검수를 받으세요.</div>` +
+      `<div class="modal-btns"><button class="modal-no">취소</button>` +
+      `<button class="modal-yes">진행</button></div></div>`;
+    (ov.querySelector("h3") as HTMLElement).textContent = title;
+    (ov.querySelector(".modal-head") as HTMLElement).textContent = label;
+    const done = (v: string | null) => {
+      ov.remove();
+      resolve(v);
+    };
+    ov.querySelector(".modal-yes")!.addEventListener("click", () => {
+      const parts: string[] = [];
+      ov.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(".cc-field").forEach((el) => {
+        const f = fields[Number(el.dataset.i)];
+        const val = el.value.trim();
+        if (val) parts.push(`${f.key ?? f.label ?? "field"}: ${val}`);
+      });
+      done(parts.length ? parts.join("\n") : null);
+    });
+    ov.querySelector(".modal-no")!.addEventListener("click", () => done(null));
+    ov.addEventListener("click", (e) => {
+      if (e.target === ov) done(null);
+    });
+    document.body.appendChild(ov);
+    setTimeout(() => (ov.querySelector(".cc-field") as HTMLElement | null)?.focus(), 50);
+  });
+}
+
 // ★기능2: 부서 완전 폐역 확인 — 부서명 타이핑 일치 시에만 "완전 삭제" 활성. 크기·최종 mtime·CEO 강등·
 // 격리 복구를 정직 고지한다(비가역처럼 보이나 실제는 격리 후 약 14일 소거 — 오도 금지). teardown-only 인
 // 기존 탭 삭제(2-click 대체 close)와 별개 경로. resolve(true)=진행.
@@ -4709,6 +4985,20 @@ document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => 
   (e.currentTarget as HTMLElement).classList.toggle("active", ccSessionsRedact);
   ccSessionSelected = null;
   refreshSessions();
+});
+// 계정 라벨 가림 토글 — 상태 영속 + refreshControlCenter로 KPI·계정 섹션 재렌더(라벨→해시).
+const acctRedactBtn = document.getElementById("btn-cc-acct-redact")!;
+acctRedactBtn.classList.toggle("active", ccAcctRedact); // 복원 상태 반영
+acctRedactBtn.addEventListener("click", (e) => {
+  ccAcctRedact = !ccAcctRedact;
+  localStorage.setItem("cys-cc-acct-redact", ccAcctRedact ? "1" : "0");
+  (e.currentTarget as HTMLElement).classList.toggle("active", ccAcctRedact);
+  refreshControlCenter();
+});
+// 스킬 보드 검색 — 카탈로그 버튼 필터(재fetch 없이 renderBoardDomains 재렌더).
+document.getElementById("cc-board-search")!.addEventListener("input", (e) => {
+  ccBoardSearch = (e.currentTarget as HTMLInputElement).value;
+  renderBoardDomains();
 });
 document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
 document.getElementById("btn-restart-daemon")!.addEventListener("click", () => void manualRestartAllDaemons());

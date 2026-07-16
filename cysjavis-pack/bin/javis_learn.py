@@ -177,6 +177,24 @@ def _run(tool, args):
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
+def _push_checkpoint(state, rid):
+    """라운드 기록을 데몬 canonical(~/.cys/state/learn)에 best-effort push — CC 학습 탭 데이터원.
+    데몬이 canonical의 단일 writer이고 로컬 state.json이 진실이다. 이 push는 순수 부가 동기화이며
+    모든 실패(cys 부재=FileNotFoundError·timeout·비0 exit)는 조용히 무시한다 — push 실패가 로컬
+    학습 기록을 절대 막지 않는다(비0 exit는 check=False라 예외를 던지지 않아 자연 무시된다)."""
+    r = state.get("rounds", {}).get(rid)
+    if not r:
+        return
+    payload = {"round": rid, "verdict": r.get("verdict"),
+               "stored": r.get("stored", []), "harness": r.get("harness", []),
+               "discovery": state.get("discovery")}
+    try:
+        subprocess.run(["cys", "learn-checkpoint"], input=json.dumps(payload, ensure_ascii=False),
+                       text=True, timeout=5, capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _enforce_gate(gate_input_arg, step, state, fallback):
     """★rsi-gate.sh 강제 호출(통합 — 봉쇄 우회 차단). 반환 (ok, msg).
 
@@ -316,6 +334,7 @@ def cmd_store(a):
         return fail(3, f"javis_memory 위임 실패: {err or out}")
     r["stored"].append({"name": name, "state": a.state, "type": a.type, "ts": time.time()})
     _save_state(state)
+    _push_checkpoint(state, a.round)
     entry = {"event": "store", "round": a.round, "name": name, "state": a.state,
              "type": a.type, "verdict": verdict, "ts": time.time()}
     _append_ledger(entry)
@@ -352,6 +371,7 @@ def cmd_harness(a):
                              "state": a.state, "fallback": bool(a.fallback),
                              "gate_passed": gate_passed, "ts": out["ts"]})
         _save_state(state)
+        _push_checkpoint(state, a.round)
     # ledger에 채택 요약(state·fallback·gate 통과) 기록 — codex minor(감사 추적성).
     _append_ledger({k: out[k] for k in
                     ("event", "round", "harness_ref", "retention", "state", "fallback", "gate_passed", "ts")})

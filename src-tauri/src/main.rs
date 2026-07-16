@@ -1059,14 +1059,44 @@ fn read_profile_audience() -> String {
         .unwrap_or_else(|| "custom".to_string())
 }
 
+/// CC v2 WS-B: run_id 생성 — 산출물 dir·생애주기 추적의 결정론 키. ascii kebab만
+/// (skillrun.rs run_started 검증과 정합 — 경로 성분 금지).
+fn make_run_id(slug: Option<&str>, task: &str) -> String {
+    let base: String = slug
+        .unwrap_or(task)
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let base = if base.is_empty() { "skill".to_string() } else { base };
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{base}-{epoch}")
+}
+
 /// D5: 무계약 차단의 결정론 강제점 — task-prompt 티켓(성공기준·4규칙)을 생성한다(UI가 직접 워커에 명령 못 함).
 /// --no-survival-gate(B2): fresh 경로는 surface를 실행 시점에 만들므로 지금 워커 생존 확인 불요.
 /// D6: 청중 프로파일 audience를 scope에 주입 — 스킬이 Implications Domain 질문을 건너뛴다(custom=전체보기).
+/// CC v2 WS-B: 반환이 {ticket, run_id}로 확장 — 산출물 위치를 run_id dir로 핀(실행↔산출물 결정론 연결).
 #[tauri::command]
-fn make_ticket(task: String, scope: String, success: String, to: String) -> Result<String, String> {
+fn make_ticket(
+    task: String,
+    scope: String,
+    success: String,
+    to: String,
+    slug: Option<String>,
+) -> Result<Value, String> {
     let script = cys::pack::pack_dir().join("bin").join("javis_orchestra.py");
-    let out_fmt = "산출물을 ~/.cys/_round/skill-out/<작업slug>/ (절대경로) 아래에 저장하라(결정론 회수 위치·SB-6). \
-                   산출물에 '🔒 AI 보조 생성 · 오너 검수 전' 신뢰선 라벨을 부착하라(과대약속 금지).";
+    let run_id = make_run_id(slug.as_deref(), &task);
+    let out_fmt = format!(
+        "산출물을 ~/.cys/_round/skill-out/{run_id}/ (절대경로) 아래에 저장하라(결정론 회수 위치·SB-6). \
+         산출물에 '🔒 AI 보조 생성 · 오너 검수 전' 신뢰선 라벨을 부착하라(과대약속 금지)."
+    );
     let audience = read_profile_audience();
     let scope_full = if audience != "custom" {
         format!("{scope} · 청중 프로파일: {audience}(이 청중 맞춤으로 산출·Implications Domain 질문 생략)")
@@ -1080,7 +1110,7 @@ fn make_ticket(task: String, scope: String, success: String, to: String) -> Resu
         .arg("task-prompt")
         .args(["--task", &task, "--scope", &scope_full, "--success", &success, "--to", &to])
         .arg("--no-survival-gate")
-        .args(["--output-format", out_fmt]);
+        .args(["--output-format", &out_fmt]);
     no_console(&mut orch_cmd);
     let output = orch_cmd
         .output()
@@ -1088,12 +1118,19 @@ fn make_ticket(task: String, scope: String, success: String, to: String) -> Resu
     if !output.status.success() {
         return Err(format!("task-prompt 실패: {}", String::from_utf8_lossy(&output.stderr)));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(json!({"ticket": String::from_utf8_lossy(&output.stdout).to_string(), "run_id": run_id}))
 }
 
 /// D5/SB-2: 보이는 일회용 워커로 스킬 실행 — cys skill run(schedule --fresh) spawn(새 RPC 0·invisible -p 금지).
+/// CC v2 WS-B: run_id(make_ticket 발급)를 --run-id로 관통 — 데몬 run 생애주기 추적.
 #[tauri::command]
-fn run_skill(name: String, ticket: String, agent: Option<String>, close_after: Option<u64>) -> Result<Value, String> {
+fn run_skill(
+    name: String,
+    ticket: String,
+    agent: Option<String>,
+    close_after: Option<u64>,
+    run_id: Option<String>,
+) -> Result<Value, String> {
     if ticket.trim().is_empty() {
         return Err("ticket 비어 있음 — 무계약 실행 금지".into());
     }
@@ -1105,11 +1142,109 @@ fn run_skill(name: String, ticket: String, agent: Option<String>, close_after: O
     if let Some(ca) = close_after {
         cmd.args(["--close-after", &ca.to_string()]);
     }
+    if let Some(rid) = run_id.as_ref() {
+        cmd.args(["--run-id", rid]);
+    }
     cmd.stdin(std::process::Stdio::null());
     no_console(&mut cmd);
     cmd.spawn()
         .map_err(|e| format!("cys skill run 실행 실패 ({}): {e}", cys.display()))?;
-    Ok(json!({"ok": true, "name": name}))
+    Ok(json!({"ok": true, "name": name, "run_id": run_id}))
+}
+
+/// CC v2 WS-B: 최근 스킬 run 목록(생애주기 카드) — 로컬 데몬 skill.runs 위임.
+#[tauri::command]
+async fn skill_runs(limit: Option<u64>) -> Result<Value, String> {
+    rpc("skill.runs", json!({"limit": limit.unwrap_or(20)})).await
+}
+
+/// CC v2 WS-B(B5): 실행 전 자원 사전 게이트 — javis_resource_gate.py check --json.
+/// exit 0=allow 1=soft(경고 후 진행 가능) 2=hard(차단). 스크립트 부재·실행 실패는 allow
+/// (게이트가 보드를 죽이지 않는다 — fail-open, 게이트 자체는 사전 경고 장치).
+#[tauri::command]
+fn resource_gate_check() -> Result<Value, String> {
+    let script = cys::pack::pack_dir().join("bin").join("javis_resource_gate.py");
+    if !script.exists() {
+        return Ok(json!({"exit_code": 0, "report": Value::Null}));
+    }
+    let mut cmd = std::process::Command::new("python3");
+    inject_runtime_path(&mut cmd);
+    cmd.arg(&script).arg("check").arg("--json");
+    no_console(&mut cmd);
+    match cmd.output() {
+        Ok(out) => {
+            let code = out.status.code().unwrap_or(0);
+            let report =
+                serde_json::from_slice::<Value>(&out.stdout).unwrap_or(Value::Null);
+            Ok(json!({"exit_code": code, "report": report}))
+        }
+        Err(_) => Ok(json!({"exit_code": 0, "report": Value::Null})),
+    }
+}
+
+/// CC v2 WS-A: 계정 rate limit 전 조직 병합 뷰 — org_fleet 동형 fan-out(본부+부서, 2s 타임아웃).
+/// 병합 = (provider, account_id) 최신 updated_at 승자 · profiles 합집합. 부서 다운은 무시(로컬 우선).
+#[tauri::command]
+async fn usage_accounts_all() -> Result<Value, String> {
+    use std::time::Duration;
+    let mut targets: Vec<std::path::PathBuf> = vec![default_socket()];
+    if let Ok(reg) = list_depts() {
+        if let Some(depts) = reg.get("depts").and_then(|d| d.as_object()) {
+            for (name, meta) in depts {
+                let sock = meta
+                    .get("socket")
+                    .and_then(|s| s.as_str())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| dept_socket_path(name));
+                targets.push(sock);
+            }
+        }
+    }
+    let mut merged: std::collections::HashMap<(String, String), Value> =
+        std::collections::HashMap::new();
+    for sock in targets {
+        let call = tokio::time::timeout(
+            Duration::from_secs(2),
+            rpc_oneshot(&sock, "usage.accounts", json!({})),
+        )
+        .await;
+        let Ok(Ok(resp)) = call else { continue };
+        for a in resp["accounts"].as_array().into_iter().flatten() {
+            let key = (
+                a["provider"].as_str().unwrap_or("").to_string(),
+                a["account_id"].as_str().unwrap_or("").to_string(),
+            );
+            match merged.get_mut(&key) {
+                None => {
+                    merged.insert(key, a.clone());
+                }
+                Some(cur) => {
+                    let cur_ts = cur["updated_at"].as_f64().unwrap_or(0.0);
+                    let new_ts = a["updated_at"].as_f64().unwrap_or(0.0);
+                    // profiles 합집합은 승자와 무관하게 유지
+                    let mut profs: Vec<String> = cur["profiles"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .chain(a["profiles"].as_array().into_iter().flatten())
+                        .filter_map(|p| p.as_str().map(String::from))
+                        .collect();
+                    profs.sort();
+                    profs.dedup();
+                    if new_ts > cur_ts {
+                        *cur = a.clone();
+                    }
+                    cur["profiles"] = json!(profs);
+                }
+            }
+        }
+    }
+    let mut accounts: Vec<Value> = merged.into_values().collect();
+    accounts.sort_by(|x, y| {
+        (x["provider"].as_str().unwrap_or(""), x["label"].as_str().unwrap_or(""))
+            .cmp(&(y["provider"].as_str().unwrap_or(""), y["label"].as_str().unwrap_or("")))
+    });
+    Ok(json!({"accounts": accounts}))
 }
 
 /// D5/SB-6: 산출물 회수 결정론 위치(~/.cys/_round/skill-out) — make_ticket output_format과 정합.
@@ -2596,6 +2731,9 @@ fn main() {
             read_board_catalog,
             make_ticket,
             run_skill,
+            skill_runs,
+            resource_gate_check,
+            usage_accounts_all,
             skill_out_dir,
             check_update,
             check_pack_update,

@@ -544,7 +544,137 @@ fn learn_state_dir() -> std::path::PathBuf {
     if let Some(r) = cys::env_compat("CYS_ROUND_DIR") {
         return std::path::PathBuf::from(r).join("learn");
     }
-    cys::pack::pack_dir().join("round").join("learn")
+    // CC v2 WS-C: canonical = ~/.cys/state/learn — pack 밖(pack 스윕·치유의 원복 사정권 회피
+    // — pack-files.txt에 round/가 실재해 구 fallback(pack/round/learn)은 원복 위험 실측).
+    // 마이그레이션 0: 구 위치에 state.json writer가 없었음을 실측(2026-07-16).
+    dirs::home_dir()
+        .map(|h| h.join(".cys/state/learn"))
+        .unwrap_or_else(|| cys::pack::pack_dir().join("round").join("learn"))
+}
+
+/// CC v2 WS-C: learn.checkpoint 코어(순수 — 명시 dir·테스트 핀) — rounds[round] 병합 +
+/// discovery 치환 + state.json 원자 쓰기(tmp→rename) + ledger.jsonl append.
+/// 호출부(dispatch)가 daemon.learn_write 락으로 직렬화한다(단일 writer 불변식).
+fn learn_checkpoint_apply(
+    dir: &std::path::Path,
+    params: &Value,
+    round: &str,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir: {e}"))?;
+    let sp = dir.join("state.json");
+    let mut state: Value = std::fs::read_to_string(&sp)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !state.is_object() {
+        state = json!({});
+    }
+    let obj = state.as_object_mut().unwrap();
+    let rounds = obj.entry("rounds").or_insert_with(|| json!({}));
+    if !rounds.is_object() {
+        *rounds = json!({});
+    }
+    let mut entry = serde_json::Map::new();
+    for k in ["verdict", "stored", "harness"] {
+        if let Some(v) = params.get(k) {
+            entry.insert(k.into(), v.clone());
+        }
+    }
+    rounds
+        .as_object_mut()
+        .unwrap()
+        .insert(round.to_string(), Value::Object(entry));
+    // discovery: 제공된 키만 절대값 치환(음수·비정수는 learn.status 읽기 정규화가 방어)
+    if let Some(d) = params.get("discovery").filter(|d| d.is_object()) {
+        let disc = obj.entry("discovery").or_insert_with(|| json!({}));
+        if !disc.is_object() {
+            *disc = json!({});
+        }
+        for (k, v) in d.as_object().unwrap() {
+            disc.as_object_mut().unwrap().insert(k.clone(), v.clone());
+        }
+    }
+    // 원자 쓰기(tmp→rename) — 부분 쓰기 파손이 learn.status를 오염시키지 않게
+    let tmp = dir.join("state.json.tmp");
+    let ser = serde_json::to_string_pretty(&state).unwrap_or_else(|_| "{}".into());
+    std::fs::write(&tmp, &ser).map_err(|e| format!("write: {e}"))?;
+    std::fs::rename(&tmp, &sp).map_err(|e| format!("rename: {e}"))?;
+    let mut ledger_line = params.clone();
+    if let Some(o) = ledger_line.as_object_mut() {
+        o.insert("ts".into(), json!(crate::state::now_epoch()));
+        o.remove("surface_id");
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("ledger.jsonl"))
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", serde_json::to_string(&ledger_line).unwrap_or_default());
+    }
+    Ok(())
+}
+
+/// CC v2 WS-C: 학습 4축 자산 스캔(기억·스킬·directives) — 읽기 전용 fs 스캔·60s 캐시.
+/// 값 부재·스캔 실패 = 0/빈 목록(fail-open). recent는 mtime 내림차순 최대 5개.
+fn learn_assets(daemon: &Arc<Daemon>) -> Value {
+    let now = crate::state::now_epoch();
+    {
+        let cache = daemon.learn_assets_cache.lock().unwrap();
+        if let Some((ts, v)) = cache.as_ref() {
+            if now - ts < 60.0 {
+                return v.clone();
+            }
+        }
+    }
+    let week_ago = now - 7.0 * 86400.0;
+    // (총수, 7d 신규, recent[{name, path, mtime}]) — dir 1층 스캔(메모리·directives=*.md, 스킬=하위 dir).
+    // path 동봉: UI가 open_path로 바로 열 수 있게(경로 조립 지식을 UI에 두지 않는다).
+    let scan = |dir: std::path::PathBuf, dirs_mode: bool| -> (u64, u64, Vec<Value>) {
+        let mut items: Vec<(String, String, f64)> = Vec::new();
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            let is_dir = p.is_dir();
+            if dirs_mode != is_dir {
+                continue;
+            }
+            if !dirs_mode && p.extension().map(|x| x != "md").unwrap_or(true) {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name.starts_with('_') {
+                continue;
+            }
+            let mtime = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            items.push((name, p.to_string_lossy().into_owned(), mtime));
+        }
+        let total = items.len() as u64;
+        let added = items.iter().filter(|(_, _, m)| *m >= week_ago).count() as u64;
+        items.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let recent: Vec<Value> = items
+            .into_iter()
+            .take(5)
+            .map(|(n, p, m)| json!({"name": n, "path": p, "mtime": m}))
+            .collect();
+        (total, added, recent)
+    };
+    let pack = cys::pack::pack_dir();
+    let (m_total, m_added, m_recent) = scan(pack.join("memory"), false);
+    let (s_total, s_added, s_recent) = scan(pack.join("skills"), true);
+    let (_, d_changed, d_recent) = scan(pack.join("directives"), false);
+    let v = json!({
+        "memory":     {"total": m_total, "added_7d": m_added, "recent": m_recent},
+        "skills":     {"total": s_total, "added_7d": s_added, "recent": s_recent},
+        "directives": {"changed_7d": d_changed, "recent": d_recent},
+    });
+    *daemon.learn_assets_cache.lock().unwrap() = Some((now, v.clone()));
+    v
 }
 
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
@@ -2066,9 +2196,41 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "perspective": dnum("perspective"),
                     "knowledge": dnum("knowledge"),
                 },
+                // CC v2 WS-C: 4축 자산 집계(기억·스킬·directives — 60s 캐시 fs 스캔). ADDITIVE.
+                "assets": learn_assets(daemon),
             });
             Reply::Single(ok_response(&id, state))
         }
+
+        // ─── CC v2 WS-C: RSI 체크포인트 수신 — canonical 학습 상태의 단일 writer는 이 데몬 ───
+        // javis_learn.py가 로컬(_round/learn) 기록 후 best-effort push. rounds[round] 병합 +
+        // ledger.jsonl append. 데몬 부재 시 스크립트는 로컬 기록만 보존(fail-open).
+        "learn.checkpoint" => {
+            let Some(round) = param_str(&params, "round").filter(|s| !s.is_empty()) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing round"));
+            };
+            let _wl = daemon.learn_write.lock().unwrap();
+            match learn_checkpoint_apply(&learn_state_dir(), &params, &round) {
+                Ok(()) => {
+                    daemon.bus.publish("learn.updated", "learn", None, json!({"round": round}));
+                    Reply::Single(ok_response(&id, json!({"round": round})))
+                }
+                Err(e) => Reply::Single(err_response(&id, "io", &e)),
+            }
+        }
+
+        // ─── CC v2 WS-A: 계정 단위 rate limit 뷰(로컬 데몬) — 부서 fan-out은 GUI(Tauri) 계층 ───
+        "usage.accounts" => Reply::Single(ok_response(
+            &id,
+            json!({"accounts": crate::accounts::local_json(daemon, crate::state::now_epoch())}),
+        )),
+
+        // ─── CC v2 WS-B: 스킬보드 run 생애주기 ───
+        "skill.run_started" => match crate::skillrun::run_started(daemon, &params) {
+            Ok(v) => Reply::Single(ok_response(&id, v)),
+            Err(e) => Reply::Single(err_response(&id, "invalid_params", &e)),
+        },
+        "skill.runs" => Reply::Single(ok_response(&id, crate::skillrun::runs_list(daemon, &params))),
 
         "learn.history" => {
             let round = param_str(&params, "round");
@@ -2393,6 +2555,18 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 session_file: param_str(&params, "session_file").unwrap_or_default(),
                 updated_at: crate::state::now_epoch(),
             });
+            // CC v2 WS-A: statusline은 claude rate의 유일한 생산자 — 계정 귀속(신선 생산분).
+            // session_file(=statusline stdin의 transcript_path)로 프로필 dir→accountUuid 해석.
+            if agent == "claude" && !rate.is_empty() {
+                crate::accounts::note_rate(
+                    daemon,
+                    "claude",
+                    &param_str(&params, "session_file").unwrap_or_default(),
+                    &rate,
+                    "statusline",
+                    crate::state::now_epoch(),
+                );
+            }
             let role = surface.role.lock().unwrap().clone();
             daemon.bus.publish(
                 "usage.updated",
@@ -2699,6 +2873,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "model_mix": model_mix,
                     },
                     "sparkline": spark,
+                    // CC v2 WS-A: 로컬 데몬의 계정 뷰(ADDITIVE — 구 UI는 미지 필드 무시).
+                    // 부서 병합본은 GUI의 usage_accounts_all(org_fleet 동형 fan-out)이 제공.
+                    "accounts": crate::accounts::local_json(daemon, now),
                 }),
             ))
         }
@@ -3401,6 +3578,41 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CC v2 WS-C: learn.checkpoint 코어 — rounds 병합·discovery 치환·ledger append·
+    /// 파손 state.json 내성(fail-open)·learn.status 읽기 스키마와의 정합 핀.
+    #[test]
+    fn learn_checkpoint_apply_merges_rounds_and_ledger() {
+        let dir = std::env::temp_dir().join(format!("cys-learn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // R1: verdict+stored+discovery
+        let p1 = json!({"round": "R1", "verdict": "improved",
+                        "stored": ["m1", "m2"],
+                        "discovery": {"capability": 2}});
+        learn_checkpoint_apply(&dir, &p1, "R1").unwrap();
+        // R2: harness만 — R1은 보존돼야 한다
+        let p2 = json!({"round": "R2", "harness": [{"retention": "keep"}]});
+        learn_checkpoint_apply(&dir, &p2, "R2").unwrap();
+        let state: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("state.json")).unwrap())
+                .unwrap();
+        assert_eq!(state["rounds"]["R1"]["verdict"], "improved");
+        assert_eq!(state["rounds"]["R1"]["stored"].as_array().unwrap().len(), 2);
+        assert_eq!(state["rounds"]["R2"]["harness"][0]["retention"], "keep");
+        assert_eq!(state["discovery"]["capability"], 2);
+        // ledger 2줄 append + ts 동봉
+        let ledger = std::fs::read_to_string(dir.join("ledger.jsonl")).unwrap();
+        let lines: Vec<&str> = ledger.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(serde_json::from_str::<Value>(lines[0]).unwrap()["ts"].is_number());
+        // 파손 state.json → 새로 시작(에러 아님 — fail-open)
+        std::fs::write(dir.join("state.json"), "{{{corrupt").unwrap();
+        learn_checkpoint_apply(&dir, &p1, "R1").unwrap();
+        let state: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("state.json")).unwrap())
+                .unwrap();
+        assert_eq!(state["rounds"]["R1"]["verdict"], "improved");
+    }
 
     /// ★W2/P0-6: cause 파싱 — "reap"=Reap, 그 외/부재/미지 값=안전측 OwnerClose(묘비).
     #[test]

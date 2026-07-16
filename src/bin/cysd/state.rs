@@ -788,6 +788,12 @@ pub struct Daemon {
     /// (W4) 전 surface reader 스레드의 vt100 파서 패닉 격리 누적 횟수(데몬 health 신호).
     /// surface별 카운터(Surface::parser_panics)의 데몬 전체 합산 — status(org.status)에 노출한다.
     pub parser_panics_total: AtomicU64,
+    /// CC v2 WS-A: 계정 단위 rate limit 집계 상태(뷰·신원 캐시·영속 스로틀) — accounts.rs 전담.
+    pub accounts: Mutex<crate::accounts::AccountsState>,
+    /// CC v2 WS-C: learn.status assets(기억·스킬·directives fs 스캔) 60s 캐시 — (계산 시각, 값).
+    pub learn_assets_cache: Mutex<Option<(f64, serde_json::Value)>>,
+    /// CC v2 WS-C: canonical 학습 상태(~/.cys/state/learn) 쓰기 직렬화 — 데몬 단일 writer 불변식.
+    pub learn_write: Mutex<()>,
     /// ★T6: auto-restore가 스폰한 phoenix restore 프로세스의 (pid, start_time) 등록부.
     /// authoritative(타이핑 가드 면제) 게이트의 restore-root allowlist — 이 목록에 있는 pid의
     /// **살아있는 자손만, 복원이 도는 동안만** 면제받는다(RestoreRootGuard가 수명 관리). 콜드부트
@@ -1294,6 +1300,9 @@ impl Daemon {
             analytics: Mutex::new(analytics_conn),
             channels: Mutex::new(channels_conn),
             parser_panics_total: AtomicU64::new(0),
+            accounts: Mutex::new(Default::default()),
+            learn_assets_cache: Mutex::new(None),
+            learn_write: Mutex::new(()),
             restore_roots: Mutex::new(Vec::new()),
         });
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.

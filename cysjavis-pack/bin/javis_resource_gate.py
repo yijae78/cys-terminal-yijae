@@ -141,6 +141,60 @@ def measure(a):
             "active_depts": active_depts, "nodes_hard_effective": nodes_hard_effective}
 
 
+# ── ★opt-in rate 축(soft-only) — 정액제(Claude Max) 5h rate 사용률 사전 경고 ──
+def _rate_enabled(a):
+    """rate 축은 opt-in — --rate-check 플래그 또는 env CYS_GATE_RATE=1일 때만 발화."""
+    return bool(getattr(a, "rate_check", False)) or os.environ.get("CYS_GATE_RATE") == "1"
+
+
+def _rate_accounts(a):
+    """rate 원천 — --rate-override(테스트 주입) 우선, 없으면 `cys usage-accounts --json`.
+    cys 부재·타임아웃·파싱 실패는 None(축 자체 스킵) — best-effort, 조직 기동 무차단."""
+    if getattr(a, "rate_override", None) is not None:
+        try:
+            data = json.loads(a.rate_override)
+        except ValueError:
+            return None
+    else:
+        try:
+            out = subprocess.run(["cys", "usage-accounts", "--json"],
+                                 capture_output=True, text=True, timeout=3).stdout
+            data = json.loads(out)
+        except (subprocess.SubprocessError, OSError, ValueError):
+            return None
+    if isinstance(data, dict):      # {"accounts":[...]} 또는 바로 [...] 둘 다 수용
+        data = data.get("accounts")
+    return data if isinstance(data, list) else None
+
+
+def _rate_checks(a):
+    """rate 5h 사용률 soft 경고 축(soft-only). 발화 조건: rate label=="5h"·신선(stale_secs<600)·
+    used_pct>=rate_soft. hard 없음 — 게이트는 master 부트 플로우가 호출하므로 rate로 조직 기동을
+    막지 않는다. 반환: soft check dict 리스트(빈 리스트=무발화). (테스트 주입=--rate-override)"""
+    accounts = _rate_accounts(a)
+    if not accounts:
+        return []
+    out = []
+    for acct in accounts:
+        if not isinstance(acct, dict):
+            continue
+        label = acct.get("label", "?")
+        for entry in acct.get("rate", []) or []:
+            if not isinstance(entry, dict) or entry.get("label") != "5h":
+                continue
+            stale = entry.get("stale_secs")
+            if stale is None:            # rate 엔트리에 없으면 계정 레벨로 폴백
+                stale = acct.get("stale_secs")
+            if stale is None or stale >= 600:   # null·비신선(오래된 측정)은 스킵
+                continue
+            used = entry.get("used_pct")
+            if used is None or used < a.rate_soft:
+                continue
+            out.append({"metric": "rate_5h(%s)" % label, "value": used,
+                        "soft": a.rate_soft, "hard": None, "level": "soft"})
+    return out
+
+
 def evaluate(m, a):
     checks = []
 
@@ -155,6 +209,11 @@ def evaluate(m, a):
     add("nodes", m["nodes"], a.nodes_soft, m["nodes_hard_effective"])
     add("load_ratio", m["load_ratio"], a.load_soft_ratio, a.load_hard_ratio)
     add("context_pct", m["context_pct"], a.context_soft, a.context_hard)
+
+    # ★opt-in rate 축(soft-only) — --rate-check 또는 CYS_GATE_RATE=1일 때만. hard 없음:
+    # 게이트는 master 부트 플로우가 호출하므로 rate로 조직 기동을 막지 않는다(soft만 반영).
+    if _rate_enabled(a):
+        checks.extend(_rate_checks(a))
 
     # 측정 실패는 최소 soft로 격상(조용한 allow 금지 · P-ORCH-1) — 실제 hard 트립이 있으면 hard가 우선.
     worst = "soft" if m.get("measure_errors") else "ok"
@@ -374,6 +433,11 @@ def main(argv=None):
     c.add_argument("--servers-override", type=int, default=None, help="테스트 주입")
     c.add_argument("--nodes-override", type=int, default=None, help="테스트 주입")
     c.add_argument("--load-override", type=float, default=None, help="테스트 주입")
+    c.add_argument("--rate-check", action="store_true",
+                   help="opt-in: 5h rate 사용률 soft 경고 축 추가(env CYS_GATE_RATE=1과 동등)")
+    c.add_argument("--rate-soft", type=float, default=80.0, help="rate 5h used_pct soft 임계")
+    c.add_argument("--rate-override", default=None,
+                   help="테스트 주입 — usage-accounts JSON(accounts 배열) 직접 주입")
     c.set_defaults(fn=cmd_check)
 
     c = sub.add_parser("classify")

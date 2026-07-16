@@ -6,6 +6,7 @@
 // GUI 앱과 동일하게 릴리스에서 windows subsystem 으로 빌드해 콘솔을 원천 제거한다(디버그는 콘솔 유지).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accounts;
 mod alerts;
 mod analytics;
 mod approval;
@@ -21,6 +22,7 @@ mod hwmon;
 mod recall;
 mod schedule;
 mod severity;
+mod skillrun;
 mod state;
 mod undo;
 mod usage;
@@ -129,6 +131,13 @@ async fn main() {
     schedule::spawn_scheduler(Arc::clone(&daemon));
     usage::spawn_usage_collector(Arc::clone(&daemon));
     usage::spawn_agy_collector(Arc::clone(&daemon));
+    // CC v2 WS-A: 계정 발견(프로필 스캔)+스냅샷 예열 — 관측 전에도 전 계정이 CC에 보인다.
+    // 전부 fail-open(파일 부재·파싱 실패=빈 뷰) — 부트체인 비치명.
+    accounts::seed_known(&daemon);
+    accounts::spawn_custom_adapters(Arc::clone(&daemon));
+    // CC v2 WS-B: 스킬 run 생애주기 — 이전 데몬의 열린 run 정리 후 전이 워처 기동.
+    skillrun::reconcile_boot(&daemon);
+    skillrun::spawn_watcher(Arc::clone(&daemon));
     // CC "🏢 오피스" 탭의 상시 가용성 — 메타버스 오피스 브리지(127.0.0.1:8642) 자동기동.
     spawn_office_bridge(crate::state::state_dir(&socket_path));
     // C0: 채널 부팅 재조정(고아 선-kill→새 토큰 재스폰) — 이벤트버스·state 준비 후(§2.1-2).

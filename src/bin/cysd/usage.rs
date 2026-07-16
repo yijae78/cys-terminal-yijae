@@ -268,6 +268,9 @@ fn collect_for(
         }
     }
     let mut next: Option<ObservedUsage> = None;
+    // CC v2 WS-A: 이 틱에 **신선 생산된** rate만 계정 귀속(claude transcript의 rate 이월분은
+    // 제외 — 이월은 stale을 최신으로 둔갑시킨다. accounts.rs 모듈 헤더 계약).
+    let mut codex_fresh_rate: Option<Vec<RateWindow>> = None;
     for line in &lines {
         match agent {
             "claude" => {
@@ -291,6 +294,9 @@ fn collect_for(
             }
             "codex" => {
                 if let Some(obs) = parse_codex_line(line) {
+                    if let Some(fresh) = obs.rate.as_ref() {
+                        codex_fresh_rate = Some(fresh.clone());
+                    }
                     // 필드별 병합: token_count 이벤트에 info/rate_limits가 따로 올 수 있다
                     let base = next.as_ref().or(prev.as_ref());
                     let ctx_tokens = obs.ctx_tokens.or(base.and_then(|b| b.ctx_tokens));
@@ -315,6 +321,13 @@ fn collect_for(
             }
             _ => {}
         }
+    }
+
+    // CC v2 WS-A: codex rollout이 이 틱에 실제 생산한 rate → 계정 귀속(이월분 제외 계약)
+    if let Some(fr) = codex_fresh_rate.as_ref() {
+        crate::accounts::note_rate(
+            daemon, "codex", &state.path.to_string_lossy(), fr, "rollout", now,
+        );
     }
 
     // T6 Control Center 소비 누적 — claude/codex 새 메시지(턴)의 소비를 데몬 트래커에 적재.
@@ -1152,6 +1165,8 @@ async fn agy_quota_probe(port: u16) -> Option<Vec<RateWindow>> {
 /// agy는 context window를 안 주므로 ctx_pct=None(배지는 쿼터만). 임계(context.threshold)는
 /// ctx_pct가 없으니 발화 대상 아님.
 fn update_agy_usage(daemon: &Arc<Daemon>, s: &Arc<Surface>, rate: Vec<RateWindow>) {
+    // CC v2 WS-A: agy 프로브는 항상 신선 생산 — 계정(antigravity/default) 귀속.
+    crate::accounts::note_rate(daemon, "gemini", "", &rate, "agy-rpc", now_epoch());
     let new = ObservedUsage {
         agent: "gemini".into(),
         ctx_tokens: None,

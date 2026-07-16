@@ -18,6 +18,9 @@ pub struct AlertConfig {
     pub fail_count: u64,      // 툴 실패수 ≥ → 경보. 기본 5.
     pub fail_rate: f64,       // 동시에 실패율 ≥. 기본 0.3.
     pub fail_min_calls: u64,  // 최소 호출수(소표본 노이즈 차단). 기본 5.
+    // CC v2 WS-A: 계정 단위 rate 경보(노드 경보와 별개 축 — 계정이 진실 풀).
+    pub account_warn_pct: f64, // 기본 80.
+    pub account_crit_pct: f64, // 기본 95.
 }
 
 impl Default for AlertConfig {
@@ -29,6 +32,8 @@ impl Default for AlertConfig {
             fail_count: 5,
             fail_rate: 0.3,
             fail_min_calls: 5,
+            account_warn_pct: 80.0,
+            account_crit_pct: 95.0,
         }
     }
 }
@@ -56,6 +61,8 @@ impl AlertConfig {
             fail_count: u("fail_count", d.fail_count),
             fail_rate: f("fail_rate", d.fail_rate),
             fail_min_calls: u("fail_min_calls", d.fail_min_calls),
+            account_warn_pct: f("account_warn_pct", d.account_warn_pct),
+            account_crit_pct: f("account_crit_pct", d.account_crit_pct),
         }
     }
 }
@@ -64,6 +71,8 @@ impl AlertConfig {
 #[derive(Default)]
 pub struct Snapshot {
     pub rates: Vec<(String, String, f64)>,        // (role, label, used_pct)
+    /// CC v2 WS-A: 계정 단위 rate — (계정 라벨, 창, used_pct). 관측된 계정만.
+    pub account_rates: Vec<(String, String, f64)>,
     pub weekly_cost_usd: f64,
     pub weekly_tokens: u64,
     pub tool_failures: Vec<(String, u64, u64, f64)>, // (tool, calls, fail, fail_rate)
@@ -102,6 +111,18 @@ pub fn evaluate(snap: &Snapshot, cfg: &AlertConfig) -> Vec<Alert> {
                 severity: if *pct >= 95.0 { "crit" } else { "warn" }.into(),
                 message: format!("{role} {label} rate {:.0}%", pct),
                 detail: json!({"role": role, "label": label, "used_pct": pct}),
+            });
+        }
+    }
+    // 1b. CC v2: 계정 단위 rate (에지 디바운스 키 = 계정 라벨 — 같은 계정 다중 노드 중복발화 0)
+    for (label, win, pct) in &snap.account_rates {
+        if *pct >= cfg.account_warn_pct {
+            out.push(Alert {
+                kind: "account_rate".into(),
+                key: format!("account_rate:{label}:{win}"),
+                severity: if *pct >= cfg.account_crit_pct { "crit" } else { "warn" }.into(),
+                message: format!("계정 {label} {win} rate {:.0}%", pct),
+                detail: json!({"account": label, "win": win, "used_pct": pct}),
             });
         }
     }
@@ -187,7 +208,8 @@ pub fn snapshot(daemon: &Arc<Daemon>, now: f64) -> Snapshot {
             None => (0.0, 0, Vec::new()),
         }
     };
-    Snapshot { rates, weekly_cost_usd, weekly_tokens, tool_failures }
+    let account_rates = crate::accounts::alert_rates(daemon);
+    Snapshot { rates, account_rates, weekly_cost_usd, weekly_tokens, tool_failures }
 }
 
 #[cfg(test)]
@@ -212,6 +234,11 @@ mod tests {
                 ("master".into(), "7d".into(), 97.0),  // ≥95 crit
                 ("cso".into(), "5h".into(), 50.0),     // 미발화
             ],
+            account_rates: vec![
+                ("a@b.c".into(), "5h".into(), 85.0),   // ≥80 warn
+                ("a@b.c".into(), "7d".into(), 96.0),   // ≥95 crit
+                ("x@y.z".into(), "5h".into(), 40.0),   // 미발화
+            ],
             weekly_cost_usd: 12.0, // ≥10 → 발화
             weekly_tokens: 0,      // 한도 0 = 비활성
             tool_failures: vec![
@@ -225,6 +252,12 @@ mod tests {
         assert!(keys.contains(&"rate_limit:worker:5h"));
         assert!(keys.contains(&"rate_limit:master:7d"));
         assert!(!keys.contains(&"rate_limit:cso:5h"));
+        // CC v2: 계정 축 — warn/crit 경계·미발화 확인
+        assert!(keys.contains(&"account_rate:a@b.c:5h"));
+        assert!(keys.contains(&"account_rate:a@b.c:7d"));
+        assert!(!keys.contains(&"account_rate:x@y.z:5h"));
+        assert!(alerts.iter().any(|a| a.key == "account_rate:a@b.c:7d" && a.severity == "crit"));
+        assert!(alerts.iter().any(|a| a.key == "account_rate:a@b.c:5h" && a.severity == "warn"));
         assert!(keys.contains(&"weekly_budget:cost"));
         assert!(keys.contains(&"repeated_failure:Bash"));
         assert!(!keys.iter().any(|k| k.contains("Edit") || k.contains("Read")));
