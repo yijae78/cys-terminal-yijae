@@ -1526,6 +1526,26 @@ mod tests {
     }
 
     #[test]
+    fn role_bootstrap_hook_command_is_os_aware_shared() {
+        // R2-LOW-B 회귀 핀(session_start 동형): 격리 config 시드와 preflight C28(_cys_hook_cmd)이
+        // 공유하는 문자열 — byte-identical이 깨지면 매 기동 중복 append(RC1 matcher 불일치)가 재발한다.
+        let cmd = role_bootstrap_hook_command(Path::new("/pack"));
+        assert!(
+            cmd.contains("hooks/role-bootstrap.sh") || cmd.contains("hooks\\role-bootstrap.sh"),
+            "must target bundled hook: {cmd:?}"
+        );
+        let interp = cmd.split_whitespace().next().unwrap_or("");
+        assert!(interp == "sh" || interp == "bash", "shell interpreter only: {interp:?}");
+        #[cfg(unix)]
+        assert_eq!(cmd, "sh /pack/hooks/role-bootstrap.sh", "unix byte-pin(제로 회귀)");
+        #[cfg(windows)]
+        {
+            assert!(cmd.starts_with("bash \""), "windows must use quoted bash: {cmd:?}");
+            assert!(!cmd.contains('\\'), "windows 경로 정슬래시 정규화: {cmd:?}");
+        }
+    }
+
+    #[test]
     fn role_directive_prefix_variants_map_to_standard() {
         // 접두 일치: 변형 역할(worker-2·reviewer-gemini·cso-1)도 표준 지침을 받는다
         // — 디렉티브 주입(각성)이 변형 역할에서 누락되지 않게 하는 핵심 불변식.

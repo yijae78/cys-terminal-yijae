@@ -5,7 +5,8 @@
 프로세스 경계가 필요한 부트 흐름을 핀한다(모듈 전역이 import 시 HOME/PACK로 고정):
   (h) 부서 레인 + 티켓 부재 → 팀 기동(④) 생략·exit 0·단독 각성 메시지(cys boot 미호출).
   (i) 부서 레인 + 유효 티켓 + 결손>0 → 팀 기동 경로 진입(cys boot 관측)·티켓 .used 소비.
-  (j) 결손 0(재선언) → 자원 게이트 미호출(오탐 hard-block 방지)·티켓 미소비.
+  (j) 결손 0(구성 충족 재선언) → 자원 게이트·cys boot 미호출(스폰 없음)·티켓 미소비.
+  (j2) 반쪽 팀(reviewer만 4 — 구 총수 비교의 오판 케이스) → 결손 판정·팀 기동 진입(네거티브).
   (k) 자원 게이트 hard(servers) 목 → 팀 기동 0·exit 9·escalation 흔적(cys boot 미호출).
   (l) issue-ticket base 레인 전용 가드(부서 레인 거부).
   (m) javis_dept_migrate 멱등(2회 --fix 동일 결과·백업 생성).
@@ -143,7 +144,8 @@ class DeptTicketGate(unittest.TestCase):
     # (i) 부서 레인 + 유효 티켓 + 결손>0 → 팀 기동 진입·티켓 소비
     def test_i_dept_valid_ticket_boots_and_consumes(self):
         ticket = {"dept": "dept-1", "issued_at": time.time(), "issuer": "base-master"}
-        # live_nodes=0 → 결손>0 → 게이트 발동(gate_exit=0 allow) → 티켓 소비 → ④boot → ⑤(orch 0) 통과.
+        # live_nodes=0 → 결손>0 → 게이트 발동(gate_exit=0 allow) → ④boot → 티켓 소비(성공 직후·
+        # R2-LOW-C "1회성 티켓 ⟺ 실스폰") → ⑤(orch 0) 통과.
         home, pack, mockbin, sock = self._setup(orch_check_exit=0, gate_exit=0,
                                                 ticket=ticket, live_nodes=0)
         rc, data, _ = _run_bootstrap(home, pack, mockbin, socket=sock)
@@ -153,20 +155,41 @@ class DeptTicketGate(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(tdir, "dept-1.ticket")), "티켓 미소비(잔존)")
         self.assertTrue(os.path.exists(os.path.join(tdir, "dept-1.ticket.used")), ".used 미생성")
 
-    # (j) 결손 0(재선언) → 자원 게이트 미호출·티켓 미소비
+    # (j) 결손 0(구성 충족 재선언) → 자원 게이트 미호출·cys boot 미호출(스폰 없음)·티켓 미소비
     def test_j_no_deficit_skips_gate_and_keeps_ticket(self):
         ticket = {"dept": "dept-1", "issued_at": time.time(), "issuer": "base-master"}
-        # live_nodes=4(의무 수) → 결손 0 → 게이트 생략·티켓 미소비.
+        # live_nodes=4 → roles 순환이 cso·worker·reviewer-gemini·reviewer-codex → 구성 충족(결손 0)
+        # → 게이트 생략 + ④ cys boot 호출 생략(R1-MED-1 — "결손 0=스폰 없음" 결정론화)·티켓 미소비.
         home, pack, mockbin, sock = self._setup(orch_check_exit=0, ticket=ticket, live_nodes=4)
         rc, data, _ = _run_bootstrap(home, pack, mockbin, socket=sock)
         self.assertEqual(rc, 0, "결손 0 재선언인데 exit≠0")
         self.assertFalse(os.path.isfile(self.gate_log), "결손 0인데 자원 게이트 호출됨(오탐 위험)")
         gate_step = [s for s in (data or {}).get("steps", []) if s["step"] == "④′resource-gate"]
         self.assertTrue(gate_step and "결손 0" in gate_step[0]["detail"], "게이트 생략 흔적 부재")
+        self.assertFalse(self._cys_called("boot"),
+                         "결손 0인데 cys boot 호출됨(스폰 경로 진입 — 구동작 잔재)")
+        self.assertIn("④boot-skip", _steps(data), "④ 생략 흔적(④boot-skip 단계) 부재")
+        self.assertNotIn("④boot", _steps(data), "결손 0인데 ④boot 단계 기록")
         tdir = os.path.join(home, ".cys", "state", "dept-boot-tickets")
         self.assertTrue(os.path.exists(os.path.join(tdir, "dept-1.ticket")),
                         "결손 0 재선언인데 티켓 소비됨(재사용 불가)")
         self.assertNotIn("③″ceo-ticket-consume", _steps(data), "결손 0인데 티켓 소비 단계 발생")
+
+    # (j2) ★네거티브(R1-MED-1 원 결함): reviewer만 4(총수 4) — 구 총수 비교는 결손 0으로 오판해
+    # cso/worker 사망을 방치했다. 신 구성 판정은 결손으로 보고 팀 기동 경로에 진입해야 한다.
+    def test_j2_half_team_reviewers_only_is_deficit(self):
+        ticket = {"dept": "dept-1", "issued_at": time.time(), "issuer": "base-master"}
+        home, pack, mockbin, sock = self._setup(orch_check_exit=0, gate_exit=0,
+                                                ticket=ticket, live_nodes=0)
+        with open(self.list_file, "w") as f:
+            f.write("".join("surface:%d\trole=reviewer-claude-%d\tpid=%d\texited=false\t\t\n"
+                            % (i, i, 100 + i) for i in range(4)))
+        rc, data, _ = _run_bootstrap(home, pack, mockbin, socket=sock)
+        self.assertEqual(rc, 0, "반쪽 팀 부트인데 exit≠0")
+        self.assertTrue(os.path.isfile(self.gate_log),
+                        "반쪽 팀(reviewer만 4)인데 자원 게이트 미호출(총수 비교 오판 잔재)")
+        self.assertTrue(self._cys_called("boot"), "반쪽 팀인데 cys boot 미호출(결손 미판정)")
+        self.assertIn("③″ceo-ticket-consume", _steps(data), "실스폰인데 티켓 미소비")
 
     # (k) 자원 게이트 hard(servers) → 팀 기동 0·exit 9·escalation
     def test_k_resource_hard_blocks_boot_exit9(self):

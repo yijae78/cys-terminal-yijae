@@ -59,7 +59,7 @@ class LanePackGuard(unittest.TestCase):
     def test_dept_socket_main_pack_exits_8(self):
         # 부서 소켓 + 메인 팩(pack) → 불일치 → exit 8, 팀 기동(cys boot) 도달 전 중단
         rc, data = self._run_bootstrap(
-            "/home/u/.local/state/cys-dept-dept-1/cys.sock", "pack")
+            "/home/x/.local/state/cys-dept-dept-1/cys.sock", "pack")
         self.assertEqual(rc, 8, "부서 소켓+메인 팩인데 exit 8 아님(교차 오염 가드 미발동)")
         self.assertIsNotNone(data, "boot-last.json 미기록")
         self.assertEqual(data["result"]["failed_step"], "lane-pack")
@@ -73,15 +73,26 @@ class LanePackGuard(unittest.TestCase):
     def test_base_socket_dept_pack_exits_8(self):
         # base 소켓(미설정 아님·본부 소켓) + 부서 팩 → 역방향 불일치도 차단
         rc, data = self._run_bootstrap(
-            "/home/u/.local/state/cys/cys.sock", "pack-dept-dept-2")
+            "/home/x/.local/state/cys/cys.sock", "pack-dept-dept-2")
         self.assertEqual(rc, 8, "base 소켓+부서 팩인데 exit 8 아님")
         self.assertEqual(data["result"]["failed_step"], "lane-pack")
+
+    def test_empty_dept_suffix_exits_8(self):
+        # R1-LOW-2: 빈 부서명(cys-dept-/ — suffix 없음)은 base도 부서도 아닌 불량 레인 —
+        # 조용한 통과(비-base·dept None으로 어느 게이트에도 안 걸림) 대신 명시 실패(exit 8).
+        rc, data = self._run_bootstrap(
+            "/home/x/.local/state/cys-dept-/cys.sock", "pack")
+        self.assertEqual(rc, 8, "빈 부서명 불량 레인인데 exit 8 아님(침묵 통과)")
+        self.assertIsNotNone(data, "boot-last.json 미기록")
+        self.assertEqual(data["result"]["failed_step"], "lane-pack")
+        steps = [s["step"] for s in data["steps"]]
+        self.assertNotIn("④boot", steps, "불량 레인인데 팀 기동으로 진행됨")
 
     def test_matched_lane_passes_guard(self):
         # dept-1 소켓 + pack-dept-dept-1 팩 → 정합 → 가드 통과(이후 ②ping에서 목 cys 실패로 exit 3).
         # 가드가 통과했음을 exit≠8 + lane-pack 미기록으로 확인(팀 기동 자체는 목 데몬이라 미완이 정상).
         rc, data = self._run_bootstrap(
-            "/home/u/.local/state/cys-dept-dept-1/cys.sock", "pack-dept-dept-1")
+            "/home/x/.local/state/cys-dept-dept-1/cys.sock", "pack-dept-dept-1")
         self.assertNotEqual(rc, 8, "정합 레인인데 레인↔팩 가드가 오발동(exit 8)")
         if data:
             self.assertNotIn("lane-pack", (data.get("result") or {}).get("failed_step", ""),
