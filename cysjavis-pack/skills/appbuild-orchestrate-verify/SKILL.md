@@ -27,3 +27,9 @@ description: 만든 페인이 아닌 다른 페인이 완성물을 E2E로 직접
 
 findings 리포트(모듈·증상·재현) + 채워진 게이트 증거 칸. 상위 `[[appbuild-orchestrate]]`로
 반환 → FAIL은 `[[appbuild-orchestrate-route]]`. 검증 페인이 직접 수정하면 규약 위반.
+
+**증거 규약 (웹/앱 UI 매체 — 결함 지적 시 의무)**: 각 결함은 필수 증거 3종을 갖춘다 —
+① 스크린샷 경로 · ② DOM ref · ③ 코드 추정 위치(**미상이면 '미상' 명시** — 침묵 금지).
+verdict evidence 로 낼 때 위치 ref 규약은 `경로.png#ref_N`(스크린샷 경로 + DOM ref 앵커 융합),
+코드 추정 위치는 별도 evidence 항목(`ref`=`파일:행` 또는 `미상`). 상세·예시 JSON =
+`${CYS_PACK_DIR:-$HOME/.cys/pack}/round/EVIDENCE_CONVENTION.md`(§1 웹/앱 UI).

@@ -22,3 +22,9 @@ description: 검증이 보고한 문제를 프론트/백 판별해 해당 페인
 
 라우팅 결정(결함→모듈) + 위임 결과 + 재검증 트리거. 상위 `[[appbuild-orchestrate]]`로 반환.
 메인의 직접 수정·오라우팅(프론트 문제를 백에)은 루프를 망친다 — 판별 정확성이 생명.
+
+**증거 규약 (웹/앱 UI 매체)**: 입력으로 받는 검증 findings와 수정 위임 브리프는 웹/앱 UI 증거
+3종(스크린샷 경로 · DOM ref · 코드 추정 위치[**미상이면 '미상' 명시**])을 담아야 한다 — 원인
+판별·라우팅은 이 증거의 DOM ref·코드 추정 위치를 근거로 삼는다. 증거 없는 결함은 라우팅 전
+`[[appbuild-orchestrate-verify]]`로 반려. 위치 ref 규약 `경로.png#ref_N`·상세 =
+`${CYS_PACK_DIR:-$HOME/.cys/pack}/round/EVIDENCE_CONVENTION.md`(§1 웹/앱 UI).
