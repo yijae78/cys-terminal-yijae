@@ -12,6 +12,7 @@ import { orderPreservingEqualize, equalizeAdoptedTrees } from "./layout";
 import { deptPlaceholderLabel, ccNodeLabel } from "./deptlabel";
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
+import { ccNodeLabel } from "./deptlabel";
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 
 declare global {
@@ -1291,7 +1292,8 @@ const panes = new Map<string, PaneRuntime>(); // 키 = paneKey(sid, socket)
 // 부서 데몬 socket_slug(F3 백엔드 단일진실) → socket 경로. launch_dept_daemon 반환·daemon-event로 채운다.
 const socketForSlug = new Map<string, string>();
 // 사이드바 노드 신호 캐시(B3) — org.status 응답을 워크스페이스 행 집계용으로 보관.
-type NodeSig = { role: string | null; state: string; ctx_pct: number | null; idle_secs: number; agent_alive: boolean | null };
+// agent·title·task는 활성 ws 탭의 노드 상태 인디케이터(buildNodePanel) 렌더용 — 집계 행은 기존 필드만 사용.
+type NodeSig = { role: string | null; state: string; ctx_pct: number | null; idle_secs: number; agent_alive: boolean | null; agent: string | null; title: string | null; task: string | null };
 const nodeSig = new Map<string, NodeSig>(); // 키 = `${socket}#${surface_id}`
 let pendingApprovals = 0; // org.status feed.pending 집계
 const root = document.getElementById("root")!;
@@ -2258,6 +2260,9 @@ async function refreshSidebarStatus() {
           ctx_pct: n.status?.context_pct ?? n.usage?.ctx_pct ?? null,
           idle_secs: n.idle_secs,
           agent_alive: n.agent_alive,
+          agent: n.agent ?? null,
+          title: n.title ?? null,
+          task: n.status?.task ?? null,
         });
     } catch {
       /* 부서 데몬 일시 부재 */
@@ -2278,6 +2283,41 @@ function updatePendingBadges(n: number) {
   }
 }
 
+// 작업2: 상단 cys 앱 버전 표시 — app_version(GUI 자기 버전) 네이티브 렌더. 데몬 버전 스큐는 기존
+// checkVersionSkew가 daemon-info 옆 배지로 별도 알림(중복 아님 — 이건 앱 버전 상시 표기).
+async function renderAppVersion() {
+  const el = document.getElementById("app-version");
+  if (!el) return;
+  try {
+    const v = (await invoke("app_version")) as string;
+    if (v) el.textContent = `v${v}`;
+  } catch {
+    /* 부가 표기 — 실패해도 무영향 */
+  }
+}
+
+// 작업2: 새로고침 버튼 — 데몬 상태를 즉시 재조회(10초 주기·이벤트 갱신을 기다리지 않고 수동 트리거).
+// 앱이 데몬 상태를 실시간 반영 못하는 체감 문제의 사용자 탈출구. 노드 상태 인디케이터·pane 제목·
+// (CC 열려있으면)컨트롤센터·버전 스큐를 함께 갱신한다.
+let manualRefreshing = false;
+async function manualRefresh() {
+  if (manualRefreshing) return;
+  manualRefreshing = true;
+  const btn = document.getElementById("btn-refresh");
+  btn?.classList.remove("spin");
+  void btn?.offsetWidth; // 재생 강제(연속 클릭에도 애니메이션 리트리거)
+  btn?.classList.add("spin");
+  try {
+    await refreshSidebarStatus();
+    refreshPaneTitles();
+    if (ccOpen) refreshControlCenter();
+    void checkVersionSkew();
+    void renderAppVersion();
+  } finally {
+    manualRefreshing = false;
+  }
+}
+
 // ws별 고유색 (id 기반 — 세션 복원에도 같은 ws는 같은 색)
 const WS_COLORS = ["#2f81f7", "#3fb950", "#d29922", "#f85149", "#a371f7", "#db61a2", "#39c5cf", "#e3b341"];
 
@@ -2292,6 +2332,178 @@ function renderWsTabs() {
   const unpinnedG = groups.filter((g) => !g.pinned && hasMembers(g));
   for (const g of [...pinnedG, ...unpinnedG]) bar.appendChild(buildGroupSection(g));
   for (const ws of workspaces.filter((w) => !w.pending && w.groupId == null)) bar.appendChild(buildTab(ws));
+}
+
+// ── 활성 ws 탭 노드 상태 인디케이터 (오너 확정 디자인 indicator_final) ──
+// 최상단 대표(master=Nobel) 카드 + 구분선 + 노드 상태 목록(오브/뱃지/CTX 게이지). 데이터는
+// nodeSig(org.status 소비)를 실시간 렌더. 패널은 표시 전용 — 클릭은 buildTab mousedown 가드가 억제.
+const WSN_PILL: Record<string, string> = { w: "작업중", i: "대기", a: "확인" };
+function wsnOrb(sig: NodeSig): "w" | "i" | "a" {
+  if (sig.agent_alive === false || sig.idle_secs > 300) return "a"; // 확인 — 죽음/유휴 5분+
+  if (sig.state === "working" && sig.idle_secs <= 60) return "w"; // 작업중
+  return "i"; // 대기
+}
+function wsnRoleCat(role: string | null): "master" | "cso" | "worker" | "reviewer" | "other" {
+  const r = (role ?? "").toLowerCase();
+  if (r === "master") return "master";
+  if (r === "cso") return "cso";
+  if (r.startsWith("worker")) return "worker";
+  if (r.startsWith("reviewer")) return "reviewer";
+  return "other";
+}
+function wsnAgentLabel(agent: string | null): string {
+  const a = (agent ?? "").toLowerCase();
+  if (!a) return "";
+  if (a.includes("gemini") || a.includes("agy")) return "AGY";
+  if (a.includes("codex")) return "codex";
+  if (a.includes("grok")) return "grok";
+  if (a.includes("claude")) return "claude";
+  return agent as string;
+}
+function wsnAvatarText(role: string | null, agent: string | null): string {
+  const r = (role ?? "").toLowerCase();
+  if (r === "master") return "N";
+  if (r === "cso") return "C";
+  const wk = r.match(/worker-?(\d+)/);
+  if (wk) return wk[1];
+  const rv = r.match(/reviewer-(\w)/);
+  if (rv) return rv[1].toUpperCase();
+  const t = (role ?? agent ?? "?").trim();
+  return (t[0] ?? "?").toUpperCase();
+}
+// master는 앱 브랜드명 Nobel, 그 외는 표준 노드 라벨(체크판 등 비표준 role은 title 폴백 — ccNodeLabel).
+function wsnNodeName(role: string | null, title: string | null): string {
+  return (role ?? "").toLowerCase() === "master" ? "Nobel" : ccNodeLabel(role, title);
+}
+function wsnAgentSmall(agent: string | null): HTMLElement | null {
+  const ag = wsnAgentLabel(agent);
+  if (!ag) return null;
+  const a = document.createElement("small");
+  a.className = "wsn-ag";
+  a.textContent = `(${ag})`;
+  return a;
+}
+function wsnGauge(sig: NodeSig, st: string, cls: "wsn-ogauge" | "wsn-gauge"): HTMLElement | null {
+  if (sig.ctx_pct == null) return null;
+  const g = document.createElement("div");
+  g.className = cls;
+  const gi = document.createElement("i");
+  if (cls === "wsn-gauge") gi.className = st; // 노드 미니 게이지는 상태색(w/i/a) — 대표 게이지는 시안→그린 고정
+  gi.style.width = `${Math.min(100, sig.ctx_pct)}%`;
+  g.appendChild(gi);
+  return g;
+}
+function wsnPct(sig: NodeSig): HTMLElement | null {
+  if (sig.ctx_pct == null) return null;
+  const pct = document.createElement("span");
+  pct.className = "wsn-pct";
+  pct.textContent = `${sig.ctx_pct}%`;
+  return pct;
+}
+function buildOwnerCard(sig: NodeSig): HTMLElement {
+  const st = wsnOrb(sig);
+  const card = document.createElement("div");
+  card.className = "wsn-owner";
+  const av = document.createElement("div");
+  av.className = "wsn-oav";
+  av.textContent = wsnAvatarText(sig.role, sig.agent);
+  const info = document.createElement("div");
+  info.className = "wsn-oinfo";
+  const name = document.createElement("div");
+  name.className = "wsn-oname";
+  const ns = document.createElement("span");
+  ns.textContent = wsnNodeName(sig.role, sig.title);
+  name.appendChild(ns);
+  const ag = wsnAgentSmall(sig.agent);
+  if (ag) name.appendChild(ag);
+  const role = document.createElement("div");
+  role.className = "wsn-orole";
+  role.textContent = `${sig.role ?? "?"} · 이 워크스페이스`;
+  const task = document.createElement("div");
+  task.className = "wsn-otask";
+  task.textContent = sig.task || "(업무 미보고)";
+  info.append(name, role, task);
+  const g = wsnGauge(sig, st, "wsn-ogauge");
+  if (g) info.appendChild(g);
+  const badge = document.createElement("div");
+  badge.className = "wsn-obadge";
+  const orb = document.createElement("span");
+  orb.className = `wsn-orb ${st}`;
+  const pill = document.createElement("span");
+  pill.className = `wsn-pill ${st}`;
+  pill.textContent = WSN_PILL[st];
+  badge.append(orb, pill);
+  const pct = wsnPct(sig);
+  if (pct) badge.appendChild(pct);
+  card.append(av, info, badge);
+  return card;
+}
+function buildNodeRow(sig: NodeSig): HTMLElement {
+  const st = wsnOrb(sig);
+  const row = document.createElement("div");
+  row.className = "wsn-node";
+  const av = document.createElement("div");
+  av.className = `wsn-av wsn-av--${wsnRoleCat(sig.role)}`;
+  av.textContent = wsnAvatarText(sig.role, sig.agent);
+  const nb = document.createElement("div");
+  nb.className = "wsn-nb";
+  const nm = document.createElement("div");
+  nm.className = "wsn-nm";
+  const ns = document.createElement("span");
+  ns.textContent = wsnNodeName(sig.role, sig.title);
+  nm.appendChild(ns);
+  const ag = wsnAgentSmall(sig.agent);
+  if (ag) nm.appendChild(ag);
+  const nt = document.createElement("div");
+  nt.className = "wsn-nt";
+  nt.textContent = sig.task || (st === "i" ? "대기" : "(업무 미보고)");
+  nb.append(nm, nt);
+  const g = wsnGauge(sig, st, "wsn-gauge");
+  if (g) nb.appendChild(g);
+  const nr = document.createElement("div");
+  nr.className = "wsn-nr";
+  const orb = document.createElement("span");
+  orb.className = `wsn-orb ${st}`;
+  const pill = document.createElement("span");
+  pill.className = `wsn-pill ${st}`;
+  pill.textContent = WSN_PILL[st];
+  nr.append(orb, pill);
+  const pct = wsnPct(sig);
+  if (pct) nr.appendChild(pct);
+  row.append(av, nb, nr);
+  return row;
+}
+function buildNodePanel(ws: Workspace): HTMLElement {
+  const panel = document.createElement("div");
+  panel.className = "wsn-expand";
+  const rows = collectSids(ws.tree)
+    .map((id) => nodeSig.get(`${ws.socket}#${id}`))
+    .filter((s): s is NodeSig => !!s);
+  if (rows.length === 0) {
+    const e = document.createElement("div");
+    e.className = "wsn-empty";
+    e.textContent = "노드 상태 수신 대기…";
+    panel.appendChild(e);
+    return panel;
+  }
+  const order = ["master", "cso", "worker", "reviewer", "other"];
+  rows.sort((a, b) => order.indexOf(wsnRoleCat(a.role)) - order.indexOf(wsnRoleCat(b.role)));
+  // ① 최상단 대표 카드 = master(없으면 최우선 노드 = 부서 대표)
+  const ownerIdx = rows.findIndex((s) => wsnRoleCat(s.role) === "master");
+  const owner = ownerIdx >= 0 ? rows.splice(ownerIdx, 1)[0] : rows.shift()!;
+  panel.appendChild(buildOwnerCard(owner));
+  if (rows.length) {
+    const div = document.createElement("div");
+    div.className = "wsn-div";
+    const label = document.createElement("div");
+    label.className = "wsn-label";
+    const b = document.createElement("b");
+    b.textContent = String(rows.length);
+    label.append(document.createTextNode("노드 상태 · "), b);
+    panel.append(div, label);
+    for (const s of rows) panel.appendChild(buildNodeRow(s));
+  }
+  return panel;
 }
 
 // 06: ws 1행 탭 DOM 생성(기존 renderWsTabs forEach 본문을 외과적으로 추출 — idx→workspaces.indexOf(ws)만 치환).
@@ -2357,9 +2569,12 @@ function buildTab(ws: Workspace): HTMLElement {
     sub.appendChild(txt);
   }
   tab.append(titleRow, sub);
+  // 활성 ws는 그 아래에 노드 상태 인디케이터(대표 카드+노드 목록)를 펼친다(Q1-A 오너 결정 2026-07-16).
+  if (!ws.pending && workspaces.indexOf(ws) === activeWs) tab.appendChild(buildNodePanel(ws));
   tab.addEventListener("mousedown", (e) => {
     // 우클릭은 전환하지 않음 — render()가 탭 DOM을 재생성하면 컨텍스트 메뉴가 죽은 엘리먼트를 잡는다
     if (e.button !== 0 || e.target === close) return;
+    if ((e.target as HTMLElement)?.closest?.(".wsn-expand")) return; // 노드 패널은 표시 전용 — 탭 전환·드래그 억제
     if ((e.target as HTMLElement)?.isContentEditable) return; // rename 편집 중엔 전환·드래그 금지
     const i = workspaces.indexOf(ws); // 그룹 재배열로 시각 순서≠배열 순서 — 실시간 위치로 전환
     if (i !== activeWs) {
@@ -3912,6 +4127,7 @@ async function start() {
 
   const status = (await invoke("daemon_status")) as Record<string, unknown>;
   info.textContent = `daemon pid=${status.daemon_pid} sock=${status.socket_path}`;
+  void renderAppVersion(); // 상단 cys 앱 버전 표시(작업2 — app_version 네이티브 렌더)
 
   // 버전 스큐 세대교체(메인 + 부서 데몬) — 시작 1회 + 5분 주기 재검(B). 무중단 rename-swap의 짝으로
   // 구 데몬(lame-duck) 스큐를 비차단 배지로 알리고, 잃을 세션 0인 노드는 무손실 자동 교대한다.
@@ -4322,6 +4538,7 @@ document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => 
   refreshSessions();
 });
 document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
+document.getElementById("btn-refresh")!.addEventListener("click", () => void manualRefresh());
 document.getElementById("btn-theme")!.addEventListener("click", (e) =>
   openThemePopover(e.currentTarget as HTMLElement),
 );
