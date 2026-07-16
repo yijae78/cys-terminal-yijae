@@ -15,7 +15,8 @@
 #    부트를 오발화하지 않는다(role-blind 결합 결함 수리·arch#1). 미claim(빈)·master pane만 발화.
 #  - 감지 정밀화: 토큰 사이 filler 허용("너는 이제 마스터다")·너가 추가·로/명령형 어미·인용/의문
 #    오발화 억제·부정 범위 축소(adv#2/7/8).
-#  - 쿨다운: 소켓별 + 진행 pid 기반(실패한 부트가 재시도를 60초 막던 결함 수리·adv#3/9).
+#  - 중복 억제: python 싱글플라이트 락(flock)이 단일 소유 — 훅은 dumb trigger(증분1). 종전 소켓별
+#    PIDF 진행-가드는 제거(실패로 죽은 부트가 재시도를 막던 결함·adv#3/9; 락은 프로세스 종료 시 자동 해제).
 #  - 출력: hookSpecificOutput.additionalContext JSON(팩 javis_memory_inject.py 관례·adv#6).
 #  - 발화 폴백: setsid→nohup→& (adv#12).
 #
@@ -56,34 +57,35 @@ echo "$HEAD" | grep -Eq '(마스터|master)[^가-힣A-Za-z]{0,3}(가|는|를)?[^
 
 PACK="${CYS_PACK_DIR:-$HOME/.cys/pack}"
 BOOT="$PACK/bin/javis_bootstrap.py"
-[ -f "$BOOT" ] || exit 0
-
-# ── 소켓별 진행-가드(adv#3/9): 살아있는 부트 pid가 있으면 skip. 실패로 죽은 pid는 재시도 허용 ──
-STATE="$HOME/.cys/state"; mkdir -p "$STATE" 2>/dev/null
-SOCK_KEY="$(basename "${CYS_SOCKET:-base}" 2>/dev/null)"; [ -z "$SOCK_KEY" ] && SOCK_KEY="base"
-PIDF="$STATE/.role-bootstrap-firing.$SOCK_KEY"
-if [ -f "$PIDF" ]; then
-  OLDPID="$(cat "$PIDF" 2>/dev/null)"
-  if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
-    printf '%s' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"[결정론 부트스트랩] 이 데몬의 부트가 이미 진행 중입니다 — 중복 실행하지 않습니다. cys list로 팀 기동을 확인하세요."}}'
-    exit 0
-  fi
+# ★BOOT 부재 명시 실패(증분1): 부서 팩에 javis_bootstrap.py가 없는 레인은 종전엔 조용한 무산이라
+# "팀이 뜬다"는 기대와 달리 아무 일도 없었다. 원인·조치를 additionalContext로 명시하고 승인 채널로도
+# 시끄럽게 알린다. 알림은 백그라운드+graceful(데몬 부재 등 실패가 훅을 죽이거나 행 걸지 않게). 훅은 exit 0.
+if [ ! -f "$BOOT" ]; then
+  MSG="[부트스트랩 불가] 이 레인의 팩($PACK)에 bin/javis_bootstrap.py가 없어 마스터 팀을 기동할 수 없습니다. 팩 배포(preflight --fix·pack-heal)를 확인하거나 CYS_PACK_DIR이 올바른 레인을 가리키는지 점검하세요."
+  ( cys feed push --kind bootstrap-fail --title "부트스트랩 불가(BOOT 부재)" --body "$MSG" >/dev/null 2>&1 \
+    || cys send --queued --to master "$MSG" >/dev/null 2>&1 ) &
+  "$CYS_PY" -c 'import json,sys
+print(json.dumps({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":sys.argv[1]}}, ensure_ascii=False))' \
+    "[결정론 부트스트랩 불가 — 명시 실패] 이 레인의 팩에 bin/javis_bootstrap.py가 없어 마스터 팀 기동을 발화할 수 없습니다(조용한 무산 아님). 조치: 팩 배포 상태(preflight --fix·pack-heal)와 CYS_PACK_DIR 레인 정합을 확인하세요. 승인 Feed에도 알림을 시도했습니다."
+  exit 0
 fi
+
+# ── 중복 억제는 python 싱글플라이트 락이 단일 소유(증분1): 종전의 PIDF 진행-가드·SOCK_KEY는 제거했다.
+# 훅은 dumb trigger로 강등한다 — 중복 발화가 있어도 javis_bootstrap.py가 flock 비획득 시 no-op(exit 0)
+# 으로 안전 종료하므로 이중 방어(락+PIDF)는 불필요하고, PIDF는 실패로 죽은 부트가 재시도를 막던 결함이
+# 있었다(락은 프로세스 종료 시 자동 해제라 그 결함이 없다). STATE는 발화 로그 경로로만 유지한다. ──
+STATE="$HOME/.cys/state"; mkdir -p "$STATE" 2>/dev/null
+LOG="$STATE/role-bootstrap.log"
 
 # 결정론 부트스트랩 백그라운드 발화(env 상속). 부모(claude) 종료와 무관하게 완주.
-LOG="$STATE/role-bootstrap.log"
 if command -v setsid >/dev/null 2>&1; then
   setsid "$CYS_PY" "$BOOT" >"$LOG" 2>&1 &
-  FPID=$!
 elif command -v nohup >/dev/null 2>&1; then
   nohup "$CYS_PY" "$BOOT" >"$LOG" 2>&1 &
-  FPID=$!
 else
   "$CYS_PY" "$BOOT" >"$LOG" 2>&1 &
-  FPID=$!
   disown 2>/dev/null
 fi
-printf '%s' "$FPID" > "$PIDF" 2>/dev/null
 
 # LLM 컨텍스트 주입(hookSpecificOutput.additionalContext JSON — 팩 관례) — 재실행/환각 차단.
 "$CYS_PY" -c 'import json,sys

@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""test_lane_isolation_v1.py — 증분1 '레인 격리 3종 + 실패 가시화' 통합(subprocess) 회귀.
+
+순수 판정(base/dept·락 키·레인↔팩)은 javis_bootstrap.py 내장 `--self-test`가 밀폐 검증한다.
+이 파일은 프로세스 경계가 필요한 두 통합 경로를 핀한다(모듈 전역이 import 시 HOME/PACK로 고정돼
+in-process로 격리 불가):
+  (t3) 레인↔팩 불일치 가드 발동 — 부서 소켓 + 메인 팩 → 팀 기동 전 exit 8 + boot-last.json 흔적.
+  (t4) 훅 BOOT 부재 — 빈 팩으로 role-bootstrap.sh 실행 → 행 없이 exit 0 + additionalContext 실패 명시
+       (데몬 없는 환경에서 feed push 실패가 훅을 죽이지 않음).
+  (t5) 내장 self-test가 subprocess에서도 exit 0(무회귀 게이트).
+
+관측 기법: 격리 HOME + PATH 앞 목 cys(모든 서브명령 실패 — 데몬 부재 재현)로 실행하고 exit code·
+boot-last.json·stdout으로 판정. 노드 스폰·라이브 데몬 무접촉.
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+BIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))          # cysjavis-pack/bin
+BOOTSTRAP = os.path.join(BIN, "javis_bootstrap.py")
+HOOK = os.path.join(os.path.dirname(BIN), "hooks", "role-bootstrap.sh")     # cysjavis-pack/hooks/...
+
+
+def _mock_cys(mockbin, surface_role="", exit_code=1):
+    """목 cys 설치 — surface-role은 주입값 반환, 그 외 서브명령은 exit_code(데몬 부재 재현)."""
+    cysp = os.path.join(mockbin, "cys")
+    with open(cysp, "w") as f:
+        f.write('#!/bin/bash\n[ "$1" = surface-role ] && { echo "%s"; exit 0; }\nexit %d\n'
+                % (surface_role, exit_code))
+    os.chmod(cysp, 0o755)
+
+
+class LanePackGuard(unittest.TestCase):
+    """t3 — 부서 소켓 레인이 메인 팩을 쓰면(교차 오염·UT-14) 팀 기동 전 exit 8·시끄러운 실패."""
+
+    def _run_bootstrap(self, sock, pack_dirname):
+        home = tempfile.mkdtemp()
+        mockbin = tempfile.mkdtemp()
+        _mock_cys(mockbin)  # 모든 cys 실패 → _notify_loud 폴백까지 빠르게 소진(데몬 부재)
+        pack = os.path.join(home, ".cys", pack_dirname)
+        os.makedirs(os.path.join(pack, "bin"), exist_ok=True)
+        env = dict(os.environ)
+        env["HOME"] = home
+        env["CYS_PACK_DIR"] = pack
+        env["CYS_SOCKET"] = sock
+        env["PATH"] = mockbin + os.pathsep + env.get("PATH", "")
+        r = subprocess.run([sys.executable, BOOTSTRAP, "run"],
+                           capture_output=True, text=True, timeout=60, env=env)
+        boot_last = os.path.join(home, ".cys", "state", "boot-last.json")
+        data = None
+        if os.path.isfile(boot_last):
+            with open(boot_last, encoding="utf-8") as f:
+                data = json.load(f)
+        return r.returncode, data
+
+    def test_dept_socket_main_pack_exits_8(self):
+        # 부서 소켓 + 메인 팩(pack) → 불일치 → exit 8, 팀 기동(cys boot) 도달 전 중단
+        rc, data = self._run_bootstrap(
+            "/home/u/.local/state/cys-dept-dept-1/cys.sock", "pack")
+        self.assertEqual(rc, 8, "부서 소켓+메인 팩인데 exit 8 아님(교차 오염 가드 미발동)")
+        self.assertIsNotNone(data, "boot-last.json 미기록")
+        self.assertEqual(data["result"]["failed_step"], "lane-pack")
+        self.assertEqual(data["result"]["exit"], 8)
+        steps = [s["step"] for s in data["steps"]]
+        self.assertIn("③′lane-pack", steps, "가드 단계 미기록")
+        self.assertIn("③′lane-pack-notify", steps, "알림 시도 흔적 없음(push 시도 미기록)")
+        # 팀 기동 단계(④boot)에 도달하지 않았어야 한다(중단 성공)
+        self.assertNotIn("④boot", steps, "가드 이후에도 팀 기동으로 진행됨")
+
+    def test_base_socket_dept_pack_exits_8(self):
+        # base 소켓(미설정 아님·본부 소켓) + 부서 팩 → 역방향 불일치도 차단
+        rc, data = self._run_bootstrap(
+            "/home/u/.local/state/cys/cys.sock", "pack-dept-dept-2")
+        self.assertEqual(rc, 8, "base 소켓+부서 팩인데 exit 8 아님")
+        self.assertEqual(data["result"]["failed_step"], "lane-pack")
+
+    def test_matched_lane_passes_guard(self):
+        # dept-1 소켓 + pack-dept-dept-1 팩 → 정합 → 가드 통과(이후 ②ping에서 목 cys 실패로 exit 3).
+        # 가드가 통과했음을 exit≠8 + lane-pack 미기록으로 확인(팀 기동 자체는 목 데몬이라 미완이 정상).
+        rc, data = self._run_bootstrap(
+            "/home/u/.local/state/cys-dept-dept-1/cys.sock", "pack-dept-dept-1")
+        self.assertNotEqual(rc, 8, "정합 레인인데 레인↔팩 가드가 오발동(exit 8)")
+        if data:
+            self.assertNotIn("lane-pack", (data.get("result") or {}).get("failed_step", ""),
+                             "정합인데 lane-pack 실패 기록")
+
+
+class HookBootAbsent(unittest.TestCase):
+    """t4 — 빈 팩(javis_bootstrap.py 부재)으로 훅 실행 → 명시 실패·행 없이 exit 0."""
+
+    def test_absent_boot_explicit_failure_exit0(self):
+        home = tempfile.mkdtemp()
+        pack = tempfile.mkdtemp()  # 빈 팩 — bin/javis_bootstrap.py 없음
+        mockbin = tempfile.mkdtemp()
+        _mock_cys(mockbin, surface_role="")  # feed/send 모두 실패(데몬 부재) — 훅을 죽이면 안 됨
+        env = dict(os.environ)
+        env["HOME"] = home
+        env["CYS_PACK_DIR"] = pack
+        env["PATH"] = mockbin + os.pathsep + env.get("PATH", "")
+        env.pop("CYS_SOCKET", None)
+        # timeout=20: 행 걸리면 TimeoutExpired로 테스트 실패(무행 요구 검증)
+        r = subprocess.run(["bash", HOOK], input=json.dumps({"prompt": "너는 마스터다"}),
+                           capture_output=True, text=True, timeout=20, env=env)
+        self.assertEqual(r.returncode, 0, "BOOT 부재인데 훅 exit≠0(feed push 실패가 훅을 죽임)")
+        out = r.stdout
+        self.assertIn("hookSpecificOutput", out, "additionalContext JSON 미출력")
+        payload = json.loads(out)
+        ctx = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("javis_bootstrap.py가 없어", ctx, "실패 원인이 additionalContext에 명시되지 않음")
+        self.assertNotIn("발화됨", ctx, "BOOT 부재인데 '발화됨'으로 잘못 보고")
+
+
+class EmbeddedSelfTest(unittest.TestCase):
+    """t5 — 내장 --self-test 무회귀 게이트(subprocess exit 0)."""
+
+    def test_self_test_passes(self):
+        r = subprocess.run([sys.executable, BOOTSTRAP, "--self-test"],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, "내장 self-test 실패:\n%s\n%s" % (r.stdout, r.stderr))
+        self.assertIn("self-test OK", r.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
