@@ -1,7 +1,8 @@
 [workspace]
 members = ["src-tauri"]
-# 벤더링된 portable-pty(ConPTY 창 flash 수정 패치)는 워크스페이스 멤버가 아니라 path 의존이다.
-exclude = ["vendor/portable-pty"]
+# 벤더링된 portable-pty(ConPTY 창 flash 수정 패치)·vt100(clear_wide OOB 패치)는 워크스페이스
+# 멤버가 아니라 path 의존/patch다.
+exclude = ["vendor/portable-pty", "vendor/vt100"]
 
 [package]
 name = "cys-terminal"
@@ -47,6 +48,11 @@ base64 = "0.22"
 # flate2/tar는 이미 의존 그래프·Cargo.lock에 존재(전이) — 직접 의존 승격으로 오프라인 빌드 가능.
 flate2 = "1"
 tar = "0.4"
+
+# ★벤더링 + 패치: vt100 0.15.2 row.rs clear_wide 무검사 인덱싱(한국어 와이드 셀+좁은 resize →
+# cells[col+1] OOB panic)에 경계검사 추가. registry 0.15.2를 벤더 사본으로 치환. vendor/vt100/ 참조.
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
 
 # 테스트 fixture 전용: minisign keypair 생성·서명(서명 roundtrip 테스트). 런타임 의존 아님.
 [dev-dependencies]

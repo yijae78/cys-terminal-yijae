@@ -653,11 +653,12 @@ mod dedup_tests {
 mod panic_isolation_tests {
     use super::{process_chunk_isolated, SCROLLBACK_LINES};
 
-    /// row.rs:89 clear_wide OOB 재현 시퀀스: 와이드(CJK) 문자의 선두 셀을 26열 그리드 끝에 놓고
-    /// 25열로 축소하면 선두 와이드 셀이 마지막 열(index 24, len 25)로 밀린다. 그 셀을 덮어쓰면
-    /// vt100 0.15.2가 `cells[col+1]`=cells[25]를 경계 밖 인덱싱해 패닉한다(프로덕션 "len 25 index 25").
-    /// 좁은 pane으로의 resize + 한국어 CLI 출력이라는 실제 경로를 그대로 박제한다.
-    fn drive_row89_panic(parser: &mut vt100::Parser) -> bool {
+    /// 한국어(CJK 와이드) 문자의 선두 셀을 26열 그리드 끝에 놓고 25열로 축소하면 선두 와이드 셀이
+    /// 마지막 열(index 24, len 25)로 밀린다. 그 셀을 덮어쓰면 구 vt100 0.15.2는 clear_wide가
+    /// `cells[col+1]`=cells[25]를 경계 밖 인덱싱해 패닉했다("len 25 index 25", row.rs:89). cys 벤더
+    /// 패치(vendor/vt100, [patch.crates-io])가 경계검사를 추가해 이 실제 경로(좁은 pane resize +
+    /// 한국어 출력)를 패닉 없이 처리한다. 헬퍼는 시퀀스를 태우고 panicked(패치 후 false)를 돌려준다.
+    fn drive_wide_resize_clear(parser: &mut vt100::Parser) -> bool {
         process_chunk_isolated(parser, b"\x1b[1;25H", false);
         process_chunk_isolated(parser, "\u{ac00}".as_bytes(), false); // '가'(wide)
         parser.set_size(10, 25); // 축소 → 선두 와이드 셀이 마지막 열로
@@ -674,32 +675,55 @@ mod panic_isolation_tests {
     }
 
     #[test]
-    fn row89_sequence_is_contained_not_propagated() {
-        // 격리가 없다면 이 시퀀스는 스레드를 죽인다 — catch_unwind가 panicked=true로 흡수해야 한다.
+    fn wide_last_col_resize_no_longer_panics() {
+        // ★회귀 핀(clear_wide col+1 OOB): 한국어 와이드 셀+좁은 resize 시퀀스가 이제 패닉 없이
+        // 처리된다(구 vt100 0.15.2는 OOB 패닉 → 격리·매 패닉마다 화면 리셋·깜빡임). 패치 후 false.
         let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
-        let panicked = drive_row89_panic(&mut p);
-        assert!(panicked, "row.rs:89 clear_wide OOB 시퀀스가 격리(패닉 흡수)를 발동해야 한다");
+        let panicked = drive_wide_resize_clear(&mut p);
+        assert!(!panicked, "clear_wide 경계검사 패치로 이 시퀀스는 패닉 없이 정상 처리돼야 한다");
     }
 
     #[test]
-    fn reinit_preserves_rows_cols() {
+    fn wide_resize_preserves_size_and_processes() {
+        // 패닉·재초기화 없이 시퀀스 처리 후에도 축소 크기(10x25) 유지 + 후속 청크가 정상 반영.
         let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
-        assert!(drive_row89_panic(&mut p));
-        // 패닉 직전 크기(축소 후 10x25)를 fresh 파서가 그대로 보존해야 한다.
-        assert_eq!(p.screen().size(), (10, 25), "재초기화가 rows/cols를 보존해야 한다");
-    }
-
-    #[test]
-    fn parser_survives_and_processes_after_panic() {
-        // 격리 후 파서는 계속 동작 — 후속 청크가 정상 반영돼야 한다(reader 배수 지속의 파서측 보증).
-        let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
-        assert!(drive_row89_panic(&mut p));
+        assert!(!drive_wide_resize_clear(&mut p), "패치 후 패닉 없음");
+        assert_eq!(p.screen().size(), (10, 25), "축소 크기 유지");
         let (_, panicked) = process_chunk_isolated(&mut p, b"\x1b[2J\x1b[1;1Halive", false);
-        assert!(!panicked, "재초기화된 파서는 후속 청크를 패닉 없이 반영해야 한다");
+        assert!(!panicked, "후속 청크도 패닉 없이 반영");
         assert!(
             p.screen().contents().contains("alive"),
-            "재초기화 후 새 출력이 화면에 반영돼야 한다"
+            "후속 출력이 화면에 반영돼야 한다"
         );
+    }
+
+    #[test]
+    fn wide_col0_continuation_clear_no_panic() {
+        // ★회귀 핀(clear_wide col-1 언더플로): 와이드 연속 셀이 0열에 남은 상태에서 그 셀을 지울 때
+        // col==0의 col-1이 u16 언더플로로 OOB였다 — 패치가 무동작으로 막는다. 2열 그리드에 와이드
+        // '가'를 넣고 1열로 축소해 선두가 그리드 밖·연속 셀만 0열에 남는 극단을 태운다.
+        let mut p = vt100::Parser::new(3, 2, SCROLLBACK_LINES);
+        process_chunk_isolated(&mut p, "\u{ac00}".as_bytes(), false); // 와이드 '가'
+        p.set_size(3, 1); // 1열로 축소 → 연속 셀이 0열 경계로
+        let (_, panicked) = process_chunk_isolated(&mut p, b"\x1b[1;1Hx", false);
+        assert!(!panicked, "col==0 연속 셀 clear의 언더플로도 패닉 없이 처리돼야 한다");
+    }
+
+    #[test]
+    fn wide_char_write_at_narrow_boundary_no_panic() {
+        // ★회귀 핀(screen.rs width>1 next_next_cell col+1 unwrap): 한국어 와이드 문자를 좁은 그리드
+        // 경계에 연속으로 쓰면 기존 와이드 셀 위에 와이드를 겹쳐 쓰는 경로에서 col+1이 off-grid일 때
+        // 패닉했다. 좁은 그리드에 와이드를 반복 투입 + 축소 후에도 패닉 없이 처리돼야 한다.
+        let mut p = vt100::Parser::new(4, 3, SCROLLBACK_LINES);
+        for _ in 0..6 {
+            let (_, panicked) = process_chunk_isolated(&mut p, "\u{ac00}".as_bytes(), false); // '가'
+            assert!(!panicked, "와이드 문자 경계 쓰기가 패닉 없이 처리돼야 한다");
+        }
+        p.set_size(4, 2); // 더 좁게 축소 후에도 지속
+        for _ in 0..4 {
+            let (_, panicked) = process_chunk_isolated(&mut p, "\u{b098}".as_bytes(), false); // '나'
+            assert!(!panicked, "resize 후 와이드 쓰기도 패닉 없이 처리돼야 한다");
+        }
     }
 
     #[test]
