@@ -1058,6 +1058,25 @@ pub fn state_dir(socket_path: &std::path::Path) -> PathBuf {
     }
 }
 
+/// 테스트 전용 공용 헬퍼: 데몬 소켓 파일명을 고유화한다. Windows state_dir은 socket 부모 dir이
+/// 아니라 LOCALAPPDATA/cys/{pipe_slug(파일명)}를 쓰므로(RC-13 부서 격리), 모든 테스트가 'cysd.sock'
+/// (slug 'cysdsock') 같은 고정 파일명을 쓰면 state_dir을 공유해 topology.json·feed.jsonl·transcripts.db
+/// 가 테스트 간·실행 간 누수돼 격리가 무너진다(병렬 flaky·stale artifact). 파일명에 pid+epoch+seq를
+/// 넣어 pipe_slug을 고유화하면 Windows에서도 테스트마다 격리 state_dir을 얻는다(unix는 socket 부모라
+/// 원래 격리·무해). ★소켓 파일명만 고유화하며 부모 dir은 호출측이 소유 — is_dept_socket이 dir의
+/// "cys-dept-" 마커로 판별하므로 main/dept 분류에 영향 없다(파일명 무관).
+#[cfg(test)]
+pub(crate) fn unique_sock_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "cysd-{}-{}-{}.sock",
+        std::process::id(),
+        now_epoch() as u64,
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// 데몬과 같은 디렉터리에 놓인 형제 `cys` CLI 경로.
 /// Windows에서는 실행파일명이 `cys.exe`이므로 플랫폼별 확장자를 붙인다
 /// Windows: 데몬(cysd)이 스폰하는 콘솔 자식(CLI·셸·taskkill 등)이 콘솔 창을 띄우지 않게
@@ -3421,7 +3440,7 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::create_dir_all(&dir);
-        dir.join("cysd.sock")
+        dir.join(crate::state::unique_sock_name())
     }
 
     fn sample_feed_item(id: &str, body: String) -> FeedItem {

@@ -1679,7 +1679,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cys-cl-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("cys.sock");
+        let socket = dir.join(crate::state::unique_sock_name());
+        // Windows state_dir은 socket 부모(dir)가 아니라 LOCALAPPDATA/cys/{slug}이므로 db 부모 dir을
+        // 명시 생성해야 SQLite가 analytics.db를 만든다(unique slug라 항상 신규 dir — 미생성 시 open None).
+        let _ = std::fs::create_dir_all(crate::state::state_dir(&socket));
         let conn = open(&socket).expect("open analytics.db");
         (socket, conn)
     }

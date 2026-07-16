@@ -1442,10 +1442,13 @@ mod tests {
             line!()
         ));
         let _ = std::fs::create_dir_all(&e2e_dir);
-        let db_dst = e2e_dir.join("transcripts.db");
+        let fake_socket = e2e_dir.join(crate::state::unique_sock_name());
+        // Windows state_dir은 socket 부모(e2e_dir)가 아니라 LOCALAPPDATA/cys/{slug}이므로,
+        // max_surface_id가 db를 읽는 위치(state_dir)에 맞춰 둔다(unix는 socket 부모라 동일 — 무해).
+        let db_dst = crate::state::state_dir(&fake_socket).join("transcripts.db");
+        let _ = std::fs::create_dir_all(db_dst.parent().unwrap());
         let _ = std::fs::remove_file(&db_dst);
         std::fs::copy(&path, &db_dst).unwrap();
-        let fake_socket = e2e_dir.join("cys.sock");
         assert_eq!(
             super::max_surface_id(&fake_socket),
             pruned_sid as u64,

@@ -2174,7 +2174,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cys_chan_test_{}_{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Daemon::new(dir.join("cysd.sock"))
+        Daemon::new(dir.join(crate::state::unique_sock_name()))
     }
 
     fn call(daemon: &Arc<Daemon>, sub: &str, params: Value, caller_pid: Option<u32>) -> Value {
@@ -2319,7 +2319,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cys-dept-chtest-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Daemon::new(dir.join("cys.sock"))
+        Daemon::new(dir.join(crate::state::unique_sock_name()))
     }
 
     #[test]

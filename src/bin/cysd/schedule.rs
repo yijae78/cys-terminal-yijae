@@ -826,7 +826,7 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::create_dir_all(&dir);
-        Daemon::new(dir.join("cysd.sock"))
+        Daemon::new(dir.join(crate::state::unique_sock_name()))
     }
 
     // ★B2-1(W3): built-in 잡 부트 ensure idempotency — 부재 생성·재실행 무접촉(중복 0)·구버전 갱신·사용자 잡 보존.

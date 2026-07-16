@@ -3559,7 +3559,7 @@ mod tests {
             crate::state::now_epoch() as u64
         ));
         let _ = std::fs::create_dir_all(&dir);
-        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let daemon = Daemon::new(dir.join(crate::state::unique_sock_name()));
         let base = daemon.health_rules.lock().unwrap().len();
 
         // 같은 name으로 수천 회 재등록 — 벡터가 1개만 늘고(upsert) 단조 성장하지 않아야 한다.
@@ -3624,7 +3624,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("acl.json"), acl_json).unwrap();
         std::env::set_var(cys::pack::ENV_PACK_DIR, &dir);
-        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let daemon = Daemon::new(dir.join(crate::state::unique_sock_name()));
         (daemon, dir)
     }
 
@@ -3963,7 +3963,7 @@ mod tests {
             crate::state::now_epoch() as u64
         ));
         let _ = std::fs::create_dir_all(&dir);
-        Daemon::new(dir.join("cysd.sock"))
+        Daemon::new(dir.join(crate::state::unique_sock_name()))
     }
 
     /// claim_daemon은 dir 키가 {pid}-{epoch초}라 같은 초에 병렬 실행되는 테스트끼리 dir를
@@ -3978,7 +3978,7 @@ mod tests {
             n
         ));
         let _ = std::fs::create_dir_all(&dir);
-        Daemon::new(dir.join("cysd.sock"))
+        Daemon::new(dir.join(crate::state::unique_sock_name()))
     }
 
     fn make_surface(daemon: &Arc<Daemon>, role: Option<&str>) -> u64 {
@@ -4929,17 +4929,19 @@ mod tests {
         let own_pid = 993_201_u32;
         bind_caller(&daemon, own_pid, own);
 
-        let resp = usage_register(
-            &daemon,
-            own,
-            "/Users/x/.claude/projects/-p/abc.jsonl",
-            Some(own_pid),
-        );
+        // 검증(handlers.rs)은 pb.is_absolute()를 요구하는데 '/Users/…'는 Windows에서 절대경로가
+        // 아니라(드라이브 문자 필요) 거부됐다 — 플랫폼별 절대 .jsonl 경로로 라운드트립 검증.
+        let tpath = if cfg!(windows) {
+            r"C:\x\.claude\projects\-p\abc.jsonl"
+        } else {
+            "/Users/x/.claude/projects/-p/abc.jsonl"
+        };
+        let resp = usage_register(&daemon, own, tpath, Some(own_pid));
         assert_eq!(resp["ok"], json!(true), "자기 등록이 막혔다 (응답: {resp})");
         assert_eq!(
             daemon.surfaces.lock().unwrap()[&own]
                 .registered_transcript.lock().unwrap().as_deref(),
-            Some("/Users/x/.claude/projects/-p/abc.jsonl")
+            Some(tpath)
         );
     }
 
@@ -5726,7 +5728,7 @@ mod tests {
             crate::state::now_epoch() as u64
         ));
         let _ = std::fs::create_dir_all(&dir);
-        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let daemon = Daemon::new(dir.join(crate::state::unique_sock_name()));
         let mut rx = daemon.bus.subscribe();
 
         // tier=c → created 이벤트에 tier=c.
@@ -5816,7 +5818,7 @@ mod tests {
             crate::state::now_epoch() as u64
         ));
         let _ = std::fs::create_dir_all(&dir);
-        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let daemon = Daemon::new(dir.join(crate::state::unique_sock_name()));
         let publisher: u32 = 4242;
         let approver: u32 = 9999;
 

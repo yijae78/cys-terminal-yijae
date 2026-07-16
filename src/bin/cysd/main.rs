@@ -1910,7 +1910,7 @@ mod feed_wait_disconnect_tests {
                 .unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let tmp = dir.join("cysd.sock");
+        let tmp = dir.join(crate::state::unique_sock_name());
         let daemon = Daemon::new(tmp.clone());
 
         // 인메모리 양방향 스트림: server는 handle_connection이, client는 테스트가 보유.
@@ -2138,7 +2138,14 @@ mod auto_restore_tests {
         std::fs::create_dir_all(&dir).unwrap();
         match decide_auto_restore(&dir, false, &dir, "/usr/bin:/bin", "sock:test") {
             AutoRestore::Ready { args, .. } => {
-                assert!(args[0].ends_with("bin/javis_phoenix.py"), "폴백 후보 경로: {}", args[0]);
+                // args[0]는 String이라 String::ends_with는 바이트 비교 → Windows 백슬래시 경로
+                // (…\bin\javis_phoenix.py)가 "bin/javis_phoenix.py"와 불일치했다. Path::ends_with로
+                // 컴포넌트 비교해 크로스플랫폼 정합(b1_extract는 PathBuf라 이미 컴포넌트 비교).
+                assert!(
+                    std::path::Path::new(&args[0]).ends_with("bin/javis_phoenix.py"),
+                    "폴백 후보 경로: {}",
+                    args[0]
+                );
                 // args = [phoenix, "--socket", <sock>, "restore", "--auto"] — W6/E1 소켓 명시 전달.
                 assert_eq!(args[1], "--socket");
                 assert_eq!(&args[3..], &["restore".to_string(), "--auto".to_string()]);
@@ -2505,7 +2512,7 @@ mod auto_restore_tests {
             crate::state::now_epoch() as u64
         ));
         let _ = std::fs::create_dir_all(&dir);
-        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let daemon = Daemon::new(dir.join(crate::state::unique_sock_name()));
 
         // ① 정상 스코프: 등록 중 1개, 스코프 종료(drop) 후 빔.
         {
@@ -2563,7 +2570,7 @@ mod auto_restore_tests {
             crate::state::now_epoch() as u64
         ));
         let _ = std::fs::create_dir_all(&dir);
-        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let daemon = Daemon::new(dir.join(crate::state::unique_sock_name()));
         let log = dir.join("phoenix-restore.log");
 
         // sleep 후 특정 코드 종료 — 관측 창 확보 + exit 매핑 검증. wait() 가 reap 한다.

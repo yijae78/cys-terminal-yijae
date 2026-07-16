@@ -1943,7 +1943,7 @@ mod tests {
     fn daemon_approval_dedup_helpers_and_stale_clear() {
         let dir = std::env::temp_dir().join(format!("cys_feed_dedup_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let daemon = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let daemon = crate::state::Daemon::new(dir.join(crate::state::unique_sock_name()));
 
         assert!(!daemon.has_pending_daemon_approval(7));
         daemon.push_feed_notification(
@@ -1973,7 +1973,7 @@ mod tests {
     fn approval_stall_fires_once_per_item() {
         let dir = std::env::temp_dir().join(format!("cys_stall_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let daemon = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let daemon = crate::state::Daemon::new(dir.join(crate::state::unique_sock_name()));
         let mut rx = daemon.bus.subscribe();
         daemon.push_feed_notification("approval", "claude 승인 대기 감지 (surface:7)", "b", Some(7));
         // 인위 노화: created_at을 임계(기본 300s) 밖으로 이동
