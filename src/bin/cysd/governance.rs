@@ -1620,6 +1620,31 @@ fn queue_quiet_secs() -> u64 {
         .unwrap_or(3)
 }
 
+/// --queued 고착 방지 임계(초) — 큐 head가 이 시간 넘게 quiet 미달(노드 지속 출력)로 막히면
+/// quiet를 못 기다려도 강제 배달한다(0=비활성·구 무한대기 복원). 근거: 노드가 계속 working이라
+/// last_output이 3초 quiet에 영영 못 이르면 queued 보고가 무한 고착(실측 depth 9~12·2026-06-12).
+/// 강제 배달도 사람 입력 가드(queue_human_quiet_secs)는 그대로 통과해야 한다(미완성 입력 보호 불변).
+fn queue_max_wait_secs() -> u64 {
+    std::env::var("CYS_QUEUE_MAX_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(45)
+}
+
+/// starvation breaker 판정(순수·테스트용): 큐 head가 max_wait 넘게 굶었는가.
+/// 첫 관측 시 `since`를 지금으로 set하고, 큐가 비면 None으로 리셋한다. max==0=비활성(구 무한대기).
+fn queue_head_starving(empty: bool, since: &mut Option<std::time::Instant>, max: u64) -> bool {
+    if empty {
+        *since = None;
+        return false;
+    }
+    let waited = since
+        .get_or_insert_with(std::time::Instant::now)
+        .elapsed()
+        .as_secs();
+    max > 0 && waited >= max
+}
+
 /// 큐 적체 경보 임계 — 배달 못 한 채 depth가 이 값 이상이면 `queue.depth_high` 이벤트
 /// (기본 5 · CYS_QUEUE_DEPTH_ALERT, 0=비활성). master가 working 중이라 조용해지지 않으면
 /// 보고가 무음 적체된다(2026-06-12 실측 depth 9~12) — 침묵 대신 결정론 경보로 드러낸다.
@@ -1715,11 +1740,31 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             alert_queue_depth_if_high(daemon, &s, depth_alerted, "queue_paused(헬스 조치)");
             continue;
         }
-        // 아직 바쁨(출력 중) — steer는 즉시 전송이 담당, 큐는 기다린다.
+        // 아직 바쁨(출력 중) — steer는 즉시 전송이 담당, 큐는 기다린다. 단 노드가 계속 출력해
+        // quiet(출력 3초)에 영영 못 이르면 큐가 무한 고착된다(실측 depth 9~12·master 지속 working).
+        // starvation breaker: head가 max_wait 넘게 굶으면 quiet 미달이라도 강제 배달한다(사람 입력
+        // 가드는 아래에서 그대로 적용 — 미완성 입력엔 절대 끼어들지 않는다).
         let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
         if quiet_for < queue_quiet_secs() {
-            alert_queue_depth_if_high(daemon, &s, depth_alerted, "busy(출력 중)");
-            continue;
+            let starving = {
+                let empty = s.pending_queue.lock().unwrap().is_empty();
+                let mut since = s.queue_starving_since.lock().unwrap();
+                queue_head_starving(empty, &mut since, queue_max_wait_secs())
+            };
+            if !starving {
+                alert_queue_depth_if_high(daemon, &s, depth_alerted, "busy(출력 중)");
+                continue;
+            }
+            // 굶주림 임계 초과 → quiet 미달이라도 아래 배달로 진행.
+            daemon.bus.publish(
+                "queue.starvation_breaker",
+                "queue",
+                Some(s.id),
+                serde_json::json!({"quiet_for": quiet_for, "max_wait": queue_max_wait_secs()}),
+            );
+        } else {
+            // 정상 quiet — 굶주림 시계 리셋(다음 head는 새 창).
+            *s.queue_starving_since.lock().unwrap() = None;
         }
         // 사람 입력 흔적이 식기 전 배달 금지 — 미완성 입력에 이어붙기/제출 차단(R1 MED-2).
         let human_recent = s
@@ -1757,6 +1802,8 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             Some((text, q.len()))
         };
         if let Some((text, remaining)) = delivered {
+            // 배달 성공 → 굶주림 시계 리셋(다음 head가 새 max_wait 창을 받는다).
+            *s.queue_starving_since.lock().unwrap() = None;
             // T4-17 에코 제외 창 — 큐 배달도 원격 주입이다
             *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
             daemon.bus.publish(
@@ -1773,7 +1820,31 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{learn_stuck_candidates, plan_duplicate_kills};
+    use super::{learn_stuck_candidates, plan_duplicate_kills, queue_head_starving};
+
+    /// --queued 고착 방지(starvation breaker) 판정 불변식 박제.
+    /// 노드가 계속 출력해 quiet에 영영 못 이르는 무한 고착을 max_wait로 끊는다(실측 depth 9~12).
+    #[test]
+    fn queue_head_starving_breaks_infinite_busy() {
+        use std::time::{Duration, Instant};
+        let mut since: Option<Instant> = None;
+        // 빈 큐 → 굶주림 아님·시계 리셋(None 유지)
+        assert!(!queue_head_starving(true, &mut since, 45));
+        assert!(since.is_none());
+        // 비지 않은 큐 첫 관측 → 시계 set·아직 굶주림 아님(0초 경과)
+        assert!(!queue_head_starving(false, &mut since, 45));
+        assert!(since.is_some(), "첫 관측에 굶주림 시계가 set돼야 한다");
+        // 시계를 과거로 밀어 max 초과 재현 → 강제 배달 판정
+        since = Some(Instant::now() - Duration::from_secs(50));
+        assert!(queue_head_starving(false, &mut since, 45), "max 초과면 강제 배달");
+        // max=0(비활성) → 아무리 오래여도 굶주림 아님(구 무한대기 복원)
+        let mut old = Some(Instant::now() - Duration::from_secs(999));
+        assert!(!queue_head_starving(false, &mut old, 0), "max=0은 비활성");
+        // 큐가 비면 오래된 시계도 리셋된다(다음 head는 새 창)
+        let mut stale = Some(Instant::now() - Duration::from_secs(999));
+        assert!(!queue_head_starving(true, &mut stale, 45));
+        assert!(stale.is_none(), "큐 비면 시계 리셋");
+    }
 
     /// L3 재발방지 핀(2026-07-07 feed 189 폭주): 데몬 감지 항목의 surface 단위
     /// pending 판정·stale 스냅샷·멱등 해소 계약을 박제한다.
