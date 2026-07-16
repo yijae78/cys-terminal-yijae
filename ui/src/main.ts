@@ -2338,6 +2338,8 @@ function renderWsTabs() {
 // 최상단 대표(master=Nobel) 카드 + 구분선 + 노드 상태 목록(오브/뱃지/CTX 게이지). 데이터는
 // nodeSig(org.status 소비)를 실시간 렌더. 패널은 표시 전용 — 클릭은 buildTab mousedown 가드가 억제.
 const WSN_PILL: Record<string, string> = { w: "작업중", i: "대기", a: "확인" };
+// 노드 상태 박스 접힘 상태(로컬 영속·기본 펼침) — 활성 ws가 매 갱신마다 재렌더되므로 localStorage가 진실원.
+let wsnNodesCollapsed = localStorage.getItem("cys-wsn-nodes-collapsed") === "1";
 function wsnOrb(sig: NodeSig): "w" | "i" | "a" {
   if (sig.agent_alive === false || sig.idle_secs > 300) return "a"; // 확인 — 죽음/유휴 5분+
   if (sig.state === "working" && sig.idle_secs <= 60) return "w"; // 작업중
@@ -2495,15 +2497,35 @@ function buildNodePanel(ws: Workspace): HTMLElement {
   const owner = ownerIdx >= 0 ? rows.splice(ownerIdx, 1)[0] : rows.shift()!;
   panel.appendChild(buildOwnerCard(owner, isHome));
   if (rows.length) {
-    const div = document.createElement("div");
-    div.className = "wsn-div";
+    // 노드 상태 목록 전체를 하나의 글래스 카드 박스로 묶고, 헤더 클릭으로 접기/펼치기(신교수님 2026-07-16).
+    const box = document.createElement("div");
+    box.className = "wsn-nodebox";
+    const head = document.createElement("div");
+    head.className = "wsn-nodehead";
+    const chev = document.createElement("span");
+    chev.className = "wsn-chev";
     const label = document.createElement("div");
     label.className = "wsn-label";
     const b = document.createElement("b");
     b.textContent = String(rows.length);
     label.append(document.createTextNode("노드 상태 · "), b);
-    panel.append(div, label);
-    for (const s of rows) panel.appendChild(buildNodeRow(s, isHome));
+    head.append(chev, label);
+    const list = document.createElement("div");
+    list.className = "wsn-nodelist";
+    for (const s of rows) list.appendChild(buildNodeRow(s, isHome));
+    const applyCollapsed = () => {
+      chev.textContent = wsnNodesCollapsed ? "▸" : "▾";
+      list.classList.toggle("collapsed", wsnNodesCollapsed);
+    };
+    applyCollapsed();
+    head.addEventListener("click", (e) => {
+      e.stopPropagation(); // 헤더 토글 — 탭 전환/드래그로 새지 않게(.wsn-expand 가드와 별개로 방어)
+      wsnNodesCollapsed = !wsnNodesCollapsed;
+      localStorage.setItem("cys-wsn-nodes-collapsed", wsnNodesCollapsed ? "1" : "0");
+      applyCollapsed();
+    });
+    box.append(head, list);
+    panel.appendChild(box);
   }
   return panel;
 }
