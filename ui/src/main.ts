@@ -2371,9 +2371,10 @@ function wsnAvatarText(role: string | null, agent: string | null): string {
   const t = (role ?? agent ?? "?").trim();
   return (t[0] ?? "?").toUpperCase();
 }
-// master는 앱 브랜드명 Nobel, 그 외는 표준 노드 라벨(체크판 등 비표준 role은 title 폴백 — ccNodeLabel).
-function wsnNodeName(role: string | null, title: string | null): string {
-  return (role ?? "").toLowerCase() === "master" ? "Nobel" : ccNodeLabel(role, title);
+// 본진(기본 데몬 소켓)의 master만 앱 브랜드명 Nobel. 부서(dept) 소켓의 master는 그 부서의
+// 부서장이므로 Nobel이 아니다 — 표준 노드 라벨(ccNodeLabel)로 표기(신교수님 본진/부서 구분 2026-07-16).
+function wsnNodeName(role: string | null, title: string | null, isHome: boolean): string {
+  return isHome && (role ?? "").toLowerCase() === "master" ? "Nobel" : ccNodeLabel(role, title);
 }
 function wsnAgentSmall(agent: string | null): HTMLElement | null {
   const ag = wsnAgentLabel(agent);
@@ -2400,7 +2401,7 @@ function wsnPct(sig: NodeSig): HTMLElement | null {
   pct.textContent = `${sig.ctx_pct}%`;
   return pct;
 }
-function buildOwnerCard(sig: NodeSig): HTMLElement {
+function buildOwnerCard(sig: NodeSig, isHome: boolean): HTMLElement {
   const st = wsnOrb(sig);
   const card = document.createElement("div");
   card.className = "wsn-owner";
@@ -2412,7 +2413,7 @@ function buildOwnerCard(sig: NodeSig): HTMLElement {
   const name = document.createElement("div");
   name.className = "wsn-oname";
   const ns = document.createElement("span");
-  ns.textContent = wsnNodeName(sig.role, sig.title);
+  ns.textContent = wsnNodeName(sig.role, sig.title, isHome);
   name.appendChild(ns);
   const ag = wsnAgentSmall(sig.agent);
   if (ag) name.appendChild(ag);
@@ -2438,7 +2439,7 @@ function buildOwnerCard(sig: NodeSig): HTMLElement {
   card.append(av, info, badge);
   return card;
 }
-function buildNodeRow(sig: NodeSig): HTMLElement {
+function buildNodeRow(sig: NodeSig, isHome: boolean): HTMLElement {
   const st = wsnOrb(sig);
   const row = document.createElement("div");
   row.className = "wsn-node";
@@ -2450,7 +2451,7 @@ function buildNodeRow(sig: NodeSig): HTMLElement {
   const nm = document.createElement("div");
   nm.className = "wsn-nm";
   const ns = document.createElement("span");
-  ns.textContent = wsnNodeName(sig.role, sig.title);
+  ns.textContent = wsnNodeName(sig.role, sig.title, isHome);
   nm.appendChild(ns);
   const ag = wsnAgentSmall(sig.agent);
   if (ag) nm.appendChild(ag);
@@ -2476,6 +2477,7 @@ function buildNodeRow(sig: NodeSig): HTMLElement {
 function buildNodePanel(ws: Workspace): HTMLElement {
   const panel = document.createElement("div");
   panel.className = "wsn-expand";
+  const isHome = !ws.socket; // 본진(기본 데몬 소켓 undefined) 여부 — Nobel 라벨은 본진 master 한정
   const rows = collectSids(ws.tree)
     .map((id) => nodeSig.get(`${ws.socket}#${id}`))
     .filter((s): s is NodeSig => !!s);
@@ -2491,7 +2493,7 @@ function buildNodePanel(ws: Workspace): HTMLElement {
   // ① 최상단 대표 카드 = master(없으면 최우선 노드 = 부서 대표)
   const ownerIdx = rows.findIndex((s) => wsnRoleCat(s.role) === "master");
   const owner = ownerIdx >= 0 ? rows.splice(ownerIdx, 1)[0] : rows.shift()!;
-  panel.appendChild(buildOwnerCard(owner));
+  panel.appendChild(buildOwnerCard(owner, isHome));
   if (rows.length) {
     const div = document.createElement("div");
     div.className = "wsn-div";
@@ -2501,7 +2503,7 @@ function buildNodePanel(ws: Workspace): HTMLElement {
     b.textContent = String(rows.length);
     label.append(document.createTextNode("노드 상태 · "), b);
     panel.append(div, label);
-    for (const s of rows) panel.appendChild(buildNodeRow(s));
+    for (const s of rows) panel.appendChild(buildNodeRow(s, isHome));
   }
   return panel;
 }
