@@ -4243,31 +4243,51 @@ fn boot_agent_on_surface(
              재시도하라"
         ));
     }
-    // marker 감지 직후 TUI 입력 활성화까지 약간의 여유
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // marker 감지 직후 TUI 입력 활성화까지 여유 — 4s(구 2s). ready_marker(❯)는 claude 입력창이
+    // 그려지자마자 뜨지만, 대량 부트 경합·MCP 초기화 중엔 창이 떠도 입력을 아직 못 받는다(2026-07-16
+    // 근본수리 §1: premature-readiness). 첫 주입 유실 확률을 낮추려 정착을 늘린다.
+    std::thread::sleep(std::time::Duration::from_secs(4));
 
-    // 3) 지침 주입 — bracketed paste로 감싸 단일 입력으로 전달
-    inject_text(sid, &directive)?;
-
-    // 4) 주입 확인: 화면에 지침 머리말이 나타났는지 검사 (실패 시 경고)
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    let screen = request(
-        "surface.read_text",
-        json!({"surface_id": sid, "lines": 200}),
-    )?;
-    let flat: String = screen["text"]
-        .as_str()
-        .unwrap_or("")
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    if flat.contains("ABSOLUTEDIRECTIVE") || flat.contains("절대지침") {
-        eprintln!(
-            "[launch-agent] directive injected & visible on screen ({} bytes)",
-            directive.len()
-        );
-    } else {
-        eprintln!("[launch-agent] warning: directive not visible on screen — verify with `cys read-screen --surface {}`", surface_ref(sid));
+    // 3+4) 지침 주입 + 가시성 확인 — 재주입 자기치유(2026-07-16 launch-agent 자동주입 실패 근본수리).
+    //   증상: readiness는 통과하는데 첫 주입이 유실 → post-check "not visible" 경고만 하고 종료 →
+    //     지침 영영 미전달 → 매번 CSO/master 수동 주입(v0.12.54 6연속 재현·s112~132 bulk-boot).
+    //   실측 규명: ❯ 마커는 단일기동 ~5s 안정(마커 부재 아님)·PS 프롬프트엔 ❯ 없음(셸 오매치 아님)·
+    //     ready 상태 주입은 대화에 즉시 렌더돼 post-check 통과. → 실패는 '창은 떴으나 입력 미준비'
+    //     상태의 조기 주입 유실이며, post-check 실패는 곧 주입 유실의 확증이다(성공했다면 대화에 보임).
+    //   수리: 머리말 미가시면 백오프 재주입(최대 3회). post-check 실패=미착지가 확실하므로 재주입은
+    //     이중제출을 만들지 않는다(정상 기동은 1회 성공·거동 무변). 3회 모두 실패해야 경고로 종료.
+    let mut injected = false;
+    for attempt in 1..=3u32 {
+        inject_text(sid, &directive)?;
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let screen = request(
+            "surface.read_text",
+            json!({"surface_id": sid, "lines": 200}),
+        )?;
+        let flat: String = screen["text"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if flat.contains("ABSOLUTEDIRECTIVE") || flat.contains("절대지침") {
+            eprintln!(
+                "[launch-agent] directive injected & visible on screen ({} bytes, attempt {attempt}/3)",
+                directive.len()
+            );
+            injected = true;
+            break;
+        }
+        if attempt < 3 {
+            eprintln!(
+                "[launch-agent] directive not visible (attempt {attempt}/3) — claude가 아직 입력준비 전일 수 있음, 정착 후 재주입"
+            );
+            // 재주입 전 추가 정착 — 시도마다 증가(2s·4s)해 초기화 완료를 기다린다.
+            std::thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
+        }
+    }
+    if !injected {
+        eprintln!("[launch-agent] warning: directive not visible after 3 attempts — verify with `cys read-screen --surface {}`", surface_ref(sid));
     }
 
     // 5) T2-5 에이전트 메타 등록은 ★Phase 5 ①a로 기동 직후(위)로 이동했다 — readiness 폴링/주입
