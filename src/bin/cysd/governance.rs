@@ -1631,6 +1631,37 @@ fn queue_max_wait_secs() -> u64 {
         .unwrap_or(45)
 }
 
+/// bracketed paste 주입 후 CR(제출)까지의 정착 지연(ms) — 텍스트 길이 비례(2026-07-16 codex 수리).
+/// 근거: 고정 400ms는 장문 paste에 부족해, CR이 paste 소화 전에 도착하면 TUI(codex 실측)가 CR을
+/// 유실 → 입력창 텍스트 잔류·미실행('전송 확정 유실'). 길이에 비례해 정착을 늘려 CR 유실을 막는다.
+/// 짧은 메시지는 400ms 근처(거동 무변), 장문일수록 증가·상한 3000ms. CYS_QUEUE_PASTE_SETTLE_MS로
+/// base(기본 400) 조정 가능(0 지정 시 400 폴백 — 제출 전 최소 정착 보장).
+fn paste_settle_ms(text_len: usize) -> u64 {
+    let base = std::env::var("CYS_QUEUE_PASTE_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(400);
+    (base + text_len as u64 / 2).min(3000)
+}
+
+/// codex 전송확정 유실 안전 재시도 확인 창(초) — agent pane에 큐 배달 후 이 시간이 지나도
+/// 노드가 여전히 quiet(idle)면 제출(CR) 유실로 보고 확인 CR을 1회 재전송한다. 0=비활성.
+/// 창은 '제출 성공 시 Working 개시'에 걸리는 시간보다 커야 오탐(생성 중 재시도)이 없다(기본 5초).
+fn queue_confirm_secs() -> u64 {
+    std::env::var("CYS_QUEUE_CONFIRM_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
+}
+
+/// 확인 재시도 판정(순수·테스트용): agent pane이고 배달 후에도 여전히 quiet(idle)면 제출 유실로
+/// 판단해 확인 CR 재전송. Working(출력 중, quiet_for < thresh)이면 제출 성공이므로 재시도 안 함
+/// (생성 인터럽트 위험 0). 비-agent pane은 Enter=제출 의미가 보장되지 않아 재시도 안 함.
+fn should_confirm_retry(is_agent: bool, quiet_for: u64, quiet_thresh: u64) -> bool {
+    is_agent && quiet_for >= quiet_thresh
+}
+
 /// starvation breaker 판정(순수·테스트용): 큐 head가 max_wait 넘게 굶었는가.
 /// 첫 관측 시 `since`를 지금으로 set하고, 큐가 비면 None으로 리셋한다. max==0=비활성(구 무한대기).
 fn queue_head_starving(empty: bool, since: &mut Option<std::time::Instant>, max: u64) -> bool {
@@ -1730,6 +1761,30 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
         if s.exited.load(Ordering::Relaxed) {
             continue;
         }
+        // codex 전송확정 유실 안전 재시도: 직전 큐 배달(agent pane) 후 confirm 창이 지나도 노드가
+        // 여전히 quiet(idle)면 제출(CR)이 유실된 것 → 확인 CR 1회 재전송. Working(출력 중)이면 제출
+        // 성공이므로 재시도 안 함(생성 인터럽트 위험 0). last_output은 paste 렌더로도 전진하나, 창(5초)
+        // 뒤 다시 quiet면 '렌더만 하고 idle 복귀'=미제출로 판별된다(제출 성공은 응답 스트리밍으로 계속 출력).
+        let confirm_due = queue_confirm_secs() > 0
+            && s.queue_confirm_pending
+                .lock()
+                .unwrap()
+                .map(|t| t.elapsed().as_secs() >= queue_confirm_secs())
+                .unwrap_or(false);
+        if confirm_due {
+            let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
+            let is_agent = s.agent_meta.lock().unwrap().is_some();
+            *s.queue_confirm_pending.lock().unwrap() = None; // 1회만 재시도
+            if should_confirm_retry(is_agent, quiet_for, queue_quiet_secs()) {
+                let _ = s.write_tx.try_send(crate::state::WriteReq::Data(b"\r".to_vec()));
+                daemon.bus.publish(
+                    "queue.confirm_retry",
+                    "queue",
+                    Some(s.id),
+                    serde_json::json!({"quiet_for": quiet_for}),
+                );
+            }
+        }
         // T4-17 헬스 조치: pause-queue 발동 중인 surface는 배달 보류 — 적체는 침묵 금지
         if s.queue_paused_until
             .lock()
@@ -1792,7 +1847,10 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             };
             let req = crate::state::WriteReq::Inject {
                 text: text.clone(),
-                cr_delay_ms: 400,
+                // ★codex 전송확정 유실 수리(2026-07-16): cr_delay를 paste 길이 비례로. 고정 400ms는
+                // 장문 발주문에 부족해 CR이 paste 소화 전 도착 → codex TUI가 CR 유실(입력창 잔류·미실행,
+                // master 3회 실측). 길이 비례 정착으로 CR이 ingest 후 도착하게 한다(위험 0·대기만 증가).
+                cr_delay_ms: paste_settle_ms(text.len()),
                 clear_first: false, // queued 배달은 quiet 대기 후라 선정리 불필요(현행 동작 보존)
             };
             if s.write_tx.try_send(req).is_err() {
@@ -1804,6 +1862,11 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
         if let Some((text, remaining)) = delivered {
             // 배달 성공 → 굶주림 시계 리셋(다음 head가 새 max_wait 창을 받는다).
             *s.queue_starving_since.lock().unwrap() = None;
+            // codex 전송확정 유실 안전 재시도: agent pane이면 confirm 시계 arm(창 뒤 여전히 idle이면
+            // 확인 CR 재전송). 비-agent pane은 arm하지 않는다(Enter=제출 의미 미보장).
+            if s.agent_meta.lock().unwrap().is_some() {
+                *s.queue_confirm_pending.lock().unwrap() = Some(std::time::Instant::now());
+            }
             // T4-17 에코 제외 창 — 큐 배달도 원격 주입이다
             *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
             daemon.bus.publish(
@@ -1820,7 +1883,35 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{learn_stuck_candidates, plan_duplicate_kills, queue_head_starving};
+    use super::{
+        learn_stuck_candidates, paste_settle_ms, plan_duplicate_kills, queue_head_starving,
+        should_confirm_retry,
+    };
+
+    /// codex 전송확정 유실 수리 불변식: paste 정착 지연은 길이 비례·상한 3000ms.
+    #[test]
+    fn paste_settle_scales_with_length_and_caps() {
+        assert_eq!(paste_settle_ms(0), 400, "빈/짧은 텍스트는 base 400ms");
+        assert_eq!(paste_settle_ms(200), 500, "200자 → 400+100");
+        assert_eq!(paste_settle_ms(2000), 1400, "장문 → 비례 증가");
+        assert_eq!(paste_settle_ms(100_000), 3000, "상한 3000ms cap");
+        assert!(
+            paste_settle_ms(3000) > paste_settle_ms(400),
+            "길수록 정착이 길다(CR이 ingest 후 도착)"
+        );
+    }
+
+    /// 확인 재시도 판정: agent pane이고 배달 후 여전히 quiet(idle)일 때만 재전송.
+    #[test]
+    fn confirm_retry_only_when_agent_and_still_idle() {
+        // agent + 여전히 quiet(idle=제출 유실) → 재시도
+        assert!(should_confirm_retry(true, 6, 3));
+        // agent지만 Working(quiet_for < thresh=출력 중, 제출 성공) → 재시도 안 함(인터럽트 0)
+        assert!(!should_confirm_retry(true, 1, 3));
+        // 비-agent pane → 재시도 안 함(Enter=제출 의미 미보장)
+        assert!(!should_confirm_retry(false, 99, 3));
+    }
+
 
     /// --queued 고착 방지(starvation breaker) 판정 불변식 박제.
     /// 노드가 계속 출력해 quiet에 영영 못 이르는 무한 고착을 max_wait로 끊는다(실측 depth 9~12).

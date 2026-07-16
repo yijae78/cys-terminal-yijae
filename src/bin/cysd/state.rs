@@ -132,6 +132,10 @@ pub struct Surface {
     /// 노드가 계속 출력해 quiet에 영영 못 이르면(실측 depth 9~12) 이 시각 기준 max_wait 초과 시
     /// 강제 배달한다. 배달·큐 비움 시 None으로 리셋(다음 head는 새 창). 사람 입력 가드는 불변.
     pub queue_starving_since: Mutex<Option<Instant>>,
+    /// codex 전송확정 유실 안전 재시도: agent pane에 큐 배달(paste+CR)한 시각. confirm 창이 지나도
+    /// 노드가 여전히 quiet(idle=제출 유실)면 확인 CR 1회 재전송한다. Working(출력 중)=제출 성공이면
+    /// 재시도 안 함(생성 인터럽트 위험 0). 재시도·재배달·큐 비움 시 None.
+    pub queue_confirm_pending: Mutex<Option<Instant>>,
     /// T1-1 자기보고 상태 (`status.set` RPC)
     pub agent_status: Mutex<Option<AgentStatus>>,
     /// T2-5 에이전트 메타: launch-agent가 등록한 (agent 이름, 실행 바이너리)
@@ -1647,6 +1651,7 @@ impl Daemon {
             last_recall_line: Mutex::new(String::new()),
             pending_queue: Mutex::new(std::collections::VecDeque::new()),
             queue_starving_since: Mutex::new(None),
+            queue_confirm_pending: Mutex::new(None),
             agent_status: Mutex::new(None),
             agent_meta: Mutex::new(None),
             agent_seen: AtomicBool::new(false),
