@@ -2074,12 +2074,24 @@ mod auto_restore_tests {
         run_auto_restore_once, AutoRestore,
     };
 
+    // ★병렬 격리(2026-07-16): 이 모듈 테스트는 프로세스 전역 상태를 공유한다 — env var
+    // (CYS_PHOENIX_EXTRACT_FAIL 추출실패 seam·CYS_AUTORESTORE_RETRY_DELAY_MS)와 restore_roots
+    // static. 한 테스트가 env를 set한 채 다른 테스트가 extract_phoenix_embed/decide_auto_restore를
+    // 병렬 호출하면 seam이 누수돼 추출이 실패·부분정리 경합(b1_extract read_to_string TOCTOU 실패).
+    // 전역 상태를 만지는 테스트를 공용 락으로 직렬화한다. guard_restore_panic 등 의도적 panic이
+    // 락을 poison시키므로 into_inner로 회복(순서 보장만이 목적이라 데이터 무결성 무관).
+    static AR_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn ar_serial() -> std::sync::MutexGuard<'static, ()> {
+        AR_SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// ★P0-7 회귀 잠금(D1/W5·CI 실경로 ⑧): 양 플랫폼 accept_loop 가 콜드부트 부트 공통 함수를 호출하는지 소스
     /// 수준으로 잠근다 — Windows accept_loop 에 배선이 빠져 auto-restore 가 발동조차 안 하던 P0-7 최종 결함 재발
     /// 차단. 호출 형태가 정확히 2회(unix+windows)여야 한다. (needle 은 concat! 으로 쪼개 이 테스트 자신을 세지
     /// 않게 한다 — 소스에 contiguous 리터럴이 없다.)
     #[test]
     fn post_listen_boot_wired_in_both_accept_loops() {
+        let _s = ar_serial();
         let src = include_str!("main.rs");
         let needle = concat!("post_listen_boot", "(socket_path, &daemon)");
         let calls = src.matches(needle).count();
@@ -2094,6 +2106,7 @@ mod auto_restore_tests {
     /// panic 하는 body → guard 는 false 반환(전파 안 함)·phoenix-restore.log 에 PANIC 기록. 정상 body → true.
     #[test]
     fn guard_restore_panic_catches_and_logs_no_propagation() {
+        let _s = ar_serial();
         let dir = std::env::temp_dir().join(format!("cys-ar-panic-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("phoenix-restore.log");
@@ -2119,6 +2132,7 @@ mod auto_restore_tests {
     /// opt-out(CYS_NO_AUTORESTORE=1)이면 phoenix가 있어도 스폰하지 않는다.
     #[test]
     fn opted_out_never_spawns() {
+        let _s = ar_serial();
         let dir = std::env::temp_dir().join(format!("cys-ar-optout-{}", std::process::id()));
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -2134,6 +2148,7 @@ mod auto_restore_tests {
     /// args[0]=디스크 phoenix 경로(폴백 후보)로 유지된다.
     #[test]
     fn missing_disk_phoenix_still_ready_embed_authoritative() {
+        let _s = ar_serial();
         let dir = std::env::temp_dir().join(format!("cys-ar-missing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         match decide_auto_restore(&dir, false, &dir, "/usr/bin:/bin", "sock:test") {
@@ -2158,6 +2173,7 @@ mod auto_restore_tests {
     /// phoenix 설치 시 `python3 <phoenix> restore --auto` 스폰 스펙을 낸다(--auto 필수).
     #[test]
     fn present_phoenix_builds_auto_restore_command() {
+        let _s = ar_serial();
         let dir = std::env::temp_dir().join(format!("cys-ar-ready-{}", std::process::id()));
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -2182,6 +2198,7 @@ mod auto_restore_tests {
     /// 폴백**만 검증(program=="python3")했다 — 그 리터럴 단언만으로는 절대경로 해석 결함을 통과시킨다(설계 D4 지적).
     #[test]
     fn ready_prefers_bundled_python_absolute_path() {
+        let _s = ar_serial();
         let dir = std::env::temp_dir().join(format!("cys-ar-bundlepy-{}", std::process::id()));
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -2214,6 +2231,7 @@ mod auto_restore_tests {
     /// PATH 를 선두주입한다(GUI/데몬 최소 PATH 침묵사 근원 수리). "python3" 문자열 단언만으로는 불충분(D4).
     #[test]
     fn ready_injects_phoenix_cys_and_path_env() {
+        let _s = ar_serial();
         let dir = std::env::temp_dir().join(format!("cys-ar-env-{}", std::process::id()));
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -2253,6 +2271,7 @@ mod auto_restore_tests {
     /// 재차 FileNotFoundError 를 만들지 않는다 — phoenix 의 which→표준경로 폴백에 위임).
     #[test]
     fn ready_omits_phoenix_cys_when_absent() {
+        let _s = ar_serial();
         let dir = std::env::temp_dir().join(format!("cys-ar-nocys-{}", std::process::id()));
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -2279,6 +2298,7 @@ mod auto_restore_tests {
     /// ★codex W4 fix1: 추출 중간 실패(seam CYS_PHOENIX_EXTRACT_FAIL) 시 partial root 즉시 정리 — phoenix-embed 잔여 0.
     #[test]
     fn b1_extract_mid_failure_leaves_no_partial_root() {
+        let _s = ar_serial();
         let sd = std::env::temp_dir().join(format!("cys-b1mf-{}", std::process::id()));
         std::fs::create_dir_all(&sd).unwrap();
         std::env::set_var("CYS_PHOENIX_EXTRACT_FAIL", "1");
@@ -2296,6 +2316,7 @@ mod auto_restore_tests {
     /// phoenix.py 는 일치해도 형제(javis_state_snapshot.py) 부재/stale 이면 거부(어느 rel 인지 보고).
     #[test]
     fn b1_disk_fallback_full_tree_verify() {
+        let _s = ar_serial();
         let pack = std::env::temp_dir().join(format!("cys-b1ft-{}", std::process::id()));
         let bin = pack.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -2322,6 +2343,7 @@ mod auto_restore_tests {
     /// 임베드 내용 그대로 쓴다. temp 누수 0: 정리 후 디렉터리 소멸.
     #[test]
     fn b1_extract_writes_phoenix_and_deps() {
+        let _s = ar_serial();
         let sd = std::env::temp_dir().join(format!("cys-b1x-{}", std::process::id()));
         std::fs::create_dir_all(&sd).unwrap();
         let (root, script) = extract_phoenix_embed(&sd).expect("추출 성공");
@@ -2347,6 +2369,7 @@ mod auto_restore_tests {
     /// ★B1③: 추출된 실 phoenix 가 --selftest 를 통과한다(python3 가용 시). self-test 게이트 실증.
     #[test]
     fn b1_self_test_passes_on_real_embed() {
+        let _s = ar_serial();
         let py = match std::process::Command::new("python3").arg("--version").output() {
             Ok(o) if o.status.success() => "python3".to_string(),
             _ => {
@@ -2367,6 +2390,7 @@ mod auto_restore_tests {
     /// ★B1 temp 누수 0: 크래시로 남은 이전 추출 디렉터리를 부트 시 prune 한다(정리 후 phoenix-embed 비움).
     #[test]
     fn b1_prune_stale_embed_dirs() {
+        let _s = ar_serial();
         use super::prune_stale_phoenix_embed;
         let sd = std::env::temp_dir().join(format!("cys-b1p-{}", std::process::id()));
         let root = sd.join("phoenix-embed");
@@ -2394,6 +2418,7 @@ mod auto_restore_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn b3_bundled_python_absolute_path_preferred() {
+        let _s = ar_serial();
         let dir = std::env::temp_dir().join(format!("cys-b3-{}", std::process::id()));
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -2416,6 +2441,7 @@ mod auto_restore_tests {
     /// ★B3: 동봉 runtime 이 없으면 program 은 "python3" 리터럴(PATH 폴백).
     #[test]
     fn b3_no_bundled_python_falls_back_to_literal() {
+        let _s = ar_serial();
         let dir = std::env::temp_dir().join(format!("cys-b3-nolit-{}", std::process::id()));
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -2432,6 +2458,7 @@ mod auto_restore_tests {
     /// run_auto_restore_once 대신 스크립트 러너를 주입해 sleep 0 으로 결정론 검증(60s 실 sleep 회귀 회피).
     #[test]
     fn retry_first_nonzero_then_noop_runs_twice() {
+        let _s = ar_serial();
         let calls = RefCell::new(Vec::<u32>::new());
         // 1차=exit 1(비0) → 2차=exit 0(수동 복원 후 재산정 NOOP). 스폰은 각 attempt 1회씩만(중복 0).
         let scripted = |attempt: u32| -> Option<i32> {
@@ -2446,6 +2473,7 @@ mod auto_restore_tests {
     /// ★재시도 소진: 2차도 비0이면 무한 재시도 금지(정확히 2회에서 종료).
     #[test]
     fn retry_exhausts_after_one_retry() {
+        let _s = ar_serial();
         let n = RefCell::new(0u32);
         let runs = loop_auto_restore_with(
             |_a| {
@@ -2461,6 +2489,7 @@ mod auto_restore_tests {
     /// ★exit 5(BREAKER)·6(CORRUPT/identity)=재시도 금지 — 정확히 1회 실행.
     #[test]
     fn breaker_and_corrupt_never_retry() {
+        let _s = ar_serial();
         for code in [5, 6] {
             let n = RefCell::new(0u32);
             let runs = loop_auto_restore_with(
@@ -2477,6 +2506,7 @@ mod auto_restore_tests {
     /// ★성공(0)은 재시도 없음 — 1회 실행.
     #[test]
     fn success_runs_once() {
+        let _s = ar_serial();
         let runs = loop_auto_restore_with(|_a| Some(0), Duration::from_millis(0));
         assert_eq!(runs, 1);
     }
@@ -2484,6 +2514,7 @@ mod auto_restore_tests {
     /// ★스폰 실패(None)도 비0 클래스 — 1회 재시도 후 소진(2회).
     #[test]
     fn spawn_failure_retries_once() {
+        let _s = ar_serial();
         let runs = loop_auto_restore_with(|_a| None, Duration::from_millis(0));
         assert_eq!(runs, 2, "None(스폰 실패)도 1회 재시도 후 종료");
     }
@@ -2491,6 +2522,7 @@ mod auto_restore_tests {
     /// ★CYS_AUTORESTORE_RETRY_DELAY_MS override 파싱(기본 60000·override 반영).
     #[test]
     fn retry_delay_env_override() {
+        let _s = ar_serial();
         // 기본값
         std::env::remove_var("CYS_AUTORESTORE_RETRY_DELAY_MS");
         assert_eq!(autorestore_retry_delay(), Duration::from_millis(60_000));
@@ -2505,6 +2537,7 @@ mod auto_restore_tests {
     /// 복원 종료 후 잔존 자손이 authoritative 면제를 얻는 A7 취약이 재발한다.
     #[test]
     fn restore_roots_cleared_on_all_paths_l1() {
+        let _s = ar_serial();
         use crate::state::{Daemon, RestoreRootGuard};
         let dir = std::env::temp_dir().join(format!(
             "cys-l1-{}-{}",
@@ -2563,6 +2596,7 @@ mod auto_restore_tests {
     #[cfg(unix)]
     #[test]
     fn run_auto_restore_once_reaps_and_clears_l1() {
+        let _s = ar_serial();
         use crate::state::Daemon;
         let dir = std::env::temp_dir().join(format!(
             "cys-l1run-{}-{}",
