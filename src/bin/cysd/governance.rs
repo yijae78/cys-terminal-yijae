@@ -2418,8 +2418,12 @@ mod tests {
     // 빈 항목은 버린다(기존 동작 보존). split_paths가 Unix에서 ':'로 가른다.
     #[test]
     fn parse_todo_dirs_drops_empty_entries() {
-        // 구버전 split(':').filter(!is_empty)와 동치임을 확인.
-        let dirs = parse_todo_dirs("/a/b::/c/d");
+        // 구버전 split(sep).filter(!is_empty)와 동치임을 확인. sep는 플랫폼 PATH 목록 구분자
+        // (unix ':' / windows ';')로 split_paths와 일치시켜야 크로스플랫폼으로 성립한다 — ':' 하드코딩은
+        // Windows에서 split_paths(';' 사용)와 어긋나 분해가 안 돼 실패했다(구 사전존재 테스트버그).
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let raw = format!("/a/b{sep}{sep}/c/d");
+        let dirs = parse_todo_dirs(&raw);
         assert_eq!(dirs, vec![PathBuf::from("/a/b"), PathBuf::from("/c/d")]);
         assert!(parse_todo_dirs("").is_empty());
     }
@@ -2609,7 +2613,14 @@ mod tests {
             n
         ));
         let _ = std::fs::create_dir_all(&dir);
-        Daemon::new(dir.join("cysd.sock"))
+        // 소켓 파일명을 고유화한다 — Windows state_dir은 socket 부모 dir이 아니라
+        // LOCALAPPDATA/cys/{pipe_slug} 를 쓰고(RC-13 부서 격리), pipe_slug은 소켓 파일명에서 파생된다.
+        // 모든 drill이 'cysd.sock'(slug='cysdsock')이면 state_dir을 공유해 topology.json·.corrupt-*
+        // 아티팩트가 테스트 간(그리고 실행 간)에 누수돼 topology 테스트가 병렬·재실행에서 깨졌다.
+        // 파일명에 tag+pid+epoch+seq를 넣어 slug를 고유화하면 Windows에서도 drill마다 격리된다
+        // (unix는 state_dir이 socket 부모라 원래 격리됨 — 이 변경은 무해).
+        let sock = format!("cysd-{}-{}-{}-{}.sock", tag, std::process::id(), now_epoch() as u64, n);
+        Daemon::new(dir.join(sock))
     }
 
     /// 역할 보유 surface(live pid) 하나를 만들어 roles·surfaces에 등록하고 id 반환.
