@@ -44,6 +44,7 @@ spawn(생성) 백엔드 2종:
 
 import argparse
 import atexit
+import glob
 import json
 import os
 import re
@@ -2143,17 +2144,31 @@ def cmd_inherit(args):
 
 
 def _read_worker_todo():
-    """WORKER_TODO 에서 미완(- [ ]) 항목 개수와 최근 섹션 제목을 추출(실측 요약)."""
-    cand = os.path.join(os.environ.get("CYS_PACK_DIR", os.path.join(HOME, ".cys", "pack")),
-                        "round", "WORKER_TODO.md")
-    if not os.path.exists(cand):
-        return {"path": cand, "exists": False}
-    txt = open(cand, errors="replace").read()
-    open_items = txt.count("- [ ]")
-    done_items = txt.count("- [x]")
-    secs = re.findall(r"^#\s*(.+)$", txt, re.M)
-    return {"path": cand, "exists": True, "open_items": open_items, "done_items": done_items,
-            "last_section": secs[-1][:80] if secs else None}
+    """워커 todo 미완(- [ ]) 집계(실측 요약). ★복수 워커 정합(2026-07-16): cys todo-path 가
+    worker-2 등 역할별 고유 파일(WORKER*_TODO.md)을 만들므로 WORKER_TODO.md 단일 하드코딩을
+    글롭 집계로 교체 — 다중 워커 환경에서 잘못된/일부 todo 만 읽는 결함 봉합."""
+    rdir = os.path.join(os.environ.get("CYS_PACK_DIR", os.path.join(HOME, ".cys", "pack")),
+                        "round")
+    files = sorted(glob.glob(os.path.join(rdir, "WORKER*_TODO.md")))
+    if not files:
+        return {"path": os.path.join(rdir, "WORKER*_TODO.md"), "exists": False}
+    open_items = done_items = 0
+    per_file, last_section = [], None
+    for cand in files:
+        try:
+            txt = open(cand, errors="replace").read()
+        except OSError:
+            continue
+        o, d = txt.count("- [ ]"), txt.count("- [x]")
+        open_items += o
+        done_items += d
+        secs = re.findall(r"^#\s*(.+)$", txt, re.M)
+        if secs:
+            last_section = secs[-1][:80]
+        per_file.append({"path": cand, "open_items": o, "done_items": d})
+    return {"path": files[0] if len(files) == 1 else rdir, "exists": True,
+            "open_items": open_items, "done_items": done_items,
+            "last_section": last_section, "files": per_file}
 
 
 # ------------------------------------------------------------------ status

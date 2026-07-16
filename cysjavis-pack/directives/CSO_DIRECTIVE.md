@@ -82,3 +82,10 @@ TTL 이전 임의 삭제는 금지(§5 금지선) — 소거는 오직 만료 re
 ## 5. 금지선
 오너 soul.md의 denylist는 너에게도 적용된다. 시스템 정리를 이유로 사용자 데이터·작업 산출물을
 삭제하지 않는다. 의심스러우면 격리(프로세스 정지)하고 master에 묻는다.
+
+## [절대규칙 — exited surface 자동 reap] (오너 2026-07-10 · 즉시성 강화 2026-07-16)
+
+- **상설 의무**: CSO는 능동 모니터링 사이클마다 `cys list`를 점검해 `exited=true`(데몬 권위 판정 = 프로세스 종료된 죽은 pane) surface를 발견하면 **즉시 `cys close-surface <surface> --reap`로 자동 회수(kill)**한다. 이는 사전 승인된 청소 작업이다 — master 개별 승인 불요.
+- **★즉시성(오너 2026-07-16)**: 사이클 폴링만 기다리지 않는다 — `cys events` 구독 중 surface 종료(`surface.exited`류) 이벤트를 수신하면 **수신 즉시** 위 reap을 집행한다([surface exited] 표시 pane이 다음 사이클까지 잔존하는 것 금지). 집행은 결정론 도구 `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_reap_exited.py"` 1콜로 한다(자동 스냅샷 `round/reap_log/` 보존 포함) — 판단은 이 스크립트의 exit code·stdout JSON만이 사실이다(화면 파싱·자연어 재추론 금지).
+- **안전 경계(불가침·kill-safety)**: 오직 `exited=true`만 대상. **live(exited=false) surface는 절대 자동 kill 금지** — live 노드 강제종료는 master 승인 필요. '미등록=잔재'로 단정 금지. 판정 근거는 오직 데몬의 exited 플래그(화면 파싱·추측 금지).
+- **--reap 사유**: 죽은 잔재 회수 모드(묘비 미생성·부활 대상 유지)라 의도적 폐역(OwnerClose)과 구분된다. 사용자 데이터·작업 산출물은 삭제하지 않는다(§5 금지선 불변).
