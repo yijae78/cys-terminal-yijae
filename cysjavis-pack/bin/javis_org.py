@@ -251,14 +251,24 @@ def cmd_status(path=None):
     return 0 if ok else 1
 
 def tar_snapshot(key, workdir, dest_dir=None):
-    """--purge-workdir 의무 선행. 성공 시 경로 반환, 실패(소스 없음) 시 None → 호출자가 rm 중단."""
+    """--purge-workdir 의무 선행. 성공 시 경로 반환, 실패(소스 없음·예외) 시 None → 호출자가 rm 중단."""
     if not workdir or not os.path.isdir(workdir): return None
     dest_dir = dest_dir or f"{HOME}/.cys/dept-snapshots"
     os.makedirs(dest_dir, exist_ok=True)
     stamp = os.environ.get("CYS_SNAP_STAMP", str(int(os.path.getmtime(workdir))))
     out = os.path.join(dest_dir, f"{key}-{stamp}.tar.gz")
-    with tarfile.open(out, "w:gz") as tar:
-        tar.add(workdir, arcname=os.path.basename(workdir.rstrip("/")))
+    # ★D1b(purge-safety 2026-07-16): 읽기불가 항목(TCC 거부 등)의 예외가 raw traceback으로 전파되고
+    # 부분 tar가 잔존하던 결함 봉인 — 예외=부분 tar 정리 후 None(_snapshot_gate의 fail-closed 경로).
+    try:
+        with tarfile.open(out, "w:gz") as tar:
+            tar.add(workdir, arcname=os.path.basename(workdir.rstrip("/")))
+    except (OSError, tarfile.TarError) as ex:
+        sys.stderr.write("[snapshot] %s 실패: %s: %s\n" % (workdir, type(ex).__name__, ex))
+        try:
+            if os.path.exists(out): os.remove(out)
+        except OSError:
+            pass
+        return None
     return out if os.path.exists(out) else None
 
 def _snapshot_gate(name, workdir):
@@ -275,6 +285,26 @@ def _snapshot_gate(name, workdir):
 # ★기능2: 격리(휴지통) 루트 — 삭제는 전부 mv로 통일(백업 없는 rm 금지). cys-dept의 TRASH_ROOT와 동일
 # 규약 · discover_depts glob(`cys-dept-*`)은 `cys-trash/`를 무매치 = 재발견 절단(부활 차단·복구 양립).
 TRASH_ROOT = f"{HOME}/.local/state/cys-trash"
+
+# ★D1a(purge-safety 2026-07-16): workdir 격리 자격 게이트 — deny-by-default allowlist.
+# 실사고: 전 부서 레지스트리 cwd=$HOME라 --purge-workdir가 홈 전체를 스냅샷(TCC .Trash에서 사망)하고,
+# 성공했다면 홈을 trash로 mv하는 파괴 경로였다. cwd는 에이전트 작업 디렉토리(공유 가능) 의미이므로,
+# 스냅샷·격리는 레지스트리 엔트리가 workdir_owned=true로 소유권을 선언한 부서 전용 경로에만 허용한다.
+_PROTECTED_ROOTS = ("/", "/Users", "/tmp", "/var", "/private/tmp", "/private/var")
+
+def _workdir_quarantine_eligible(workdir, entry):
+    """(eligible, label). 평가 순서: 부재 → 보호루트/홈 → 소유 미선언 → 홈 밖(realpath) → 적격."""
+    if not (workdir and os.path.isdir(workdir)):
+        return False, "workdir_absent_skip"
+    real = os.path.realpath(workdir)
+    home = os.path.realpath(HOME)
+    if real == home or real in tuple(os.path.realpath(p) for p in _PROTECTED_ROOTS):
+        return False, "workdir_protected_skip"
+    if entry.get("workdir_owned") is not True:
+        return False, "workdir_shared_skip"
+    if not real.startswith(home + os.sep):
+        return False, "workdir_outside_home_skip"
+    return True, "workdir_owned"
 
 def _quarantine(src, trash_dir, label):
     """삭제 대신 격리(mv → trash_dir/label). 대상(디렉토리) 없으면 None, 격리하면 action 튜플."""
@@ -296,15 +326,31 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_stat
     # 조회가 빈값이 된다(종전 post-down 재조회 rmtree는 이 때문에 실운영에서 no-op이던 잠복결함).
     reg = load_json(DEPTS, {"depts":{}}); e = reg["depts"].get(name, {})
     workdir = expand(e.get("cwd",""))
-    # 1) 작업물 삭제는 의무 스냅샷 뒤에만 — 단 workdir 부재면 skip(no-op·abort 금지)
+    # 1) 작업물 삭제는 의무 스냅샷 뒤에만 — 단 D1a 자격 게이트 통과(소유 선언) 경로에서만.
+    #    부적격(공유 cwd·홈·보호루트·부재)=skip 후 진행(no-op — state·pack 격리는 계속).
+    wd_eligible = False
     if purge_workdir:
-        proceed, action = _snapshot_gate(name, workdir)
-        actions.append(action)
-        if not proceed:
-            return actions  # abort_no_snapshot (workdir 존재+스냅샷 실패만)
+        wd_eligible, wd_label = _workdir_quarantine_eligible(workdir, e)
+        if not wd_eligible:
+            actions.append((wd_label, workdir))
+            sys.stderr.write("[destroy] %s: workdir 격리 skip(%s) — %s\n" % (name, wd_label, workdir))
+        else:
+            proceed, action = _snapshot_gate(name, workdir)
+            actions.append(action)
+            if not proceed:
+                return actions  # abort_no_snapshot (workdir 존재+스냅샷 실패만)
     # 2) cys-dept down 위임 — purge_state면 --purge-state 전달(state 격리도 프리미티브에 위임·단일소유).
     #    CYS_TRASH_STAMP 공유로 프리미티브도 동일 trash 하위(<name>-<ts>/state)에 격리.
-    down_cmd = ["cys-dept", "down", name] + (["--purge-state"] if purge_state else [])
+    # ★D1c(purge-safety 2026-07-16): PATH 의존 제거 — GUI(Finder 런칭) PATH엔 cys-dept가 없어
+    #   FileNotFoundError로 죽던 잠복결함 + PATH 선두의 부서팩 forwarder가 base판을 가리던 드리프트 봉인.
+    #   검증기(javis_purge_verify.py)와 동일하게 자기 디렉토리에서 해소. CYS_DEPT_BIN=테스트 주입용.
+    cys_dept = os.environ.get("CYS_DEPT_BIN") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "cys-dept")
+    if not os.path.exists(cys_dept):
+        actions.append(("down", 127))
+        sys.stderr.write("[destroy] %s: cys-dept 미발견(%s) — down 불가\n" % (name, cys_dept))
+        return actions  # down 실패로 cmd_destroy가 비0 판정
+    down_cmd = [cys_dept, "down", name] + (["--purge-state"] if purge_state else [])
     r = subprocess.run(down_cmd, capture_output=True, text=True,
                        env={**os.environ, "CYS_TRASH_STAMP": ts})
     actions.append(("down", r.returncode))
@@ -319,8 +365,8 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_stat
         pack = f"{HOME}/.cys/pack-dept-{name}"
         a = _quarantine(pack, trash_dir, "pack")
         if a: actions.append(a)
-    # 4) workdir 격리(down 전 포착 경로 사용)
-    if purge_workdir:
+    # 4) workdir 격리(down 전 포착 경로 사용) — D1a 자격 게이트 통과 시에만(스냅샷과 대칭)
+    if purge_workdir and wd_eligible:
         a = _quarantine(workdir, trash_dir, "workdir")
         if a: actions.append(a)
     # ★F1(reviewer1): purge_state 성공 경로에 사후 결정론 검증기를 배선한다 — 라이브에서도 재등재0·
@@ -341,25 +387,31 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_stat
 
 def cmd_destroy(args):
     require_cso()
-    reg = load_json(DEPTS, {"depts":{}})
-    targets = list(reg.get("depts", {}).keys()) if args.all else ([args.dept] if args.dept else [])
-    if not targets: sys.stderr.write("[destroy] 대상 없음(--dept 또는 --all)\n"); return 4
-    allres = {}
-    failed = False   # ★F1: down·검증 실패 누적 — 최종 exit 판정
-    for name in targets:
-        mk = reg["depts"].get(name, {}).get("mission_key")
-        res = destroy_dept(name, mk, purge=args.purge, purge_workdir=args.purge_workdir,
-                           purge_state=args.purge_state)
-        allres[name] = res
-        if any(a[0]=="abort_no_snapshot" for a in res):
-            sys.stderr.write(f"[destroy] {name}: 스냅샷 실패 → 작업물 삭제 중단(fail-closed)\n"); return 1
-        # ★F1(reviewer1): down·사후검증 실패는 최종 exit 비0 — 부분 성공을 "done"·0으로 오보 금지
-        #   (state 잔존→재발견→부활 차단 붕괴를 조용히 통과시키던 결함 봉인).
-        if any(a[0]=="down" and a[1]!=0 for a in res) or any(a[0]=="verify" and a[1]!=0 for a in res):
-            failed = True
-    print(json.dumps({"destroy": "done" if not failed else "incomplete", "targets": allres,
-                      "note": "forwarder는 소켓 소멸 후 ~30s self-reap(직접 회수 안 함)"}, ensure_ascii=False))
-    return 1 if failed else 0
+    # ★D1d(purge-safety 2026-07-16): 예외가 raw traceback으로 GUI 토스트까지 새던 결함 봉인 —
+    #   최상위에서 1줄 사유로 정직 보고하고 비0 반환(SystemExit=require_cso 등은 그대로 전파).
+    try:
+        reg = load_json(DEPTS, {"depts":{}})
+        targets = list(reg.get("depts", {}).keys()) if args.all else ([args.dept] if args.dept else [])
+        if not targets: sys.stderr.write("[destroy] 대상 없음(--dept 또는 --all)\n"); return 4
+        allres = {}
+        failed = False   # ★F1: down·검증 실패 누적 — 최종 exit 판정
+        for name in targets:
+            mk = reg["depts"].get(name, {}).get("mission_key")
+            res = destroy_dept(name, mk, purge=args.purge, purge_workdir=args.purge_workdir,
+                               purge_state=args.purge_state)
+            allres[name] = res
+            if any(a[0]=="abort_no_snapshot" for a in res):
+                sys.stderr.write(f"[destroy] {name}: 스냅샷 실패 → 작업물 삭제 중단(fail-closed)\n"); return 1
+            # ★F1(reviewer1): down·사후검증 실패는 최종 exit 비0 — 부분 성공을 "done"·0으로 오보 금지
+            #   (state 잔존→재발견→부활 차단 붕괴를 조용히 통과시키던 결함 봉인).
+            if any(a[0]=="down" and a[1]!=0 for a in res) or any(a[0]=="verify" and a[1]!=0 for a in res):
+                failed = True
+        print(json.dumps({"destroy": "done" if not failed else "incomplete", "targets": allres,
+                          "note": "forwarder는 소켓 소멸 후 ~30s self-reap(직접 회수 안 함)"}, ensure_ascii=False))
+        return 1 if failed else 0
+    except Exception as ex:
+        sys.stderr.write("[destroy] 실행 실패: %s: %s\n" % (type(ex).__name__, ex))
+        return 1
 
 def classify_dept(alive, intake):
     if not alive: return "redeploy"   # 소켓 死 → 멱등 apply 재실행(cys-dept REUSE_DEAD 재spawn)
@@ -585,6 +637,44 @@ def self_test():
     chk("snapgate-absent-skip", proceed_abs and act_abs[0]=="workdir_absent_skip", "workdir 부재인데 abort(영구 락인)")
     proceed_pre, act_pre = _snapshot_gate("authoring", src)  # src는 위에서 생성된 실재 workdir
     chk("snapgate-present-snap", proceed_pre and act_pre[0]=="snapshot", "workdir 존재인데 스냅샷 안 됨")
+    # --- D1a(purge-safety): workdir 격리 자격 게이트 truth table ---
+    chk("wdgate-absent", _workdir_quarantine_eligible(os.path.join(td,"nope-wd2"), {}) == (False,"workdir_absent_skip"),
+        "부재 workdir 판정 오류")
+    chk("wdgate-home", _workdir_quarantine_eligible(HOME, {"workdir_owned": True}) == (False,"workdir_protected_skip"),
+        "홈이 보호루트로 차단 안 됨(소유 선언으로도 우회 불가여야 — 실사고 재발 경로)")
+    chk("wdgate-root", _workdir_quarantine_eligible("/", {"workdir_owned": True}) == (False,"workdir_protected_skip"),
+        "루트가 차단 안 됨")
+    chk("wdgate-shared", _workdir_quarantine_eligible(src, {}) == (False,"workdir_shared_skip"),
+        "소유 미선언(공유) workdir이 skip 안 됨")
+    chk("wdgate-outside", _workdir_quarantine_eligible(src, {"workdir_owned": True}) == (False,"workdir_outside_home_skip"),
+        "홈 밖(tmp) workdir이 소유 선언만으로 통과(경계 붕괴)")
+    _owned = os.path.join(HOME, ".cys", "selftest-wd-%d" % os.getpid())
+    os.makedirs(_owned, exist_ok=True)
+    try:
+        chk("wdgate-owned", _workdir_quarantine_eligible(_owned, {"workdir_owned": True}) == (True,"workdir_owned"),
+            "적격(홈 내부+소유 선언) workdir이 거부됨")
+        _link = os.path.join(_owned, "esc-link")
+        try:
+            os.symlink(td, _link)
+            chk("wdgate-symlink-escape", _workdir_quarantine_eligible(_link, {"workdir_owned": True})[0] is False,
+                "심링크로 홈 밖 탈출이 통과(realpath 우회)")
+        finally:
+            if os.path.islink(_link): os.remove(_link)
+    finally:
+        os.rmdir(_owned)
+    # --- D1b(purge-safety): tar_snapshot 예외 fail-closed(부분 tar 정리·None 반환) ---
+    _real_ld = os.listdir
+    def _deny_ld(p="."):
+        if str(p).endswith("deny-dir"): raise PermissionError(1, "Operation not permitted", str(p))
+        return _real_ld(p)
+    src_deny = os.path.join(td, "wd-deny"); os.makedirs(os.path.join(src_deny, "deny-dir"), exist_ok=True)
+    os.listdir = _deny_ld
+    try:
+        snapped = tar_snapshot("denytest", src_deny, dest_dir=td)
+    finally:
+        os.listdir = _real_ld
+    chk("snap-exc-none", snapped is None, "읽기불가 예외인데 None 아님(traceback 전파 결함 재발)")
+    chk("snap-exc-clean", not [f for f in _real_ld(td) if f.startswith("denytest-")], "실패 부분 tar 잔존")
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False))
     return 1 if failures else 0

@@ -2040,10 +2040,14 @@ async fn stop_dept_daemon_by_socket(socket: String) -> Result<(), String> {
 }
 
 /// ★기능2(2026-07-15): 부서 완전 폐역(purge) — teardown을 넘어 대화기억(state·transcripts.db)까지
-/// 격리해 부활을 영구 차단한다. javis_org.py destroy 오케스트레이터에 일임(state·pack-dept·workdir
-/// 3디렉토리를 ~/.local/state/cys-trash/ 로 격리·묘비 영구 존치·재발견 glob 절단). CSO 전용 게이트라
+/// 격리해 부활을 영구 차단한다. javis_org.py destroy 오케스트레이터에 일임(state·pack-dept
+/// 2디렉토리를 ~/.local/state/cys-trash/ 로 격리·묘비 영구 존치·재발견 glob 절단). CSO 전용 게이트라
 /// CYS_ROLE=cso 로 호출하고, base 레지스트리 대상이므로 CYS_SOCKET 은 제거한다(부서 소켓 오염 방지).
 /// 실패는 Err 로 GUI 에 정직 표기(무음 삼킴 금지). stop_dept_daemon_by_socket 과 socket→name 규약 공유.
+/// ★D2a(purge-safety 2026-07-16): --purge-workdir 는 GUI 에서 요청하지 않는다 — 실사고: 전 부서
+/// 레지스트리 cwd=$HOME(공유 에이전트 작업 디렉토리)라 홈 전체 스냅샷(TCC .Trash 에서 사망)·성공 시
+/// 홈 mv 파괴 경로였다. 백엔드 D1a 게이트(workdir_owned 선언제)가 이중 방어하나 GUI 계약도 정직하게
+/// "작업 폴더 보존"으로 고정한다(모달 고지문과 동일 커밋 — 변경 결합).
 #[tauri::command]
 async fn purge_dept_daemon_by_socket(socket: String) -> Result<String, String> {
     let name = dept_name_from_socket(&socket)
@@ -2058,7 +2062,6 @@ async fn purge_dept_daemon_by_socket(socket: String) -> Result<String, String> {
             .arg("destroy")
             .args(["--dept", &name])
             .arg("--purge")
-            .arg("--purge-workdir")
             .arg("--purge-state");
         no_console(&mut cmd);
         cmd.output()
@@ -3201,5 +3204,23 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         assert!(!plan.osascript_arg.starts_with("do shell script '"));
         assert!(plan.osascript_arg.contains("'/usr/local/bin/cys'"));
         assert!(plan.osascript_arg.contains("ln -sf"));
+    }
+
+    /// ★D2a(purge-safety 2026-07-16) 회귀 트립와이어: GUI purge 는 --purge-workdir 를 절대
+    /// 되살리지 않는다 — 전 부서 cwd=$HOME 현실에서 홈 스냅샷·격리(파괴) 경로였다(실사고).
+    /// 재도입하려면 백엔드 D1a 게이트(workdir_owned)와 모달 고지문("작업 폴더 보존")을 함께 바꿔야
+    /// 하며, 그 전에 이 테스트가 막는다.
+    #[test]
+    fn purge_dept_cmd_never_requests_workdir_purge() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("async fn purge_dept_daemon_by_socket")
+            .expect("purge_dept_daemon_by_socket 정의 소실 — 트립와이어 재배선 필요");
+        let seg = &src[start..start + src[start..].find("\n#[tauri::command]").unwrap_or(src.len() - start)];
+        assert!(
+            !seg.contains("--purge-workdir"),
+            "GUI purge 가 --purge-workdir 를 다시 요청함 — 홈 파괴 경로 재개방(실사고 2026-07-16 재발)"
+        );
+        assert!(seg.contains("--purge-state"), "purge 명령 골격 변형 — 트립와이어 재검토 필요");
     }
 }

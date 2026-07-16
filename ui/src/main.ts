@@ -11,6 +11,7 @@ import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
 import { deptPlaceholderLabel } from "./deptlabel";
+import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purgeconfirm";
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
@@ -4292,7 +4293,9 @@ function purgeConfirmModal(
       info.exists
         ? `대화기억(state) 크기 ${info.sizeHuman} · 최종 수정 ${info.mtime}`
         : "대화기억(state) 디렉토리 없음(격리 대상 없음)",
-      "삭제되는 것: 부서 데몬 종료 + 대화기억·pack·작업물 격리 + 재시작 부활 영구 차단(묘비 존치).",
+      // ★D2a(purge-safety 2026-07-16): 작업 폴더(cwd)는 격리하지 않는다 — 전 부서 cwd=$HOME(공유)
+      // 현실에서 "작업물 격리" 고지는 홈 격리 약속이 되는 오도였다. GUI는 --purge-workdir 미요청.
+      "삭제되는 것: 부서 데몬 종료 + 대화기억·pack 격리 + 재시작 부활 영구 차단(묘비 존치). 작업 폴더(cwd)는 보존됩니다.",
       info.isLast ? "⚠ 이 부서가 마지막입니다 — 삭제 시 CEO가 표준 master로 강등됩니다." : "",
       "복구: 즉시 삭제가 아니라 ~/.local/state/cys-trash/ 로 격리 보관되어 되돌릴 수 있고, 약 14일 후 자동 소거됩니다.",
       `계속하려면 아래에 부서명 "${name}" 을 정확히 입력하세요.`,
@@ -4302,15 +4305,22 @@ function purgeConfirmModal(
     ov.innerHTML =
       `<div class="modal"><h3></h3><p class="modal-label" style="white-space:pre-wrap"></p>` +
       `<input class="modal-input" type="text" />` +
+      `<div class="modal-hint" aria-live="polite"></div>` +
       `<div class="modal-btns"><button class="modal-no">취소</button>` +
       `<button class="modal-yes" disabled>완전 삭제</button></div></div>`;
     (ov.querySelector("h3") as HTMLElement).textContent = `부서 "${name}" 완전 삭제(부활 차단)`;
     (ov.querySelector(".modal-label") as HTMLElement).textContent = notice;
     const inp = ov.querySelector(".modal-input") as HTMLInputElement;
     const yes = ov.querySelector(".modal-yes") as HTMLButtonElement;
+    const hint = ov.querySelector(".modal-hint") as HTMLElement;
+    // ★D3b(purge-safety 2026-07-16): macOS 자동 대문자화가 소문자 입력을 재교정해 정확 재입력조차
+    // 불일치가 되던 실사고 차단 — 확인 입력엔 자동 교정 3종을 끈다(계약=PURGE_INPUT_GUARDS).
+    for (const [k, v] of PURGE_INPUT_GUARDS) inp.setAttribute(k, v);
     inp.placeholder = name;
     inp.addEventListener("input", () => {
-      yes.disabled = inp.value.trim() !== name;
+      // ★D3c: 불일치는 침묵이 아니라 사유를 말한다(비활성 버튼 무반응 오인 방지).
+      yes.disabled = !purgeNameMatches(inp.value, name);
+      hint.textContent = purgeMismatchHint(inp.value, name);
     });
     const done = (v: boolean) => {
       ov.remove();
@@ -4377,12 +4387,16 @@ async function purgeDept(ws: Workspace) {
   // ★[F3] 데몬 폐역 구간 동안 restart를 배제(manualRestartAllDaemons·checkVersionSkew가 purgingDept 존중).
   purgingDept = true;
   try {
+    // ★D2b(purge-safety 2026-07-16): 실패는 8초 자동소멸 toast가 아니라 sticky — 실사고에서 사용자가
+    // 실패 사실 자체를 인지하지 못했다("눌러도 무반응"). 재시도 진입 시 이전 실패는 갱신/해소된다.
+    const failId = `purge-fail-${ws.socket}`;
     try {
       await invoke("purge_dept_daemon_by_socket", { socket: ws.socket });
     } catch (e) {
-      toast("watchdog", "부서 완전 삭제 실패", `${e} — 삭제되지 않았습니다.`);
+      stickyToast(failId, "watchdog", "부서 완전 삭제 실패", `${nm}: ${e} — 삭제되지 않았습니다.`);
       return;
     }
+    dismissToast(failId);
     toast("watchdog", "부서 완전 삭제 완료", `${nm} — 대화기억은 격리 보관(복구 가능)·재시작 부활 차단.`);
     // 프론트 pane·탭 정리(데몬은 이미 down — close_surface 실패는 관용).
     for (const sid of collectSids(ws.tree)) {

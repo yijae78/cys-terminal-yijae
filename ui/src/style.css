@@ -524,6 +524,11 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
   background: var(--bg); color: var(--canvas-text); cursor: pointer; font-size: 13px;
 }
 .modal-btns .modal-yes { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+/* ★D3a(purge-safety 2026-07-16): 비활성이 활성과 픽셀 동일해 "눌러도 무반응"으로 오인되던 실사고 —
+   #btn-ws-dept:disabled(위 113행)와 동일 관용구로 모달 버튼 전체에 비활성 시각화. */
+.modal-btns button:disabled { opacity: .5; cursor: default; }
+/* 완전삭제 확인 입력의 불일치 실시간 힌트(modal-trust 계열 경고색·빈 상태 높이 예약) */
+.modal-hint { font-size: 11px; color: #f59e0b; margin: 6px 0 0; min-height: 14px; }
 
 /* 07 Command Palette (⌘K) — modal-overlay + ctx-menu 패턴 합성 */
 .palette-overlay {
