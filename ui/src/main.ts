@@ -5,8 +5,8 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
-import { shellQuote, shellQuoteJoin } from "./shellquote";
-import { insertionText, isStreaming } from "./ftdrop";
+import { shellQuote } from "./shellquote";
+import { baseName, insertionText, isStreaming, splitPath } from "./ftdrop";
 import { transferTrees } from "./transfer";
 import { updatePlan } from "./updateplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
@@ -526,7 +526,7 @@ async function refreshBoard() {
           })
           .join("");
   outHost.querySelectorAll<HTMLElement>(".cc-board-out-item").forEach((b) =>
-    b.addEventListener("click", () => invoke("open_path", { path: b.dataset.path }).catch(() => {})),
+    b.addEventListener("click", () => { if (b.dataset.path) void openPathChecked(b.dataset.path); }),
   );
 }
 
@@ -639,7 +639,7 @@ async function refreshBoardRuns() {
         .join("")
     : `<div class="cc-empty">최근 실행 없음</div>`;
   host.querySelectorAll<HTMLElement>(".cc-run-art").forEach((b) =>
-    b.addEventListener("click", () => invoke("open_path", { path: b.dataset.path }).catch(() => {})),
+    b.addEventListener("click", () => { if (b.dataset.path) void openPathChecked(b.dataset.path); }),
   );
 }
 
@@ -915,7 +915,7 @@ async function refreshLearn() {
     assetsHost.innerHTML = assetRows.join("");
     assetsHost.querySelectorAll<HTMLElement>(".cc-asset-chip").forEach((c) =>
       c.addEventListener("click", () => {
-        if (c.dataset.path) invoke("open_path", { path: c.dataset.path }).catch(() => {});
+        if (c.dataset.path) void openPathChecked(c.dataset.path);
       }),
     );
   }
@@ -1235,7 +1235,7 @@ function jumpEvidence(ev: string) {
   } else if (/^[0-9a-f]{7,40}$/i.test(ev)) {
     toast("feed", "🔗 커밋 근거", ev); // SHA — 표시(점프 대상 없음)
   } else {
-    invoke("open_path", { path: ev }).catch(() => toast("watchdog", "근거 파일 없음", ev));
+    void openPathChecked(ev); // 실패 사유(비존재·실행형)별 정확한 안내는 헬퍼가 담당
   }
 }
 
@@ -2210,12 +2210,32 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
     surfaces: { surface_id: number; live_cwd: string | null; role?: string | null; agent?: string | null }[];
   } | null;
   const me = r?.surfaces.find((s) => s.surface_id === sid);
-  const isAgent = !!(me?.role || me?.agent);
-  const cwd = me?.live_cwd ?? null;
+  // fail-closed: RPC 실패·미발견이면 분류 불가 — 살아있는 에이전트를 '셸'로 오분류해
+  // 핸드오프 없이 닫는 파괴 분기로의 fail-open 금지(적대검증 최강 공격 봉인).
+  if (!me) {
+    toast("watchdog", "전출 불가", "pane 상태를 확인할 수 없습니다(RPC 실패) — 원본은 그대로입니다");
+    return;
+  }
+  const isAgent = !!(me.role || me.agent);
+  const cwd = me.live_cwd ?? null;
+  // 에이전트인데 cwd 미확보면 핸드오프 파일 검증이 불가 — 지시 주입 '전'에 중단(오염 방지).
+  if (isAgent && !cwd) {
+    toast("watchdog", "전출 불가", "pane의 현재 경로를 확인할 수 없습니다 — 원본은 그대로입니다");
+    return;
+  }
+  // 역할 승계: 원 역할 그대로 재기동(무음 worker 강등 금지). 데몬 유래 값이지만 명령 조합에
+  // 들어가므로 형식 가드([a-z0-9-]) — 벗어나면 worker 폴백. 리뷰어는 전용 CLI 처방(RESTART와 동일).
+  const srcRole = me.role && /^[a-z0-9-]{1,32}$/.test(me.role) ? me.role : "worker";
+  const LAUNCH_BY_ROLE: Record<string, string> = {
+    "reviewer-gemini": "agy --dangerously-skip-permissions",
+    "reviewer-codex": "codex --dangerously-bypass-approvals-and-sandbox",
+  };
+  const launchCmd = LAUNCH_BY_ROLE[srcRole] ?? `cys launch-agent --role ${srcRole} --agent claude`;
   const ok = await confirmModal(
     "부서 간 전출",
     isAgent
-      ? "부서 간 전출은 핸드오프 문서로 맥락을 승계한 재기동입니다. 진행 중이던 응답(라이브 추론 상태)은 이어지지 않습니다. 진행하시겠습니까?"
+      ? `부서 간 전출은 핸드오프 문서로 맥락을 승계한 재기동입니다(${srcRole} 역할로 재기동). ` +
+          "진행 중이던 응답(라이브 추론 상태)은 이어지지 않습니다. 진행하시겠습니까?"
       : "이 pane은 에이전트 미등록(셸)입니다 — 같은 경로의 새 셸을 대상 부서에 만들고 이 pane을 닫습니다. 진행하시겠습니까?",
     "전출",
   );
@@ -2223,36 +2243,37 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
   try {
     let handoffPath: string | null = null;
     if (isAgent) {
-      // ① 핸드오프 지시 주입(CR 포함 제출 — 워커가 파일을 기록한다)
-      const base = cwd || "~";
-      handoffPath = `${base}/_round/handoffs/transfer-${sid}-${Date.now()}.md`;
+      // ① 핸드오프 지시 주입(CR 포함 제출 — 워커가 파일을 기록한다). cwd는 위에서 확보 보장.
+      handoffPath = `${cwd}/_round/handoffs/transfer-${sid}-${Date.now()}.md`;
       const inst =
-        `지금까지의 작업 상태를 HANDOFF_CONTRACT 5필드(Decided/Rejected/Risks/Files/Remaining)로 ` +
-        `${handoffPath} 에 기록하라(디렉토리가 없으면 mkdir -p로 생성). 파일 생성 완료가 전출 준비 완료 신호다.\r`;
+        `지금까지의 작업 상태를 HANDOFF_CONTRACT 5필드로 ${handoffPath} 에 기록하라` +
+        `(디렉토리가 없으면 mkdir -p로 생성). 각 필드는 정확히 "## Decided" "## Rejected" "## Risks" ` +
+        `"## Files" "## Remaining" 마크다운 헤더로 쓰고, 해당 없음은 "없음"으로 명기하라. ` +
+        `5필드가 모두 기록된 파일이 전출 준비 완료 신호다.\r`;
       await invoke("send_input", { socket: srcSock, surfaceId: sid, data: inst });
-      // ② 파일 실존 대기(3초 간격·최대 120초) — 화면 파싱이 아니라 파일시스템 확인(결정론).
-      //    cwd를 모르면(~) 파일 확인이 불가하므로 위 base 폴백은 cwd 확보 실패 시 전출을 중단한다.
-      if (!cwd) {
-        toast("watchdog", "전출 중단", "pane의 현재 경로를 확인할 수 없습니다 — 원본은 그대로입니다");
-        return;
-      }
+      // ② 5필드 내용 검증 대기(3초 간격·최대 120초) — 화면 파싱이 아니라 파일 내용 확인(결정론).
       stickyToast("transfer", "feed", "전출 준비 중", "핸드오프 기록 대기(최대 120초)…");
-      const dir = handoffPath.slice(0, handoffPath.lastIndexOf("/"));
-      const name = handoffPath.slice(handoffPath.lastIndexOf("/") + 1);
+      // 파일 실존≠내용 유효 — 5필드(HANDOFF_CONTRACT)가 전부 갖춰질 때까지 대기한다.
+      // 부분 기록(아직 쓰는 중)도 다음 틱에 재확인되므로 조기 통과가 없다.
+      const FIELDS = ["## Decided", "## Rejected", "## Risks", "## Files", "## Remaining"];
       const deadline = Date.now() + 120_000;
       let ready = false;
       while (Date.now() < deadline) {
         await new Promise((res) => setTimeout(res, 3000));
-        const ents = (await invoke("list_dir", { path: dir }).catch(() => null)) as
-          | { name: string }[]
+        const head = (await invoke("read_text_head", { path: handoffPath }).catch(() => null)) as
+          | string
           | null;
-        if (ents?.some((en) => en.name === name)) {
+        if (head && FIELDS.every((f) => head.includes(f))) {
           ready = true;
           break;
         }
       }
       if (!ready) {
-        toast("watchdog", "전출 중단", "핸드오프가 기록되지 않았습니다(120초) — 원본은 그대로입니다");
+        toast(
+          "watchdog",
+          "전출 중단",
+          "핸드오프가 기록되지 않았거나 5필드가 미완성입니다(120초) — 원본은 그대로입니다",
+        );
         return;
       }
     }
@@ -2261,23 +2282,44 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
     destWs.tree = destWs.tree
       ? { type: "split", dir: "row", a: destWs.tree, b: { type: "pane", sid: newSid } }
       : { type: "pane", sid: newSid };
-    if (isAgent) {
-      // ④ 에이전트 재기동(노드 재기동 처방과 동일 명령) — 복원 지시는 queued(조용 시점 배달)로
-      //    부팅 중 주입을 피한다(데몬 deliver_queued가 quiet 시점에 순서대로 배달).
-      await invoke("send_input", {
-        socket: destWs.socket,
-        surfaceId: newSid,
-        data: "cys launch-agent --role worker --agent claude\r",
-      });
-      await invoke("send_input", {
-        socket: destWs.socket,
-        surfaceId: newSid,
-        data: `너는 전출된 워커다. ${handoffPath} 를 읽고 작업을 이어가라.`,
-        queued: true,
-      });
+    // ③ 이후 실패는 보상 트랜잭션 — 새 pane 회수+트리 복원으로 "원본 보존"을 거짓말이 아니게 한다.
+    try {
+      if (isAgent) {
+        // ④ 에이전트 재기동(노드 재기동 처방과 동일 명령)
+        await invoke("send_input", {
+          socket: destWs.socket,
+          surfaceId: newSid,
+          data: `${launchCmd}\r`,
+        });
+        // agent-ready 폴링(최대 60초): agent_meta 등록을 확인한 뒤 복원 지시를 보낸다 —
+        // queued(조용 시점 배달)만으로는 부팅 중 quiet 순간에 떨어져 유실될 수 있다(이중 안전).
+        stickyToast("transfer", "feed", "전출 진행 중", "새 워커 기동 대기…");
+        const readyBy = Date.now() + 60_000;
+        while (Date.now() < readyBy) {
+          await new Promise((res) => setTimeout(res, 3000));
+          const rr = (await invoke("list_surfaces", { socket: destWs.socket }).catch(() => null)) as {
+            surfaces: { surface_id: number; role?: string | null; agent?: string | null }[];
+          } | null;
+          const ns = rr?.surfaces.find((s) => s.surface_id === newSid);
+          if (ns?.agent || ns?.role) break; // 등록 확인 — 미확인이어도 queued가 2차 안전망
+        }
+        await invoke("send_input", {
+          socket: destWs.socket,
+          surfaceId: newSid,
+          data: `너는 전출된 워커다. ${handoffPath} 를 읽고 작업을 이어가라.`,
+          queued: true,
+        });
+      }
+      // ⑤ 재기동 성공 후에만 원본 정리
+      await invoke("close_surface", { socket: srcSock, surfaceId: sid });
+    } catch (e) {
+      await invoke("close_surface", { socket: destWs.socket, surfaceId: newSid }).catch(() => {});
+      destroyPaneRuntime(newSid, destWs.socket);
+      if (destWs.tree) destWs.tree = replaceNode(destWs.tree, newSid, () => null);
+      render();
+      toast("watchdog", "전출 실패", `${e} — 원본 pane은 보존되고 새 pane은 회수했습니다`);
+      return;
     }
-    // ⑤ 재기동 성공 후에만 원본 정리(실패는 catch에서 가시화 — 원본 보존)
-    await invoke("close_surface", { socket: srcSock, surfaceId: sid });
     destroyPaneRuntime(sid, srcSock);
     if (srcWs.tree) srcWs.tree = replaceNode(srcWs.tree, sid, () => null);
     if (focusedSid === sid) focusedSid = collectSids(current()?.tree ?? null)[0] ?? null;
@@ -3420,7 +3462,7 @@ async function renderFileTree() {
     label.textContent = "파일";
     return;
   }
-  label.textContent = (ftPinned ? "📌 " : "") + (ftRoot.split("/").pop() || ftRoot);
+  label.textContent = (ftPinned ? "📌 " : "") + (baseName(ftRoot) || ftRoot);
   label.title = ftPinned ? `${ftRoot}\n📌 고정됨 — 클릭하면 pane 경로 자동 추종으로 복귀` : ftRoot;
   label.onclick = ftPinned
     ? () => {
@@ -3440,9 +3482,10 @@ async function renderFileTree() {
   pathLine.title = ftRoot;
   const frag = await buildDirNodes(ftRoot, 0);
   body.innerHTML = "";
-  // F5: 상위 폴더 행 — 더블클릭으로 한 단계 위로(단일 클릭 무동작 = 오클릭 방지)
-  if (ftRoot !== "/") {
-    const parent = ftRoot.slice(0, ftRoot.lastIndexOf("/")) || "/";
+  // F5: 상위 폴더 행 — 더블클릭으로 한 단계 위로(단일 클릭 무동작 = 오클릭 방지).
+  // parent===ftRoot(루트 "/"·"C:\")면 생략 — 자기 자신으로의 루프 방지.
+  const parent = splitPath(ftRoot).parent;
+  if (parent && parent !== ftRoot) {
     const up = document.createElement("div");
     up.className = "ft-row dir";
     up.style.paddingLeft = "8px";
@@ -3481,7 +3524,7 @@ async function buildDirNodes(dir: string, depth: number): Promise<DocumentFragme
         else ftExpanded.add(full);
         renderFileTree();
       } else {
-        void openFtPath(full); // F1: 실패 가시화 + 실행형 확인
+        void openPathChecked(full); // F1: 실패 가시화 + 실행형 확인
       }
     });
     if (ent.is_dir) row.addEventListener("dblclick", () => setFtRoot(full, true)); // F5(D2b)
@@ -3500,7 +3543,7 @@ async function buildDirNodes(dir: string, depth: number): Promise<DocumentFragme
 
 // F1: 파일 열기 — 실패 무음 금지(feed_reply dead-button 수리와 동일 처방).
 // 실행형 파일은 백엔드가 executable_confirm으로 거절 → 확인 후 force 재호출(fail-closed).
-async function openFtPath(full: string) {
+async function openPathChecked(full: string) {
   try {
     await invoke("open_path", { path: full });
   } catch (e) {
@@ -3545,7 +3588,7 @@ function ftContextMenu(e: MouseEvent, full: string, isDir: boolean) {
     { label: full, action: () => {}, disabled: true }, // F4: 경로 표시(아래 복사와 짝)
     { label: "경로 복사", action: () => copyPath(full) },
   ];
-  if (!isDir) items.push({ label: "열기", action: () => void openFtPath(full) });
+  if (!isDir) items.push({ label: "열기", action: () => void openPathChecked(full) });
   items.push({
     label: "Finder에서 보기",
     action: () =>
@@ -3577,8 +3620,8 @@ function ftContextMenu(e: MouseEvent, full: string, isDir: boolean) {
 // ④형식 결정(에이전트=@멘션/미등록=셸 인용) ⑤주입+피드백. 자동 Return 없음 — 전송은 사람 몫.
 async function injectPathsToPane(rt: PaneRuntime, paths: string[]) {
   for (const p of paths) {
-    const parent = p.slice(0, p.lastIndexOf("/")) || "/";
-    const name = p.slice(p.lastIndexOf("/") + 1);
+    // Windows OS 드롭 경로는 "\" 구분 — splitPath가 양쪽 구분자를 인식(POSIX-only 파싱 회귀 방지)
+    const { parent, name } = splitPath(p);
     const entries = (await invoke("list_dir", { path: parent }).catch(() => null)) as
       | { name: string }[]
       | null;
@@ -3641,7 +3684,7 @@ function startFtDrag(e0: MouseEvent, full: string) {
       ftDragConsumed = true;
       ghost = document.createElement("div");
       ghost.id = "drag-ghost";
-      ghost.textContent = full.split("/").pop() || full;
+      ghost.textContent = baseName(full) || full;
       document.body.append(ghost);
     }
     ghost!.style.left = `${e.clientX + 10}px`;

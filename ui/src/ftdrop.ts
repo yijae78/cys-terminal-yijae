@@ -5,6 +5,18 @@
 
 import { shellQuote, shellQuoteJoin } from "./shellquote";
 
+// 경로 분해 — 트리 경로는 "/" 결합이지만 live_cwd 유래 경로(Windows)는 "\"일 수 있어 양쪽 인식.
+export function splitPath(p: string): { parent: string; name: string } {
+  const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+  if (i < 0) return { parent: "", name: p };
+  let parent = p.slice(0, i);
+  if (parent === "") parent = "/"; // "/file"
+  if (/^[A-Za-z]:$/.test(parent)) parent += "\\"; // "C:\file" → 드라이브 루트
+  return { parent, name: p.slice(i + 1) };
+}
+
+export const baseName = (p: string): string => splitPath(p).name;
+
 // cwd 기준 상대화 — cwd 바깥 경로는 절대경로 유지(../ 사슬은 가독성·정확성을 해친다).
 export function relativize(abs: string, cwd: string | null): string {
   if (!cwd) return abs;

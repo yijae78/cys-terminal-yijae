@@ -498,6 +498,15 @@ fn open_path(path: String, force: Option<bool>) -> Result<(), String> {
     // 실재하는 로컬 경로만 허용 — URL 스킴·존재하지 않는 문자열이 OS 런처에 닿지 않게
     let meta = std::fs::metadata(&path).map_err(|e| format!("not a local path: {e}"))?;
     if !force.unwrap_or(false) && meta.is_file() {
+        // 근본한계 명문화: '열기=실행'이 되는 타입의 완전 열거는 불가능하다(OS·설치 앱에 따라
+        // 확장). 게이트 = 실행비트(unix) + 위험 확장자 목록(문서-실행형 포함) — 목록 밖 신종
+        // 타입은 통과할 수 있으므로 신뢰 없는 파일은 Finder/탐색기에서 확인이 원칙이다.
+        fn ext_of(path: &str) -> String {
+            std::path::Path::new(path)
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default()
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -505,16 +514,23 @@ fn open_path(path: String, force: Option<bool>) -> Result<(), String> {
                 return Err("executable_confirm".into());
             }
         }
-        #[cfg(windows)]
-        {
-            let ext = std::path::Path::new(&path)
-                .extension()
-                .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
-            if ["exe", "bat", "cmd", "com", "scr", "ps1", "msi"].contains(&ext.as_str()) {
-                return Err("executable_confirm".into());
-            }
+        // macOS 문서-실행형: 실행비트 없이도 open이 설치·명령 실행으로 이어지는 타입
+        #[cfg(target_os = "macos")]
+        if ["pkg", "mpkg", "command", "terminal", "tool"].contains(&ext_of(&path).as_str()) {
+            return Err("executable_confirm".into());
         }
+        // Windows: 실행비트가 없어 확장자 게이트 — 스크립트·핸들러 실행형 전반
+        #[cfg(windows)]
+        if [
+            "exe", "bat", "cmd", "com", "scr", "ps1", "msi", "vbs", "vbe", "js", "jse",
+            "wsf", "wsh", "hta", "lnk", "reg", "jar", "pif", "scf", "cpl", "msc",
+        ]
+        .contains(&ext_of(&path).as_str())
+        {
+            return Err("executable_confirm".into());
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let _ = ext_of; // linux 등에서 미사용 경고 억제(실행비트 게이트만 적용)
     }
     #[cfg(target_os = "macos")]
     let r = std::process::Command::new("open").arg(&path).spawn();
@@ -524,6 +540,20 @@ fn open_path(path: String, force: Option<bool>) -> Result<(), String> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let r = std::process::Command::new("xdg-open").arg(&path).spawn();
     r.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// 전출(F6-2) 핸드오프 내용 검증용 텍스트 헤드 읽기 — 파일 실존≠내용 유효이므로
+/// UI가 5필드(HANDOFF_CONTRACT)를 확인한다. 실재 파일만, 기본 64KB 캡(대파일 프리즈 방지).
+#[tauri::command]
+fn read_text_head(path: String, max_bytes: Option<u64>) -> Result<String, String> {
+    let meta = std::fs::metadata(&path).map_err(|e| format!("not a local path: {e}"))?;
+    if !meta.is_file() {
+        return Err("not a file".into());
+    }
+    let cap = max_bytes.unwrap_or(65536).min(1_048_576) as usize;
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let head = &bytes[..bytes.len().min(cap)];
+    Ok(String::from_utf8_lossy(head).into_owned())
 }
 
 /// 파일 관리자에서 해당 항목을 선택해 보여준다 (macOS Finder reveal / Windows explorer select).
@@ -2782,6 +2812,7 @@ fn main() {
             list_dir,
             open_path,
             reveal_path,
+            read_text_head,
             open_url,
             send_key,
             read_board_catalog,

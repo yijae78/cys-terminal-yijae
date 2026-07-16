@@ -1,6 +1,24 @@
 // ftdrop.ts 순수 함수 회귀 테스트 (bun test — 신규 의존성 0).
 import { describe, expect, test } from "bun:test";
-import { insertionText, isStreaming, relativize } from "./ftdrop";
+import { baseName, insertionText, isStreaming, relativize, splitPath } from "./ftdrop";
+
+describe("splitPath", () => {
+  test("POSIX 경로", () => {
+    expect(splitPath("/a/b/c.txt")).toEqual({ parent: "/a/b", name: "c.txt" });
+    expect(splitPath("/file")).toEqual({ parent: "/", name: "file" });
+  });
+  test("Windows 역슬래시·드라이브 루트", () => {
+    expect(splitPath("C:\\Users\\x\\f.txt")).toEqual({ parent: "C:\\Users\\x", name: "f.txt" });
+    expect(splitPath("C:\\f.txt")).toEqual({ parent: "C:\\", name: "f.txt" });
+  });
+  test("혼합 구분자(트리가 / 로 결합한 Windows 경로)", () => {
+    expect(splitPath("C:\\Users\\x/f.txt")).toEqual({ parent: "C:\\Users\\x", name: "f.txt" });
+  });
+  test("구분자 없음", () => {
+    expect(splitPath("f.txt")).toEqual({ parent: "", name: "f.txt" });
+    expect(baseName("f.txt")).toBe("f.txt");
+  });
+});
 
 describe("relativize", () => {
   test("cwd 안 경로는 상대화", () => {
