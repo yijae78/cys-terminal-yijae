@@ -2593,12 +2593,14 @@ function buildTab(ws: Workspace): HTMLElement {
     sub.appendChild(txt);
   }
   tab.append(titleRow, sub);
-  // 활성 ws는 그 아래에 노드 상태 인디케이터(대표 카드+노드 목록)를 펼친다(Q1-A 오너 결정 2026-07-16).
-  if (!ws.pending && workspaces.indexOf(ws) === activeWs) tab.appendChild(buildNodePanel(ws));
+  // 노드 상태 인디케이터(대표 카드+노드 목록)는 모든 탭에 상시 렌더 — 부서 탭도 노벨 본진과 동일
+  // 컴포넌트·동일 로직으로 클릭 전에 활동을 보인다(신교수님 2026-07-16 R2 ③). 전역 접기 토글로 컴팩트 유지.
+  if (!ws.pending) tab.appendChild(buildNodePanel(ws));
   tab.addEventListener("mousedown", (e) => {
     // 우클릭은 전환하지 않음 — render()가 탭 DOM을 재생성하면 컨텍스트 메뉴가 죽은 엘리먼트를 잡는다
     if (e.button !== 0 || e.target === close) return;
-    if ((e.target as HTMLElement)?.closest?.(".wsn-expand")) return; // 노드 패널은 표시 전용 — 탭 전환·드래그 억제
+    // 노드 패널: 활성 탭에선 표시 전용(탭 전환·드래그 억제). 비활성(부서) 탭에선 패널을 눌러도 그 탭으로 전환되게 통과(상시 렌더 ③).
+    if (workspaces.indexOf(ws) === activeWs && (e.target as HTMLElement)?.closest?.(".wsn-expand")) return;
     if ((e.target as HTMLElement)?.isContentEditable) return; // rename 편집 중엔 전환·드래그 금지
     const i = workspaces.indexOf(ws); // 그룹 재배열로 시각 순서≠배열 순서 — 실시간 위치로 전환
     if (i !== activeWs) {
