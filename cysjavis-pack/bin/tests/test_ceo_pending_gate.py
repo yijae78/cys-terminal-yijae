@@ -3,7 +3,9 @@
 
 가짜 HOME(팩 directives·registry)+스텁 cys($HOME/.local/bin — cys-dept PATH prepend 1순위)로
 실 데몬 무접촉 검증:
-  1) 마커 無 + 승격 시도 → PENDING·디렉티브 무교체(사고 R2 봉쇄)
+  1) 마커 無 + 승격 시도 → PENDING·디렉티브 무교체(사고 R2 봉쇄) + truthful exit 5
+     (af6fcb6 D-2 post-verify: 미승격인데 exit 0이면 GUI가 "승격 완료"로 오보 — 부서 흐름
+     불파괴는 내부 ceo_promote의 return 0이 담당, 지명 서브커맨드는 진실 보고)
   2) 마커 생성 후 promote-if-pending(대기형) → 동의 게이트 경유 승격·PENDING 해소
   3) --request-only → 무변조·알림만·exit 0 (부트 ⑦ 비대기 계약)
   4) 단일소유 가드: master 세션 대기형=exit 7 / --request-only=허용
@@ -81,7 +83,8 @@ tmp = tempfile.mkdtemp(prefix="ceo-t1-")
 env, home = setup(tmp)
 code, out = run(env, "promote-ceo")
 mdp, pre, pend, marker = paths(home)
-check("1a 승격 시도 exit 0(부서 흐름 불파괴)", code == 0, out[-150:])
+check("1a 승격 시도 truthful exit 5(미승격 오보 차단·D-2 post-verify)", code == 5,
+      "exit=%d %s" % (code, out[-150:]))
 check("1b PENDING 기록", os.path.exists(pend))
 check("1c 디렉티브 무교체", md(home) == "STANDARD-MASTER\n")
 check("1d .pre-ceo 미생성", not os.path.exists(pre))

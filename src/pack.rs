@@ -90,6 +90,19 @@ pub fn session_start_hook_command(pack_dir: &Path) -> String {
     }
 }
 
+/// UserPromptSubmit hook(role-bootstrap.sh) 등록 명령 — session_start_hook_command 와 동일 OS 규약
+/// (unix `sh <abs>` / win `bash "<정슬래시>"`). ★javis_preflight._cys_hook_cmd("role-bootstrap.sh")
+/// 와 **byte-identical** 이어야 한다 — 격리 config 초기 시드(이 함수)와 preflight C28 재등록이 같은
+/// 문자열을 방출해야 중복 append 0(_prune_stale_hook_entries·_event_hook_registered matcher 일치·RC1).
+pub fn role_bootstrap_hook_command(pack_dir: &Path) -> String {
+    let script = pack_dir.join("hooks/role-bootstrap.sh");
+    if cfg!(windows) {
+        format!("bash \"{}\"", script.display().to_string().replace('\\', "/"))
+    } else {
+        format!("sh {}", script.display())
+    }
+}
+
 /// cys 전용 CLAUDE_CONFIG_DIR — 사용자 ~/.claude(외부 터미널 체계·구 지침 오염 가능)와 **격리**한다.
 /// cys가 띄우는 claude는 이 디렉터리만 읽으므로, 사용자 프로필이 오염돼 있어도 영향받지 않고
 /// 사용자 프로필을 건드리지도(읽지도·지우지도) 않는다. macOS 인증은 계정 단위 Keychain이라
@@ -119,14 +132,24 @@ fn setup_isolated_config_dir() {
             let _ = std::fs::write(&claude_md, tmpl);
         }
     }
-    // hook: <cfg>/settings.json 에 SessionStart → session-start.sh (없을 때만)
+    // hook: <cfg>/settings.json 에 SessionStart → session-start.sh + UserPromptSubmit →
+    // role-bootstrap.sh (없을 때만)
     let settings = cfg.join("settings.json");
     if !settings.exists() {
         // RC-2: OS-aware 공용 함수 사용 — Windows는 bash(Git Bash가 bash.exe만 보장·cmd/PowerShell은
         // .sh를 인터프리터 없이 못 실행). 구 `sh` 하드코딩 제거(격리 config dir·init-pack 경로 일치).
-        let hook = session_start_hook_command(&pack_dir());
+        let ss_hook = session_start_hook_command(&pack_dir());
+        // ★RC1(증분2): "너는 마스터다" 선언 시 결정론 부트스트랩을 발화하는 UserPromptSubmit 훅을
+        // 초기 시드에 함께 등록한다. 종전엔 preflight C28(SELFCORR_HOOKS)이 첫 --fix 때 비로소 등록해,
+        // 초기 세션(preflight 실행 전) 마스터 선언은 훅 미등록으로 발화되지 않는 창이 있었다.
+        // 부서 config의 결정론 등록 SOT는 preflight C28(role-bootstrap.sh→UserPromptSubmit, 이미 배선)
+        // 이며, 이 시드는 base 격리 config의 초기 창을 닫는 belt-and-suspenders다(양자 동일 문자열).
+        let ups_hook = role_bootstrap_hook_command(&pack_dir());
         let json = serde_json::json!({
-            "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": hook } ] } ] }
+            "hooks": {
+                "SessionStart": [ { "hooks": [ { "type": "command", "command": ss_hook } ] } ],
+                "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": ups_hook } ] } ]
+            }
         });
         if let Ok(s) = serde_json::to_string_pretty(&json) {
             let _ = std::fs::write(&settings, s);
@@ -1655,6 +1678,10 @@ mod tests {
         let cfg_settings = std::fs::read_to_string(cfgdir.join("settings.json")).expect("격리 settings.json 미설치");
         assert!(cfg_settings.contains("SessionStart") && cfg_settings.contains("session-start.sh"),
                 "격리 settings.json에 SessionStart hook 부재");
+        // ★RC1(증분2): 초기 시드에 UserPromptSubmit→role-bootstrap.sh 등록(마스터 선언 결정론 발화의
+        // preflight-전 초기 창을 닫음). preflight _cys_hook_cmd 와 동일 문자열이라 재등록 시 중복 0.
+        assert!(cfg_settings.contains("UserPromptSubmit") && cfg_settings.contains("role-bootstrap.sh"),
+                "격리 settings.json에 UserPromptSubmit(role-bootstrap.sh) hook 부재");
         for probe in [
             "skills/korean-humanizer/SKILL.md",
             "skills/kosis-stats/scripts/run_kosis_stats.py",
