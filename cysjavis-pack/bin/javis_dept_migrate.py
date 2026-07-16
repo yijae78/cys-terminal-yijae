@@ -7,11 +7,16 @@
 부재해, 부서 pane에서 "너는 마스터다" 선언이 부트스트랩을 발화하지 못한다(RC1). 이 도구는
 그 기존 부서들을 **부트 재실행 없이** 멱등 백필한다(신규 부서는 preflight가 이미 처리).
 
-집행(양대):
+집행(3대):
   ① ~/.cys/claude-*(basename에 'dept-') account config settings.json 에 UserPromptSubmit →
      `sh <부서팩>/hooks/role-bootstrap.sh`(preflight `_cys_hook_cmd` 와 byte-identical) 등록.
   ② 부서 팩(~/.cys/pack-dept-<name>)에 hooks/role-bootstrap.sh · bin/javis_bootstrap.py 부재 시
      메인 팩(CYS_PACK_DIR|~/.cys/pack)에서 복사(훅 명령이 참조하는 실체 보장).
+  ③ 부서 팩 directives/MASTER_DIRECTIVE.md 에 스테일 "[부서장 스코프 절대규칙]" §3 블록
+     ("각성 기본값=부서장 단독 대기" 등 — D1 옵션 1'로 폐기된 교리)이 있으면 메인 팩 최신 본
+     (④-c 분기 포함)으로 **전체 교체**. §3 외과 제거가 아니라 전체 교체인 이유: 스테일 팩은
+     §3 외 본문도 ④-c 이전 구본이라 제거만으로는 ④-c 부재가 남고, 전체 교체는 교리 SOT(메인 팩)
+     재동기화라 드리프트 재발을 차단하며 멱등 판정도 자명하다(교체 후 §3 부재=ok).
 
 관례(preflight `_register_event_hook` 동형): symlink 거부 · 파싱 실패 거부 · 백업(.bak-migrate)
 · 구/파손 우리-훅 엔트리 prune 후 재등록(중복 append 0) · 원자적 교체.
@@ -34,6 +39,9 @@ SCRIPT_NAME = "role-bootstrap.sh"
 HOOK_REL = os.path.join("hooks", "role-bootstrap.sh")
 BOOTSTRAP_REL = os.path.join("bin", "javis_bootstrap.py")
 REQUIRED_PACK_FILES = [HOOK_REL, BOOTSTRAP_REL]
+DIRECTIVE_REL = os.path.join("directives", "MASTER_DIRECTIVE.md")
+STALE_DOCTRINE_MARK = "[부서장 스코프 절대규칙]"   # 폐기 교리 heading(2026-07-11 구본)
+CURRENT_DOCTRINE_MARK = "④-c"                      # 현행 교리 분기(D1 옵션 1')
 
 
 def _hook_cmd(pack):
@@ -156,6 +164,62 @@ def _ensure_pack_files(pack, do_fix):
     return results
 
 
+def _strip_stale_block(content):
+    """드리프트 보고용 근사 제거 — 스테일 §3 heading부터 다음 구조 라인('#'/'>' 시작) 직전까지 제거."""
+    lines = content.splitlines(keepends=True)
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        ln = lines[i]
+        if ln.startswith("##") and STALE_DOCTRINE_MARK in ln:
+            i += 1
+            while i < n and not (lines[i].startswith("#") or lines[i].startswith(">")):
+                i += 1
+            continue
+        out.append(ln)
+        i += 1
+    return "".join(out)
+
+
+def _migrate_directive(pack, do_fix):
+    """③ 스테일 교리 백필. returns (action, detail). action ∈ ok|would|fixed|skip|error."""
+    path = os.path.join(pack, DIRECTIVE_REL)
+    if os.path.islink(path):
+        return "skip", "symlink 거부: %s" % path
+    if not os.path.isfile(path):
+        return "skip", "MASTER_DIRECTIVE.md 부재 — 부트 시 preflight가 배포(백필 대상 아님)"
+    try:
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+    except OSError as e:
+        return "error", "읽기 실패: %s" % e
+    if STALE_DOCTRINE_MARK not in content:
+        return "ok", "스테일 §3 블록 부재(멱등)"
+    src_path = os.path.join(MAIN_PACK, DIRECTIVE_REL)
+    try:
+        with open(src_path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        return "error", "메인 팩 소스 읽기 실패(%s): %s" % (src_path, e)
+    if CURRENT_DOCTRINE_MARK not in src or STALE_DOCTRINE_MARK in src:
+        return "error", ("메인 팩 소스가 현행 아님(④-c 부재 또는 §3 잔존) — 스테일로 스테일을 "
+                         "덮지 않도록 교체 보류: %s" % src_path)
+    drift = (" · §3 외 본문도 소스와 상이(부서 커스텀/구본 가능 — .bak-migrate 보존)"
+             if _strip_stale_block(content) != src else "")
+    if not do_fix:
+        return "would", "스테일 §3 감지 — 메인 팩 최신 본(④-c 포함)으로 전체 교체 예정(--fix)%s" % drift
+    backup = path + ".bak-migrate"
+    if not os.path.exists(backup):
+        shutil.copy2(path, backup)
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(src)
+        os.replace(tmp, path)
+    except OSError as e:
+        return "error", "교체 실패: %s" % e
+    return "fixed", "스테일 §3 교체 — 메인 팩 최신 본(④-c 포함) 동기화(백업 .bak-migrate)%s" % drift
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="기존 부서 config 마이그레이션 (증분2 D)")
     ap.add_argument("--fix", action="store_true", help="집행(기본: dry-run — 계획만)")
@@ -171,12 +235,15 @@ def main(argv=None):
         settings = os.path.join(acctdir, "settings.json")
         pack_files = _ensure_pack_files(pack, do_fix)   # 훅 실체 먼저 보장
         h_action, h_detail = _register_hook(settings, cmd, do_fix)
-        if h_action == "error" or any(ac == "error" for _, ac, _ in pack_files):
+        d_action, d_detail = _migrate_directive(pack, do_fix)
+        if (h_action == "error" or d_action == "error"
+                or any(ac == "error" for _, ac, _ in pack_files)):
             had_error = True
         report["depts"].append({
             "dept": name, "acctdir": acctdir, "pack": pack, "settings": settings,
             "hook": {"action": h_action, "detail": h_detail},
             "pack_files": [{"rel": r, "action": ac, "detail": dt} for r, ac, dt in pack_files],
+            "directive": {"action": d_action, "detail": d_detail},
         })
 
     if a.json:
@@ -191,6 +258,7 @@ def main(argv=None):
             print("     hook: %s — %s" % (d["hook"]["action"], d["hook"]["detail"]))
             for pf in d["pack_files"]:
                 print("     pack %s: %s — %s" % (pf["rel"], mark.get(pf["action"], "?"), pf["detail"]))
+            print("     directive: %s — %s" % (d["directive"]["action"], d["directive"]["detail"]))
         if not do_fix and report["depts"]:
             print("  (dry-run — 집행하려면 --fix)")
     return 2 if had_error else 0
