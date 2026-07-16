@@ -88,12 +88,26 @@ pub fn schedule_path() -> PathBuf {
 }
 
 /// ★B2-1(W3): built-in 잡 정의 버전. 잡 내용이 바뀌면 올린다 — 부트 ensure 가 구버전 항목을 갱신하는 기준.
-const BUILTIN_JOBS_VERSION: u64 = 1;
+/// v2(A안·2026-07-11): text_command를 셸 메타문자 0의 단일 명령으로 정상화(Windows cmd /C 무실행 결함 근본수리).
+const BUILTIN_JOBS_VERSION: u64 = 2;
 
 /// built-in(phoenix 인프라) 잡 정의 — 팩 schedule.json 배달이 아니라 코드가 소유한다(schedule.json 이 user-owned
 /// 로 전환돼 팩 강제갱신이 사용자 잡을 보존하므로, built-in 잡 진화는 이 코드가 담당). 각 항목에 `_builtin`/
 /// `_builtin_version` 마커를 달아 ensure 가 id 로 upsert·버전 대조한다(Job 의 미지 필드는 serde 가 무시).
 fn builtin_jobs() -> Vec<serde_json::Value> {
+    // ★A안(2026-07-11): text_command를 **셸 메타문자 0의 단일 명령**으로 정상화한다.
+    //   구 정의(POSIX 문법: `printf …; python3 … 2>&1 | tail -N`)는 Windows에서 run_text_command가
+    //   `cmd /C`로 실행하는데 cmd는 `;`를 명령 구분자로 보지 않아(구분자는 `&`) 전체가 printf 단일
+    //   명령으로 파싱 → python3 무실행(세대 자동생성 0건 실측·CSO_REPORT_phoenix_governance.md).
+    //   하트비트 문구·tail 캡을 javis_state_snapshot.py 안으로 이동(--heartbeat/--tail)해 명령에서
+    //   `;`·`${..}`·`| tail`·`2>&1`을 전부 제거한다. 스크립트 경로는 셸 확장(${CYS_PACK_DIR})이 아니라
+    //   데몬이 pack_dir()로 치환 — cmd/sh 무관하게 동작하고, R-CLI-4 게이트(is_trusted_builtin)도 동일
+    //   builtin_jobs() 산출을 대조하므로 정확 일치가 유지된다(pack_dir()는 프로세스 내 결정론).
+    let snap = cys::pack::pack_dir()
+        .join("bin")
+        .join("javis_state_snapshot.py")
+        .to_string_lossy()
+        .into_owned();
     vec![
         json!({
             "id": "phoenix-snapshot-6h",
@@ -101,7 +115,7 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "action": "push",
             "to": "master",
             "if_absent": "skip",
-            "text_command": "printf '[heartbeat] phoenix 세대 스냅샷 정기화(6h·P2-4) — 손상 치유 소스 최신화.\\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_state_snapshot.py\" snapshot 2>&1 | tail -3",
+            "text_command": format!("python3 \"{snap}\" snapshot --heartbeat --tail 3"),
             "_builtin": "phoenix",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
@@ -111,7 +125,7 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "action": "push",
             "to": "master",
             "if_absent": "skip",
-            "text_command": "printf '[heartbeat] phoenix 주간 격리 드릴(원자성·중단내성 self-test·라이브 무접촉) — 실전이 첫 테스트인 상태 종료(축E E2).\\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_state_snapshot.py\" self-test 2>&1 | tail -5",
+            "text_command": format!("python3 \"{snap}\" self-test --heartbeat --tail 5"),
             "_builtin": "phoenix",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),

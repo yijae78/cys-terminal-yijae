@@ -139,6 +139,17 @@ def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, l
     srcs.extend(sorted(_glob.glob(os.path.join(proj_round, "*_TODO.md"))))
     srcs.extend(sorted(_glob.glob(os.path.join(
         home, ".claude*", "projects", "*", "memory", "*.md"))))
+    # ★SOT 경로 교정(2026-07-11·CSO_REPORT_20260710_rpc_wedge §6): 이 배치의 실 복원 SOT·노드
+    #   TODO·장기기억은 ~/.cys/pack/{round,memory}에 있는데 위 proj_round($JAVIS_ROOT/_round)와
+    #   ~/.claude* glob만 탐색해 SESSION_STATE.md·전 노드 *_TODO.md·MEMORY가 6h 세대 보관에서 통째로
+    #   빠졌다(세대 manifest 303건 중 round 파일 0건 실측). 카논 경로 ${CYS_PACK_DIR:-$HOME/.cys/pack}
+    #   의 round/·memory/를 추가한다(개인경로 하드코딩 금지 — env 우선·HOME 파생 폴백). self-test T6은
+    #   present 파일만 필터하고 any() 존재검사라 이 추가로 회귀하지 않는다(실측).
+    pack_dir = os.environ.get("CYS_PACK_DIR") or os.path.join(home, ".cys", "pack")
+    pack_round = os.path.join(pack_dir, "round")
+    srcs.append(os.path.join(pack_round, "SESSION_STATE.md"))
+    srcs.extend(sorted(_glob.glob(os.path.join(pack_round, "*_TODO.md"))))
+    srcs.extend(sorted(_glob.glob(os.path.join(pack_dir, "memory", "*.md"))))
     return srcs
 
 # GC 파라미터
@@ -537,6 +548,43 @@ def do_self_test():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+# ★A안(2026-07-11): 하트비트 문구를 스크립트가 소유한다(구: schedule.rs text_command의 `printf …;`).
+#   Windows cmd /C는 `;`를 구분자로 보지 않아 POSIX 합성 명령이 무실행됐다 — 데몬 text_command를
+#   셸 메타문자 0의 단일 명령(`python3 … snapshot --heartbeat --tail 3`)으로 만들고, 문구·tail 캡을
+#   여기로 이동한다. 데몬 run_text_command는 stdout(비어있지 않아야·exit 0)을 master push로 쓴다.
+HEARTBEAT_MSGS = {
+    "snapshot": "[heartbeat] phoenix 세대 스냅샷 정기화(6h·P2-4) — 손상 치유 소스 최신화.",
+    "self-test": "[heartbeat] phoenix 주간 격리 드릴(원자성·중단내성 self-test·라이브 무접촉) — 실전이 첫 테스트인 상태 종료(축E E2).",
+}
+
+
+def _emit_heartbeat_capped(cmd, fn, heartbeat, tail):
+    """서브커맨드 fn()을 실행하되 stdout을 캡처해 [하트비트 문구 + tail 캡]으로 재출력한다.
+    셸 파이프(`| tail`) 없이 스크립트가 직접 문구·캡을 소유(A안). fn 반환이 int면 그 값을 exit code로,
+    아니면 0을 반환한다(snapshot은 세대명 str 반환 → 0). stderr는 캡처하지 않아 실패 진단은 그대로 노출."""
+    import io
+    import contextlib
+
+    buf = io.StringIO()
+    rc = 0
+    with contextlib.redirect_stdout(buf):
+        r = fn()
+        if isinstance(r, int):
+            rc = r
+    captured = buf.getvalue().strip("\n")
+    body = captured.split("\n") if captured.strip() else []
+    if tail is not None and tail > 0:
+        body = body[-tail:]
+    lines = []
+    if heartbeat:
+        lines.append(HEARTBEAT_MSGS.get(cmd, "[heartbeat]"))
+    lines.extend(body)
+    text = "\n".join(lines).strip()
+    if text:
+        print(text)
+    return rc
+
+
 def main():
     # ★Windows 패리티(S5): 과거 os.name=="nt" hard-gate 는 제거됐다 — 디렉터리 fsync 를 Windows 에서 건너뛰고
     # (_fsync_path) os.rename(동일 볼륨 원자 승격)에 의존하므로 snapshot/list/gc/verify 가 Windows 에서 동작한다.
@@ -545,6 +593,9 @@ def main():
 
     p_snap = sub.add_parser("snapshot", help="세대 1건 생성 + GC")
     p_snap.add_argument("--dry-run", action="store_true")
+    # A안: 데몬 하트비트 잡용 — 문구 prefix + stdout tail 캡(셸 파이프 제거).
+    p_snap.add_argument("--heartbeat", action="store_true", help="하트비트 문구를 앞에 붙인다(데몬 push용)")
+    p_snap.add_argument("--tail", type=int, default=None, help="stdout 마지막 N줄만 남긴다")
 
     sub.add_parser("list", help="세대 목록")
 
@@ -554,12 +605,21 @@ def main():
     p_ver = sub.add_parser("verify", help="manifest 해시 무결성 검증")
     p_ver.add_argument("--gen", default=None)
 
-    sub.add_parser("self-test", help="원자성/중단내성 실증(격리)")
+    p_st = sub.add_parser("self-test", help="원자성/중단내성 실증(격리)")
+    p_st.add_argument("--heartbeat", action="store_true", help="하트비트 문구를 앞에 붙인다(데몬 push용)")
+    p_st.add_argument("--tail", type=int, default=None, help="stdout 마지막 N줄만 남긴다")
 
     args = ap.parse_args()
     cmd = args.cmd or "snapshot"
 
     if cmd == "snapshot":
+        # A안 배선: --heartbeat/--tail 지정 시 문구 prefix + stdout tail 캡을 스크립트가 소유(셸 파이프 제거).
+        # 플래그 없으면 기존 동작 보존(회귀 0). do_snapshot 반환(gen_name str)은 캡처 무관 — rc 0.
+        hb, tail = getattr(args, "heartbeat", False), getattr(args, "tail", None)
+        if hb or tail is not None:
+            return _emit_heartbeat_capped(
+                "snapshot", lambda: do_snapshot(dry_run=getattr(args, "dry_run", False)), hb, tail
+            )
         do_snapshot(dry_run=getattr(args, "dry_run", False))
         return 0
     if cmd == "list":
@@ -576,6 +636,10 @@ def main():
     if cmd == "verify":
         return do_verify(gen=getattr(args, "gen", None))
     if cmd == "self-test":
+        # A안 배선: do_self_test 반환은 int rc → _emit_heartbeat_capped가 그대로 exit code로 전파.
+        hb, tail = getattr(args, "heartbeat", False), getattr(args, "tail", None)
+        if hb or tail is not None:
+            return _emit_heartbeat_capped("self-test", do_self_test, hb, tail)
         return do_self_test()
     ap.print_help()
     return 1
