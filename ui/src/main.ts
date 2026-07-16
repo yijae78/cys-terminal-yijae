@@ -2373,10 +2373,15 @@ function wsnAvatarText(role: string | null, agent: string | null): string {
   const t = (role ?? agent ?? "?").trim();
   return (t[0] ?? "?").toUpperCase();
 }
-// 본진(기본 데몬 소켓)의 master만 앱 브랜드명 Nobel. 부서(dept) 소켓의 master는 그 부서의
-// 부서장이므로 Nobel이 아니다 — 표준 노드 라벨(ccNodeLabel)로 표기(신교수님 본진/부서 구분 2026-07-16).
+// 본진(기본 데몬 소켓)의 master만 앱 브랜드명 Nobel(브랜드 불변). 그 외 노드는 surface title을
+// 우선한다 — 데몬 title('행정부'·'총무(master)' 등)이 정확한데 role 자동생성 라벨을 표시하던 부서 탭
+// 결함 수정(신교수님 2026-07-16). 단 raw pane title('worker-claude · 신이재'처럼 ' · ' 포함)·자동제목
+// ("surface N")은 의미 라벨이 아니라 자동생성 라벨(ccNodeLabel)로 폴백 — 본진 노드 표시 무회귀.
 function wsnNodeName(role: string | null, title: string | null, isHome: boolean): string {
-  return isHome && (role ?? "").toLowerCase() === "master" ? "Nobel" : ccNodeLabel(role, title);
+  if (isHome && (role ?? "").toLowerCase() === "master") return "Nobel";
+  const t = (title ?? "").trim();
+  if (t && !t.includes(" · ") && !/^surface \d+$/.test(t)) return t;
+  return ccNodeLabel(role, title);
 }
 function wsnAgentSmall(agent: string | null): HTMLElement | null {
   const ag = wsnAgentLabel(agent);
