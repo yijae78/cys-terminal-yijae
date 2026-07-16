@@ -6,6 +6,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
 import { shellQuote, shellQuoteJoin } from "./shellquote";
+import { insertionText, isStreaming } from "./ftdrop";
+import { transferTrees } from "./transfer";
 import { updatePlan } from "./updateplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
@@ -82,6 +84,10 @@ interface PaneRuntime {
   observer: ResizeObserver;
   // 바닥 고정 재적용 — 리사이즈(fitPane) 뒤 뷰포트가 바닥에서 밀려나면 복귀시킨다.
   snapToBottom: () => void;
+  // 마지막 PTY 출력 시각(ms) — 경로 주입의 스트리밍 가드(ftdrop.isStreaming)가 읽는다.
+  lastOutputAt: () => number;
+  // IME 조합 pending 여부 — 조합 중 주입의 순서 역전(자모 뒤섞임) 차단.
+  imeBusy: () => boolean;
 }
 
 // ---------- T5 사용량 관측 배지 (pane 헤더) ----------
@@ -2034,7 +2040,9 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     output_event: string;
     exited_event: string;
   };
+  const outStamp = { t: 0 }; // 마지막 출력 시각 — rt.lastOutputAt(스트리밍 가드)의 원천
   const un1 = await listen(ev.output_event, (e) => {
+    outStamp.t = Date.now();
     term.write(b64ToBytes(e.payload as string), snapToBottom);
   });
   const un2 = await listen(ev.exited_event, () => {
@@ -2051,7 +2059,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   });
   observer.observe(termHost);
 
-  const rt: PaneRuntime = { sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom };
+  const rt: PaneRuntime = { sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom, lastOutputAt: () => outStamp.t, imeBusy: () => imeState.pending !== "" };
   panes.set(paneKey(sid, socket), rt);
   return rt;
 }
@@ -2084,7 +2092,12 @@ function startPaneDrag(e0: MouseEvent, sid: number) {
   let ghost: HTMLElement | null = null;
   let hint: HTMLElement | null = null;
   let target: { sid: number; side: DropSide } | null = null;
+  let tabTarget: HTMLElement | null = null; // F6: 사이드바 ws 탭 위 드롭 = 전출
 
+  const clearTabTarget = () => {
+    tabTarget?.classList.remove("transfer-target");
+    tabTarget = null;
+  };
   const move = (e: MouseEvent) => {
     if (!dragging) {
       // 클릭(포커스)과 구분 — 6px 이상 움직여야 드래그 시작
@@ -2101,9 +2114,22 @@ function startPaneDrag(e0: MouseEvent, sid: number) {
     }
     ghost!.style.left = `${e.clientX + 10}px`;
     ghost!.style.top = `${e.clientY + 10}px`;
-    const over = (document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null)?.closest(
-      ".pane",
-    ) as HTMLElement | null;
+    // F6: 사이드바 탭 히트테스트 — 탭 위면 전출 대상 표시(pane 분할 힌트와 배타)
+    const hitEl = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+    const tab = hitEl?.closest(".ws-tab") as HTMLElement | null;
+    if (tab !== tabTarget) {
+      clearTabTarget();
+      if (tab?.dataset.wsId) {
+        tabTarget = tab;
+        tab.classList.add("transfer-target");
+      }
+    }
+    if (tabTarget) {
+      target = null;
+      if (hint) hint.hidden = true;
+      return;
+    }
+    const over = hitEl?.closest(".pane") as HTMLElement | null;
     target = null;
     if (over?.dataset.sid && Number(over.dataset.sid) !== sid) {
       const r = over.getBoundingClientRect();
@@ -2129,10 +2155,139 @@ function startPaneDrag(e0: MouseEvent, sid: number) {
     ghost?.remove();
     hint?.remove();
     document.body.classList.remove("pane-dragging");
-    if (dragging && target) movePane(sid, target.sid, target.side);
+    const destWsId = tabTarget?.dataset.wsId;
+    clearTabTarget();
+    if (dragging && destWsId != null) void transferPaneToWs(sid, Number(destWsId));
+    else if (dragging && target) movePane(sid, target.sid, target.side);
   };
   window.addEventListener("mousemove", move, true);
   window.addEventListener("mouseup", up, true);
+}
+
+// F6: pane 전출 — 동일 socket ws 간은 원자 트리 이동(transfer.ts 순수 로직),
+// 크로스 부서(다른 socket)는 맥락보존 재인스턴스화(transferCrossDept).
+async function transferPaneToWs(sid: number, destWsId: number) {
+  const srcWs = current();
+  const destWs = workspaces.find((w) => w.id === destWsId);
+  if (!destWs || destWs === srcWs) return;
+  if (destWs.pending) {
+    toast("watchdog", "전출 불가", "대상 부서 데몬이 아직 준비 중입니다");
+    return;
+  }
+  if ((destWs.socket ?? undefined) !== (srcWs.socket ?? undefined)) {
+    return transferCrossDept(sid, srcWs, destWs);
+  }
+  // 가드: 전출 시점 pane 생존(reap 경합) — 죽은 sid를 대상 트리에 넣지 않는다
+  if (!panes.has(paneKey(sid, srcWs.socket))) {
+    toast("watchdog", "전출 불가", "pane이 이미 종료되었습니다");
+    return;
+  }
+  const moved = transferTrees(srcWs.tree, destWs.tree, sid);
+  if (!moved) {
+    toast("watchdog", "전출 불가", "레이아웃에서 pane을 찾지 못했습니다");
+    return;
+  }
+  // 원자 반영: 두 트리 동시 교체 → 단일 render(saveLayout 포함) — JS 단일 스레드의 동기 블록이라
+  // 같은 sid가 두 트리에 걸친 중간 상태가 렌더·영속에 노출되지 않는다.
+  srcWs.tree = moved.src;
+  destWs.tree = moved.dest;
+  if (focusedSid === sid) focusedSid = collectSids(srcWs.tree)[0] ?? null;
+  render();
+  if (focusedSid != null) setFocus(focusedSid);
+  toast("feed", "pane 전출 완료", `→ ${destWs.name || UNTITLED}`);
+}
+
+// F6-2: 크로스 부서 전출 — 라이브 프로세스는 데몬 간 이주가 물리적으로 불가하므로,
+// 핸드오프 문서로 맥락을 승계(HANDOFF_CONTRACT 5필드)한 뒤 대상 부서에서 재기동한다.
+// 어느 단계든 실패 시 원본 무접촉(전출 실패=현상 유지). 원본 정리는 재기동 성공 후에만.
+async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspace) {
+  const srcSock = srcWs.socket;
+  if (!panes.has(paneKey(sid, srcSock))) {
+    toast("watchdog", "전출 불가", "pane이 이미 종료되었습니다");
+    return;
+  }
+  const r = (await invoke("list_surfaces", { socket: srcSock }).catch(() => null)) as {
+    surfaces: { surface_id: number; live_cwd: string | null; role?: string | null; agent?: string | null }[];
+  } | null;
+  const me = r?.surfaces.find((s) => s.surface_id === sid);
+  const isAgent = !!(me?.role || me?.agent);
+  const cwd = me?.live_cwd ?? null;
+  const ok = await confirmModal(
+    "부서 간 전출",
+    isAgent
+      ? "부서 간 전출은 핸드오프 문서로 맥락을 승계한 재기동입니다. 진행 중이던 응답(라이브 추론 상태)은 이어지지 않습니다. 진행하시겠습니까?"
+      : "이 pane은 에이전트 미등록(셸)입니다 — 같은 경로의 새 셸을 대상 부서에 만들고 이 pane을 닫습니다. 진행하시겠습니까?",
+    "전출",
+  );
+  if (!ok) return;
+  try {
+    let handoffPath: string | null = null;
+    if (isAgent) {
+      // ① 핸드오프 지시 주입(CR 포함 제출 — 워커가 파일을 기록한다)
+      const base = cwd || "~";
+      handoffPath = `${base}/_round/handoffs/transfer-${sid}-${Date.now()}.md`;
+      const inst =
+        `지금까지의 작업 상태를 HANDOFF_CONTRACT 5필드(Decided/Rejected/Risks/Files/Remaining)로 ` +
+        `${handoffPath} 에 기록하라(디렉토리가 없으면 mkdir -p로 생성). 파일 생성 완료가 전출 준비 완료 신호다.\r`;
+      await invoke("send_input", { socket: srcSock, surfaceId: sid, data: inst });
+      // ② 파일 실존 대기(3초 간격·최대 120초) — 화면 파싱이 아니라 파일시스템 확인(결정론).
+      //    cwd를 모르면(~) 파일 확인이 불가하므로 위 base 폴백은 cwd 확보 실패 시 전출을 중단한다.
+      if (!cwd) {
+        toast("watchdog", "전출 중단", "pane의 현재 경로를 확인할 수 없습니다 — 원본은 그대로입니다");
+        return;
+      }
+      stickyToast("transfer", "feed", "전출 준비 중", "핸드오프 기록 대기(최대 120초)…");
+      const dir = handoffPath.slice(0, handoffPath.lastIndexOf("/"));
+      const name = handoffPath.slice(handoffPath.lastIndexOf("/") + 1);
+      const deadline = Date.now() + 120_000;
+      let ready = false;
+      while (Date.now() < deadline) {
+        await new Promise((res) => setTimeout(res, 3000));
+        const ents = (await invoke("list_dir", { path: dir }).catch(() => null)) as
+          | { name: string }[]
+          | null;
+        if (ents?.some((en) => en.name === name)) {
+          ready = true;
+          break;
+        }
+      }
+      if (!ready) {
+        toast("watchdog", "전출 중단", "핸드오프가 기록되지 않았습니다(120초) — 원본은 그대로입니다");
+        return;
+      }
+    }
+    // ③ 대상 부서에 새 surface 생성 + 트리 편입(같은 경로에서 시작)
+    const newSid = await newSurface(cwd, destWs.socket);
+    destWs.tree = destWs.tree
+      ? { type: "split", dir: "row", a: destWs.tree, b: { type: "pane", sid: newSid } }
+      : { type: "pane", sid: newSid };
+    if (isAgent) {
+      // ④ 에이전트 재기동(노드 재기동 처방과 동일 명령) — 복원 지시는 queued(조용 시점 배달)로
+      //    부팅 중 주입을 피한다(데몬 deliver_queued가 quiet 시점에 순서대로 배달).
+      await invoke("send_input", {
+        socket: destWs.socket,
+        surfaceId: newSid,
+        data: "cys launch-agent --role worker --agent claude\r",
+      });
+      await invoke("send_input", {
+        socket: destWs.socket,
+        surfaceId: newSid,
+        data: `너는 전출된 워커다. ${handoffPath} 를 읽고 작업을 이어가라.`,
+        queued: true,
+      });
+    }
+    // ⑤ 재기동 성공 후에만 원본 정리(실패는 catch에서 가시화 — 원본 보존)
+    await invoke("close_surface", { socket: srcSock, surfaceId: sid });
+    destroyPaneRuntime(sid, srcSock);
+    if (srcWs.tree) srcWs.tree = replaceNode(srcWs.tree, sid, () => null);
+    if (focusedSid === sid) focusedSid = collectSids(current()?.tree ?? null)[0] ?? null;
+    render();
+    toast("feed", "부서 전출 완료", `→ ${destWs.name || UNTITLED} (surface:${newSid})`);
+  } catch (e) {
+    toast("watchdog", "전출 실패", `${e} — 원본 pane은 보존됩니다`);
+  } finally {
+    dismissToast("transfer");
+  }
 }
 
 /// sid pane을 트리에서 떼어 target pane의 side 쪽에 분할 삽입한다.
@@ -2167,28 +2322,16 @@ function setFocus(sid: number) {
   updateFtRoot(); // 파일 트리가 열려 있으면 선택한 surface의 폴더로 전환
 }
 
-// 드롭 물리좌표(디바이스 픽셀)를 CSS px로 환산해 그 지점을 포함하는 pane 런타임을 찾는다.
-// 매칭 실패 시 포커스된 pane → 현재 ws 첫 pane 폴백. pane이 전무하면 undefined(호출측이 조용히 무시).
-function paneAtPhysicalPoint(pos?: { x: number; y: number }): PaneRuntime | undefined {
-  if (panes.size === 0) return undefined;
-  if (pos) {
-    const dpr = window.devicePixelRatio || 1;
-    const hit = document.elementFromPoint(pos.x / dpr, pos.y / dpr) as HTMLElement | null;
-    const paneEl = hit?.closest(".pane") as HTMLElement | null;
-    if (paneEl) {
-      for (const rt of panes.values()) if (rt.el === paneEl) return rt;
-    }
-  }
-  const sock = current()?.socket;
-  if (focusedSid != null) {
-    const rt = panes.get(paneKey(focusedSid, sock));
-    if (rt) return rt;
-  }
-  const firstSid = collectSids(current()?.tree ?? null)[0];
-  if (firstSid != null) {
-    const rt = panes.get(paneKey(firstSid, sock));
-    if (rt) return rt;
-  }
+// 드롭 물리좌표(디바이스 픽셀)를 CSS px로 환산해 그 지점을 '직격'하는 pane만 찾는다.
+// 폴백 없음 — 빗나간 드롭이 포커스 pane에 조용히 주입되던 오배달 footgun 제거.
+// 호출측이 undefined를 무동작+토스트로 처리한다(무음 실패 금지).
+function paneAtPointStrict(pos?: { x: number; y: number }): PaneRuntime | undefined {
+  if (!pos) return undefined;
+  const dpr = window.devicePixelRatio || 1;
+  const hit = document.elementFromPoint(pos.x / dpr, pos.y / dpr) as HTMLElement | null;
+  const paneEl = hit?.closest(".pane") as HTMLElement | null;
+  if (!paneEl) return undefined;
+  for (const rt of panes.values()) if (rt.el === paneEl) return rt;
   return undefined;
 }
 
@@ -2920,7 +3063,11 @@ async function confirmDeleteGroup(g: GroupMeta) {
 const UNTITLED = "non title";
 
 // 커스텀 컨텍스트 메뉴 (WKWebView 기본 메뉴 대체) — 싱글톤, 바깥 클릭·Esc로 닫힘.
-function showCtxMenu(x: number, y: number, items: { label: string; action: () => void }[]) {
+function showCtxMenu(
+  x: number,
+  y: number,
+  items: { label: string; action: () => void; disabled?: boolean }[],
+) {
   document.getElementById("ctx-menu")?.remove();
   const menu = document.createElement("div");
   menu.id = "ctx-menu";
@@ -2938,13 +3085,15 @@ function showCtxMenu(x: number, y: number, items: { label: string; action: () =>
   };
   for (const it of items) {
     const row = document.createElement("div");
-    row.className = "ctx-item";
+    // disabled = 표시 전용 행(경로 표시 등) — 클릭 무반응(CSS pointer-events 차단과 짝)
+    row.className = "ctx-item" + (it.disabled ? " disabled" : "");
     row.textContent = it.label;
-    row.addEventListener("mousedown", (e) => {
-      e.preventDefault();
-      closeMenu();
-      it.action();
-    });
+    if (!it.disabled)
+      row.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        closeMenu();
+        it.action();
+      });
     menu.appendChild(row);
   }
   menu.style.left = `${x}px`;
@@ -3227,6 +3376,7 @@ function scheduleFeedSwitchIfStillPending(requestId: string) {
 
 let ftOpen = false;
 let ftRoot: string | null = null;
+let ftPinned = false; // F5: 수동 재루팅(더블클릭/메뉴) 시 true — live_cwd 자동 추종 일시 해제
 const ftExpanded = new Set<string>(); // 펼쳐진 하위 폴더 경로
 
 function setFtOpen(open: boolean) {
@@ -3235,9 +3385,10 @@ function setFtOpen(open: boolean) {
   if (open) updateFtRoot(); // pane 폭 변화는 ResizeObserver가 자동 보정
 }
 
-// 포커스된 surface의 현재 경로를 트리 루트로 — 포커스 이동·cd 모두 추적
+// 포커스된 surface의 현재 경로를 트리 루트로 — 포커스 이동·cd 모두 추적.
+// 수동 핀(ftPinned) 중엔 정지 — 다음 틱의 live_cwd 추종이 수동 이동을 되돌리는 경합 차단(F5).
 async function updateFtRoot() {
-  if (!ftOpen || focusedSid == null) return;
+  if (!ftOpen || focusedSid == null || ftPinned) return;
   try {
     const r = (await invoke("list_surfaces", { socket: current()?.socket })) as {
       surfaces: { surface_id: number; live_cwd: string | null }[];
@@ -3253,6 +3404,14 @@ async function updateFtRoot() {
   }
 }
 
+// F5: 수동 재루팅 — 핀을 세워 자동 추종을 멈춘다(헤더 📌 클릭 = 추종 복귀).
+function setFtRoot(dir: string, pinned: boolean) {
+  ftRoot = dir;
+  ftPinned = pinned;
+  ftExpanded.clear();
+  renderFileTree();
+}
+
 async function renderFileTree() {
   const body = document.getElementById("ft-body")!;
   const label = document.getElementById("ft-root-label")!;
@@ -3261,10 +3420,37 @@ async function renderFileTree() {
     label.textContent = "파일";
     return;
   }
-  label.textContent = ftRoot.split("/").pop() || ftRoot;
-  label.title = ftRoot;
+  label.textContent = (ftPinned ? "📌 " : "") + (ftRoot.split("/").pop() || ftRoot);
+  label.title = ftPinned ? `${ftRoot}\n📌 고정됨 — 클릭하면 pane 경로 자동 추종으로 복귀` : ftRoot;
+  label.onclick = ftPinned
+    ? () => {
+        ftPinned = false;
+        void updateFtRoot();
+        renderFileTree();
+      }
+    : null;
+  // F4: 루트 전체 경로 상시 표시(헤더 서브라인) — "어디에 있는지"를 우클릭 없이도 보이게
+  let pathLine = document.getElementById("ft-path");
+  if (!pathLine) {
+    pathLine = document.createElement("div");
+    pathLine.id = "ft-path";
+    document.getElementById("ft-head")!.after(pathLine);
+  }
+  pathLine.textContent = ftRoot;
+  pathLine.title = ftRoot;
   const frag = await buildDirNodes(ftRoot, 0);
   body.innerHTML = "";
+  // F5: 상위 폴더 행 — 더블클릭으로 한 단계 위로(단일 클릭 무동작 = 오클릭 방지)
+  if (ftRoot !== "/") {
+    const parent = ftRoot.slice(0, ftRoot.lastIndexOf("/")) || "/";
+    const up = document.createElement("div");
+    up.className = "ft-row dir";
+    up.style.paddingLeft = "8px";
+    up.textContent = "▴ ..";
+    up.title = `${parent} — 더블클릭으로 이동`;
+    up.addEventListener("dblclick", () => setFtRoot(parent, true));
+    body.appendChild(up);
+  }
   body.appendChild(frag);
 }
 
@@ -3285,18 +3471,212 @@ async function buildDirNodes(dir: string, depth: number): Promise<DocumentFragme
     row.textContent = ent.is_dir ? `${ftExpanded.has(full) ? "▾" : "▸"} ${ent.name}` : ent.name;
     row.title = full;
     row.addEventListener("click", () => {
+      // 드래그로 소비된 mousedown의 후행 click 억제 — 펼침/열기 오발 방지(F2)
+      if (ftDragConsumed) {
+        ftDragConsumed = false;
+        return;
+      }
       if (ent.is_dir) {
         if (ftExpanded.has(full)) ftExpanded.delete(full);
         else ftExpanded.add(full);
         renderFileTree();
       } else {
-        invoke("open_path", { path: full }).catch(() => {}); // 시스템 기본 앱으로 열기
+        void openFtPath(full); // F1: 실패 가시화 + 실행형 확인
       }
+    });
+    if (ent.is_dir) row.addEventListener("dblclick", () => setFtRoot(full, true)); // F5(D2b)
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      ftContextMenu(e, full, ent.is_dir); // F3
+    });
+    row.addEventListener("mousedown", (e) => {
+      if (e.button === 0) startFtDrag(e, full); // F2: pane으로 드래그해 경로 주입
     });
     frag.appendChild(row);
     if (ent.is_dir && ftExpanded.has(full)) frag.appendChild(await buildDirNodes(full, depth + 1));
   }
   return frag;
+}
+
+// F1: 파일 열기 — 실패 무음 금지(feed_reply dead-button 수리와 동일 처방).
+// 실행형 파일은 백엔드가 executable_confirm으로 거절 → 확인 후 force 재호출(fail-closed).
+async function openFtPath(full: string) {
+  try {
+    await invoke("open_path", { path: full });
+  } catch (e) {
+    if (String(e).includes("executable_confirm")) {
+      const ok = await confirmModal(
+        "실행 파일 열기",
+        `${full}\n\n실행 권한이 있는 파일입니다 — 기본 앱으로 여는 대신 실행될 수 있습니다. 계속하시겠습니까?`,
+        "열기",
+      );
+      if (!ok) return;
+      await invoke("open_path", { path: full, force: true }).catch((e2) =>
+        toast("watchdog", "파일 열기 실패", String(e2)),
+      );
+    } else {
+      toast("watchdog", "파일 열기 실패", String(e));
+    }
+  }
+}
+
+// 클립보드 복사 — WKWebView에서 navigator.clipboard가 거부될 수 있어 execCommand 폴백.
+function copyPath(s: string) {
+  const fallback = () => {
+    const ta = document.createElement("textarea");
+    ta.value = s;
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    if (ok) toast("feed", "경로 복사됨", s);
+    else toast("watchdog", "경로 복사 실패", "클립보드 접근이 거부되었습니다");
+  };
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(s).then(() => toast("feed", "경로 복사됨", s), fallback);
+  } else fallback();
+}
+
+// F3: 파일 트리 컨텍스트 메뉴 — 확장 가능 항목 배열(도메인 액션 추가 = 원소 추가).
+// 삽입 대상 pane을 라벨에 명시해 오배달 인지를 차단한다(현재 ws의 pane 나열).
+function ftContextMenu(e: MouseEvent, full: string, isDir: boolean) {
+  const sock = current()?.socket;
+  const items: { label: string; action: () => void; disabled?: boolean }[] = [
+    { label: full, action: () => {}, disabled: true }, // F4: 경로 표시(아래 복사와 짝)
+    { label: "경로 복사", action: () => copyPath(full) },
+  ];
+  if (!isDir) items.push({ label: "열기", action: () => void openFtPath(full) });
+  items.push({
+    label: "Finder에서 보기",
+    action: () =>
+      void invoke("reveal_path", { path: full }).catch((err) =>
+        toast("watchdog", "Finder 표시 실패", String(err)),
+      ),
+  });
+  for (const sid of collectSids(current()?.tree ?? null).slice(0, 6)) {
+    const rt = panes.get(paneKey(sid, sock));
+    if (!rt) continue;
+    const name = rt.titleEl.textContent || `surface ${sid}`;
+    items.push({ label: `➤ ${name} 에 경로 삽입`, action: () => void injectPathsToPane(rt, [full]) });
+  }
+  if (isDir) {
+    items.push({ label: "패널 루트를 여기로", action: () => setFtRoot(full, true) });
+    items.push({
+      label: "cd 텍스트 삽입(전송 없음)",
+      action: () => {
+        const rt = focusedSid != null ? panes.get(paneKey(focusedSid, sock)) : undefined;
+        if (!rt) return toast("watchdog", "삽입 대상 없음", "포커스된 pane이 없습니다");
+        void injectRawToPane(rt, `cd ${shellQuote(full, /Windows/i.test(navigator.userAgent))}`);
+      },
+    });
+  }
+  showCtxMenu(e.clientX, e.clientY, items);
+}
+
+// F2: 경로 주입 파이프라인 — ①실존 재검증(스테일 트리 차단) ②스트리밍 가드 ③IME 가드
+// ④형식 결정(에이전트=@멘션/미등록=셸 인용) ⑤주입+피드백. 자동 Return 없음 — 전송은 사람 몫.
+async function injectPathsToPane(rt: PaneRuntime, paths: string[]) {
+  for (const p of paths) {
+    const parent = p.slice(0, p.lastIndexOf("/")) || "/";
+    const name = p.slice(p.lastIndexOf("/") + 1);
+    const entries = (await invoke("list_dir", { path: parent }).catch(() => null)) as
+      | { name: string }[]
+      | null;
+    if (!entries || !entries.some((en) => en.name === name)) {
+      toast("watchdog", "경로가 더 이상 없음", `${p} — 트리를 새로고침합니다`);
+      void renderFileTree();
+      return;
+    }
+  }
+  if (isStreaming(rt.lastOutputAt(), Date.now())) {
+    const ok = await confirmModal(
+      "에이전트 응답 중",
+      "대상 pane이 출력 중입니다. 지금 삽입하면 프롬프트가 섞일 수 있습니다. 그래도 삽입하시겠습니까?",
+      "삽입",
+    );
+    if (!ok) return;
+  }
+  if (rt.imeBusy()) {
+    toast("watchdog", "한글 조합 중", "조합을 끝낸 뒤 다시 시도해 주세요");
+    return;
+  }
+  const r = (await invoke("list_surfaces", { socket: rt.socket }).catch(() => null)) as {
+    surfaces: { surface_id: number; live_cwd: string | null; role?: string | null; agent?: string | null }[];
+  } | null;
+  const me = r?.surfaces.find((s) => s.surface_id === rt.sid);
+  const agent = !!(me?.role || me?.agent);
+  const isWin = /Windows/i.test(navigator.userAgent);
+  await injectRawToPane(rt, insertionText(paths, { agent, isWin, cwd: me?.live_cwd ?? null }));
+}
+
+// 주입 공통부 — 성공 피드백(헤더 플래시+토스트)·실패 토스트(무음 삼킴 금지). 자동 Return 없음.
+async function injectRawToPane(rt: PaneRuntime, data: string) {
+  try {
+    await invoke("send_input", { socket: rt.socket, surfaceId: rt.sid, data });
+    rt.el.classList.add("inject-flash");
+    setTimeout(() => rt.el.classList.remove("inject-flash"), 700);
+    toast("feed", "경로 삽입됨", `${rt.titleEl.textContent || rt.sid} — Enter를 눌러야 전송됩니다`);
+  } catch (e) {
+    toast("watchdog", "삽입 실패", String(e));
+  }
+}
+
+let ftDragConsumed = false; // 드래그로 소비된 mousedown의 후행 click 억제 플래그
+
+// F2: 트리 행 드래그 — pane 위 드롭 시 경로 주입. startPaneDrag와 동일한 mouse 기반(6px 임계).
+// 드롭이 pane을 직격하지 못하면 무동작+토스트 — 포커스 pane 폴백 오배달(footgun) 금지.
+function startFtDrag(e0: MouseEvent, full: string) {
+  const start = { x: e0.clientX, y: e0.clientY };
+  let dragging = false;
+  let ghost: HTMLElement | null = null;
+  let over: PaneRuntime | null = null;
+  const clearOver = () => {
+    over?.el.classList.remove("drop-target");
+    over = null;
+  };
+  const move = (e: MouseEvent) => {
+    if (!dragging) {
+      if (Math.abs(e.clientX - start.x) + Math.abs(e.clientY - start.y) < 6) return;
+      dragging = true;
+      ftDragConsumed = true;
+      ghost = document.createElement("div");
+      ghost.id = "drag-ghost";
+      ghost.textContent = full.split("/").pop() || full;
+      document.body.append(ghost);
+    }
+    ghost!.style.left = `${e.clientX + 10}px`;
+    ghost!.style.top = `${e.clientY + 10}px`;
+    const el = (document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null)?.closest(
+      ".pane",
+    ) as HTMLElement | null;
+    let rt: PaneRuntime | null = null;
+    if (el) for (const cand of panes.values()) if (cand.el === el) rt = cand;
+    if (rt !== over) {
+      clearOver();
+      over = rt;
+      over?.el.classList.add("drop-target");
+    }
+  };
+  const up = () => {
+    window.removeEventListener("mousemove", move, true);
+    window.removeEventListener("mouseup", up, true);
+    ghost?.remove();
+    const target = over;
+    clearOver();
+    if (!dragging) return;
+    // click은 mouseup과 같은 엘리먼트에서만 발화 — pane 위에서 끝난 드래그는 행 click이 없어
+    // 플래그가 잔류하면 다음 정상 클릭 1회를 오발 억제한다 → 태스크 큐에서 무조건 청소.
+    setTimeout(() => {
+      ftDragConsumed = false;
+    }, 0);
+    if (!target) {
+      toast("watchdog", "드롭 취소", "pane 위에 놓아야 삽입됩니다");
+      return;
+    }
+    void injectPathsToPane(target, [full]);
+  };
+  window.addEventListener("mousemove", move, true);
+  window.addEventListener("mouseup", up, true);
 }
 
 // ★GUI 오퍼레이터 승인(오너 2026-07-15): feed_reply 실패 사유를 사용자 문구로 분류 — 기존
@@ -4601,20 +4981,22 @@ async function start() {
 
   await listen("daemon-event", (e) => onDaemonEvent(e.payload as Record<string, unknown>));
 
-  // ── 파일 드래그&드롭 → 드롭한 pane의 PTY에 셸 인용 경로 타이핑(iTerm2 동작) ──
+  // ── 파일 드래그&드롭 → 드롭한 pane의 PTY에 경로 주입(iTerm2 동작) ──
   // dragDropEnabled 기본 활성이라 Tauri가 OS 드롭을 가로채 tauri://drag-drop로 준다(HTML5 drop 미발화).
   // payload.position=물리 픽셀. 전역 listen은 target=Any라 창 라벨로 emit된 이 이벤트를 수신한다
   // (검증: tauri 2.11 event/listener.rs match_any_or_filter — listener.target==Any면 emit 타겟 무관 매칭).
+  // F2: 트리 드래그와 동일 파이프라인(injectPathsToPane) — 재검증·스트리밍 가드·@멘션 형식 공유.
+  // 직격 실패 시 무동작+토스트(포커스 pane 폴백 오배달 금지).
   await listen("tauri://drag-drop", (e) => {
     const p = (e.payload ?? {}) as { paths?: string[]; position?: { x: number; y: number } };
     const paths = p.paths ?? [];
     if (!paths.length) return;
-    const rt = paneAtPhysicalPoint(p.position);
-    if (!rt) return; // pane이 하나도 없으면 무시(에러 금지)
-    const isWin = /Windows/i.test(navigator.userAgent);
-    // 여러 파일이면 각각 셸 인용 후 공백 연결, 끝에 공백 1개(개행 없음 — 실행은 사용자 몫).
-    const data = shellQuoteJoin(paths, isWin) + " ";
-    invoke("send_input", { socket: rt.socket, surfaceId: rt.sid, data }).catch(() => {});
+    const rt = paneAtPointStrict(p.position);
+    if (!rt) {
+      if (panes.size > 0) toast("watchdog", "드롭 취소", "pane 위에 놓아야 삽입됩니다");
+      return;
+    }
+    void injectPathsToPane(rt, paths);
   });
 
   // 바이너리 업데이트 진행률(install_update가 emit). chunk=이번 청크 바이트(누적 아님), total=전체(Option→null 가능).

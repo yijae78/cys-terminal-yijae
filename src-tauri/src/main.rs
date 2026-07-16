@@ -425,13 +425,21 @@ fn ime_debug_enabled() -> bool {
 }
 
 #[tauri::command]
-async fn send_input(socket: Option<String>, surface_id: u64, data: String) -> Result<(), String> {
+async fn send_input(
+    socket: Option<String>,
+    surface_id: u64,
+    data: String,
+    queued: Option<bool>,
+) -> Result<(), String> {
     // human=true: T3-13 타이핑 가드의 신호 — UI 키 입력을 '사람'으로 표시해
-    // 원격 주입이 사람의 미완성 입력을 오염시키지 못하게 한다
+    // 원격 주입이 사람의 미완성 입력을 오염시키지 못하게 한다.
+    // queued=true(전출 복원 주입 등 후속 지시)는 사람 타이핑이 아니므로 human=false —
+    // human=true로 큐잉하면 last_human_input 갱신이 타이핑 가드를 3초 오염시킨다.
+    let q = queued.unwrap_or(false);
     rpc_on(
         &resolve_socket(&socket),
         "surface.send_text",
-        json!({"surface_id": surface_id, "text": data, "quiet": true, "human": true}),
+        json!({"surface_id": surface_id, "text": data, "quiet": true, "human": !q, "queued": q}),
     )
     .await
     .map(|_| ())
@@ -483,10 +491,31 @@ fn list_dir(path: String) -> Result<Value, String> {
 }
 
 /// 파일을 시스템 기본 앱으로 연다 (macOS open / Windows start).
+/// 실행형 파일(유닉스 실행비트·Windows 실행 확장자)은 open이 곧 실행일 수 있어
+/// force 없이는 "executable_confirm" 에러로 거절한다 — UI가 확인 후 force로 재호출(fail-closed).
 #[tauri::command]
-fn open_path(path: String) -> Result<(), String> {
+fn open_path(path: String, force: Option<bool>) -> Result<(), String> {
     // 실재하는 로컬 경로만 허용 — URL 스킴·존재하지 않는 문자열이 OS 런처에 닿지 않게
-    std::fs::metadata(&path).map_err(|e| format!("not a local path: {e}"))?;
+    let meta = std::fs::metadata(&path).map_err(|e| format!("not a local path: {e}"))?;
+    if !force.unwrap_or(false) && meta.is_file() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 != 0 {
+                return Err("executable_confirm".into());
+            }
+        }
+        #[cfg(windows)]
+        {
+            let ext = std::path::Path::new(&path)
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if ["exe", "bat", "cmd", "com", "scr", "ps1", "msi"].contains(&ext.as_str()) {
+                return Err("executable_confirm".into());
+            }
+        }
+    }
     #[cfg(target_os = "macos")]
     let r = std::process::Command::new("open").arg(&path).spawn();
     // explorer는 인자를 셸 파싱하지 않는다 — cmd /C start의 메타문자 주입 경로 제거
@@ -494,6 +523,29 @@ fn open_path(path: String) -> Result<(), String> {
     let r = std::process::Command::new("explorer").arg(&path).spawn();
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let r = std::process::Command::new("xdg-open").arg(&path).spawn();
+    r.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// 파일 관리자에서 해당 항목을 선택해 보여준다 (macOS Finder reveal / Windows explorer select).
+/// open_path와 동일한 실재 경로 게이트 — URL 스킴·비존재 문자열 차단.
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    std::fs::metadata(&path).map_err(|e| format!("not a local path: {e}"))?;
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("explorer")
+        .arg(format!("/select,{path}"))
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let r = {
+        // xdg에는 reveal 표준이 없다 — 부모 폴더 열기로 폴백
+        let parent = std::path::Path::new(&path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        std::process::Command::new("xdg-open").arg(parent).spawn()
+    };
     r.map(|_| ()).map_err(|e| e.to_string())
 }
 
@@ -2729,6 +2781,7 @@ fn main() {
             feed_reply,
             list_dir,
             open_path,
+            reveal_path,
             open_url,
             send_key,
             read_board_catalog,
@@ -2852,6 +2905,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [F1] open_path 실행형 게이트 — 실행비트 파일은 force 없이 executable_confirm으로 거절(fail-closed),
+    /// 비존재 경로는 metadata 게이트에서 거절(스폰 없음). force 경로는 실제 스폰이라 여기서 검사하지 않는다.
+    #[test]
+    fn open_path_gates_executable_and_missing() {
+        let r = open_path("/definitely/not/a/real/path-xyz".into(), None);
+        assert!(r.is_err() && !r.unwrap_err().contains("executable_confirm"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join("cys-openpath-test");
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("run.sh");
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let r = open_path(p.to_string_lossy().into_owned(), None);
+            assert_eq!(r, Err("executable_confirm".to_string()));
+        }
+    }
 
     /// [F5] drain --verify 실패 분류 — 구버전 미지원(clap unknown-flag)과 크래시/하드캡을 구분한다.
     /// UI 문구 정직성: ①→"미지원" ②→"검증 실패(원인 미상)". 거동(plain drain 폴백)은 양쪽 동일.
