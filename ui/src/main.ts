@@ -2218,11 +2218,9 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
   }
   const isAgent = !!(me.role || me.agent);
   const cwd = me.live_cwd ?? null;
-  // 에이전트인데 cwd 미확보면 핸드오프 파일 검증이 불가 — 지시 주입 '전'에 중단(오염 방지).
-  if (isAgent && !cwd) {
-    toast("watchdog", "전출 불가", "pane의 현재 경로를 확인할 수 없습니다 — 원본은 그대로입니다");
-    return;
-  }
+  // 부서 노드는 cwd가 "/"(루트)로 뜨는 경우가 실측됨 — 루트류(/·드라이브 루트)·미확보 cwd는
+  // 프로젝트 상대 경로(_round/handoffs)가 성립하지 않으므로 ~/.cys/transfers 로 폴백한다.
+  const rootish = !cwd || cwd === "/" || /^[A-Za-z]:[\\/]?$/.test(cwd);
   // 역할 승계: 원 역할 그대로 재기동(무음 worker 강등 금지). 데몬 유래 값이지만 명령 조합에
   // 들어가므로 형식 가드([a-z0-9-]) — 벗어나면 worker 폴백. 리뷰어는 전용 CLI 처방(RESTART와 동일).
   const srcRole = me.role && /^[a-z0-9-]{1,32}$/.test(me.role) ? me.role : "worker";
@@ -2243,14 +2241,18 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
   try {
     let handoffPath: string | null = null;
     if (isAgent) {
-      // ① 핸드오프 지시 주입(CR 포함 제출 — 워커가 파일을 기록한다). cwd는 위에서 확보 보장.
-      handoffPath = `${cwd}/_round/handoffs/transfer-${sid}-${Date.now()}.md`;
+      // ① 핸드오프 지시 주입 — clear_first(데몬 T3-13 권위 전달: Ctrl-U 정리→paste→지연 CR
+      //    원자 제출). raw "\r" 동봉은 Claude CLI가 붙여넣기로 삼켜 미제출(e2e 실측 결함).
+      const base = rootish
+        ? `${(await invoke("home_dir_path")) as string}/.cys/transfers`
+        : `${cwd}/_round/handoffs`;
+      handoffPath = `${base}/transfer-${sid}-${Date.now()}.md`;
       const inst =
         `지금까지의 작업 상태를 HANDOFF_CONTRACT 5필드로 ${handoffPath} 에 기록하라` +
         `(디렉토리가 없으면 mkdir -p로 생성). 각 필드는 정확히 "## Decided" "## Rejected" "## Risks" ` +
         `"## Files" "## Remaining" 마크다운 헤더로 쓰고, 해당 없음은 "없음"으로 명기하라. ` +
-        `5필드가 모두 기록된 파일이 전출 준비 완료 신호다.\r`;
-      await invoke("send_input", { socket: srcSock, surfaceId: sid, data: inst });
+        `5필드가 모두 기록된 파일이 전출 준비 완료 신호다.`;
+      await invoke("send_input", { socket: srcSock, surfaceId: sid, data: inst, clearFirst: true });
       // ② 5필드 내용 검증 대기(3초 간격·최대 120초) — 화면 파싱이 아니라 파일 내용 확인(결정론).
       stickyToast("transfer", "feed", "전출 준비 중", "핸드오프 기록 대기(최대 120초)…");
       // 파일 실존≠내용 유효 — 5필드(HANDOFF_CONTRACT)가 전부 갖춰질 때까지 대기한다.
@@ -2277,8 +2279,9 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
         return;
       }
     }
-    // ③ 대상 부서에 새 surface 생성 + 트리 편입(같은 경로에서 시작)
-    const newSid = await newSurface(cwd, destWs.socket);
+    // ③ 대상 부서에 새 surface 생성 + 트리 편입(같은 경로에서 시작 — 루트류 cwd는 승계하지
+    //    않고 데몬 기본값(home)으로: 루트 cwd pane 재생산 차단)
+    const newSid = await newSurface(rootish ? null : cwd, destWs.socket);
     destWs.tree = destWs.tree
       ? { type: "split", dir: "row", a: destWs.tree, b: { type: "pane", sid: newSid } }
       : { type: "pane", sid: newSid };

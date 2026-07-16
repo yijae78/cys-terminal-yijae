@@ -430,19 +430,32 @@ async fn send_input(
     surface_id: u64,
     data: String,
     queued: Option<bool>,
+    clear_first: Option<bool>,
 ) -> Result<(), String> {
     // human=true: T3-13 타이핑 가드의 신호 — UI 키 입력을 '사람'으로 표시해
     // 원격 주입이 사람의 미완성 입력을 오염시키지 못하게 한다.
     // queued=true(전출 복원 주입 등 후속 지시)는 사람 타이핑이 아니므로 human=false —
     // human=true로 큐잉하면 last_human_input 갱신이 타이핑 가드를 3초 오염시킨다.
+    // clear_first=true는 데몬 T3-13 권위 전달(Ctrl-U 정리→paste→지연 CR 원자 제출) —
+    // raw "\r" 동봉은 Claude CLI가 paste로 삼켜 미제출된다(전출 e2e 실측). queued와 결합 불가.
+    // 전출 지시도 사람의 클릭에서 발화하므로 human 유지(타이핑 가드 결정론 통과).
     let q = queued.unwrap_or(false);
+    let cf = clear_first.unwrap_or(false);
     rpc_on(
         &resolve_socket(&socket),
         "surface.send_text",
-        json!({"surface_id": surface_id, "text": data, "quiet": true, "human": !q, "queued": q}),
+        json!({"surface_id": surface_id, "text": data, "quiet": true, "human": !q,
+               "queued": q, "clear_first": cf}),
     )
     .await
     .map(|_| ())
+}
+
+/// 전출(F6-2) 핸드오프 폴백 경로용 홈 디렉토리 — cwd가 루트류(/·C:\)인 pane은
+/// 프로젝트 상대 경로(_round/handoffs)가 성립하지 않아 ~/.cys/transfers 로 폴백한다.
+#[tauri::command]
+fn home_dir_path() -> String {
+    cys::home_dir().to_string_lossy().into_owned()
 }
 
 /// 클립보드 이미지 붙여넣기(F): base64 이미지를 임시 파일로 저장하고 절대경로를 반환한다.
@@ -2813,6 +2826,7 @@ fn main() {
             open_path,
             reveal_path,
             read_text_head,
+            home_dir_path,
             open_url,
             send_key,
             read_board_catalog,
