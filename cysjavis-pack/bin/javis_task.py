@@ -551,9 +551,11 @@ def cmd_set_status(a):
                 return EXIT_NO_EVIDENCE
             print("evidence-artifact warn: 유효 --evidence-artifact 없음 — "
                   "--evidence-artifact 또는 --skip-reason 권장", file=sys.stderr)
-        # skip 감사(R3): skip-reason이 게이트 통과 근거이면 예약 — 실제 기록은 전이·settle 게이트를
-        #   통과해 done이 확정된 뒤(wlock 안)에만. 조기 기록은 거부된 재진입에도 감사가 오염된다.
-        skip_audit_pending = (art_mode != "off" and skip_text and not art_valid)
+        # skip 감사(R3): skip-reason이 done 통과의 부담 근거(유효 artifact 부재)이면 예약 — art_mode와
+        #   무관하다(★어태커 결함1: off 밸브에서도 --skip-reason은 텍스트 게이트 통과 근거로 쓰이므로
+        #   기록해야 원장이 완전하다). 실제 기록은 전이·settle 게이트를 통과해 done이 확정된 뒤
+        #   (wlock 안)에만 — 조기 기록은 거부된 재진입에도 감사가 오염된다.
+        skip_audit_pending = (bool(skip_text) and not art_valid)
     settle_override_note = None
     if a.status == "done" and task.get("owner"):
         if getattr(a, "settled_override", None):
@@ -767,6 +769,18 @@ def cmd_self_test(args):
             assert rc == EXIT_OK, "off 모드가 0을 안 냄: %s (%s)" % (rc, e)
             assert "artifacts" not in read_task(root, "Toff").get("evidence", {}), "off인데 artifacts 기록됨"
 
+            # ── off 밸브 skip 감사(어태커 결함1): artifact 게이트 off라도 --skip-reason이 done 통과
+            #    근거이면 skip_audit.jsonl에 기록돼 원장이 완전해야 한다 ──
+            rc, _, e = run(root, ["create", "Toffskip", "--id", "Toffskip", "--status", "in_progress"])
+            assert rc == 0
+            rc, _, e = run(root, ["set-status", "Toffskip", "done", "--skip-reason", "off 밸브 skip"],
+                           {"CYS_TASK_EVIDENCE_ARTIFACT_GATE": "off"})
+            assert rc == EXIT_OK, "off+skip done이 0을 안 냄: %s (%s)" % (rc, e)
+            with open(audit, encoding="utf-8") as f:
+                offlines = [json.loads(ln) for ln in f.read().splitlines() if ln.strip()]
+            assert any(r["task"] == "Toffskip" and r["reason"] == "off 밸브 skip" for r in offlines), \
+                "off 밸브에서 skip 감사가 누락됨(원장 불완전): %s" % offlines
+
             # ── 하위호환 A: --evidence 텍스트만(artifact 게이트 off) → 무파손(evidence.text 보존) ──
             rc, _, e = run(root, ["create", "Tbc1", "--id", "Tbc1", "--status", "in_progress"])
             assert rc == 0
@@ -790,7 +804,7 @@ def cmd_self_test(args):
         print("javis_task self-test FAIL: %s" % ex, file=sys.stderr)
         return 1
     print("javis_task self-test OK (E1 evidence-artifact 게이트 — 부정4·긍정·폴백·skip감사·"
-          "재진입·warn/off 경계·하위호환 A/B · 밀폐 tmpdir+JAVIS_ROOT)")
+          "재진입·warn/off 경계·off밸브 skip감사·하위호환 A/B · 밀폐 tmpdir+JAVIS_ROOT)")
     return EXIT_OK
 
 

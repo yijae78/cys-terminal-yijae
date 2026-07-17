@@ -73,7 +73,8 @@ def cmd_add(a):
 def compute_stats(records, total=None):
     """순수 함수(self-test 밀폐 핀) — 오리엔테이션 실패 계측 통계.
     by_kind: 유형별 건수 · by_kind_ratio: 유형별 비율(전체 실패 대비) ·
-    failure_rate: total(위임 총건) 주어질 때만 실패/위임 (Phase B 게이트 근거)."""
+    failure_rate: total(위임 총건) 주어질 때만 실패/위임 (Phase B 게이트 근거).
+    ★어태커 결함2 가드: total은 양수이고 실패건 이상이어야 한다 — 위반 시 ValueError(호출부 exit 2)."""
     n = len(records)
     by_kind = {k: 0 for k in KINDS}
     unknown = 0
@@ -91,13 +92,22 @@ def compute_stats(records, total=None):
     if unknown:
         stats["unknown_kind"] = unknown
     if total is not None:
+        if total <= 0:
+            raise ValueError("--total은 양수여야 한다(위임 총건 > 0): %r" % total)
+        if total < n:
+            raise ValueError("--total(%d) < 기록된 실패건(%d) — 위임 총건이 실패건보다 작을 수 없다"
+                             % (total, n))
         stats["delegations_total"] = total
-        stats["failure_rate"] = (n / total) if total else 0.0
+        stats["failure_rate"] = n / total
     return stats
 
 
 def cmd_stats(a):
-    stats = compute_stats(_read_records(_log_path()), total=a.total)
+    try:
+        stats = compute_stats(_read_records(_log_path()), total=a.total)
+    except ValueError as e:
+        print("error: %s" % e, file=sys.stderr)
+        return EXIT_USAGE
     print(json.dumps(stats, ensure_ascii=False, indent=1))
     return EXIT_OK
 
@@ -128,6 +138,19 @@ def cmd_self_test(args):
         assert abs(s["by_kind_ratio"]["wrong-target"] - 2 / 3) < 1e-9, "비율 산출 오류: %s" % s
         assert abs(s["failure_rate"] - 3 / 20) < 1e-9, "failure_rate 산출 오류: %s" % s
         assert compute_stats([{"kind": "bogus"}])["unknown_kind"] == 1, "미지 kind 미집계"
+        # ★어태커 결함2 가드(순수): total<=0·total<실패건 → ValueError
+        for bad in (0, -5):
+            try:
+                compute_stats(recs, total=bad)
+                assert False, "total=%r가 ValueError를 안 냄" % bad
+            except ValueError:
+                pass
+        try:
+            compute_stats(recs, total=2)  # 실패 3건 > total 2
+            assert False, "total<실패건이 ValueError를 안 냄"
+        except ValueError:
+            pass
+        assert compute_stats(recs, total=3)["failure_rate"] == 1.0, "total==실패건 경계(1.0) 오류"
 
         with tempfile.TemporaryDirectory(prefix="javis-orient-") as root:
             # add: append 누적(O_APPEND)
@@ -154,6 +177,12 @@ def cmd_self_test(args):
             js = json.loads(out)
             assert js["total_failures"] == 2 and js["failure_rate"] == 2 / 20, "stats CLI 집계 오류: %s" % js
 
+            # ★어태커 결함2 CLI 가드: --total 0 → exit 2, --total 1(실패 2건 미만) → exit 2
+            rc, _, err = run(root, ["stats", "--total", "0"])
+            assert rc == EXIT_USAGE and "양수" in err, "--total 0 미거부: rc=%s err=%s" % (rc, err)
+            rc, _, err = run(root, ["stats", "--total", "1"])
+            assert rc == EXIT_USAGE and "실패건" in err, "--total<실패건 미거부: rc=%s err=%s" % (rc, err)
+
             # 빈 로그 경계: 새 root에서 stats는 total 0(무크래시)
             with tempfile.TemporaryDirectory(prefix="javis-orient-empty-") as root2:
                 rc, out, e = run(root2, ["stats"])
@@ -162,7 +191,7 @@ def cmd_self_test(args):
         print("javis_orient_log self-test FAIL: %s" % ex, file=sys.stderr)
         return 1
     print("javis_orient_log self-test OK (add append·--by 필수·kind 검증·stats 비율·"
-          "failure_rate·빈 로그 경계 · 밀폐 tmpdir+JAVIS_ROOT)")
+          "failure_rate·--total 가드(0·<실패건)·빈 로그 경계 · 밀폐 tmpdir+JAVIS_ROOT)")
     return EXIT_OK
 
 
