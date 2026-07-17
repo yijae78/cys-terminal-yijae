@@ -66,11 +66,13 @@ async fn main() {
     scrub_claude_session_env();
 
     // ★W1(조기 단일 인스턴스 게이트): 소켓 경로 확정 직후·pack 설치보다 먼저 단일 인스턴스 게이트를
-    // 통과시킨다. 목적 — 락/싱글턴 경쟁의 **패자**가 부트 부수효과를 단 한 줄도 실행하기 전에 죽게 하는 것.
-    // (부수효과: Daemon::new 의 operator.token 디스크 덮어쓰기·feed.jsonl compaction, 워치독·스케줄러·
-    //  오피스 브리지 spawn, daemon.started 발행 등.) 과거엔 락 획득을 accept_loop 진입까지 미뤄, 패자가
-    // 부수효과 전량을 실행한 뒤에야 죽었다 → launchd KeepAlive 재기동 폭주 시 패자가 매번 operator.token 을
-    // 덮어써 라이브 데몬 메모리 토큰과 불일치 → GUI 승인 Feed 우회가 무력화되어 Allow 전멸.
+    // 통과시킨다. 목적 — 락/싱글턴 경쟁의 **패자**가 상태를 오염시키는 부트 부수효과 전에 죽게 하는 것.
+    // (게이트 뒤 부수효과: Daemon::new 의 operator.token 디스크 덮어쓰기·feed.jsonl compaction, 워치독·
+    //  스케줄러·오피스 브리지 spawn, pack install, daemon.started 발행 등.) ★리뷰어1 F2: 패자의 잔여
+    // 부수효과는 상태디렉터리 mkdir/chmod 0o700(멱등·무해)뿐 — operator.token·feed.jsonl 등 상태 파일과
+    // 프로세스 spawn 은 무접촉이다. 과거엔 락 획득을 accept_loop 진입까지 미뤄 패자가 부수효과 전량을
+    // 실행한 뒤에야 죽었다 → launchd KeepAlive 재기동 폭주 시 패자가 매번 operator.token 을 덮어써 라이브
+    // 데몬 메모리 토큰과 불일치 → GUI 승인 Feed 우회가 무력화되어 Allow 전멸.
     let socket_path = cys::socket_path();
 
     // unix: flock 기반 startup 락 — 경합 시 hung 홀더는 데드맨이 회수·인수, 건강한 홀더/구 락파일은
@@ -118,6 +120,8 @@ async fn main() {
         match create_pipe_instance(&pipe_name, true) {
             Ok(s) => s,
             Err(e) => {
+                // ★리뷰어1 F3: 구 panic!(exit 101) → exit(1) 통일 — 즉사 의미는 동일하되 종료코드를
+                // unix 패자(acquire_startup_lock 의 exit(1))와 일치화한다.
                 eprintln!("error: another cysd already owns the pipe {pipe_name}: {e}");
                 std::process::exit(1);
             }
@@ -160,10 +164,15 @@ async fn main() {
     // crash recovery(§7-⑤): 직전 pack-update가 apply 도중 죽어 남긴 orphan 저널을 install(false)
     // **이전에** 자가치유한다(미커밋=rollback / 커밋완료=정리). 순서가 중요 — install(false)가
     // 부분반영 트리 위에서 돌면 안 되므로 반드시 선행한다.
-    match cys::pack::recover_pack_journal() {
-        Ok(true) => eprintln!("[cysd] pack-update orphan journal recovered (self-heal)"),
-        Ok(false) => {}
-        Err(e) => eprintln!("[cysd] pack journal recovery skipped: {e}"),
+    // ★리뷰어1 F1: 조기 락 전진(W1)으로 "락 보유~소켓 bind" 창이 이 pack recover/install 동기 블로킹을
+    // 통째로 포함하게 됐다 — 단일 워커(1코어)에서 이 블로킹이 tokio 워커를 45초(HEARTBEAT_STALE_THRESHOLD)+
+    // 굶기면 heartbeat interval 태스크가 못 돌아 stale → 경합자 데드맨이 정당한 승자를 Dead 오판·SIGKILL 할
+    // 수 있다. spawn_blocking 으로 별도 블로킹 풀에 태워 main 태스크가 yield 해도 interval 이 계속 돌게 한다.
+    match tokio::task::spawn_blocking(cys::pack::recover_pack_journal).await {
+        Ok(Ok(true)) => eprintln!("[cysd] pack-update orphan journal recovered (self-heal)"),
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => eprintln!("[cysd] pack journal recovery skipped: {e}"),
+        Err(e) => eprintln!("[cysd] pack journal recovery task failed: {e}"),
     }
     // 온보딩②: 팩이 이 바이너리 버전으로 미커밋일 때만 자동 설치 — 신규 머신·바이너리 업그레이드·
     // 팩 소실(.pack-version/매니페스트 부재 = 게이트 개방)이 실행 조건. launch-agent·디렉티브·acl이
@@ -173,13 +182,16 @@ async fn main() {
     // 손상+마커 무결 상태의 치유는 cys init-pack/pack-update/doctor --fix 명시 경로가 담당한다
     // (매 부트 전량 치유는 seed-once 원복 사고(7-12)의 원인 기전 — 의도적 축소).
     if !cys::pack::pack_current_for(env!("CARGO_PKG_VERSION")) {
-        match cys::pack::install(false) {
-            Ok((written, _)) if written > 0 => eprintln!(
+        // ★리뷰어1 F1: install(false)도 동기 블로킹(최대 320파일 read+해시+write)이라 위 heartbeat 굶김
+        // 위험이 동일 — spawn_blocking 으로 분리한다. (pack_current_for 게이트는 stat 2회라 동기 유지.)
+        match tokio::task::spawn_blocking(|| cys::pack::install(false)).await {
+            Ok(Ok((written, _))) if written > 0 => eprintln!(
                 "[cysd] CYSJavis Pack: {written} file(s) installed at {}",
                 cys::pack::pack_dir().display()
             ),
-            Ok(_) => {}
-            Err(e) => eprintln!("[cysd] pack auto-install skipped: {e}"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("[cysd] pack auto-install skipped: {e}"),
+            Err(e) => eprintln!("[cysd] pack auto-install task failed: {e}"),
         }
     }
     let daemon = Daemon::new(socket_path.clone());
