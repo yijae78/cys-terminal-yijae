@@ -528,6 +528,12 @@ enum Command {
         role: String,
         #[arg(long)]
         surface: Option<String>,
+        /// ★SEAT: 보유자가 '빈 좌석'(agent 없는 셸·자손 프로세스 0·최근 입력 없음)이면 승계한다.
+        /// 데몬이 그 좌석의 공허를 결정론으로 재판정하므로 요청일 뿐 강제가 아니다 — agent 가 붙은
+        /// 정당한 보유자는 종전대로 거부된다. 부트 체인(javis_bootstrap ③)이 빈 셸에 막혀
+        /// '유령 master' 데드엔드에 빠지던 경로를 푼다.
+        #[arg(long = "takeover-empty-seat")]
+        takeover_empty_seat: bool,
     },
     /// Mark a surface quiescing(=채널 inbox 주입 보류) or release it (§2.2 S5) — cycle-agent가 clear 전후 호출
     Quiesce {
@@ -1989,8 +1995,9 @@ fn run(command: Command) -> i32 {
             })
         }),
 
-        Command::ClaimRole { role, surface } => target_surface(&surface, &None).and_then(|sid| {
-            request("system.claim_role", json!({"role": role, "surface_id": sid}))
+        Command::ClaimRole { role, surface, takeover_empty_seat } => target_surface(&surface, &None).and_then(|sid| {
+            request("system.claim_role", json!({"role": role, "surface_id": sid,
+                                                "takeover_empty_seat": takeover_empty_seat}))
                 .map(|r| println!("registered: {} → surface:{}", r["role"].as_str().unwrap_or("?"), sid))
         }),
 
@@ -4691,6 +4698,11 @@ fn run_launch_agent_opts(
             "surface.create",
             json!({"cwd": cwd, "title": workflow_title(role, agent, &cwd), "role": role,
                    "rows": 40, "cols": 140, "idempotency_key": idem, "env": env_obj,
+                   // ★SEAT: launch-agent 는 '이 역할의 노드를 실제로 띄우겠다'는 명시 의사다 —
+                   // 보유자가 빈 좌석(agent 없는 셸)이면 승계를 요청한다. 데몬이 그 좌석이 정말
+                   // 비었는지 결정론으로 재판정하므로(seat_claimable), 이 플래그는 '요청'일 뿐
+                   // 강제가 아니다. agent 가 붙은 정당한 보유자는 종전대로 claim_denied 로 보호된다.
+                   "takeover_empty_seat": true,
                    // (W1) restore 원값 전달(부재=신규는 데몬이 자기 env로 결정론 해소·기록).
                    "claude_config_dir": config_dir_override}),
         )?;
@@ -6271,16 +6283,43 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
     }
 }
 
+/// ★W2 복원 디렉티브 분기: 워커·리뷰어는 master 지시를 기다리지만, master는 지시할 상위가 없다 —
+/// RECOVERY 프로토콜로 스스로 상태를 복원하고 미해결 게이트부터 자율 재개한다(콜드부트
+/// auto-restore가 master를 포함하는 경로).
+/// ★SEAT: fresh 기동과 **좌석 내 재연결(in-seat)** 두 경로가 같은 문구를 쓰도록 함수로 둔다 —
+/// 인라인 중복이면 한쪽만 고쳐지는 드리프트가 난다(복원 계약은 경로와 무관하게 하나다).
+fn restore_directive(role: &str) -> &'static str {
+    if role == "master" {
+        "[RESTORE] 조직 복원 절차다(master). _round/RECOVERY.md → SESSION_STATE.md → 자기 TODO → memory → git 순으로 읽고, 노드 재기동·surface 재매핑·directive 각성 후 미해결 게이트부터 자율 재개하라."
+    } else {
+        "[RESTORE] 조직 복원 절차다. _round/SESSION_STATE.md와 자기 TODO를 읽고 상태를 복원하라. ★작업 재개는 하지 말고 master의 지시를 기다려라."
+    }
+}
+
 /// T2-6 조직 복원: 토폴로지 스냅샷 기준으로 죽은 역할 일괄 재기동 (작업 재개는 master 판단)
 fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i32 {
     let result = (|| -> Result<(usize, usize), String> {
         let topo = request("system.topology", json!({}))?;
-        let live: std::collections::HashSet<String> = topo["live"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        // ★SEAT(2026-07-17 실사고 수리): '역할이 등록됨'과 '그 좌석에 누가 앉아 있음'을 구분한다.
+        // 종전 live 집합은 role 등록만 보고 skip 해서, role=master 를 쥔 **빈 셸**(agent 없는 좌석)이
+        // 있으면 master 를 영영 부활시키지 못했다(phoenix·▶부서장 버튼·부트가 동시에 잠김).
+        // 이제 live = "좌석이 실제 점유된 역할"만. 빈 좌석 역할은 아래 seats 맵으로 넘겨,
+        // **그 좌석에 직접 연결**(in-seat)하거나 승계 fresh 로 되살린다.
+        let live_entries = topo["live"].as_array().cloned().unwrap_or_default();
+        let live: std::collections::HashSet<String> = live_entries
             .iter()
+            .filter(|e| e["seat"].as_str() != Some("empty"))
             .filter_map(|e| e["role"].as_str().map(String::from))
+            .collect();
+        // 빈 좌석 인덱스: role → (surface_id, env_injected). 부활 대상이면서 좌석이 이미 존재하는 경우.
+        let empty_seats: std::collections::HashMap<String, (u64, bool)> = live_entries
+            .iter()
+            .filter(|e| e["seat"].as_str() == Some("empty"))
+            .filter_map(|e| {
+                let role = e["role"].as_str()?.to_string();
+                let sid = e["surface_id"].as_u64()?;
+                Some((role, (sid, e["env_injected"].as_bool().unwrap_or(false))))
+            })
             .collect();
         let saved = topo["saved"].as_array().cloned().unwrap_or_default();
         // ★W2a 심층방어: 의도적으로 닫힌(surface.close 경유) 역할의 묘비 — raw restore도 절대 재스폰하지
@@ -6316,17 +6355,73 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                 continue;
             }
             let Some(agent) = entry["agent"].as_str() else {
-                println!("· {role}: agent 미상 — 건너뜀 (claim-role로 등록된 pane)");
+                // 스냅샷에 agent 가 없으면 무엇을 띄울지 결정론으로 알 수 없다(claim-role 로만 등록된
+                // pane). 좌석 유무와 무관하게 여기서 멈추는 것이 옳다 — 임의 기본값(claude) 추정은
+                // 다른 에이전트를 쓰는 좌석에 엉뚱한 CLI 를 띄운다.
+                let hint = if empty_seats.contains_key(role) {
+                    " (좌석은 비어 있음 — 그 pane 에서 직접 agent 를 실행하면 등록된다)"
+                } else {
+                    ""
+                };
+                println!("· {role}: agent 미상 — 건너뜀 (claim-role로 등록된 pane){hint}");
                 continue;
             };
             let target_cwd = cwd
                 .clone()
                 .or_else(|| entry["cwd"].as_str().map(String::from));
-            println!("· {role}: {agent} 재기동…");
             // (4b) saved entry의 session_id를 꺼내 정확한 세션 재개(없으면 fallback)
             let sess = entry["session_id"].as_str().map(String::from);
             // (W1) topology에 기록된 원 계정 config_dir을 넘긴다(구 topology=None → 기존 템플릿 동작).
             let cfg = entry["claude_config_dir"].as_str().map(String::from);
+            // ★SEAT in-seat 연결(오너 의도: "최초로 만들어지는 surface에 클로드가 연결되고 마스터로
+            // 부활"): 그 역할의 좌석이 이미 있고 비어 있으면 **새 surface 를 만들지 않고 그 좌석에
+            // 직접** 에이전트를 기동한다. 좌석이 늘지 않고(796형 잔존 pane 0) 사용자가 보는 그 pane 이
+            // 그대로 부서장이 된다.
+            //
+            // ★계정격리 가드(E8): 빈 셸은 `cys new-surface` 산물이라 **pane env 가 비어 있다**.
+            // unix 는 boot_agent_on_surface 가 `KEY="val" cmd` 인라인으로 env 를 실어 안전하지만,
+            // Windows 는 순수 cmd 를 보내므로 CLAUDE_CONFIG_DIR 이 실리지 않아 **계정 격리가 깨진다**
+            // (node-recover 가 같은 이유로 fail-closed 하는 지점). 안전하지 않으면 in-seat 를 포기하고
+            // fresh 로 폴백한다 — 기능은 회복되고 격리는 보존된다(좌석이 하나 늘 뿐이며 승계가 정리한다).
+            let in_seat = empty_seats.get(role).and_then(|&(sid, env_injected)| {
+                let safe = cfg!(unix) || env_injected;
+                safe.then_some(sid)
+            });
+            if let Some(sid) = in_seat {
+                println!("· {role}: {agent} 좌석 내 재연결(surface:{sid})…");
+                let spec = match load_agent_spec(agent) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("· {role}: agent spec 해석 실패({e}) — 건너뜀");
+                        fail += 1;
+                        continue;
+                    }
+                };
+                let seat_cwd = target_cwd.clone();
+                match boot_agent_on_surface(
+                    sid,
+                    role,
+                    agent,
+                    &spec,
+                    !no_resume,
+                    sess.as_deref(),
+                    false,
+                    seat_cwd.as_deref(),
+                    cfg.as_deref(),
+                ) {
+                    Ok(()) => {
+                        ok += 1;
+                        let directive = restore_directive(role);
+                        let _ = inject_text(sid, directive);
+                        continue;
+                    }
+                    Err(e) => {
+                        // in-seat 실패는 치명이 아니다 — fresh 폴백이 가용성을 지킨다(정직히 알린다).
+                        println!("· {role}: 좌석 내 재연결 실패({e}) — fresh 기동으로 폴백");
+                    }
+                }
+            }
+            println!("· {role}: {agent} 재기동…");
             if run_launch_agent_opts(role, agent, target_cwd, !no_resume, sess, true, cfg) == 0 {
                 ok += 1;
                 if let Ok(r) = request("system.resolve_role", json!({"role": role})) {
@@ -6343,15 +6438,7 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                                 json!({"surface_id": sid, "pack_version": pv, "directive_hash": dh}),
                             );
                         }
-                        // ★W2 복원 디렉티브 분기: 워커·리뷰어는 master 지시를 기다리지만, master는
-                        // 지시할 상위가 없다 — RECOVERY 프로토콜로 스스로 상태를 복원하고 미해결
-                        // 게이트부터 자율 재개한다(콜드부트 auto-restore가 master를 포함하는 경로).
-                        let directive = if role == "master" {
-                            "[RESTORE] 조직 복원 절차다(master). _round/RECOVERY.md → SESSION_STATE.md → 자기 TODO → memory → git 순으로 읽고, 노드 재기동·surface 재매핑·directive 각성 후 미해결 게이트부터 자율 재개하라."
-                        } else {
-                            "[RESTORE] 조직 복원 절차다. _round/SESSION_STATE.md와 자기 TODO를 읽고 상태를 복원하라. ★작업 재개는 하지 말고 master의 지시를 기다려라."
-                        };
-                        let _ = inject_text(sid, directive);
+                        let _ = inject_text(sid, restore_directive(role));
                     }
                 }
             } else {

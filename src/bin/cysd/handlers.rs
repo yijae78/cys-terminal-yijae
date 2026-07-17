@@ -166,6 +166,60 @@ pub fn glob_match(pattern: &str, value: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// ★SEAT 승계 시 큐 이관 — 보고 유실 0.
+/// 구 좌석의 pending_queue 에는 좌석이 비어 있는 동안 보류된 role 앞 메시지(리뷰어 verdict·워커
+/// 보고·wakeup)가 쌓여 있다. role 만 옮기고 큐를 두고 오면 그 보고는 **영영 배달되지 않는다**
+/// (역할 주소로 보냈는데 주소가 이사한 꼴). 순서를 보존해 신 좌석 큐의 **뒤에** 붙인다.
+///
+/// 동시성: 두 surface 의 pending_queue 를 **동시에 잡지 않는다** — drain 은 한 문장 안에서
+/// 임시 guard 가 끝나며 락이 풀리고, 그 뒤 대상 큐를 잡는다. 두 leaf 락을 겹쳐 쥐면 반대 방향
+/// 승계와 AB-BA 데드락이 난다(코드 규약 '락 순서: surfaces → roles'의 연장선).
+fn migrate_seat_queue(prev: &Arc<crate::state::Surface>, next: &Arc<crate::state::Surface>) {
+    let drained: Vec<String> = prev.pending_queue.lock().unwrap().drain(..).collect();
+    if drained.is_empty() {
+        return;
+    }
+    let mut nq = next.pending_queue.lock().unwrap();
+    for text in drained {
+        nq.push_back(text);
+    }
+}
+
+/// ★SEAT 승계 고지 — **무음 승계 금지**.
+/// 빈 좌석의 특권 role 을 다른 surface 가 승계할 때, 구 좌석 사용자가 그 사실을 모르면 "내 pane 이
+/// 조용히 강등됐다"는 온보딩 불신을 낳는다(부트 체인이 사용자가 쓰려던 좌석을 가져가는 경우).
+/// 채널 2개: ①`role.takeover` 이벤트(GUI·구독자·저널) ②구 좌석 화면의 **셸 주석 1줄**.
+///
+/// 주석을 쓰는 이유: 좌석은 셸이므로 텍스트 주입은 곧 '입력'이다 — 평문을 넣으면 프롬프트에
+/// 미제출 잔재가 남고 사용자의 다음 Return 이 그걸 명령으로 실행한다(오히려 위험). `#` 접두는
+/// 실행돼도 no-op 이고 scrollback 에 남아 눈에 보인다. cmd.exe 는 `#` 를 오류로 뱉으므로
+/// unix 한정으로 주입한다(Windows 는 이벤트 채널로 고지 — 셸 오염보다 안전 우선).
+/// 큐 배달과 달리 좌석은 seat_claimable 이 이미 '자손 0·사람 입력 없음'을 보장한 상태다.
+fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path: &str) {
+    daemon.bus.publish(
+        "role.takeover",
+        "system",
+        Some(prev_sid),
+        json!({"role": role, "prev_surface": prev_sid, "path": path,
+               "reason": "empty seat (no descendant process, no agent meta, no recent input)"}),
+    );
+    if cfg!(unix) {
+        if let Some(s) = daemon.get_surface(prev_sid) {
+            let text = format!(
+                "# [cys] 이 좌석이 쥐고 있던 '{role}' 역할을 부활 절차가 다른 pane 으로 재연결했습니다 \
+                 (좌석이 비어 있었음). 이 셸은 그대로 사용할 수 있습니다."
+            );
+            // try_send: 채널 포화면 조용히 포기 — 고지는 best-effort 이고, 실패가 승계(가용성 회복)를
+            // 막아선 안 된다. 이벤트 채널이 이미 사실을 남긴다.
+            let _ = s.write_tx.try_send(crate::state::WriteReq::Inject {
+                text,
+                cr_delay_ms: 120,
+                clear_first: false,
+            });
+        }
+    }
+}
+
 /// T1-3 발신자 소속 surface 해석: peer pid의 조상 체인에서 surface 루트 pid를 찾는다.
 /// (cys CLI 프로세스는 pane 셸의 자손이므로 조상 추적으로 소속 pane이 확정된다)
 fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
@@ -727,20 +781,41 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 통째로 하이재킹할 수 있다. claim_role(handlers.rs)이 막는 바로 그 공격이 create
             // 경로로 우회되므로 동일 게이트를 RPC 입구에 둔다 — 살아있는 보유자가 있으면 거부.
             // PTY를 띄우기 전(create_surface 호출 전)에 차단해 좀비 셸도 남기지 않는다.
+            // ★SEAT: 승계 대상(구 좌석)을 생성 성공 후 마무리(role 해제·큐 이관)하기 위해 상위 스코프에 둔다.
+            let mut seat_takeover_from: Option<u64> = None;
             if let Some(role) = param_str(&params, "role") {
                 if matches!(role.as_str(), "master" | "cso") {
-                    let held_by_live = {
+                    // ★SEAT 승계(opt-in): 보유자가 '살아있으나 빈 좌석'(role 만 쥔 셸)이면 부활·부트가
+                    // 영원히 잠긴다(2026-07-17 실사고). 승계는 **명시 요청(takeover_empty_seat)이 있고**
+                    // 그 좌석이 결정론으로 Empty 일 때만 허용한다 — 파라미터가 없으면 아래 판정은
+                    // 종전과 완전히 동일하다(deny-by-default·기존 위협모델 불변).
+                    let want_takeover = params
+                        .get("takeover_empty_seat")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let holder_surface = {
                         // 락 순서 규약: surfaces → roles (close_surface·claim_role과 동일).
                         // 두 락을 동시 보유하므로 순서가 어긋나면 close/claim과 AB-BA 데드락이 난다.
                         let surfaces = daemon.surfaces.lock().unwrap();
                         let roles = daemon.roles.lock().unwrap();
-                        roles.get(&role).is_some_and(|&holder| {
-                            surfaces
-                                .get(&holder)
-                                .map(|h| !h.exited.load(Ordering::Relaxed))
-                                .unwrap_or(false)
+                        roles.get(&role).and_then(|&holder| {
+                            surfaces.get(&holder).and_then(|h| {
+                                (!h.exited.load(Ordering::Relaxed)).then(|| (holder, h.clone()))
+                            })
                         })
                     };
+                    // ★락 밖에서 프로브: seat_claimable_now 는 전 프로세스 표를 refresh 한다(수십 ms).
+                    // surfaces/roles 락을 쥔 채 하면 데몬 전체가 그동안 멈춘다 — 반드시 락 해제 후.
+                    let mut held_by_live = holder_surface.is_some();
+                    if let Some((holder, hs)) = holder_surface {
+                        if want_takeover && crate::governance::seat_claimable_now(&hs) {
+                            held_by_live = false;
+                            seat_takeover_from = Some(holder);
+                        }
+                    }
+                    if let Some(prev) = seat_takeover_from {
+                        announce_seat_takeover(daemon, prev, &role, "surface.create");
+                    }
                     if held_by_live {
                         daemon.bus.publish(
                             "role.claim_denied",
@@ -851,6 +926,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 cfg_override,
             ) {
                 Ok(s) => {
+                    // ★SEAT 승계 마무리(create 경로) — create_surface_with_env 가 roles 맵을 새 surface 로
+                    // 덮은 뒤이므로, 구 좌석의 role·caps 를 내리고 보류 큐를 새 좌석으로 옮긴다.
+                    // claim_role 경로와 동일 규약(§migrate_seat_queue) — 두 경로가 갈라지면 한쪽만
+                    // 고쳐지는 결함이 재발한다. 락 순서: surfaces 만 잡는다(roles 는 이미 반영됨).
+                    if let Some(prev) = seat_takeover_from {
+                        let prev_s = daemon.surfaces.lock().unwrap().get(&prev).cloned();
+                        if let Some(prev_s) = prev_s {
+                            *prev_s.role.lock().unwrap() = None;
+                            *prev_s.caps.lock().unwrap() = crate::caps::Caps::for_role(None);
+                            migrate_seat_queue(&prev_s, &s);
+                            daemon.persist_queue_state(); // 이관 결과를 WAL 에 확정(재기동 생존)
+                            crate::governance::persist_topology(daemon);
+                        }
+                    }
                     // (E-e) 멱등 캐시 기록 — 다음 동일 key 재시도가 이 surface를 재반환.
                     if let Some(key) = idem_key {
                         daemon
@@ -919,6 +1008,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "pid": s.pid,
                         "exited": s.exited.load(Ordering::Relaxed),
                         "created_at": s.created_at,
+                        // ★SEAT: 좌석 점유 사실(occupied|empty|unknown) — watchdog 캐시 소비(키 추가만).
+                        // pack(phoenix)·CLI(restore)는 이 값을 **소비만** 한다. 각자 판정을 구현하면
+                        // 판정 이원화로 오늘의 결함(빈 좌석을 생존으로 오인)이 다른 얼굴로 재발한다.
+                        "seat": crate::governance::SeatState::from_u8(
+                            s.seat_cache.load(Ordering::Relaxed),
+                        )
+                        .as_str(),
                         "env_injected": s.env_injected, // RC-3 잔여(T2.1): node-recover 안전판정용
                         "claude_config_dir": s.claude_config_dir.lock().unwrap().clone(), // (W1) node-recover resume 게이트용
                         "agent": agent,
@@ -1492,6 +1588,34 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 락을 끼우지 않아 surfaces→roles 순서 보존). (이전 master 보유자, 새 master 보유자).
             // 블록 정상 종료(fall-through)에서만 읽힌다 — 조기 return 경로는 arm 전체를 종료한다.
             let master_before: Option<u64>;
+            // ★SEAT 승계(opt-in·claim_role) — surface.create 게이트와 대칭.
+            // 판정 프로브(seat_claimable_now)는 전 프로세스 표를 refresh 하므로 **락 진입 전에**
+            // 끝낸다: surfaces/roles 락을 쥔 채 수십 ms 를 태우면 데몬 전체가 그동안 정지한다.
+            // 결과는 (승계 대상 surface_id) — 아래 임계영역이 이 판정만 소비한다(락 안 프로브 0).
+            let seat_takeover_ok: Option<u64> = if matches!(role.as_str(), "master" | "cso")
+                && params
+                    .get("takeover_empty_seat")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            {
+                let holder = {
+                    let surfaces = daemon.surfaces.lock().unwrap();
+                    let roles = daemon.roles.lock().unwrap();
+                    roles.get(&role).and_then(|&h| {
+                        surfaces.get(&h).and_then(|hs| {
+                            (h != sid && !hs.exited.load(Ordering::Relaxed)).then(|| (h, hs.clone()))
+                        })
+                    })
+                };
+                holder.and_then(|(h, hs)| {
+                    crate::governance::seat_claimable_now(&hs).then_some(h)
+                })
+            } else {
+                None
+            };
+            if let Some(prev) = seat_takeover_ok {
+                announce_seat_takeover(daemon, prev, &role, "claim_role");
+            }
             let master_after: Option<u64>;
             {
                 let surfaces = daemon.surfaces.lock().unwrap();
@@ -1511,7 +1635,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // 경우의 정당한 승계는 허용 — governance의 live 판정과 동일 기준.
                 if matches!(role.as_str(), "master" | "cso") {
                     if let Some(&holder) = roles.get(&role) {
+                        // ★SEAT: 승계 판정(락 밖 프로브 결과)이 이 보유자를 지목하면 live 에서 제외한다.
+                        // 파라미터 미전달 시 seat_takeover_ok=None → 판정식은 종전과 byte-identical.
                         let holder_live = holder != sid
+                            && Some(holder) != seat_takeover_ok
                             && surfaces
                                 .get(&holder)
                                 .map(|h| !h.exited.load(Ordering::Relaxed))
@@ -1558,9 +1685,25 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // T4-4/T6-P3: 역할 전이와 동기로 능력 집합 재도출(reviewer-*=read/search,
                 // full=worker/master/cso, 그 외 deny-by-default). cysd-매개 변형 게이트의 키 갱신.
                 *surface.caps.lock().unwrap() = crate::caps::Caps::for_role(Some(&final_role));
+                // ★SEAT 승계 마무리 — roles 맵만 바꾸면 구 좌석에 role 필드가 **stale 로 남는다**
+                // (surface.role 은 별도 저장소). 그러면 ①`cys list` 가 좌석 2개를 role=master 로
+                // 보이고 ②좌석 큐 게이트(role 유무 기준)가 오작동하며 ③교대 보호 카운트가 부풀린다.
+                // 같은 임계영역에서 구 좌석의 role·caps 를 내려 '일반 pane'으로 되돌린다(셸은 보존).
+                if let Some(prev) = seat_takeover_ok {
+                    if let Some(prev_s) = surfaces.get(&prev) {
+                        *prev_s.role.lock().unwrap() = None;
+                        *prev_s.caps.lock().unwrap() = crate::caps::Caps::for_role(None);
+                        migrate_seat_queue(prev_s, surface);
+                    }
+                }
                 // 전이 관찰: insert/remove 반영 후의 master 보유자.
                 master_after = roles.get("master").copied();
                 claimed_role = final_role;
+            }
+            // ★SEAT: 승계로 큐를 옮겼으면 WAL 을 최신화한다(락 해제 후 — persist 는 파일 I/O).
+            // 없으면 재기동 시 구 좌석 기준의 스냅샷이 되살아나 이관이 되돌려진다.
+            if seat_takeover_ok.is_some() {
+                daemon.persist_queue_state();
             }
             // 벡터-9 방어심화 — master_claimed_at 갱신 (surfaces·roles 락 해제 후, master_claimed_at
             // 단일 락만 보유 → 락 순서 무변경). 이미 같은 surface가 master면 갱신 안 함(연속성 보존),
@@ -2735,6 +2878,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "queue_paused": queue_paused,
                         "agent": agent,
                         "agent_alive": agent_alive,
+                        // ★SEAT: phoenix·restore 가 '살아있음'과 '좌석에 누가 앉아 있음'을 구분하는 근거.
+                        // agent_alive 는 launch-agent 로 등록된 노드만 답할 수 있고(수동 연결·빈 셸은
+                        // null), seat 는 등록 여부와 무관한 커널 사실이다 — 둘은 보완재다.
+                        "seat": crate::governance::SeatState::from_u8(
+                            s.seat_cache.load(Ordering::Relaxed),
+                        )
+                        .as_str(),
                         "status": status,
                         "usage": s.observed_usage.lock().unwrap().clone()
                             .and_then(|u| serde_json::to_value(u).ok()),
@@ -3327,7 +3477,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .filter(|s| !s.exited.load(Ordering::Relaxed))
                 .filter_map(|s| {
                     s.role.lock().unwrap().clone().map(|role| {
+                        // ★SEAT: live 엔트리에 좌석 사실을 동봉한다(키 추가만·기존 키 불변).
+                        // run_restore 가 "role 이 등록돼 있다"와 "그 좌석에 누가 앉아 있다"를 구분하는
+                        // 유일한 근거 — 종전엔 전자만 보고 skip 해서 빈 셸이 부활을 영구 차단했다.
+                        // surface_id 는 그 좌석에 직접 연결(in-seat)하기 위한 주소다.
                         json!({"role": role, "surface_ref": surface_ref(s.id),
+                               "surface_id": s.id,
+                               "seat": crate::governance::SeatState::from_u8(
+                                   s.seat_cache.load(Ordering::Relaxed)).as_str(),
+                               "env_injected": s.env_injected,
                                "agent": s.agent_meta.lock().unwrap().as_ref().map(|(n, _)| n.clone())})
                     })
                 })

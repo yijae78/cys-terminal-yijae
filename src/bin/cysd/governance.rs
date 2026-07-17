@@ -42,6 +42,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
             // 자원 거버넌스가 데몬 수명 내내 조용히 사라지는 것을 막는다.
             let tick = std::panic::AssertUnwindSafe(|| {
                 sys.refresh_processes(ProcessesToUpdate::All, true);
+                // ★SEAT: 프로세스 표를 갓 refresh 한 이 지점이 좌석 판정의 유일한 write 시점이다.
+                // deliver_queued 보다 **먼저** 갱신해야 같은 틱의 배달이 최신 좌석 사실을 본다.
+                refresh_seat_cache(&daemon, &sys);
                 check_load(&daemon, &mut last_load_alert);
                 check_surfaces(&daemon, &sys, &mut last_dup_alert, &mut last_proc_alert);
                 check_idle(&daemon);
@@ -1226,6 +1229,115 @@ fn check_load(daemon: &Daemon, last_alert: &mut f64) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ★SEAT: 좌석 점유(seat-occupancy) 판정 — 단일 SOT
+//
+// 왜 필요한가(2026-07-17 실사고): role=master 를 쥔 채 agent 가 없는 '빈 셸' 좌석이
+// ①phoenix 부활 ②▶부서장/▶CEO 버튼 ③디렉티브 재주입을 전부 잠그고, master 앞 큐 메시지를
+// zsh 프롬프트에 문자로 타이핑시켰다. 뿌리는 모든 생존 판정이 `exited` 만 보고 **좌석에 실제로
+// 누가 앉아 있는지**를 묻지 않은 것이다(cys.rs run_restore `live.contains(role)` ·
+// javis_phoenix `_alive()` · surface.create/claim_role 의 holder_live 전부 동형).
+//
+// 설계 원칙(3중 성찰 반영):
+//  - **커널 사실 1차**: "셸 이외의 자손 프로세스가 있는가" = 좌석이 쓰이는 중인가. hook·에이전트
+//    종류·config 와 무관하게 커널이 증언한다. 에이전트 계층 부산물(usage transcript 등록 등)을
+//    판정에 섞으면 hook 없는 환경에서 '영원히 Occupied → 부활 잠김'이라는 **고치려는 결함과 동형의
+//    반대편 결함**이 열린다 — 계층을 섞지 않는다.
+//  - **정책 2차는 승계에만**: agent_meta·최근 사람 입력은 좌석을 *지키는* 방향으로만 가산한다
+//    (seat_claimable). 큐 배달은 1차만 본다 — agent_meta 가 남은 죽은 노드의 셸에 배달하면 그것도
+//    zsh 타이핑이기 때문이다(같은 사고의 다른 얼굴).
+//  - **Unknown = 현행 동작 유지**: 프로브 미도달은 새 실패를 만들지 않는다(큐=배달·승계=거부).
+//
+// 한계(명시): 사용자가 좌석에서 잡을 백그라운드로 돌리면(`sleep 100 &`) 프롬프트가 비어도
+// Occupied 로 판정된다 — 보호(fail-closed) 방향이라 오탈취는 없고, 부활은 다음 틱에 재시도된다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeatState {
+    /// 판정 미도달(프로브 실패·첫 틱 이전) — 소비처는 **현행 동작**으로 강등한다.
+    Unknown = 0,
+    /// 자손 프로세스 존재 = 사람이든 에이전트든 이 좌석은 쓰이는 중.
+    Occupied = 1,
+    /// 셸 단독 = 빈 좌석.
+    Empty = 2,
+}
+
+impl SeatState {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => SeatState::Occupied,
+            2 => SeatState::Empty,
+            _ => SeatState::Unknown,
+        }
+    }
+    /// status/topology 노출용 — pack·CLI 는 이 문자열만 소비한다(판정 이원화 금지).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SeatState::Occupied => "occupied",
+            SeatState::Empty => "empty",
+            SeatState::Unknown => "unknown",
+        }
+    }
+}
+
+/// ★SEAT 1차(커널 사실): 이 좌석에 셸 이외의 자손 프로세스가 있는가.
+/// 종료된 surface 는 좌석 개념이 없으므로 Empty(무해 — 승계 게이트는 exited 를 이미 별도 처리).
+/// 셸 pid 가 프로세스 표에 아예 없으면(아직 미갱신·프로브 실패) Unknown → 소비처가 현행 동작 유지.
+pub fn seat_state(sys: &System, s: &crate::state::Surface) -> SeatState {
+    if s.exited.load(Ordering::Relaxed) {
+        return SeatState::Empty;
+    }
+    if sys.process(sysinfo::Pid::from_u32(s.pid)).is_none() {
+        return SeatState::Unknown;
+    }
+    if collect_descendants(sys, s.pid).is_empty() {
+        SeatState::Empty
+    } else {
+        SeatState::Occupied
+    }
+}
+
+/// ★SEAT 캐시 갱신 — **단일 writer**(watchdog 틱). 판정 재료(전 프로세스 표)를 이미 refresh 한
+/// 지점에서 한 번만 계산해 캐시에 싣는다. RPC 읽기 경로(surface.list·status·deliver_queued)는
+/// 재조회 없이 이 값을 소비한다(비용 중복 0).
+pub fn refresh_seat_cache(daemon: &Arc<Daemon>, sys: &System) {
+    let surfaces: Vec<Arc<crate::state::Surface>> =
+        daemon.surfaces.lock().unwrap().values().cloned().collect();
+    for s in surfaces {
+        s.seat_cache
+            .store(seat_state(sys, &s).as_u8(), Ordering::Relaxed);
+    }
+}
+
+/// ★SEAT 2차(승계 정책): 이 좌석의 특권 role 을 다른 surface 가 가져가도 되는가.
+/// 커널 사실이 Empty 이고 + agent_meta 부재(죽은 에이전트의 좌석은 node-recover 영역이지 탈취
+/// 대상이 아니다) + 최근 사람 입력 없음(사용자가 지금 claude 를 띄우려 타이핑 중일 수 있다)
+/// 셋을 **모두** 만족할 때만 true. Unknown 은 false(현행=거부 유지).
+pub fn seat_claimable(sys: &System, s: &crate::state::Surface) -> bool {
+    if seat_state(sys, s) != SeatState::Empty {
+        return false;
+    }
+    if s.agent_meta.lock().unwrap().is_some() {
+        return false;
+    }
+    let human_recent = s
+        .last_human_input
+        .lock()
+        .unwrap()
+        .map(|t| t.elapsed().as_secs() < queue_human_quiet_secs())
+        .unwrap_or(false);
+    !human_recent
+}
+
+/// 승계 게이트 전용 즉시 프로브 — 캐시(watchdog 틱 주기)는 role 재바인딩 판정에 쓰기엔 stale 하다.
+/// 드문 경로(부활·부트 선언)라 전 프로세스 refresh 비용을 그 시점에 지불한다.
+pub fn seat_claimable_now(s: &crate::state::Surface) -> bool {
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    seat_claimable(&sys, s)
+}
+
 /// Walk the process table and collect all descendants of `root`.
 /// 에이전트 생존 매칭 — cmdline의 어느 토큰이든 ①basename 정확 일치 ②`.js` 번들 일치
 /// (`…/gemini.js`) ③경로 세그먼트 일치(`…/gemini/…` 또는 `…/gemini-cli/…` 패키지 경로)면
@@ -1812,6 +1924,11 @@ fn alert_queue_depth_if_high(
         "사람 입력이 식을 때까지 보류 중(CYS_QUEUE_HUMAN_QUIET_SECS)"
     } else if blocked_by.starts_with("queue_paused") {
         "헬스 조치(pause-queue) 해제가 대응 — 해당 surface 헬스 상태를 점검하라"
+    } else if blocked_by.starts_with("empty_seat") {
+        // ★SEAT: 이 사유는 '좌석에 에이전트가 없다'는 뜻이다 — 임계·quiet 노브로는 풀리지 않는다.
+        // 조치는 좌석에 에이전트를 앉히는 것(부활·수동 연결)이므로 그 손잡이를 가리킨다.
+        "좌석에 에이전트가 없다 — 그 pane 에서 직접 agent 를 실행하거나 `cys restore`(부활)로 \
+         좌석을 채우면 보류분이 순서대로 배달된다(메시지는 보존 중·유실 아님)"
     } else {
         "임계 조정은 CYS_QUEUE_QUIET_SECS"
     };
@@ -1872,6 +1989,29 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             .unwrap_or(false);
         if human_recent {
             alert_queue_depth_if_high(daemon, &s, depth_alerted, "human_typing(사람 입력 직후)");
+            continue;
+        }
+        // ★SEAT 게이트(2026-07-17 실사고 수리): **role 좌석**인데 좌석이 비었으면(에이전트 없음)
+        // 배달을 보류한다. 종전엔 quiet 이기만 하면 배달해, 빈 셸이 role 을 쥔 동안 리뷰어 verdict·
+        // 워커 보고가 zsh 프롬프트에 문자로 타이핑돼 **보고가 증발**했다(surface:112 실측).
+        //
+        // 판정 기준을 'role 유무'로 둔 이유: pending_queue 는 텍스트만 담아(anchor 미보존) 항목별
+        // role-앵커 여부를 구분할 수 없다. 그런데 role 좌석은 정의상 에이전트 자리이므로 'role 있는
+        // surface'가 role-앵커 메시지의 실질 대상이다. role 없는 맨 셸의 `--queued` 자동화는
+        // 종전 그대로 통과한다(무회귀).
+        //
+        // Unknown(프로브 미도달)은 **배달**한다 — 현행 동작 유지(판정 실패가 전 큐를 멈추는
+        // 새 장애를 만들지 않는다). 보류는 유실이 아니라 지연이며, 좌석에 에이전트가 앉으면
+        // 순서대로 배달된다. 적체는 아래 기존 알림이 사유와 함께 가시화한다(침묵 적체 금지).
+        if s.role.lock().unwrap().is_some()
+            && SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)) == SeatState::Empty
+        {
+            alert_queue_depth_if_high(
+                daemon,
+                &s,
+                depth_alerted,
+                "empty_seat(좌석에 에이전트 미연결)",
+            );
             continue;
         }
         // pop은 writer 채널 인계 성공 후에만 — 실패 시 메시지를 보존해 다음 틱에 재시도.

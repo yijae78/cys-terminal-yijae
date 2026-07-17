@@ -1223,6 +1223,11 @@ def _live_surfaces_raw(socket):
             "pid": None,  # OS pid 는 status --json 미노출(보고 전용 필드 — liveness 판정엔 exited 사용)
             "exited": bool(s.get("exited")),
             "agent_alive": s.get("agent_alive"),  # ★C5 구조화 readiness ack 신호(P1-10)
+            # ★SEAT: 데몬이 커널 사실(자손 프로세스 유무)로 판정한 좌석 점유 — occupied|empty|unknown.
+            #   **소비만 한다**(판정 재구현 금지 — phoenix 가 자기 규칙을 따로 두면 데몬과 이원화돼
+            #   오늘의 결함[빈 좌석을 생존으로 오인]이 다른 얼굴로 재발한다). 구 데몬은 이 키가 없어
+            #   None → _alive() 가 종전(exited 만) 규칙으로 degrade 한다(하위호환·악화 0).
+            "seat": s.get("seat"),
         })
     _LAST_LIVENESS_KNOWN = True
     return out
@@ -1677,11 +1682,29 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
     live, _live_known = _live_role_surfaces_checked(socket)
 
     # 대상 = desired 로스터에 있으나 살아있지 않은(또는 exited) 역할
+    # ★SEAT(2026-07-17 실사고 수리): '살아있다'를 exited 만으로 판정하면, role=master 를 쥔 채
+    #   agent 가 없는 **빈 셸**이 生으로 잡혀 master 가 부활 대상에서 통째로 빠졌다(09:35 dept-2 실측:
+    #   대상역할에 master 부재 → 아래 completeness 가 master 를 검증조차 않고 COMPLETE 선언 = 침묵 성공).
+    #   좌석이 비었으면(seat=='empty') 그 역할은 살아있는 게 아니라 **부활 대상**이다.
+    #   seat 키가 없는 구 데몬에선 None → 종전 규칙으로 degrade(하위호환).
     def _alive(role):
         for s in live.get(role, []):
-            if not s["exited"]:
-                return True
+            if s["exited"]:
+                continue
+            if s.get("seat") == "empty":
+                continue  # 좌석은 있으나 아무도 앉아 있지 않다 — 부활시킨다(in-seat 연결은 cys restore 담당)
+            return True
         return False
+
+    # ★SEAT: 빈 좌석으로 판정돼 부활 대상이 된 역할(정직 보고용) — completeness 의 manual_seats 근거.
+    def _empty_seat_roles():
+        out = []
+        for role, ss in live.items():
+            if role == "-":
+                continue
+            if any((not s["exited"]) and s.get("seat") == "empty" for s in ss):
+                out.append(role)
+        return sorted(out)
 
     # ★codex W2 BLOCKING: 묘비 제외는 target 산정 **시점**에 tombstones 대조로 수행(roster 엔트리는 보존됨).
     #   entries 에 묘비 역할이 남아 있어도 부활 대상에서만 빠진다 — untomb 시 엔트리·메타가 있어 즉시 부활 가능.
@@ -1955,6 +1978,15 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
 
     incomplete_roles = [r for r in target_roles if not _revived_complete(r)]
     ready_roles = [r for r in target_roles if r not in incomplete_roles]
+    # ★SEAT 정직 보고(침묵 성공 금지): 부활을 마쳤는데도 **여전히 빈 좌석**인 역할을 명시한다.
+    #   종전엔 '살아있는 것으로 보이는' 역할은 target 에서 빠져 검증조차 안 됐고(09:35 실측), 그 결과
+    #   role=master 를 쥔 빈 셸이 있는데도 COMPLETE 가 선언됐다 — 시스템이 자기 실패를 몰랐다.
+    #   이제 좌석 사실을 다시 읽어, 비어 있는 역할이 남았으면 그 사실을 verdict 에 싣는다.
+    #   (구 데몬은 seat 키가 없어 항상 빈 목록 → 종전 동작과 동일하게 degrade.)
+    manual_seats = sorted({
+        role for role, ss in live_end.items()
+        if role != "-" and any((not s["exited"]) and s.get("seat") == "empty" for s in ss)
+    })
     if not target_roles:
         completeness = "NOOP"
     elif not incomplete_roles:
@@ -1968,6 +2000,12 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
     if completeness == "INCOMPLETE":
         honesty += (" ★INCOMPLETE — 재시도 소진 후에도 미부활 역할=%s. 침묵 성공 금지: "
                     "이 역할들은 실제로 부활하지 않았다(escalation 필요·master/사람 개입)." % incomplete_roles)
+    if manual_seats:
+        honesty += (" ★빈 좌석 잔존=%s: 이 역할들은 surface(좌석)는 있으나 **에이전트가 앉아 있지 않다**"
+                    "(자손 프로세스 0 — 커널 사실). 부활이 아니라 '사람이 그 pane 에서 직접 agent 를 "
+                    "실행'해야 채워지는 상태이거나, agent 미상(claim-role 등록 pane)이라 무엇을 띄울지 "
+                    "결정론으로 알 수 없는 상태다. 좌석 앞 큐 메시지는 배달 보류(보존)된다 — 침묵 성공 "
+                    "아님." % manual_seats)
     if fresh_fallback_roles:
         honesty += (" ★fresh 강등 역할=%s: 원 세션이 독약(resume 불가)이라 무 resume 로 새 세션을 기동하고 "
                     "디렉티브/원장을 재주입했다(세션 보존 실패를 정직히 밝힘 — roster 는 부활 완료). "
@@ -1977,6 +2015,7 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         "phoenix_restore": final,
         "completeness": completeness,          # ★Phase10: readiness 기반 전원 부활 판정
         "incomplete_roles": incomplete_roles,  # ★Phase10: 미부활 역할 정직 명시(침묵 성공 금지)
+        "manual_seats": manual_seats,          # ★SEAT: 좌석은 있으나 에이전트 부재(사람 개입 필요) — 정직 명시
         "fresh_fallback_roles": fresh_fallback_roles,  # ★Phase11: 독약 세션→fresh 강등 역할 정직 명시
         "ready_roles": ready_roles,
         "ticket": ticket,

@@ -592,8 +592,13 @@ def cmd_run():
         return log.fail("②ping", code, out, 3)
 
     # ③ claim-role master — 거부=exit 7(유령 master 차단: 이 surface는 master가 아니다)
+    # ★SEAT(2026-07-17 실사고): 보유자가 '빈 좌석'(role 만 쥔 agent 없는 셸 — cys-dept 가 부서 생성 시
+    #   띄우는 그 셸)이면 종전엔 여기서 영구 거부돼 부트가 데드엔드에 빠졌다(부서장이 영영 못 뜸).
+    #   --takeover-empty-seat 는 **요청**일 뿐이다: 데몬이 커널 사실(자손 프로세스 0·agent 메타 없음·
+    #   최근 입력 없음)로 재판정해 정말 빈 좌석일 때만 승계를 허용하고, agent 가 붙은 정당한 master 는
+    #   종전대로 거부한다(유령 master 차단 규칙 불변 — 살아있는 master 가 있으면 여전히 exit 7).
     _progress("③ master 역할 등록…")
-    code, out = _run(["cys", "claim-role", "master"], timeout=15)
+    code, out = _run(["cys", "claim-role", "master", "--takeover-empty-seat"], timeout=15)
     log.step("③claim-role", code, out)
     if code != 0:
         msg = ("이 surface는 master가 아님(claim 거부). 살아있는 master가 레지스트리에 존재한다 — "
