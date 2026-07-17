@@ -1,0 +1,77 @@
+=== test-evidence.txt — E1+E2A 구현 검증 (worker) ===
+생성: 2026-07-17T22:05:21+0900
+worktree: /private/tmp/claude-501/-Users-cys-Desktop-CYSjavis/e39fd871-ba50-4ba9-a62e-81b1416e7e23/scratchpad/lazydist-wt · branch: feat/evidence-artifact-gate
+
+########## 0. py_compile (구문 무결성) ##########
+py_compile: 3파일 OK (exit 0)
+
+########## 1. javis_task.py self-test (E1 게이트) ##########
+javis_task self-test OK (E1 evidence-artifact 게이트 — 부정4·긍정·폴백·skip감사·재진입·warn/off 경계·하위호환 A/B · 밀폐 tmpdir+JAVIS_ROOT)
+→ exit=0
+
+########## 2. javis_orchestra.py --self-test (기존+티켓 갱신) ##########
+javis_orchestra self-test OK (4종 노드·라운드 상한·경로 탈출방지·제약 주입·4규칙 티켓 주입·do/don't 무접촉·파싱·셀 새니타이즈·무음실패 카탈로그·전제지식 주입·매니페스트 배선)
+→ exit=0
+
+########## 3. javis_orient_log.py self-test (E2 Phase A) ##########
+javis_orient_log self-test OK (add append·--by 필수·kind 검증·stats 비율·failure_rate·빈 로그 경계 · 밀폐 tmpdir+JAVIS_ROOT)
+→ exit=0
+
+########## 4. 수동 실증 — 부정 사례가 실제로 exit 5를 낸다 (밀폐 JAVIS_ROOT) ##########
+-- 4a. 부재 경로 --evidence-artifact → exit 5 기대 --
+evidence-artifact required(5): 부재 경로: /var/folders/zr/y58c0vj52xl31f9t_kzktt7r0000gn/T/tmp.W9xc97QQID/nope.txt (기계 검사 3종 — 실존·비어있지않음·신선도 mtime≥앵커)
+→ exit=5 (5=거부)
+-- 4b. 빈 파일 → exit 5 기대 --
+evidence-artifact required(5): 빈 파일(0바이트): /var/folders/zr/y58c0vj52xl31f9t_kzktt7r0000gn/T/tmp.W9xc97QQID/empty.txt (기계 검사 3종 — 실존·비어있지않음·신선도 mtime≥앵커)
+→ exit=5 (5=거부)
+-- 4c. 유효 artifact → exit 0 + artifacts 기록 --
+handoff: _round/handoffs/demoC-done.md 5필드 기록 권장(HANDOFF_CONTRACT)
+evidence에 전사 통계 첨부 권장: javis_transcript_stats.py --latest --oneline (도구 부재 시 생략 — 비차단)
+{"id": "demoC", "status": "done", "evidence": {"artifacts": [{"path": "/var/folders/zr/y58c0vj52xl31f9t_kzktt7r0000gn/T/tmp.W9xc97QQID/proof.txt", "size": 18, "mtime": 1784293523.105, "sha256_8": "919afadf", "anchor": "acquired_at"}]}, "unblocked": []}
+→ exit=0 (0=통과)
+-- demoC task.evidence.artifacts 기록 확인 --
+{
+ "artifacts": [
+  {
+   "path": "/var/folders/zr/y58c0vj52xl31f9t_kzktt7r0000gn/T/tmp.W9xc97QQID/proof.txt",
+   "size": 18,
+   "mtime": 1784293523.105,
+   "sha256_8": "919afadf",
+   "anchor": "acquired_at"
+  }
+ ]
+}
+-- 4d. skip-reason → exit 0 + skip_audit.jsonl 감사 --
+handoff: _round/handoffs/demoD-done.md 5필드 기록 권장(HANDOFF_CONTRACT)
+evidence에 전사 통계 첨부 권장: javis_transcript_stats.py --latest --oneline (도구 부재 시 생략 — 비차단)
+{"id": "demoD", "status": "done", "evidence": {"type": "skip", "text": "CI 재현 불가", "at": "2026-07-17T22:05:23+0900"}, "unblocked": []}
+→ exit=0
+skip_audit.jsonl:
+{"ts": "2026-07-17T22:05:23+0900", "task": "demoD", "reason": "CI 재현 불가"}
+
+########## 5. orient_log add/stats 실증 (밀폐) ##########
+{"ts": "2026-07-17T22:05:23+0900", "task": "demoC", "kind": "wrong-target", "by": "codex", "note": "엉뚱한 폴더 배회"}
+{"ts": "2026-07-17T22:05:23+0900", "task": "demoD", "kind": "missing-context", "by": "agy", "note": ""}
+{
+ "total_failures": 2,
+ "by_kind": {
+  "wrong-target": 1,
+  "missing-context": 1,
+  "re-explore": 0
+ },
+ "by_kind_ratio": {
+  "wrong-target": 0.5,
+  "missing-context": 0.5,
+  "re-explore": 0.0
+ },
+ "delegations_total": 20,
+ "failure_rate": 0.1
+}
+
+########## 6. 실장부 무접촉 확인 (밀폐 검증 증명) ##########
+실장부 _round/tasks/ mtime (자기검증이 건드리지 않았음):
+total 192
+drwxr-xr-x@  28 cys  staff    896  7월 17 20:14 .
+drwxr-xr-x@ 316 cys  staff  10112  7월 17 21:58 ..
+
+=== END ===

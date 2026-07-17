@@ -635,6 +635,12 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
                  "로 직접 push하라(--queued는 자동 Return 배달 — send-key 불필요·타이핑 가드 "
                  "안전). 즉시 끼어들어야 할 긴급 보고만 직접 send 후 `cys send-key --to master "
                  "Return`(가드 차단 시 --queued로 전환).")
+    # E1 증거의 기계화(설계 §E1): 태스크 done 전이는 실제 검증 산출물 파일을 제출해야 통과(strict).
+    lines.append("완료 증거(E1 evidence-artifact 게이트 · strict): 태스크를 done 처리할 때 검증 산출물"
+                 " 파일(테스트 로그·빌드 출력 등, 권장 위치 `_round/evidence/<task-id>/`)을 만들고 "
+                 "`javis_task.py set-status <id> done --evidence-artifact <경로>`로 제출하라 — "
+                 "파일은 실존·비어있지않음·태스크 착수 이후 신선도를 기계 검사한다(검증 불가 시 "
+                 "--skip-reason, skip_audit.jsonl 감사 기록).")
     if prereq_block:
         lines.append("")
         lines.append(prereq_block)
@@ -1459,7 +1465,7 @@ def cmd_self_test(args):
         for must in ("절대 강조 4규칙", "품질 절대우선", "할루시네이션 방지",
                      "hallucination-guard", "grill-me", "요약·압축 절대 금지", "게이트",
                      "성공 기준", "WORKER_TODO.md", "${CYS_PACK_DIR", "보고 채널",
-                     "--queued"):
+                     "--queued", "완료 증거(E1 evidence-artifact 게이트", "--evidence-artifact"):
             assert must in ticket, "task-prompt 티켓에 '%s' 누락" % must
         # 폴백 단독으로도 4규칙 마커 전부를 갖는다(디렉티브 부재 환경의 최후 방어선)
         fb = "\n".join(FALLBACK_RULES)
