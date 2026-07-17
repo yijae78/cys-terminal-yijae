@@ -64,6 +64,67 @@ fn scrub_claude_session_env() {
 #[tokio::main]
 async fn main() {
     scrub_claude_session_env();
+
+    // ★W1(조기 단일 인스턴스 게이트): 소켓 경로 확정 직후·pack 설치보다 먼저 단일 인스턴스 게이트를
+    // 통과시킨다. 목적 — 락/싱글턴 경쟁의 **패자**가 부트 부수효과를 단 한 줄도 실행하기 전에 죽게 하는 것.
+    // (부수효과: Daemon::new 의 operator.token 디스크 덮어쓰기·feed.jsonl compaction, 워치독·스케줄러·
+    //  오피스 브리지 spawn, daemon.started 발행 등.) 과거엔 락 획득을 accept_loop 진입까지 미뤄, 패자가
+    // 부수효과 전량을 실행한 뒤에야 죽었다 → launchd KeepAlive 재기동 폭주 시 패자가 매번 operator.token 을
+    // 덮어써 라이브 데몬 메모리 토큰과 불일치 → GUI 승인 Feed 우회가 무력화되어 Allow 전멸.
+    let socket_path = cys::socket_path();
+
+    // unix: flock 기반 startup 락 — 경합 시 hung 홀더는 데드맨이 회수·인수, 건강한 홀더/구 락파일은
+    // fail-closed exit. 락 파일 핸들은 이 main 스코프에서 데몬 수명 동안 보유한다(핸들 drop = flock 해제 =
+    // 게이트 소멸이므로 절대 조기 drop 금지 — accept_loop 는 반환하지 않아 main 종료까지 살아있다).
+    #[cfg(unix)]
+    let _lock_file = {
+        use std::os::unix::fs::PermissionsExt;
+        // 상태 디렉터리 선생성: 락 파일이 이 디렉터리에 놓이므로 락 획득 전에 반드시 존재해야 한다
+        // (소유자 전용 0o700 — transcripts.db·feed.jsonl·소켓을 같은 UID로 봉인).
+        if let Some(dir) = socket_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        // ★W3: 경합 시 단순 exit(1)이 아니라, 홀더가 hung(무응답 + heartbeat stale)이면 데드맨이
+        // 회수·인수한다. 건강한 홀더/구 락파일(pid 미상)은 fail-closed로 exit(무손실·오살상 차단).
+        let lock_path = socket_path.with_extension("lock");
+        let state_dir = socket_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let lock = acquire_startup_lock(&lock_path, &socket_path, &state_dir);
+        // ★W3 heartbeat: 승자만 주기적으로 mtime을 갱신한다 → 런타임이 wedge되면 interval 태스크가
+        // 진행하지 못해 자연히 stale이 되고, 다음 경합자의 데드맨이 dead로 판정할 수 있다.
+        // 기동 창(락 획득~첫 주기 touch)은 claim_lock의 동기 초기 touch가 방어한다.
+        {
+            let hb = deadman::heartbeat_path(&state_dir);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(deadman::HEARTBEAT_INTERVAL);
+                loop {
+                    tick.tick().await;
+                    deadman::touch_heartbeat(&hb);
+                }
+            });
+        }
+        lock
+    };
+
+    // windows: named pipe first-instance 선점 = 데몬 싱글턴 가드. 조기에 first 인스턴스를 만들어
+    // accept_loop 로 넘겨 재사용한다(probe-후-close-재open 레이스 없이 그대로 리스너 풀에 편입).
+    // 선점 실패(이미 홀더 존재)는 기존 즉사 의미 유지 — eprintln 후 exit 1.
+    #[cfg(windows)]
+    let first_pipe = {
+        let pipe_name = socket_path.to_string_lossy().into_owned();
+        match create_pipe_instance(&pipe_name, true) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: another cysd already owns the pipe {pipe_name}: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // windows .prev sweep 은 위 싱글턴 게이트 **뒤**에서 수행 — 승자만 잔해를 정리한다(패자는 이미 즉사).
     // ★무중단 rename-swap 잔해 청소(nsis-hooks.nsh의 짝): 업데이트가 잠긴 파일을 죽이는 대신
     // <이름>.prev*(cysd/cys 고정 체인 + unlock-sweep의 <이름>.prev<rand> — msys-2.0.dll 등 세션이
     // 로드한 runtime 이미지)로 밀어두므로, 새 cysd 기동 시 설치 트리를 재귀 순회하며 이름에
@@ -121,7 +182,6 @@ async fn main() {
             Err(e) => eprintln!("[cysd] pack auto-install skipped: {e}"),
         }
     }
-    let socket_path = cys::socket_path();
     let daemon = Daemon::new(socket_path.clone());
 
     governance::spawn_watchdog(Arc::clone(&daemon));
@@ -196,7 +256,11 @@ async fn main() {
         "cysd (CYSJavis terminal daemon) listening on {}",
         socket_path.display()
     );
+    #[cfg(unix)]
     accept_loop(daemon, &socket_path).await;
+    // windows: main()에서 조기 선점한 first 파이프 인스턴스를 넘겨 리스너 풀에 재사용시킨다.
+    #[cfg(windows)]
+    accept_loop(daemon, &socket_path, first_pipe).await;
 }
 
 /// 종료 직전 회수: 원장의 scoped 그룹을 전부 죽이고, stopping 이벤트 발행 후
@@ -216,36 +280,9 @@ fn shutdown_cleanup(daemon: &Arc<Daemon>, reason: &str) {
 #[cfg(unix)]
 async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    if let Some(dir) = socket_path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-        // 상태 디렉터리는 소유자 전용 — transcripts.db·feed.jsonl·소켓을 같은 UID로 봉인
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
-    // 동시 기동 TOCTOU 차단: 점검-삭제-바인드를 flock으로 직렬화 — 늦게 뜬 데몬이
-    // 살아있는 데몬의 소켓 파일을 unlink해 도달 불가 좀비로 만드는 경로를 막는다.
-    // 락 파일은 데몬 수명 동안 보유한다.
-    // ★W3: 경합 시 단순 exit(1)이 아니라, 홀더가 hung(무응답 + heartbeat stale)이면 데드맨이
-    // 회수·인수한다. 건강한 홀더/구 락파일(pid 미상)은 fail-closed로 exit(무손실·오살상 차단).
-    let lock_path = socket_path.with_extension("lock");
-    let state_dir = socket_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let _lock_file = acquire_startup_lock(&lock_path, socket_path, &state_dir);
-
-    // ★W3 heartbeat: 승자만 주기적으로 mtime을 갱신한다 → 런타임이 wedge되면 interval 태스크가
-    // 진행하지 못해 자연히 stale이 되고, 다음 경합자의 데드맨이 dead로 판정할 수 있다.
-    // 기동 창(락 획득~첫 주기 touch)은 claim_lock의 동기 초기 touch가 방어한다.
-    {
-        let hb = deadman::heartbeat_path(&state_dir);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(deadman::HEARTBEAT_INTERVAL);
-            loop {
-                tick.tick().await;
-                deadman::touch_heartbeat(&hb);
-            }
-        });
-    }
+    // ★W1: startup 락 획득·heartbeat spawn·상태 디렉터리 선생성은 부트 부수효과보다 먼저 실행돼야
+    // 하므로 main()으로 전진했다(경쟁 패자가 부수효과 실행 전 즉사). 락 파일 핸들은 main 스코프에서
+    // 데몬 수명 동안 보유된다. 여기(accept_loop)에는 소켓 바인드·수신 준비만 남긴다.
     // Refuse to start if a live daemon already owns the socket (중복 기동 방지 — 거버넌스 철학).
     if socket_path.exists() {
         if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
@@ -1230,11 +1267,15 @@ async fn pipe_listener(
 }
 
 #[cfg(windows)]
-async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
+async fn accept_loop(
+    daemon: Arc<Daemon>,
+    socket_path: &std::path::Path,
+    first: tokio::net::windows::named_pipe::NamedPipeServer,
+) {
     let pipe_name = socket_path.to_string_lossy().into_owned();
-    // 첫 인스턴스: first_pipe_instance(true) = 데몬 싱글턴 가드(이름 선점 시 즉사) — 기존 의미 유지.
-    let first = create_pipe_instance(&pipe_name, true)
-        .unwrap_or_else(|e| panic!("create pipe {pipe_name} failed: {e}"));
+    // ★W1-c: 첫 인스턴스(= 데몬 싱글턴 가드)는 main()에서 부트 부수효과보다 먼저 조기 선점해 넘겨받는다.
+    // 여기서 다시 만들지 않고 그대로 리스너 풀에 편입한다(probe-후-close-재open 레이스 제거·경쟁 패자는
+    // main()의 선점 실패 지점에서 이미 즉사).
     // ★P0-7 최종 층위(D1/W5): 파이프 listening 직후 공통 부트 — unix accept_loop 와 **동일 함수**(prune +
     //   콜드부트 auto-restore). 과거 이 호출이 Windows 에만 빠져 auto-restore 가 발동조차 안 하고 phoenix-restore.log
     //   가 빈 파일이던 결함(CI 실경로 스모크 ⑧)을 봉인. state_dir 은 함수 내부 canonical 매핑(Windows 슬러그).

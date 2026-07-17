@@ -416,15 +416,16 @@ sys.exit(3)' 2>/dev/null) || true
   fi
 }
 # CEO 승격: 부서가 1개 이상이면 기본 데몬을 CEO로(디렉티브 교체, 가역 백업). 부서 0이면 표준 master 보존(하위호환).
-# ★첫 승격은 자동이 아니다(오너 2026-07-14): 최소 1개 마스터(부서)가 존재한 뒤 오너가 승인(feed)
-# 하거나 지명(promote-ceo)해야 한다. 마커(.pre-ceo)=기승인 상태라 조정(무결 유지)은 묻지 않는다.
+# ★자동 승격(오너 정책 2026-07-17): 부서(최소 1개 마스터) 생성 자체를 승격 동의로 간주해 자동 승격한다.
+#   (종전 2026-07-14 'feed 승인/지명 필요'는 폐기 — GUI 승인 버튼이 §3.2 자기승인 차단·토큰 불일치로 침묵
+#   실패해 승격이 걸리던 문제 해소). 지명(promote-ceo)은 여전히 오너 직접 경로다. 마커(.pre-ceo)=기승인 상태라 조정(무결 유지)은 묻지 않는다.
 # ★부트 게이트(BOOTSTRAP_HARDENING WP-2): base master가 한 번도 부트되지 않은 기계
 #   (.master-bootstrapped 부재 — writer=javis_bootstrap.py 성공 경로 유일)에서는 승격을 PENDING으로
 #   보류한다. 부트 전 승격은 "부트 시퀀스 0개인 CEO"를 낳는다(윈도우 초보 실사고 근본원인 R2).
 #   stale 정책(설계 §4.1): 이 게이트는 마커 '존재만' 본다(버전 무관 — 승격은 조직 사실).
 BOOT_MARKER="$HOME/.cys/.master-bootstrapped"
 CEO_PENDING="$HOME/.cys/state/ceo-pending"
-ceo_promote(){  # $1: "consented"면 동의 게이트 생략(오너 지명 promote-ceo 경로)
+ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자동 승격 알림 생략
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
   local ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
   [ -f "$ceo" ] || { echo "[cys-dept] CEO 템플릿 없음 — 승격 생략(cys init-pack 필요)"; return 0; }
@@ -439,19 +440,11 @@ ceo_promote(){  # $1: "consented"면 동의 게이트 생략(오너 지명 promo
     echo "[cys-dept] CEO 승격 보류(PENDING) — base master 미부트(.master-bootstrapped 부재)" >&2
     return 0
   fi
-  if [ ! -f "$md.pre-ceo" ] && [ "${1:-}" != "consented" ]; then
-    # deny/timeout/feed불가 = 승격 보류(표준 master 유지·다음 부서 이벤트에 재질의) — fail-safe는 '승격 안 함'.
-    # env -u CYS_SOCKET: 승격 대상은 기본 데몬이므로 승인 요청도 기본 데몬 feed로(ceo_reinject_master와 동형).
-    # ★GUI 오퍼레이터 승인(오너 2026-07-15): 기본 120초는 오너가 GUI feed 패널을 열어 판단하기에
-    # 짧아 timeout(보류)로 흘렀다 — 600초로 연장(데몬 상한 3600초 이내·이 push 경로 한정).
-    if env -u CYS_SOCKET "$CYS" feed push --wait --timeout-secs 600 --kind ceo-promote-request --title "CEO 승격 승인 요청" \
-         --body "부서 생성 감지 — 기본 데몬 master를 CEO(master of master)로 승격합니까? (MASTER_DIRECTIVE→CEO 규약 교체·헌법은 .pre-ceo 보존·ceo_demote로 가역)"; then
-      echo "[cys-dept] CEO 승격 오너 승인됨"
-    else
-      echo "[cys-dept] CEO 승격 보류(오너 미승인/응답없음) — 표준 master 유지" >&2
-      return 0
-    fi
-  fi
+  # ★자동 승격(오너 정책 2026-07-17): 종전 feed --wait 동의 게이트를 제거한다. 부서 생성 자체를 승격 동의로
+  #   간주해 자동 승격한다(GUI 승인 버튼이 §3.2 자기승인 차단·토큰 불일치로 침묵 실패해 승격이 걸리던 문제 해소).
+  #   위 ③ 부트 마커 PENDING 게이트는 불변(미부트 머신 승격 금지). consented(오너 지명)는 원래 자동 아님 — 알림 생략 판별용.
+  local _auto=0
+  if [ ! -f "$md.pre-ceo" ] && [ "${1:-}" != "consented" ]; then _auto=1; fi
   # ★동시 승격 직렬화(오너 2026-07-15 적대검증 D-5): 두 promote가 겹치면 두 번째가 "pre-ceo 없음"을
   # 읽은 뒤 첫 번째의 cp(ceo→md) 이후 실행돼 CEO 템플릿을 .pre-ceo로 복사→ceo_demote 원복 불능.
   # flock으로 백업+교체를 원자화(flock 미설치 환경은 그대로 진행 — 인간 페이스 더블클릭은 저위험).
@@ -464,6 +457,13 @@ ceo_promote(){  # $1: "consented"면 동의 게이트 생략(오너 지명 promo
   rm -f "$CEO_PENDING" 2>/dev/null || true   # 승격 완료 = PENDING 해소
   echo "[cys-dept] 기본 데몬 CEO 승격(directives 교체·백업 .pre-ceo)"
   ceo_reinject_master "CEO 승격"
+  if [ "$_auto" -eq 1 ]; then
+    # ★자동 승격 직후 비대기 알림(오너 정책 2026-07-17). 실패는 || true(기존 관행 — 승격 차단 금지).
+    #   가역 사실 근거: ceo_demote는 부서 0개(reg_count=0) 시 down/down-sock에서 자동 호출되어 .pre-ceo
+    #   백업을 복원한다(수동 강등 명령은 없음 — 환각 금지).
+    env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 완료(자동)" \
+      --body "부서 생성 감지 — 오너 정책(2026-07-17)에 따라 기본 데몬 master를 CEO로 자동 승격했습니다. 가역: 부서를 모두 정리해 0개가 되면 자동으로 표준 master로 강등(원복)됩니다(.pre-ceo 백업 복원)." >/dev/null 2>&1 || true
+  fi
 }
 ceo_demote(){
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
@@ -939,7 +939,7 @@ EOF
     n=$(reg_count)
     [ "$n" -ge 1 ] || { echo "[cys-dept] 부서 0개 — CEO는 최소 1개 마스터(부서) 존재 후 단계다(승격 안 함)"; exit 4; }
     ceo_promote consented
-    # ★진짜 승격 검증(오너 2026-07-15 적대검증 D-2): consented는 동의 게이트만 우회할 뿐 boot-marker
+    # ★진짜 승격 검증(오너 2026-07-15 적대검증 D-2): consented(오너 지명)든 자동 승격이든 boot-marker
     # PENDING 게이트(부트 미완)는 못 뚫어 ceo_promote가 미승격인데 return 0 할 수 있다. GUI가 그 exit 0을
     # "✅ 승격 완료"로 오보하지 않게, 실제 승격 여부(md==CEO 템플릿 또는 .pre-ceo 백업 존재)를 post-verify해
     # 미승격이면 exit 5로 truthful 실패를 반환한다(approve_ceo_promotion→Err→GUI 실패 표시).
@@ -954,14 +954,14 @@ EOF
   promote-if-pending)
     # BOOTSTRAP_HARDENING WP-2: 부트 게이트로 보류된 승격의 해소 경로.
     # 조건 = PENDING 존재 + .master-bootstrapped 존재 + 부서≥1. 미충족=no-op(exit 0·멱등).
-    # --request-only(부트 ⑦ 전용·비대기): 알림 재발행만 — 실제 승격·동의 대기는 하지 않는다
-    #   (부트와 승격 동의의 분리 — 설계 v1.1 결함⑤). 대기형: ceo_promote(자체 동의 게이트 --wait) 경유.
+    # --request-only(부트 ⑦ 전용·비대기): 알림 재발행만 — 실제 승격은 하지 않는다
+    #   (부트와 자동 승격의 분리 — 설계 v1.1 결함⑤). 대기형: ceo_promote(자동 승격, 오너 정책 2026-07-17) 경유.
     _pend_ok=0
     [ -f "$CEO_PENDING" ] && [ -f "$BOOT_MARKER" ] && [ "$(reg_count)" -ge 1 ] && _pend_ok=1
     if [ "${2:-}" = "--request-only" ]; then
       if [ "$_pend_ok" -eq 1 ]; then
         env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 대기" \
-          --body "부트 완료 — 부서가 존재하여 CEO 승격이 대기 중입니다. 명령 팔레트의 'CEO 승격 진행' 또는 다음 부서 이벤트에서 승인을 진행하세요." >/dev/null 2>&1 || true
+          --body "부트 완료 — 부서가 존재하여 CEO 승격이 대기 중입니다. 명령 팔레트의 'CEO 승격 진행' 또는 다음 부서 이벤트에서 자동 승격됩니다(오너 정책 2026-07-17)." >/dev/null 2>&1 || true
         echo "[cys-dept] CEO 승격 대기 알림 발행(request-only)"
       else
         echo "[cys-dept] promote-if-pending(request-only): 조건 미충족 — no-op (pending=$([ -f "$CEO_PENDING" ] && echo y || echo n) 마커=$([ -f "$BOOT_MARKER" ] && echo y || echo n) 부서=$(reg_count))"
@@ -969,7 +969,7 @@ EOF
       exit 0
     fi
     if [ "$_pend_ok" -eq 1 ]; then
-      ceo_promote   # 동의 게이트(feed --wait) 경유 — 성공 시 PENDING 해소는 ceo_promote 내부
+      ceo_promote   # 자동 승격(오너 정책 2026-07-17) 경유 — 성공 시 PENDING 해소는 ceo_promote 내부
     else
       echo "[cys-dept] promote-if-pending: 조건 미충족 — no-op"
     fi

@@ -1675,10 +1675,46 @@ async fn ensure_daemon() -> Result<(), String> {
         _ => std::path::PathBuf::from(daemon_name), // fall back to PATH
     };
     let mut command = std::process::Command::new(&program);
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    command.stdin(std::process::Stdio::null());
+    // ★W1-b: 앱-스폰 데몬의 stdout/stderr 를 기본 데몬 로그(launchd StandardErrorPath 와 동일 파일 규약)에
+    // O_APPEND 로 잇는다 — 과거 Stdio::null() 로 버려, 락 경쟁 패배·데드맨 판정 등 앱-스폰 데몬의 부트
+    // 진단이 통째로 증발했다(launchd-스폰 데몬만 로그가 남았다). open 실패 시 기존 null() 폴백 —
+    // 로그를 못 열어도 부트는 막지 않는다(fail-open).
+    #[cfg(target_os = "macos")]
+    {
+        let log = cys::launchd::log_path();
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+        {
+            Ok(f) => match f.try_clone() {
+                Ok(f2) => {
+                    command
+                        .stdout(std::process::Stdio::from(f))
+                        .stderr(std::process::Stdio::from(f2));
+                }
+                Err(_) => {
+                    command
+                        .stdout(std::process::Stdio::from(f))
+                        .stderr(std::process::Stdio::null());
+                }
+            },
+            Err(_) => {
+                command
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+            }
+        }
+    }
+    // launchd::log_path 는 mac 전용 경로 규약(#![cfg(target_os = "macos")])이라 그 외 OS(windows 포함)는
+    // 기존 null() 을 유지한다 — 별도 로그 파일 규약이 정해지면 그때 동등 배선한다.
+    #[cfg(not(target_os = "macos"))]
+    {
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    }
     no_console(&mut command);
     command
         .spawn()
