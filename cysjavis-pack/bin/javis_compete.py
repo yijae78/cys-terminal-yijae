@@ -206,6 +206,13 @@ def cmd_init(args):
     if track == "code" and not args.repo:
         print("[compete-init] 거부: CODE 트랙은 --repo 필수(worktree 격리)", file=sys.stderr)
         return 2
+    # 심판 익명성 — producer 는 MAPPING 전용, MANIFEST/RESULT/stdout 출력 금지 (v3.1 Δ1).
+    # 미제공 시 기존 동작 완전 동일(하위 호환 — 기록용 선택 인자, 게이트 아님).
+    producers = list(getattr(args, "producer", []) or [])
+    if producers and len(producers) != n:
+        print("[compete-init] 거부: --producer 개수(%d)가 --n(%d)과 불일치"
+              % (len(producers), n), file=sys.stderr)
+        return 2
 
     # F5② 클로버 차단: 같은 디렉토리에 다른 task 의 MANIFEST 가 이미 있으면 거부
     mpath = manifest_path(task)
@@ -231,6 +238,7 @@ def cmd_init(args):
         "criteria_file": criteria_abs,
         "created_at": time.time(),
         "repo": os.path.abspath(args.repo) if args.repo else None,
+        "producer_note": getattr(args, "producer_note", None),  # 이질화 예외 사유 — MAPPING 전용
         "candidates": [],
     }
     # MANIFEST(심판 무해): 라벨·트랙·criteria 해시만 — 실경로·접근축 미노출.
@@ -249,6 +257,8 @@ def cmd_init(args):
             label = "cand_%s" % LABELS[i]
             wn = "w%d" % (i + 1)
             entry = {"label": label, "approach": approaches[i], "slot": wn}
+            if producers:
+                entry["producer"] = producers[i]  # MAPPING 전용 — MANIFEST/RESULT/stdout 출력 금지
             if track == "code":
                 repo = os.path.abspath(args.repo)
                 wt = os.path.abspath(os.path.join(repo, "..", "_worktrees",
@@ -730,6 +740,11 @@ def main():
                     help="후보별 차등 접근축 — N회 반복(서로 달라야 함·다양성 강제)")
     pi.add_argument("--repo", default=None, help="CODE 트랙: worktree 격리 대상 git repo")
     pi.add_argument("--setup", default=None, help="CODE 트랙: worktree 생성 후 실행할 준비 훅")
+    # 심판 익명성 — producer 는 MAPPING 전용, MANIFEST/RESULT/stdout 출력 금지 (v3.1 Δ1)
+    pi.add_argument("--producer", action="append", default=[],
+                    help="후보별 생산자 기록(선택·반복 — 예: worker:claude) — 기록용, 게이트 아님")
+    pi.add_argument("--producer-note", default=None,
+                    help="이질화 예외 사유(선택) — MAPPING 전용 기록")
 
     pj = sub.add_parser("judge", help="익명 verdict 일괄 검증 + 판정(점수 없음)")
     pj.add_argument("--task", required=True)
