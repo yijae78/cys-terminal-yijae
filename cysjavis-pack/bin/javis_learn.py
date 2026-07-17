@@ -613,9 +613,14 @@ def _freeze_check(rid, state):
         if not isinstance(led, dict) or led.get("content_sha256") != freeze_content_sha(led):
             return False, "freeze ledger 해시 무결 위반(사후 변조 의심) — 기준 사전 등록 오염"
         return True, "freeze 무결"
-    regime_active = bool(glob.glob(os.path.join(_bench_dir(), "*.json")))
+    # ★P1-2 냉시작 봉쇄 — 레짐 활성 판정을 '벤치마크 파일 존재'(자발적 opt-in·냉시작 우회)에서
+    #   '첫 confirmed 승격 이후 freeze 의무'로 강화. confirmed가 하나라도 존재하면 레짐 활성.
+    regime_active = (bool(glob.glob(os.path.join(_bench_dir(), "*.json")))
+                     or state.get("confirmed_ever") is True
+                     or any(it.get("state") == "confirmed"
+                            for _, _, it, _ in _iter_items(state)))
     if regime_active and rid not in state.get("rounds", {}):
-        return False, f"신규 라운드 '{rid}' freeze 레코드 부재 — 기준 사전 등록(freeze) 없이 evaluate 불가(fail-closed)"
+        return False, f"신규 라운드 '{rid}' freeze 레코드 부재 — 기준 사전 등록(freeze) 없이 evaluate 불가(fail-closed·레짐 활성)"
     return True, "freeze 면제(레짐 이전 환경 또는 구 라운드)"
 
 
@@ -758,7 +763,7 @@ def cmd_evaluate(a):
             rc, out, err = _run(RSI, ["checkpoint", "--round", a.round, "--score", repr(a.score)]
                                 + (["--note", a.note] if a.note else []))
         if rc != 0:
-            return fail(3, f"javis_rsi 위임 실패: {err or out}")
+            return fail(12, f"javis_rsi 위임 실패(일시적·재시도 가능): {err or out}")  # ★P2-1 위임 실패=12(계약 위반 exit 2/3과 분리)
     try:
         rsi_res = json.loads(out)
     except ValueError:
@@ -856,7 +861,7 @@ def cmd_store(a):
                       ensure_ascii=False, indent=2)
     rc, out, err = _run(MEM, ["add", "--type", a.type, "--name", name, "--desc", desc, "--body", body])
     if rc != 0:
-        return fail(3, f"javis_memory 위임 실패: {err or out}")
+        return fail(12, f"javis_memory 위임 실패(일시적·재시도 가능): {err or out}")  # ★P2-1 위임 실패=12
     rec = {"name": name, "id": name, "type": a.type, "ts": time.time()}
     rec.update(new_item_fields(a.state, refs))  # C1 항목 레코드 v2
     r.setdefault("stored", []).append(rec)
@@ -1146,7 +1151,23 @@ def cmd_audit(a):
         return 0
     report = {"expired_tombstoned": [], "reval_enqueued": [], "lapsed": [],
               "refs_hard_fail": [], "orphan_markers": [], "effect_none_streak": [],
-              "chain_hard_fail": [], "ts": time.time()}
+              "chain_hard_fail": [], "sample_audits_pending": [], "ts": time.time()}
+    # ★P1-5 sample_audit 소비 배선(레드팀 F7 dead signal 해소) — conflictscan이 발행한 20%
+    #   샘플 감사 플래그를 audit가 읽어 미소비 목록으로 표면화(reviewer2 의미 감사 대상 큐).
+    lp = os.path.join(learn_dir(), "ledger.jsonl")
+    try:
+        for ln in open(lp, encoding="utf-8"):
+            try:
+                e = json.loads(ln)
+            except ValueError:
+                continue
+            if e.get("event") == "conflictscan" and e.get("sample_audit") is True:
+                report["sample_audits_pending"].append(
+                    {"round": e.get("round"), "name": e.get("name"),
+                     "seed": e.get("sample_audit_seed"),
+                     "note": "conflictscan 0건 20% 샘플 — reviewer2 의미 감사 대상"})
+    except OSError:
+        pass
     changed_rounds = set()
     known_ids = {iid for _, _, _, iid in _iter_items(state) if iid}
     for rid, kind, item, iid in _iter_items(state):

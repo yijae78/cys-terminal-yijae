@@ -133,7 +133,8 @@ def main():
             "snapshot": {"path": snap, "sha256_expected": sha},
             # ★P0-1: confirmed는 conflict_audit(reviewer2) 무조건 필수.
             "conflict_audit": {"reviewer": "reviewer2", "verdict": "PASS"},
-            "dimensions": {"source": {"fetch_log": True, "canonical": True, "distinct_sources": 2},
+            "dimensions": {"source": {"fetch_log": True, "canonical": True, "distinct_sources": 2,
+                                      "source_urls": ["https://w3.org/a", "https://developer.mozilla.org/b"]},
                            "fact_check": {"cross_checked": True},
                            "evidence": {"quote": "quote-here", "snapshot_path": snap, "context_entailment": "support"},
                            "logic": {"verdict_json": "{\"verdict\":\"PASS\"}"},
@@ -255,7 +256,8 @@ def main():
             "target_paths": ["docs/x.md"], "operations": [],
             "snapshot": {"path": snap, "sha256_expected": sha},
             "dimensions": {
-                "source": {"fetch_log": True, "canonical": True, "distinct_sources": 2},
+                "source": {"fetch_log": True, "canonical": True, "distinct_sources": 2,
+                           "source_urls": ["https://w3.org/a", "https://developer.mozilla.org/b"]},
                 "fact_check": {"cross_checked": True},
                 "evidence": {"quote": "quote-here", "snapshot_path": snap, "context_entailment": "support"},
                 "logic": {"verdict_json": "{\"verdict\":\"PASS\",\"reason\":\"ok\"}"},

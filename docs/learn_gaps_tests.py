@@ -143,7 +143,8 @@ def gi_conf_bundle(snap, sha):
             "snapshot": {"path": snap, "sha256_expected": sha},
             # ★P0-1: confirmed는 후보 수 무관 conflict_audit(reviewer2) 무조건 필수.
             "conflict_audit": {"reviewer": "reviewer2", "verdict": "PASS", "note": "의미 감사 통과"},
-            "dimensions": {"source": {"fetch_log": True, "canonical": True, "distinct_sources": 2},
+            "dimensions": {"source": {"fetch_log": True, "canonical": True, "distinct_sources": 2,
+                                      "source_urls": ["https://w3.org/a", "https://developer.mozilla.org/b"]},
                            "fact_check": {"cross_checked": True},
                            "evidence": {"quote": "quote-here", "snapshot_path": snap,
                                         "context_entailment": "support"},
@@ -460,6 +461,11 @@ def env_a():
         find_item(st, "gapx-conf-audited")["effect_log"] = [
             {"date": "2026-07-01", "effect": "none"}, {"date": "2026-07-10", "effect": "none"}]
         save_state(d, st)
+        # ★P1-2: confirmed 존재 후 레짐 활성 — 새 라운드 RC는 freeze 선행 필수.
+        benchc = os.path.join(d, "benchc.json")
+        write(benchc, {"tasks": ["t"], "success_criteria": "s", "aux_metrics_protocol": {"m": "def"}})
+        run_learn(["freeze", "--round", "RC", "--benchmarks", benchc, "--proposer", "worker",
+                   "--auditor-sig", "reviewer2:s"], d)
         run_learn(["evaluate", "--round", "RC", "--score", "0.90", "--baseline"], d)
         run_learn(["evaluate", "--round", "RC", "--score", "0.70"], d)
         run_learn(["evaluate", "--round", "RC", "--score", "0.75"], d)
@@ -470,6 +476,14 @@ def env_a():
         check("C11 체인 대조 hard-fail(직전 승·최초 대비 하락·rc1)",
               r.returncode == 1 and any(x["round"] == "RC" for x in rep["chain_hard_fail"]),
               r.stdout[:400])
+        # ★P1-5 sample_audit 소비 배선 — 20% 플래그는 시드 결정론이라 직접 ledger에 심어 소비 검증.
+        with open(os.path.join(d, "_round", "learn", "ledger.jsonl"), "a", encoding="utf-8") as lf:
+            lf.write(json.dumps({"event": "conflictscan", "round": "RC", "name": "sampx",
+                                 "count": 0, "sample_audit": True, "sample_audit_seed": "seed1"}) + "\n")
+        rep3 = json.loads(run_learn(["audit", "--json"], d).stdout)
+        check("P1-5 sample_audit 소비(audit 표면화·dead signal 해소)",
+              any(x.get("name") == "sampx" for x in rep3.get("sample_audits_pending", [])),
+              str(rep3.get("sample_audits_pending")))
 
 
 # ───────────────────────── ENV B: evaluator/attempts/freeze ─────────────────────────

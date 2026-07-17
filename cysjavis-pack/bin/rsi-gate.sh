@@ -154,8 +154,20 @@ def gate(inp):
     if not src.get("fetch_log"):
         return "[출처] fetch 실호출 로그 없음(학습지식 단독 금지·hard fail)"
     is_confirmed = inp.get("target_state") == "confirmed"
-    if is_confirmed and int(src.get("distinct_sources", 0)) < 2:
-        return "[출처] confirmed 승격에 독립 출처 2개+ 필요(단일 출처 confirmed 불가)"
+    # ★P1-3 자기신고 정수 → 실측 대체(레드팀 F6): confirmed는 source_urls 목록을 요구하고
+    #   게이트가 distinct 호스트 수를 실측한다(자기신고 distinct_sources 정수 인플레 차단).
+    if is_confirmed:
+        urls = src.get("source_urls")
+        if not (isinstance(urls, list) and urls):
+            return "[출처] confirmed 승격에 source_urls 목록 필수(자기신고 정수 금지 — 게이트 실측 대상)"
+        hosts = set()
+        for u in urls:
+            s = str(u)
+            if "://" in s:
+                s = s.split("://", 1)[1]
+            hosts.add(s.split("/", 1)[0].lower())
+        if len(hosts) < 2:
+            return f"[출처] confirmed 독립 출처 2개+ 실측 필요(distinct host={len(hosts)})"
     if is_confirmed and not src.get("canonical"):
         return "[출처] canonical 미충족 — whitelist 밖은 provisional만(confirmed 불가)"
 
@@ -327,7 +339,8 @@ def self_test():
     def cbase(**_):
         d = copy.deepcopy(base)
         d["target_state"] = "confirmed"
-        d["dimensions"]["source"] = {"fetch_log": True, "canonical": True, "distinct_sources": 2}
+        d["dimensions"]["source"] = {"fetch_log": True, "canonical": True, "distinct_sources": 2,
+                                     "source_urls": ["https://w3.org/a", "https://mozilla.org/b"]}
         d["dimensions"]["fact_check"] = {"cross_checked": True}
         d["dimensions"]["evidence"] = {"quote": "q", "context_entailment": "support"}
         d["dimensions"]["logic"] = {"verdict_json": "{\"verdict\":\"PASS\"}"}
@@ -352,8 +365,14 @@ def self_test():
     d = copy.deepcopy(base); d["dimensions"]["source"]["fetch_log"] = False
     expect("출처 fetch_log 0 DENY", d, False)
 
-    d = copy.deepcopy(base); d["target_state"] = "confirmed"; d["dimensions"]["source"]["distinct_sources"] = 1
-    expect("confirmed 단일출처 DENY", d, False)
+    d = copy.deepcopy(base); d["target_state"] = "confirmed"
+    d["dimensions"]["source"]["distinct_sources"] = 1
+    d["dimensions"]["source"]["source_urls"] = ["https://only-one.example/a"]  # 1 host → 실측 DENY
+    expect("confirmed 단일출처 DENY(실측)", d, False)
+    # ★P1-3 자기신고 인플레 차단 — distinct_sources=9 자기신고여도 실측 host=1이면 DENY.
+    d = cbase(); d["dimensions"]["source"]["distinct_sources"] = 9
+    d["dimensions"]["source"]["source_urls"] = ["https://same.host/a", "https://same.host/b"]
+    expect("confirmed 자기신고 인플레 무효(실측 host=1) DENY", d, False)
 
     d = copy.deepcopy(base); d["dimensions"]["logic"]["verdict_json"] = "{not valid json"
     expect("논리 JSON 파싱실패=FAIL DENY", d, False)
