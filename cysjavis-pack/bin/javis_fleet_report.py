@@ -219,6 +219,78 @@ def pack_version_advisory():
         return None  # skip+기록(아래 build_report 가 None 을 notes 로 표기)
 
 
+def learn_summary(round_arg):
+    """RSI 학습 결과 지표(설계 G5 — quota-filling 봉쇄: '추천 수' 등 활동량 지표 금지·결과만).
+    데이터원=CYS_ROUND_DIR 규약의 learn 상태(javis_learn과 동일 해석 — learn_state.json 우선·
+    legacy state.json 폴백). 부재/불량=None(digest 행 생략 관용 — 라인 11 불변 준수)."""
+    try:
+        d = os.path.join(round_dir(round_arg), "learn")
+        # ★P0-2 canonical 동조 — CYS_ROUND_DIR==~/.cys/state면 데몬 state.json 라운드를 사설에 union
+        #   (stale 사설만 읽어 adopted=0 오신호→"게이트 비용 재조정" 거짓 트리거 봉쇄).
+        canonical = False
+        root = os.environ.get("CYS_ROUND_DIR")
+        if root:
+            try:
+                canonical = os.path.realpath(root) == os.path.realpath(os.path.expanduser("~/.cys/state"))
+            except OSError:
+                canonical = False
+
+        def _rd(fn):
+            p = os.path.join(d, fn)
+            if os.path.isfile(p):
+                try:
+                    with open(p, encoding="utf-8") as fh:
+                        v = json.load(fh)
+                    return v if isinstance(v, dict) else None
+                except (OSError, ValueError):
+                    return None
+            return None
+
+        priv = _rd("learn_state.json")
+        if canonical:
+            st = priv if priv is not None else {}
+            daemon = _rd("state.json")
+            if daemon:
+                dr = daemon.get("rounds", {})
+                sr = st.setdefault("rounds", {})
+                for rid, rec in (dr.items() if isinstance(dr, dict) else []):
+                    if rid not in sr:
+                        sr[rid] = rec
+            if priv is None and not daemon:
+                st = None
+        else:
+            st = priv if priv is not None else _rd("state.json")
+        if not isinstance(st, dict):
+            return None
+        counts = {"confirmed": 0, "provisional": 0, "challenged": 0, "tombstone": 0}
+        effects = {"improved": 0, "none": 0}
+        last_ts = None
+        for r in (st.get("rounds") or {}).values():
+            if not isinstance(r, dict):
+                continue
+            for it in (r.get("stored") or []) + (r.get("harness") or []):
+                if not isinstance(it, dict):
+                    continue
+                s = it.get("state")
+                if s in counts:
+                    counts[s] += 1
+                for e in it.get("effect_log") or []:
+                    eff = (e or {}).get("effect") if isinstance(e, dict) else None
+                    if eff in effects:
+                        effects[eff] += 1
+                ts = it.get("ts")
+                if isinstance(ts, (int, float)):
+                    last_ts = max(last_ts or 0, ts)
+        # 채택(효력)=confirmed+provisional+challenged(challenged는 효력 유지 명문 — javis_learn C4).
+        adopted = counts["confirmed"] + counts["provisional"] + counts["challenged"]
+        return {"adopted": adopted, "by_state": counts, "effects": effects,
+                "last_episode": (time.strftime("%Y-%m-%d", time.localtime(last_ts))
+                                 if last_ts else None),
+                "gate_cost_review": adopted == 0}
+    except Exception:
+        return None  # 부재/불량=행 생략(fleet_report 는 데이터 문제로 절대 죽지 않는다)
+
+
 def build_report(days, limit, round_arg):
     cutoff = time.time() - days * 86400 if days else None
     dbs = discover_dbs()
@@ -231,6 +303,7 @@ def build_report(days, limit, round_arg):
     fleet = fleet_aggregate(per_db)
     fleet["missed_savings"] = mine_missed_savings(days, limit)
     fleet["pack_version_advisory"] = pack_version_advisory()  # None 가능(skip)
+    fleet["learn"] = learn_summary(round_arg)  # None 가능(learn 상태 부재=행 생략 관용)
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "days_window": days,
@@ -272,6 +345,15 @@ def render_digest(rep):
     if pv and pv.get("verdict"):
         L.append("• PACK/버전 advisory(javis_semver·결정론·비행동): installed cys %s vs source %s → %s"
                  % (pv.get("installed_cys"), pv.get("source_cargo"), pv["verdict"]))
+    ln = f.get("learn")
+    if ln:  # G5 결과 지표 — 활동량('추천 수') 금지: 채택 학습물·사후 효과·tombstone 만.
+        bs, ef = ln["by_state"], ln["effects"]
+        L.append("• 학습(RSI·결과 지표): 채택(효력) %d (confirmed %d·provisional %d·challenged %d)"
+                 " · 사후효과 improved %d/none %d · tombstone %d · 마지막 에피소드 %s"
+                 % (ln["adopted"], bs["confirmed"], bs["provisional"], bs["challenged"],
+                    ef["improved"], ef["none"], bs["tombstone"], ln["last_episode"] or "-"))
+        if ln["gate_cost_review"]:
+            L.append("  ↳ 채택 학습물 0건 — 알람 아님: '게이트 비용 재조정 검토' 트리거(G5)")
     L.append("(요약금지 carve-out: mechanical 대시보드 — 풀 무압축 데이터는 JSON sidecar)")
     return "\n".join(L)
 

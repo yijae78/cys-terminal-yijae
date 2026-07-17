@@ -131,12 +131,21 @@ def main():
             "human_signed": False, "producer_model_family": "claude",
             "target_paths": ["docs/x.md"], "operations": [],
             "snapshot": {"path": snap, "sha256_expected": sha},
+            # ★P0-1: confirmed는 conflict_audit(reviewer2) 무조건 필수.
+            "conflict_audit": {"reviewer": "reviewer2", "verdict": "PASS"},
             "dimensions": {"source": {"fetch_log": True, "canonical": True, "distinct_sources": 2},
                            "fact_check": {"cross_checked": True},
                            "evidence": {"quote": "quote-here", "snapshot_path": snap, "context_entailment": "support"},
                            "logic": {"verdict_json": "{\"verdict\":\"PASS\"}"},
                            "quality": {"eval_improved": True}},
             "verdicts": verdicts})
+        # ★P0-1: confirmed 승격용 v2 pattern(behavioral_claim·falsifier·maturity).
+        pat_v2_path = os.path.join(d, "pat_v2.json")
+        write(pat_v2_path, {**pat, "behavioral_claim": "관찰 가능 행동 서술",
+                            "falsifier": "반증 관측 조건",
+                            "maturity": {"first_seen": "2024-05", "adoption_evidence": "3개 조직",
+                                         "known_failures": [{"source_url": "https://ex.org/pm",
+                                                             "snapshot_sha256": sha, "summary": "실패 사례"}]}})
 
         r = run_learn(["propose", "--reason", "ceiling", "--topic", "T"], d)
         check("propose 0", r.returncode == 0 and "awaiting_approval" in r.stdout, r.stderr)
@@ -160,7 +169,7 @@ def main():
         check("store가 memory 파일 생성",
               os.path.exists(os.path.join(d, "pack", "memory", "reference_rsi-e2e-x.md")), r.stderr)
 
-        r = run_learn(["store", "--round", "R1", "--pattern", pat_path, "--type", "reference",
+        r = run_learn(["store", "--round", "R1", "--pattern", pat_v2_path, "--type", "reference",
                        "--approved", "--state", "confirmed", "--gate-input", gi_conf,
                        "--name", "rsi-e2e-conf", "--json"], d)
         check("store confirmed+full gate통과 0", r.returncode == 0, r.stdout + r.stderr)
@@ -301,6 +310,70 @@ def main():
         # gate 빈 입력 fail-closed
         r = subprocess.run(["bash", GATE], cwd=d, capture_output=True, text=True, input="")
         check("gate 빈 입력 fail-closed DENY(1)", r.returncode == 1, r.stdout)
+
+    # ── (4) LEARN GAPS v2 경로 스모크 — 상세 계약 검증은 docs/learn_gaps_tests.py ──
+    with tempfile.TemporaryDirectory(prefix="cys-learn-v2-") as d:
+        git(["init", "-q"], d)
+        git(["config", "user.email", "t@t"], d)
+        git(["config", "user.name", "t"], d)
+        open(os.path.join(d, "seed"), "w").write("x")
+        git(["add", "-A"], d)
+        git(["commit", "-qm", "seed"], d)
+        os.makedirs(os.path.join(d, "pack", "memory"), exist_ok=True)
+        open(os.path.join(d, "pack", "memory", "MEMORY.md"), "w", encoding="utf-8").write(
+            "# MEMORY.md\n\n## 색인\n\n")
+
+        sha_a = "a" * 64
+        cand_v2 = [{"source_url": "https://w3.org/spec", "claim": "X", "retrieved_at": "2026-07-17",
+                    "canonical": True, "first_seen": "2024-05-01", "adoption_evidence": "3개 조직",
+                    "known_failures": [{"source_url": "https://ex.org/pm", "snapshot_sha256": sha_a,
+                                        "summary": "실패 사례"}],
+                    "counterquery_log": ["X problems 역질의"]}]
+        cv2_path = os.path.join(d, "cands_v2.json")
+        write(cv2_path, cand_v2)
+        r = run_learn(["search", "--topic", "V2", "--candidates", cv2_path, "--json"], d)
+        check("v2 search 정상 + normalized 전 필드 보존",
+              r.returncode == 0 and '"first_seen"' in r.stdout, r.stdout[:300] + r.stderr)
+
+        pat_v2 = {"domain": "d", "condition": "c", "action": "a", "rationale": "r",
+                  "evidence_ref": "https://w3.org/spec",
+                  "behavioral_claim": "관찰 가능 행동", "falsifier": "반증 관측 조건",
+                  "maturity": {"first_seen": "2024-05-01", "adoption_evidence": "3개 조직",
+                               "known_failures": [{"source_url": "https://ex.org/pm",
+                                                   "snapshot_sha256": sha_a, "summary": "실패 사례"}]}}
+        pv2_path = os.path.join(d, "pat_v2.json")
+        write(pv2_path, pat_v2)
+        gi_prov2 = os.path.join(d, "gi_prov2.json")
+        write(gi_prov2, {
+            "human_signed": False, "producer_model_family": "claude",
+            "target_paths": ["docs/x.md"], "operations": [],
+            "dimensions": {"source": {"fetch_log": True, "canonical": False, "distinct_sources": 1},
+                           "fact_check": {"cross_checked": True},
+                           "evidence": {"quote": "", "context_entailment": "support"},
+                           "logic": {"verdict_json": "{\"verdict\":\"PASS\"}"},
+                           "quality": {"eval_improved": True}},
+            "verdicts": [{"dimension": "fact_check", "model_family": "gemini", "verdict": "PASS"},
+                         {"dimension": "logic", "model_family": "codex", "verdict": "PASS"}]})
+
+        run_learn(["evaluate", "--round", "V2R", "--score", "0.90", "--baseline"], d)
+        run_learn(["evaluate", "--round", "V2R", "--score", "0.95"], d)
+        mark = os.path.join(d, "impl.md")
+        open(mark, "w", encoding="utf-8").write("반영 문서\n<!-- learn:rsi-v2-smoke -->\n")
+        r = run_learn(["store", "--round", "V2R", "--pattern", pv2_path, "--type", "reference",
+                       "--approved", "--gate-input", gi_prov2, "--refs", mark,
+                       "--name", "rsi-v2-smoke", "--json"], d)
+        check("v2 store(pattern v2+refs 마커) 정상", r.returncode == 0, r.stdout + r.stderr)
+        check("v2 store 레코드 TTL(expires) 기록", '"expires"' in r.stdout, r.stdout[:300])
+
+        bad_ev = os.path.join(d, "bad_ev.json")
+        write(bad_ev, {"id": "rsi-v2-smoke", "reason": "r",
+                       "evidence": [{"source_url": "https://e/x", "quote": "q"}]})  # 해시 부재
+        r = run_learn(["challenge", "--id", "rsi-v2-smoke", "--evidence", bad_ev], d)
+        check("v2 challenge 프리스크린 거부(rc4)", r.returncode == 4, f"rc={r.returncode}")
+
+        r = run_learn(["audit", "--json"], d)
+        check("v2 audit 정상(rc0·hard-fail 없음)", r.returncode == 0 and '"hard_fail": false' in r.stdout,
+              r.stdout[:300] + r.stderr)
 
     print()
     if FAIL:

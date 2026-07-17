@@ -877,7 +877,17 @@ async function refreshLearn() {
         .map((k) => {
           const r = rounds[k];
           const v = String(r?.verdict ?? "-");
-          return `<div class="cc-learn-row"><span class="cc-learn-round">${ccEsc(k)}</span><span class="cc-learn-verdict" style="color:${vColor[v] ?? "inherit"}">${ccEsc(v)}</span><span class="cc-learn-meta">저장 ${r?.stored?.length ?? 0} · harness ${r?.harness?.length ?? 0}</span></div>`;
+          // C2 v2: items(state/expires) 칩 — 구 라운드(items 부재)는 칩 0개로 관용(기존 렌더 불변).
+          // 값 전부 ccEsc 경유(오염 state.json XSS 방어 — 상단 gemini REVISE와 동일 원칙).
+          const its: any[] = Array.isArray(r?.items) ? r.items : [];
+          const itemChips = its
+            .map((it: any) => {
+              const st = String(it?.state ?? "-");
+              const ex = it?.expires ? ` ~${String(it.expires)}` : "";
+              return `<span class="cc-chip cc-learn-item" title="type: ${ccEsc(String(it?.type ?? "?"))} · expires: ${ccEsc(String(it?.expires ?? "미기록"))}">${ccEsc(String(it?.name ?? "?"))} · ${ccEsc(st + ex)}</span>`;
+            })
+            .join("");
+          return `<div class="cc-learn-row"><span class="cc-learn-round">${ccEsc(k)}</span><span class="cc-learn-verdict" style="color:${vColor[v] ?? "inherit"}">${ccEsc(v)}</span><span class="cc-learn-meta">저장 ${r?.stored?.length ?? 0} · harness ${r?.harness?.length ?? 0}</span>${itemChips}</div>`;
         })
         .join("")
     : `<div class="cc-empty">학습 라운드 기록 없음 — RSI 라운드(javis_rsi.py checkpoint)가 기록을 남기면 여기 표시됩니다</div>`;

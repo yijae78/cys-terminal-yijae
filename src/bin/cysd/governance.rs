@@ -25,7 +25,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut queue_depth_alerted: HashMap<u64, f64> = HashMap::new();
         let mut deadman_last_alert: f64 = 0.0;
         let mut alert_fired: HashMap<String, f64> = HashMap::new();
-        let mut learn_stuck_debounce: HashMap<u64, f64> = HashMap::new();
+        // (learn gaps C12②) 재시작에도 디바운스 창 유지 — state 파일에서 복원.
+        let mut learn_stuck_debounce: HashMap<u64, f64> =
+            load_learn_stuck_debounce(&daemon.socket_path);
         let mut zombie_miss: HashMap<u64, u32> = HashMap::new();
         let mut launch_flag_warned: std::collections::HashSet<u64> =
             std::collections::HashSet::new();
@@ -402,6 +404,42 @@ fn learn_stuck_candidates(
     out
 }
 
+/// (RSI 학습 자율추천 i·learn gaps C12②) stuck 디바운스 지속화 파일명 — 데몬 state
+/// 디렉터리(소켓 동거·부서별 격리) 하위. 직렬화: {"<surface_id>": <last_propose_epoch>}.
+const LEARN_STUCK_DEBOUNCE_FILE: &str = "learn_stuck_debounce.json";
+
+/// 디바운스 맵 로드 — 데몬 재시작 시 인메모리 디바운스 소실로 CYS_RSI_STUCK_DEBOUNCE_SECS
+/// (기본 3600) 창이 리셋돼 동일 노드 추천이 중복 발화하던 문제 수리: spawn_watchdog가 부트 시
+/// 1회 읽어 창을 이어간다. 부재/손상=빈 맵(fail-open — 최악은 추천 1회 중복일 뿐, 차단이 더 해롭다).
+fn load_learn_stuck_debounce(socket_path: &std::path::Path) -> HashMap<u64, f64> {
+    let path = crate::state::state_dir(socket_path).join(LEARN_STUCK_DEBOUNCE_FILE);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| Some((k.parse::<u64>().ok()?, v.as_f64()?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 디바운스 맵 저장(원자) — check_learn_stuck가 추천 발화로 타임스탬프를 갱신한 직후 호출.
+/// 죽은 surface 항목은 watchdog retain이 인메모리에서 솎아내고 다음 발화 시 파일에도 반영된다.
+fn save_learn_stuck_debounce(socket_path: &std::path::Path, debounce: &HashMap<u64, f64>) {
+    let obj: serde_json::Map<String, serde_json::Value> = debounce
+        .iter()
+        .map(|(k, v)| (k.to_string(), json!(v)))
+        .collect();
+    let dir = crate::state::state_dir(socket_path);
+    let _ = write_json_atomic(
+        &dir,
+        LEARN_STUCK_DEBOUNCE_FILE,
+        &serde_json::Value::Object(obj).to_string(),
+    );
+}
+
 /// (RSI 학습 자율추천 i) 막힘 트리거 — ★읽기 전용: watchdog의 기존 재시작 카운터(동일 노드
 /// N회 실패=막힘 신호)만 읽어 학습 추천 feed 항목을 만든다. autopilot(EFEC/AMI) 자율주행
 /// 로직은 무손상·자동응답 0 — 추천까지만 자율, 착수는 사람 승인(directive §4). 디바운스로 스팸 차단.
@@ -444,6 +482,8 @@ fn check_learn_stuck(
             Some(sid),
         );
     }
+    // (learn gaps C12②) 발화 직후 지속화 — 재시작이 디바운스 창을 리셋하지 않게.
+    save_learn_stuck_debounce(&daemon.socket_path, debounce);
 }
 
 /// T3-12 승인 aging 재알림: pending feed가 무음 적체되지 않게 N분마다 재push.
@@ -1836,6 +1876,33 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
 #[cfg(test)]
 mod tests {
     use super::{learn_stuck_candidates, plan_duplicate_kills};
+
+    /// (learn gaps C12②) stuck 디바운스 지속화 — 저장→로드 왕복 + 부재/손상 fail-open 핀.
+    /// 데몬 재시작 후에도 CYS_RSI_STUCK_DEBOUNCE_SECS 창이 유지되는 토대(소실=추천 중복 발화).
+    #[test]
+    fn learn_stuck_debounce_persistence_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("cys_learn_debounce_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("cysd.sock");
+        // 실제 저장 위치는 state_dir 파생(unix=소켓 부모·Windows=LOCALAPPDATA 슬러그) —
+        // 플랫폼 중립으로 state_dir 경유로 정리·손상 주입한다.
+        let sfile = crate::state::state_dir(&sock).join(super::LEARN_STUCK_DEBOUNCE_FILE);
+        let _ = std::fs::create_dir_all(sfile.parent().unwrap());
+        let _ = std::fs::remove_file(&sfile);
+        // 부재 = 빈 맵(fail-open)
+        assert!(super::load_learn_stuck_debounce(&sock).is_empty());
+        let mut m = std::collections::HashMap::new();
+        m.insert(7u64, 1_700_000_000.5f64);
+        m.insert(12u64, 1_700_000_100.0f64);
+        super::save_learn_stuck_debounce(&sock, &m);
+        assert_eq!(super::load_learn_stuck_debounce(&sock), m, "저장→로드 왕복 보존");
+        // 손상 = 빈 맵(fail-open — 조용한 차단보다 추천 재발화가 안전측)
+        std::fs::write(&sfile, "{corrupt").unwrap();
+        assert!(super::load_learn_stuck_debounce(&sock).is_empty());
+        let _ = std::fs::remove_file(&sfile);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// L3 재발방지 핀(2026-07-07 feed 189 폭주): 데몬 감지 항목의 surface 단위
     /// pending 판정·stale 스냅샷·멱등 해소 계약을 박제한다.

@@ -574,16 +574,25 @@ fn learn_checkpoint_apply(
     if !rounds.is_object() {
         *rounds = json!({});
     }
-    let mut entry = serde_json::Map::new();
-    for k in ["verdict", "stored", "harness"] {
-        if let Some(v) = params.get(k) {
-            entry.insert(k.into(), v.clone());
-        }
-    }
-    rounds
+    // C2(learn gaps): 라운드 엔트리 병합 시맨틱 — 구 교체 시맨틱은 재체크포인트마다
+    // 비화이트리스트 필드를 소거했다(설계안 §0 A4). 기존 엔트리를 보존한 채 알려진 키만
+    // 갱신한다: 미지 키(향후 v3 필드 등)는 보존, 전송 필드(round·surface_id)는 화이트리스트가
+    // 계속 차단. v2 키(items·evaluator_hash·schema) 편입 — 구 5키 페이로드는 부분집합이라
+    // 그대로 수용(후방 호환).
+    let entry = rounds
         .as_object_mut()
         .unwrap()
-        .insert(round.to_string(), Value::Object(entry));
+        .entry(round.to_string())
+        .or_insert_with(|| json!({}));
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    let emap = entry.as_object_mut().unwrap();
+    for k in ["verdict", "stored", "harness", "items", "evaluator_hash", "schema"] {
+        if let Some(v) = params.get(k) {
+            emap.insert(k.into(), v.clone());
+        }
+    }
     // discovery: 제공된 키만 절대값 치환(음수·비정수는 learn.status 읽기 정규화가 방어)
     if let Some(d) = params.get("discovery").filter(|d| d.is_object()) {
         let disc = obj.entry("discovery").or_insert_with(|| json!({}));
@@ -3612,6 +3621,49 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.join("state.json")).unwrap())
                 .unwrap();
         assert_eq!(state["rounds"]["R1"]["verdict"], "improved");
+    }
+
+    /// C2(learn gaps): 병합 시맨틱 3케이스 핀 — ①구 5키 페이로드 후방 호환 ②v2 키
+    /// (items·evaluator_hash·schema) 화이트리스트 편입+같은 라운드 재체크포인트 병합
+    /// ③기존 엔트리의 미지 키(v3 대비) 보존. 전송 필드(round)는 엔트리 미유입.
+    #[test]
+    fn learn_checkpoint_apply_merge_semantics_v2() {
+        let dir = std::env::temp_dir().join(format!("cys-learn-v2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let read_state = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(dir.join("state.json")).unwrap())
+                .unwrap()
+        };
+        // ① 구 페이로드(고정 5키: round·verdict·stored·harness·discovery) — 그대로 수용
+        let old = json!({"round": "R1", "verdict": "improved", "stored": ["m1"],
+                         "harness": [{"retention": "keep"}], "discovery": {"knowledge": 1}});
+        learn_checkpoint_apply(&dir, &old, "R1").unwrap();
+        let state = read_state();
+        assert_eq!(state["rounds"]["R1"]["verdict"], "improved");
+        assert_eq!(state["rounds"]["R1"]["stored"][0], "m1");
+        assert!(state["rounds"]["R1"].get("items").is_none(), "구 페이로드에 v2 키 무주입");
+        assert!(state["rounds"]["R1"].get("round").is_none(), "전송 필드는 엔트리 미유입");
+        // ② v2 페이로드 — 같은 라운드 재체크포인트가 교체가 아니라 병합돼야 한다
+        let v2 = json!({"round": "R1", "schema": "v2", "evaluator_hash": "abc123",
+                        "items": [{"name": "m1", "type": "feedback",
+                                   "state": "provisional", "expires": "2026-10-15"}]});
+        learn_checkpoint_apply(&dir, &v2, "R1").unwrap();
+        let state = read_state();
+        assert_eq!(state["rounds"]["R1"]["schema"], "v2");
+        assert_eq!(state["rounds"]["R1"]["evaluator_hash"], "abc123");
+        assert_eq!(state["rounds"]["R1"]["items"][0]["state"], "provisional");
+        assert_eq!(state["rounds"]["R1"]["items"][0]["expires"], "2026-10-15");
+        assert_eq!(state["rounds"]["R1"]["verdict"], "improved", "병합 — 직전 verdict 보존");
+        assert_eq!(state["rounds"]["R1"]["stored"][0], "m1", "병합 — 직전 stored 보존");
+        // ③ 미지 키 보존 — 기존 엔트리의 향후(v3) 필드가 재체크포인트에 소거되지 않는다
+        let mut st = read_state();
+        st["rounds"]["R1"]["future_v3_field"] = json!("keep-me");
+        std::fs::write(dir.join("state.json"), serde_json::to_string(&st).unwrap()).unwrap();
+        learn_checkpoint_apply(&dir, &json!({"round": "R1", "verdict": "flat"}), "R1").unwrap();
+        let state = read_state();
+        assert_eq!(state["rounds"]["R1"]["future_v3_field"], "keep-me", "미지 키 보존(v3 대비)");
+        assert_eq!(state["rounds"]["R1"]["verdict"], "flat", "알려진 키는 갱신");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ★W2/P0-6: cause 파싱 — "reap"=Reap, 그 외/부재/미지 값=안전측 OwnerClose(묘비).
