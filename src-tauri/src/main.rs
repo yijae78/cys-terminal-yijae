@@ -705,6 +705,16 @@ fn classify_bundle_dir(macos_dir: &std::path::Path) -> BundleKind {
     BundleKind::NonStandard
 }
 
+/// launchd 자기등록 가드(순수): **Canonical(/Applications·~/Applications)만 허용**한다. 무음
+/// autostart(GUI 시작 시 plist 무음 기록)는 명시 사용자설치(plan_cli_install: 사용자 액션+가시 경고)와
+/// 위험 프로파일이 다르다 — NonStandard(~/Downloads·/Volumes/USB 등 휘발/이동 경로)가 plist
+/// ProgramArguments 에 각인되면 언마운트·삭제 시 죽은 경로 데몬을 무한 스폰한다(Translocated·Backup 도
+/// 동류). 그래서 plan_cli_install 이 NonStandard 를 경고만 하고 허용하는 것과 **의도적으로 divergence**해,
+/// 자동등록은 Canonical 로 한정한다(비-Canonical 은 ensure_daemon 런타임 폴백=휘발성 데몬으로 안전).
+fn autoregister_allowed(kind: &BundleKind) -> bool {
+    matches!(kind, BundleKind::Canonical)
+}
+
 /// `do shell script` 본문: target_dir 생성 + cys·cysd 심볼릭 멱등 생성(`ln -sf`).
 fn build_install_script(
     cys: &std::path::Path,
@@ -1540,14 +1550,36 @@ async fn wait_for_connect(attempts: u32) -> bool {
 /// launchd-owned cysd의 socket-ready를 폴링해야 한다(중복 spawn·flock 경합 방지 — codex BLOCKER).
 #[cfg(target_os = "macos")]
 async fn maybe_autoregister_launchd() -> bool {
-    // 번들 동봉 cysd 절대경로(ensure_daemon과 동일 규칙) — 형제 cysd가 없으면 보류.
-    let daemon = match std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("cysd")))
-    {
-        Some(p) if p.exists() => p,
-        _ => return false,
+    // 번들 동봉 cysd 절대경로(ensure_daemon과 동일 규칙) — current_exe()=.../Contents/MacOS/cys-app,
+    // 그 parent 가 곧 <bundle>/Contents/MacOS(=classify_bundle_dir 입력)이자 형제 cysd 의 디렉터리다.
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return false,
     };
+    let macos_dir = match exe.parent() {
+        Some(d) => d,
+        None => return false,
+    };
+    // ★번들 위치 가드: plist 를 쓰기 **전에** 실행 번들 위치를 분류해 **Canonical(/Applications·
+    // ~/Applications)만** 자동등록한다. 무음 autostart 는 명시 사용자설치(plan_cli_install)와 위험
+    // 프로파일이 달라(GUI 시작 시 plist 무음 기록) 더 엄격하다: 휘발/이동 경로 — Translocated
+    // (/AppTranslocation/…)·Backup(cys.app.bak*/prev*)·NonStandard(~/Downloads·/Volumes/USB 등) — 가
+    // plist ProgramArguments 에 각인되면 언마운트·삭제·앱 이동 시 죽은 경로 데몬을 무한 스폰한다(사용자
+    // "손상됨"·앱 반복소실의 근본원인). 비-Canonical 은 자동등록만 skip 하고 ensure_daemon 런타임 폴백
+    // (휘발성 데몬)으로 안전하게 흐른다.
+    let kind = classify_bundle_dir(macos_dir);
+    if !autoregister_allowed(&kind) {
+        eprintln!(
+            "[cys-app] launchd autoregister skipped: 비정규 실행 위치({kind:?}) — \
+             Finder에서 cys.app을 Applications로 옮겨 다시 여세요"
+        );
+        return false;
+    }
+    // 형제 cysd가 없으면 보류(기존 동작 보존).
+    let daemon = macos_dir.join("cysd");
+    if !daemon.exists() {
+        return false;
+    }
     let running = connect().await.is_ok();
     match cys::launchd::register_if_absent(&daemon, running) {
         Ok(outcome) => {
@@ -3311,6 +3343,17 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
             std::path::Path::new("/Applications/cys.app.bak-044/Contents/MacOS"),
             "/usr/local/bin"
         ).is_err());
+    }
+
+    #[test]
+    fn autoregister_allowed_only_canonical() {
+        // 무음 launchd 자동등록은 plan_cli_install 보다 엄격하다(의도적 divergence): Canonical 만 허용.
+        // NonStandard(~/Downloads·/Volumes 등)도 거부 — 휘발/이동 경로가 plist 에 각인되면 언마운트·삭제
+        // 시 죽은 경로 데몬 무한 스폰(리뷰어1 F1). 비-Canonical 은 ensure_daemon 런타임 폴백으로 안전.
+        assert!(autoregister_allowed(&BundleKind::Canonical), "정규 번들(/Applications·~/Applications)만 자동등록 허용");
+        assert!(!autoregister_allowed(&BundleKind::Translocated), "임시 경로는 자동등록 거부");
+        assert!(!autoregister_allowed(&BundleKind::Backup), "백업 번들은 자동등록 거부");
+        assert!(!autoregister_allowed(&BundleKind::NonStandard), "비표준(Downloads·USB 등)도 자동등록 거부");
     }
 
     #[test]
