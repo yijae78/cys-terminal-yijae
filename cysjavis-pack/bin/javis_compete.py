@@ -213,6 +213,10 @@ def cmd_init(args):
         print("[compete-init] 거부: --producer 개수(%d)가 --n(%d)과 불일치"
               % (len(producers), n), file=sys.stderr)
         return 2
+    if producers and any(not p.strip() for p in producers):
+        print("[compete-init] 거부: 빈 producer 가 있다 — 각 후보의 생산자를 서술하라",
+              file=sys.stderr)
+        return 2
 
     # F5② 클로버 차단: 같은 디렉토리에 다른 task 의 MANIFEST 가 이미 있으면 거부
     mpath = manifest_path(task)
