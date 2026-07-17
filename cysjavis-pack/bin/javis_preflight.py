@@ -252,6 +252,9 @@ SELFCORR_HOOKS = [
     # ★결정론 부트스트랩 발화(오너 2026-07-15 절대요구): "너는 마스터다" 선언 입력 시 LLM 재량과
     # 무관하게 하네스가 javis_bootstrap.py(팀 5노드 기동)를 발화 — 산문 계약의 코드 결정론 격상.
     ("role-bootstrap.sh", [("UserPromptSubmit", None)]),
+    # ★W-C1(커스텀 생존 2026-07-17): vendor(system·임베드) 팩 파일 수정 감지 → 치유 예고 +
+    # 영속 경로 안내(additionalContext WARN — BLOCK 아님·자기발화 봉쇄 금지 경계 준수).
+    ("pack-guard.sh", [("PostToolUse", "Write|Edit|MultiEdit")]),
 ]
 
 # work management 앵커(절대지침 5차) 4규칙 b·c의 전담 sub-skill — C22가 존재·본문을 검증한다.
@@ -2896,7 +2899,7 @@ class Preflight:
                     else:
                         warns.append("%s %s 미등록(--fix)"
                                      % (os.path.basename(t), script_name))
-        detail = "자기교정·영속성 hook(inject·save·reflect-scan·commit-nudge) 4종 + reflect 엔진"
+        detail = "자기교정·영속성 hook(inject·save·reflect-scan·commit-nudge·role-bootstrap·pack-guard) 6종 + reflect 엔진"
         if fixed:
             shown = "; ".join(fixed[:6]) + (" …+%d" % (len(fixed) - 6) if len(fixed) > 6 else "")
             detail += " · " + shown
@@ -3578,7 +3581,75 @@ class Preflight:
             parts.append("신버전 대기(.new) %d건: %s%s"
                          % (len(newp), ", ".join(newp[:8]),
                             " 외 %d건" % (len(newp) - 8) if len(newp) > 8 else ""))
-        self.add(cid, WARN, "; ".join(parts) + " — `cys pack-merge`로 검토(가치 있는 수정은 vendor 승격 제보)")
+        self.add(cid, WARN, "; ".join(parts)
+                 + " — `cys pack-merge`로 검토(가치 있는 수정은 vendor 승격 제보)"
+                 + " · 방금 원복된 파일의 원커맨드 복원: `cys pack-rollback --file <파일>`")
+
+    # ── C68 병합 원장 체류 기한 게이트 (★W-D1 커스텀 생존 2026-07-17) ──
+    # 고지 채널은 실측으로 반증됐다(원장 항목 9주 체류 — C62 WARN·init-pack 보고 줄이 있었는데도).
+    # 소비를 강제한다: 기한 초과 항목이 있으면 WARN + master 에게 wakeup 큐로 "병합 검토 위임"
+    # 티켓 신호를 push(코얼레싱·멱등 — javis_wakeup 재사용). master 는 앵커대로 직접 병합하지
+    # 않고 워커에 검토를 위임·승인만 한다. WARN 전용(READY 미차단)·--fix 비대상(스윕 트리거 아님).
+    def c68_merge_pending_age(self):
+        cid = "C68.merge-pending-age"
+        if self.skipped(cid):
+            return
+        ledger = os.path.join(pack_dir(), ".merge-pending.json")
+        if not os.path.isfile(ledger):
+            self.add(cid, PASS, "병합 대기 0건")
+            return
+        try:
+            with open(ledger, encoding="utf-8") as f:
+                pending = json.load(f)
+            if not isinstance(pending, dict):
+                raise ValueError("원장 루트가 객체가 아님")
+        except Exception as e:
+            self.add(cid, WARN, "병합 원장 파싱 실패(%s) — C62 참조" % e)
+            return
+        try:
+            max_days = float(os.environ.get("CYS_MERGE_PENDING_MAX_DAYS", "14"))
+        except ValueError:
+            max_days = 14.0
+        now = time.time()
+        stale = sorted(
+            (rel, (now - float(v.get("ts", now))) / 86400.0)
+            for rel, v in pending.items()
+            if isinstance(v, dict) and (now - float(v.get("ts", now))) / 86400.0 > max_days
+        )
+        if not stale:
+            self.add(cid, PASS, "병합 대기 %d건 — 전부 기한(%.0f일) 이내" % (len(pending), max_days))
+            return
+        # 소비 강제 신호: master wakeup 큐 enqueue(멱등 키=원장 지문 — 같은 잔존 상태로 재부트해도 1건).
+        # ★모드 계약 준수(C28 관례와 동일 `self.fix` 게이트): report=관찰만·safe/dry=무변경이므로
+        # 큐 적재(가역 부작용)는 --fix(부트 ⓪ 표준 호출)에서만 집행한다. 다른 모드는 WARN 관찰만.
+        oldest = max(d for _, d in stale)
+        fingerprint = "%d-%d" % (len(stale), int(oldest))
+        enq = "관찰만(--fix 에서 master 큐 적재)"
+        wakeup = os.path.join(pack_dir(), "bin", "javis_wakeup.py")
+        # ★cwd 의존 방어(launchd cwd=/ 오염 사고 계열 · 2026-07-15 실측): javis_wakeup 의 큐 루트는
+        # `JAVIS_ROOT or os.getcwd()` 라, 부트가 워크스페이스 밖(cwd=/ 등)에서 실행되면 엉뚱한 곳에
+        # 큐를 만든다. 루트가 결정론으로 확정될 때만 적재하고, 아니면 WARN 관찰만(무해측).
+        wk_root = os.environ.get("JAVIS_ROOT") or os.getcwd()
+        root_ok = os.path.isdir(os.path.join(wk_root, "_round"))
+        if self.fix and not root_ok:
+            enq = "큐 적재 보류(워크스페이스 루트 미확정: %s — JAVIS_ROOT 미설정·cwd 에 _round 부재)" % wk_root
+        if self.fix and root_ok and os.path.isfile(wakeup):
+            try:
+                r = subprocess.run(
+                    [sys.executable, wakeup, "enqueue", "--to", "master",
+                     "--task", "merge-review",
+                     "--reason", "병합 원장 기한 초과 %d건(최장 %.0f일) — 워커에 pack-merge 검토 위임 필요"
+                                 % (len(stale), oldest),
+                     "--idempotency-key", "merge-review-" + fingerprint],
+                    capture_output=True, text=True, timeout=10, env=_utf8_env())
+                enq = "wakeup enqueue %s" % ("OK" if r.returncode == 0 else "실패(%d)" % r.returncode)
+            except Exception as e:
+                enq = "wakeup enqueue 예외(%s)" % e
+        shown = ", ".join("%s(%.0f일)" % (rel, d) for rel, d in stale[:6])
+        self.add(cid, WARN,
+                 "병합 대기 기한(%.0f일) 초과 %d건: %s%s — master: 워커에 `cys pack-merge` 검토 위임(직접 병합 금지) · %s"
+                 % (max_days, len(stale), shown,
+                    " 외 %d건" % (len(stale) - 6) if len(stale) > 6 else "", enq))
 
     # ── C65 cys drain --verify 능력 체크 (기능1 이월분 · 재시작 전 저장검증 feature-detect) ──
     # GUI 저장후재시작 흐름이 `cys drain --verify`에 의존한다. 번들 cys가 미지원(구버전 스큐)이면 GUI가
@@ -3713,7 +3784,9 @@ class Preflight:
             self.c60_gate_wiring, self.c61_doc_code_sot, self.c65_drain_verify,
             self.c66_board_catalog, self.c67_learn_wiring,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
+            # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,
+            self.c68_merge_pending_age,
         ]
         # --fix/dry/safe 는 공유 상태(repair_via_init_pack 메모이즈·settings.json 원자적
         # 쓰기·planned 버퍼)를 갖는 변이 경로라 전면 직렬 유지. report 모드만 병렬화한다.

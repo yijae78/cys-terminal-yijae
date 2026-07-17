@@ -679,6 +679,41 @@ fn check_todo(daemon: &Arc<Daemon>) {
         .retain(|k, _| seen.contains(k));
 }
 
+/// ★W-B 보완(승인 미감지=워커 hang 방지 · 2026-07-17): agents.json 이 user 소유로 승격되면
+/// 사용자 수정본은 영구 보존되지만 **동결**된다 — vendor 가 새 CLI 프롬프트용 approval_patterns 를
+/// 추가해도 그 사용자에겐 영영 도달하지 않아 승인 격상이 조용히 멈추고 워커가 hang 한다(우리
+/// 지침이 최우선 방지 대상으로 명시한 '큐 적체'의 정확한 기전).
+///
+/// 해소 = **합집합**: 디스크(사용자) 패턴 + 임베드(vendor) 패턴을 name 기준 dedup 병합하고,
+/// 충돌 시 **디스크가 이긴다**(사용자 주권 불변). approval_patterns 는 *감지 전용*(자동 응답
+/// 절대 없음 — 판단은 master)이라 추가 패턴은 부작용이 없고 미감지만 위험하다 = 합집합이 안전측.
+/// 순수 함수로 분리해 테스트 가능하게 둔다.
+fn merged_approval_patterns(
+    disk: &serde_json::Value,
+    embed: &serde_json::Value,
+    agent: &str,
+) -> Vec<serde_json::Value> {
+    let get = |v: &serde_json::Value| -> Vec<serde_json::Value> {
+        v.get(agent)
+            .and_then(|a| a.get("approval_patterns"))
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut out = get(disk);
+    let have: std::collections::HashSet<String> = out
+        .iter()
+        .filter_map(|p| p["name"].as_str().map(String::from))
+        .collect();
+    for p in get(embed) {
+        match p["name"].as_str() {
+            Some(n) if !have.contains(n) => out.push(p), // vendor 신규 패턴만 보강
+            _ => {}                                      // 동명 = 사용자본 유지(디스크 우선)
+        }
+    }
+    out
+}
+
 /// T4-16 승인 격상 스캔: agents.json의 approval_patterns를 visible screen에 매칭.
 /// ★자동 응답 절대 금지 — 감지·격상(이벤트+feed 항목)만. 판단은 master의 몫.
 fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f64>) {
@@ -690,6 +725,12 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
             Some(v) => v,
             None => return,
         };
+    // 임베드 vendor 정의(동결 사용자본 보강용 — 파싱 실패 시 빈 객체로 무해 폴백).
+    let embed_agents: serde_json::Value = cys::pack::PACK_ALL
+        .iter()
+        .find(|(r, _)| *r == "agents.json")
+        .and_then(|(_, c)| serde_json::from_str(c).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
     let now = now_epoch();
     let surfaces: Vec<Arc<crate::state::Surface>> =
         daemon.surfaces.lock().unwrap().values().cloned().collect();
@@ -700,12 +741,11 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
         let Some((agent, _)) = s.agent_meta.lock().unwrap().clone() else {
             continue;
         };
-        let Some(patterns) = agents[&agent]["approval_patterns"].as_array() else {
-            continue;
-        };
+        let patterns = merged_approval_patterns(&agents, &embed_agents, &agent);
         if patterns.is_empty() {
             continue;
         }
+        let patterns = &patterns;
         let screen = s.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().contents();
         let mut any_match = false;
         for p in patterns {
@@ -1875,7 +1915,35 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{learn_stuck_candidates, plan_duplicate_kills};
+    use super::{learn_stuck_candidates, merged_approval_patterns, plan_duplicate_kills};
+
+    /// ★W-B 보완 핀: agents.json user 동결이 vendor 신규 approval_patterns 를 못 받아 승인
+    /// 미감지→워커 hang 으로 가는 경로를 차단한다. 규칙 = 합집합(디스크 ∪ 임베드), 동명은 디스크 승.
+    #[test]
+    fn approval_patterns_union_disk_wins_vendor_fills() {
+        let disk = serde_json::json!({
+            "claude": { "approval_patterns": [
+                { "name": "tool-permission", "pattern": "MY-CUSTOM-REGEX" }
+            ]}
+        });
+        let embed = serde_json::json!({
+            "claude": { "approval_patterns": [
+                { "name": "tool-permission", "pattern": "VENDOR-OLD" },
+                { "name": "new-vendor-prompt", "pattern": "VENDOR-NEW" }
+            ]},
+            "codex": { "approval_patterns": [{ "name": "codex-approve", "pattern": "CX" }]}
+        });
+        let merged = merged_approval_patterns(&disk, &embed, "claude");
+        assert_eq!(merged.len(), 2, "동명 dedup + vendor 신규 1건 보강: {merged:?}");
+        let mine = merged.iter().find(|p| p["name"] == "tool-permission").unwrap();
+        assert_eq!(mine["pattern"], "MY-CUSTOM-REGEX", "동명 충돌은 디스크(사용자) 승");
+        assert!(merged.iter().any(|p| p["name"] == "new-vendor-prompt"), "vendor 신규 패턴 도달(hang 방지)");
+        // 디스크에 아예 없는 어댑터 → 임베드 전량 폴백(신규 CLI 지원 즉시 유효).
+        let cx = merged_approval_patterns(&disk, &embed, "codex");
+        assert_eq!(cx.len(), 1, "디스크 결손 어댑터는 임베드로 채움");
+        // 양쪽 모두 없음 → 빈 벡터(무해 — 호출측이 continue).
+        assert!(merged_approval_patterns(&disk, &embed, "nosuch").is_empty());
+    }
 
     /// (learn gaps C12②) stuck 디바운스 지속화 — 저장→로드 왕복 + 부재/손상 fail-open 핀.
     /// 데몬 재시작 후에도 CYS_RSI_STUCK_DEBOUNCE_SECS 창이 유지되는 토대(소실=추천 중복 발화).

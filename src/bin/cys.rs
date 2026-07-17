@@ -399,6 +399,28 @@ enum Command {
         /// (healed system 파일 전용) 보존본(.user)을 ~/.cys/local 오버레이로 이동(스킬 shadowing)
         #[arg(long)]
         to_local: bool,
+        /// 내 수정(.user/현재본)과 vendor 본의 diff 를 제안 patch 파일로 생성(개선 환류 — 자동 전송 없음)
+        #[arg(long)]
+        propose: bool,
+        /// 확인 프롬프트 없이 적용 (헌법 파일 병합·교체는 --yes 여도 확인 필수)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 팩 상대경로의 소유권 등급(system|user|seed-once) 판정 — pack-guard hook·스크립트용 결정론 조회
+    #[command(name = "pack-ownership")]
+    PackOwnership {
+        /// 팩 상대경로(예: bin/javis_learn.py, soul.md)
+        rel: String,
+        /// 등급 문자열만 출력(스크립트 소비용)
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// 직전 설치 보존본(<pack>.prev)에서 파일 단위 복원 — 업데이트 직후 "잃었다" 순간의 원커맨드 되돌리기
+    #[command(name = "pack-rollback")]
+    PackRollback {
+        /// 복원할 팩 상대경로. 생략 시 .prev 와 현재 팩의 차이 목록 표시
+        #[arg(long)]
+        file: Option<String>,
         /// 확인 프롬프트 없이 적용
         #[arg(long)]
         yes: bool,
@@ -461,6 +483,9 @@ enum Command {
         /// 진단 결과를 JSON으로 출력.
         #[arg(long)]
         json: bool,
+        /// 커스터마이즈 실태 리포트 생성(로컬 파일 — 자발 제출용·자동 전송 없음)
+        #[arg(long)]
+        custom_report: bool,
     },
     /// Search the persistent transcript memory of ALL agents' terminal activity (FTS)
     Recall {
@@ -734,12 +759,16 @@ enum ChannelAction {
 
 #[derive(Subcommand)]
 enum SkillAction {
-    /// Create a new skill from experience (SKILL.md, 4-칸 본문 템플릿)
+    /// Create a new skill from experience (SKILL.md, 4-칸 본문 템플릿).
+    /// 기본 생성 위치 = ~/.cys/local/skills (업데이트·치유가 절대 건드리지 않는 사용자 영역)
     New {
         /// kebab-case skill name
         name: String,
         #[arg(long)]
         description: String,
+        /// 팩 디렉터리(vendor 영역)에 생성 — 개발 기계에서 upstream 승격 예정인 스킬 전용
+        #[arg(long)]
+        pack: bool,
     },
     /// List skill covers (name + description)
     List,
@@ -1884,15 +1913,42 @@ fn run(command: Command) -> i32 {
             return run_pack_update(from, manifest_url, dry_run);
         }
         Command::PackPlan { force } => return run_pack_plan(force),
-        Command::PackMerge { file, take_new, keep_mine, ai, to_local, yes } => {
-            return run_pack_merge(file, take_new, keep_mine, ai, to_local, yes);
+        Command::PackMerge { file, take_new, keep_mine, ai, to_local, propose, yes } => {
+            return run_pack_merge(file, take_new, keep_mine, ai, to_local, propose, yes);
+        }
+        Command::PackOwnership { rel, quiet } => {
+            // 결정론 조회 전용(쓰기 0) — 분류 SOT 는 pack::ownership() 한 곳(pack-guard hook 이 소비).
+            // ★effective 등급: 치유·prune 은 임베드/매니페스트 파일에만 작용하므로, 임베드에 없는
+            // 자작 신규 파일은 등급과 무관하게 불가침 — "custom" 으로 구분해 hook 오탐을 차단한다.
+            let embedded = cys::pack::PACK_ALL.iter().any(|(r, _)| *r == rel.as_str());
+            let name = if embedded { cys::pack::ownership_name(&rel) } else { "custom" };
+            if quiet {
+                println!("{name}");
+            } else {
+                let meaning = match name {
+                    "custom" => "비출하 자작 파일 — 업데이트·치유·정리 전부 불가침(생존 보증 대상)",
+                    "user" => "사용자 소유 — 업데이트가 절대 덮지 않음(vendor 전진은 .new 병치)",
+                    "seed-once" => "런타임 상태 — 부재 시에만 시드, 존재하면 불가침",
+                    _ => "vendor 소유 — 수정본은 다음 설치 스윕에 치유(수정 전 .user 보존). 자작은 새 파일로",
+                };
+                println!("{rel}: {name} — {meaning}");
+            }
+            return 0;
+        }
+        Command::PackRollback { file, yes } => {
+            return run_pack_rollback(file, yes);
         }
 
         Command::PackManifest { key_id, signed_at, expires_at, min_binary_version, pack_version } => {
             return run_pack_manifest(key_id, signed_at, expires_at, &min_binary_version, pack_version);
         }
 
-        Command::Doctor { fix, json } => return run_doctor(fix, json),
+        Command::Doctor { fix, json, custom_report } => {
+            if custom_report {
+                return run_doctor_custom_report();
+            }
+            return run_doctor(fix, json);
+        }
 
         Command::License { action } => {
             let now = chrono::Utc::now().timestamp();
@@ -2573,15 +2629,46 @@ fn run_cost_baseline(action: CostBaselineAction) -> i32 {
 fn run_skill(action: SkillAction) -> i32 {
     let skills_dir = cys::pack::pack_dir().join("skills");
     let result: Result<(), String> = match action {
-        SkillAction::New { name, description } => (|| {
+        SkillAction::New { name, description, pack } => (|| {
             if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
                 return Err("name must be kebab-case ascii (a-z0-9-)".into());
             }
-            let dir = skills_dir.join(&name);
+            // ★W-G1(커스텀 생존 설계 2026-07-17): 자작 스킬의 기본 거처 = local 오버레이(업데이트
+            // 불가침 — §12.7 문서와 CLI 의 비대칭 해소). --pack 은 upstream 승격 예정 전용이며,
+            // vendor 임베드와 동명이면 다음 스윕에 치유(교체)되므로 생성 자체를 거부한다.
+            let vendor_rel = format!("skills/{name}/SKILL.md");
+            let vendor_exists = cys::pack::PACK_ALL.iter().any(|(r, _)| *r == vendor_rel);
+            let root = if pack {
+                if vendor_exists {
+                    return Err(format!(
+                        "vendor 스킬 '{name}' 이 이미 출하됨 — 팩 안 동명 생성은 다음 스윕에 치유(소실)됩니다. \
+                         오버레이 생성(기본값·shadowing) 또는 다른 이름을 쓰세요."
+                    ));
+                }
+                skills_dir.clone()
+            } else {
+                cys::pack::local_dir().join("skills")
+            };
+            let dir = root.join(&name);
             let path = dir.join("SKILL.md");
             if path.exists() {
                 return Err(format!("skill '{name}' already exists: {}", path.display()));
             }
+            // 반대편 루트 중복도 고지(생성은 허용 — shadowing 은 정당한 사용).
+            if !pack && vendor_exists {
+                println!("[주의] 동명 vendor 스킬 존재 — 이 오버레이 스킬이 shadowing 으로 이깁니다(의도 확인).");
+            }
+            // ★W-D2 기준점: vendor 동명을 가리는 순간의 임베드 해시를 기록 — 이후 pack-plan 이
+            // vendor 전진을 결정론 판정한다. 기록이 없으면 매 실행 "판정 불가" 잡음이 되어
+            // 경고 피로(무시 학습)를 부른다 — 승격(--to-local)과 손수 생성 양 경로 모두에 심는다.
+            let vendor_base: Option<String> = if !pack {
+                cys::pack::PACK_ALL
+                    .iter()
+                    .find(|(r, _)| *r == vendor_rel)
+                    .map(|(_, c)| cys::pack::content_hash_pub(c))
+            } else {
+                None
+            };
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let body = format!(
                 "---\nname: {name}\ndescription: {description}\n---\n\n\
@@ -2592,7 +2679,13 @@ fn run_skill(action: SkillAction) -> i32 {
                  ## 확인하는 방법 (검증 — 겪을 때마다 한 줄씩 누적하라)\n- \n"
             );
             std::fs::write(&path, body).map_err(|e| e.to_string())?;
+            if let Some(h) = vendor_base {
+                let _ = cys::pack::write_atomic(&dir.join(".vendor-base"), h.as_bytes());
+            }
             println!("created {}", path.display());
+            if !pack {
+                println!("(업데이트 불가침 영역 — 어떤 패치·재설치에도 보존됩니다)");
+            }
             println!("(4칸을 채우고, master 승인이 필요하면 feed push로 보고하라)");
             Ok(())
         })(),
@@ -3952,19 +4045,41 @@ fn run_boot(cwd: Option<String>) -> i32 {
 /// agents.json에서 어댑터 스펙 로드
 fn load_agent_spec(agent: &str) -> Result<Value, String> {
     let agents_path = cys::pack::pack_dir().join("agents.json");
-    let agents: Value = std::fs::read_to_string(&agents_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .ok_or_else(|| {
-            format!(
-                "agents.json not found at {} — run `cys init-pack` first",
-                agents_path.display()
-            )
-        })?;
-    agents
-        .get(agent)
-        .cloned()
-        .ok_or_else(|| format!("unknown agent '{agent}' (agents.json에 정의 필요)"))
+    // agents.json 은 user 소유(★W-B) — 손상돼도 치유가 자동 복구하지 않으므로 부재/파싱 실패를
+    // 구분해 복구 경로를 정확히 안내한다(부재→init-pack 시드 / 손상→take-new 또는 삭제 후 재시드).
+    let raw = std::fs::read_to_string(&agents_path).map_err(|_| {
+        format!(
+            "agents.json not found at {} — run `cys init-pack` first",
+            agents_path.display()
+        )
+    })?;
+    let agents: Value = serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "agents.json 파싱 실패({e}) — 사용자 수정 중 손상된 듯. 복구: 파일을 백업·삭제 후 \
+             `cys init-pack`(vendor 본 재시드) → 백업에서 커스텀 어댑터만 되살리기",
+        )
+    })?;
+    if let Some(spec) = agents.get(agent) {
+        return Ok(spec.clone());
+    }
+    // ★W-B 보완(성찰 2 적대검증 산물): user 승격의 대가 = 동결 — 사용자가 agents.json 을 수정해
+    // 두면 vendor 가 **새 어댑터**를 출하해도 .new 병치만 되고 디스크 본엔 영영 안 들어와
+    // "신규 CLI 지원했는데 안 됨"이 된다(schedule.json 은 데몬의 ensure_builtin_jobs 가 같은
+    // 문제를 코드로 메우지만 agents.json 엔 그 보완이 없었다). 디스크에 없는 키만 **임베드
+    // 어댑터로 폴백**해 '사용자 수정 보존'과 'vendor 신기능 즉시 사용'의 합집합을 만든다.
+    // (덮어쓰기 0 — 디스크 정의가 있으면 항상 디스크가 이긴다.)
+    let embedded_agents: Option<Value> = cys::pack::PACK_ALL
+        .iter()
+        .find(|(r, _)| *r == "agents.json")
+        .and_then(|(_, c)| serde_json::from_str(c).ok());
+    if let Some(spec) = embedded_agents.as_ref().and_then(|v| v.get(agent)) {
+        eprintln!(
+            "[agents] '{agent}' 은 내 agents.json 에 없어 **내장 정의로 폴백**했다 \
+             (vendor 신규 어댑터 — 내 수정본은 그대로 보존됨). 편입하려면: cys pack-merge --file agents.json"
+        );
+        return Ok(spec.clone());
+    }
+    Err(format!("unknown agent '{agent}' (agents.json에 정의 필요)"))
 }
 
 /// 역할 디렉티브 + soul.md + 장기메모리 색인 + 스킬 색인 조립 (launch/reinject/cycle 공용)
@@ -7375,7 +7490,44 @@ fn run_pack_plan(force: bool) -> i32 {
         println!("※ 기존 병합 대기 {}건 — `cys pack-merge` 로 검토", pending.len());
     }
     println!("※ 사용자 전용 오버레이(~/.cys/local — 디렉티브 append·스킬 shadowing·훅 후행)는 업데이트가 절대 건드리지 않음");
+    report_overlay_skill_drift();
     0
+}
+
+/// ★W-D2(커스텀 생존 설계 2026-07-17): 오버레이 shadowing 스킬의 vendor 전진 감지(읽기 전용 —
+/// local 에는 절대 쓰지 않음·⑥층 불가침 유지). 오버레이는 업데이터가 존재를 모르는 영역이라
+/// "불가침의 대가 = 드리프트 무감지"였다 — --to-local 승격 시 기록한 `.vendor-base`(승격 당시
+/// vendor SKILL.md 해시)와 현 임베드 해시를 대조해, 사용자가 가리고 있는 vendor 스킬이 그 뒤
+/// 전진했으면 알린다. 기준 미기록(구 승격본·수동 생성)은 판정 불가로 정직하게 표시.
+fn report_overlay_skill_drift() {
+    let local_skills = cys::pack::local_dir().join("skills");
+    let Ok(entries) = std::fs::read_dir(&local_skills) else { return };
+    let mut lines: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !entry.path().join("SKILL.md").is_file() {
+            continue;
+        }
+        let rel = format!("skills/{name}/SKILL.md");
+        let Some(embed) = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c) else {
+            continue; // vendor 대응물 없는 순수 자작 스킬 — 드리프트 개념 없음
+        };
+        let embed_hash = cys::pack::content_hash_pub(embed);
+        match std::fs::read_to_string(entry.path().join(".vendor-base")) {
+            Ok(base) if base.trim() == embed_hash => {} // vendor 미전진 — 조용히 통과
+            Ok(_) => lines.push(format!(
+                "  {name}: vendor 전진 있음 — 내 오버레이본이 낡은 vendor 를 기준으로 함. \
+                 대조: `cys skill show {name}`(오버레이) vs 팩본 {rel}"
+            )),
+            Err(_) => lines.push(format!("  {name}: 승격 기준 미기록 — vendor 전진 여부 판정 불가(수동 대조 권장)")),
+        }
+    }
+    if !lines.is_empty() {
+        println!("\n⚠ 오버레이 shadowing 스킬의 vendor 드리프트 ({}건):", lines.len());
+        for l in lines {
+            println!("{l}");
+        }
+    }
 }
 
 /// ③ 커스터마이즈 병합: 병합 대기 원장 목록·해소. 해소 경로 4종 —
@@ -7389,6 +7541,7 @@ fn run_pack_merge(
     keep_mine: bool,
     ai: bool,
     to_local: bool,
+    propose: bool,
     yes: bool,
 ) -> i32 {
     let dir = cys::pack::pack_dir();
@@ -7406,10 +7559,10 @@ fn run_pack_merge(
             let ver = e.get("version").and_then(|v| v.as_str()).unwrap_or("?");
             match kind {
                 "new-pending" => println!(
-                    "  ⏸ {rel} — 내 수정본 유지 중, vendor {ver} 신버전이 {side} 에 대기\n     → cys pack-merge --file {rel} [--take-new|--keep-mine|--ai]"
+                    "  ⏸ {rel} — 내 수정본 유지 중, vendor {ver} 신버전이 {side} 에 대기\n     → cys pack-merge --file {rel} [--take-new|--keep-mine|--ai|--propose]"
                 ),
                 "healed" => println!(
-                    "  🛠 {rel} — vendor {ver} 로 치유됨, 내 수정본은 {side} 에 보존\n     → cys pack-merge --file {rel} [--to-local|--keep-mine(보존본 정리)]"
+                    "  🛠 {rel} — vendor {ver} 로 치유됨, 내 수정본은 {side} 에 보존\n     → cys pack-merge --file {rel} [--to-local|--propose|--keep-mine(보존본 정리)]"
                 ),
                 _ => println!("  ? {rel} ({kind})"),
             }
@@ -7427,9 +7580,19 @@ fn run_pack_merge(
         .iter()
         .find(|(r, _)| *r == rel.as_str())
         .map(|(_, c)| *c);
+    // ★W-F2: --propose 는 해소가 아니라 환류 — patch 파일 생성만 하고 원장은 건드리지 않는다.
+    if propose {
+        return run_pack_propose(&dir, &rel, kind, embed_now);
+    }
+    // ★W-D4: 헌법 파일(디렉티브·soul·CLAUDE)은 --yes 여도 대화형 확인 필수 — 자동 병합·자동
+    // 교체 금지(자율주행 denylist 정합). 비대화형(stdin EOF)에서는 빈 입력 → 거절되므로 안전측.
+    let is_const = cys::pack::is_constitution_file(&rel);
     let confirm = |prompt: &str| -> bool {
-        if yes {
+        if yes && !is_const {
             return true;
+        }
+        if yes && is_const {
+            println!("(헌법 파일 — --yes 무시, 확인 필수)");
         }
         print!("{prompt} [y/N] ");
         use std::io::Write;
@@ -7505,6 +7668,19 @@ fn run_pack_merge(
                     0
                 }
                 Some(m) => {
+                    // ★W-D3: 헌법 파일 병합은 안전핵 소실 결정론 검증을 통과해야 적용 가능
+                    // (fail-closed — AI 병합의 미묘한 왜곡·통째 소실로부터 안전핵을 지킨다).
+                    if is_const {
+                        if let Err(lost) = cys::overrides::verify_constitution_merge(&ours, &theirs, &m) {
+                            eprintln!(
+                                "⛔ 병합 거부(헌법 안전핵 소실 검출): {} — 병합본에서 안전핵 조항이 사라짐.\n\
+                                 \x20 수동 병합 후 --keep-mine 으로 해소하거나 --take-new(vendor 본)를 쓰세요.",
+                                lost.join(", ")
+                            );
+                            return 1;
+                        }
+                        println!("✔ 헌법 안전핵 검증 통과(소실 0)");
+                    }
                     println!("── 병합 제안 diff (내 수정본 → 병합본) ──");
                     print_unified_diff(&ours, &m);
                     if confirm(&format!("'{rel}' 에 병합본 적용?")) {
@@ -7554,6 +7730,15 @@ fn run_pack_merge(
                         if rel.starts_with("skills/") {
                             if let Some(skill_dir) = dest.parent() {
                                 skillscan_warn(skill_dir);
+                                // ★W-D2: 승격 당시 vendor 해시를 기록 — pack-plan 이 이후 vendor
+                                // 전진(shadowing 드리프트)을 결정론 감지하는 기준점. 사용자의 명시적
+                                // 승격 명령에 딸린 메타 기록이라 "업데이터의 local 불가침"과 무관.
+                                if let Some(embed) = embed_now {
+                                    let _ = cys::pack::write_atomic(
+                                        &skill_dir.join(".vendor-base"),
+                                        cys::pack::content_hash_pub(embed).as_bytes(),
+                                    );
+                                }
                             }
                         }
                         resolve(&mut pending, ".user");
@@ -7592,6 +7777,357 @@ fn run_pack_merge(
             1
         }
     }
+}
+
+/// ★W-F2(개선 환류 채널): 내 수정본과 vendor 본의 diff 를 제안 patch 파일로 생성.
+/// 배포 사용자의 system 커스텀에는 upstream 이 없다 — 가치 있는 개조가 제품으로 돌아올 유일한
+/// 길은 제안이다. **자동 전송 없음**(외부 발행은 항상 사용자 수동) — 파일 생성+안내까지만.
+/// 비밀 유출 가드: 홈 경로·키 패턴을 스캔해 검출 시 경고를 함께 출력(제출 전 사용자 확인 의무).
+fn run_pack_propose(dir: &std::path::Path, rel: &str, kind: &str, embed_now: Option<&str>) -> i32 {
+    // mine = 사용자 쪽 내용(healed → .user 보존본 / new-pending → 현재 디스크본).
+    let (mine_path, vendor): (std::path::PathBuf, String) = match kind {
+        "healed" => (
+            dir.join(format!("{rel}.user")),
+            match embed_now {
+                Some(c) => c.to_string(),
+                None => {
+                    eprintln!("'{rel}' 은 현 임베드에 없음(폐기된 파일) — 제안 대상 아님");
+                    return 1;
+                }
+            },
+        ),
+        "new-pending" => (
+            dir.join(rel),
+            match std::fs::read_to_string(dir.join(format!("{rel}.new"))) {
+                Ok(s) => s,
+                Err(_) => embed_now.map(str::to_string).unwrap_or_default(),
+            },
+        ),
+        other => {
+            eprintln!("알 수 없는 원장 kind '{other}' — 제안 생성 불가");
+            return 1;
+        }
+    };
+    let mine = match std::fs::read_to_string(&mine_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{} 읽기 실패: {e}", mine_path.display());
+            return 1;
+        }
+    };
+    // 비밀 스캔(안내용 WARN — 차단 아님: 제출은 어차피 사용자 수동이라 최종 책임 지점이 명확).
+    let mut secret_hits: Vec<String> = Vec::new();
+    for (i, line) in mine.lines().enumerate() {
+        let l = line.to_lowercase();
+        if l.contains("/users/") || l.contains("c:\\users\\") || l.contains("private key")
+            || l.contains("api_key") || l.contains("apikey") || l.contains("password")
+            || l.contains("secret")
+        {
+            secret_hits.push(format!("  {}행: {}", i + 1, line.trim()));
+        }
+    }
+    let out_dir = cys::pack::local_dir().join("proposals");
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("proposals 디렉터리 생성 실패: {e}");
+        return 1;
+    }
+    let ver = env!("CARGO_PKG_VERSION");
+    let fname = format!("{}-v{ver}.patch", rel.replace('/', "_"));
+    let out = out_dir.join(&fname);
+    // diff -u(맥·리눅스·git-bash 공통) 시도 — 부재 시 전문(全文) 제안으로 폴백(내용 손실 0).
+    let body = unified_diff_via_cmd(&vendor, &mine, rel).unwrap_or_else(|| {
+        format!(
+            "# unified diff 도구 부재 — 전문 제안(위=vendor {ver} 기준, 아래=내 수정 전문)\n\
+             # ── 내 수정 전문 ──\n{mine}"
+        )
+    });
+    let header = format!(
+        "# cys 개선 제안 patch\n# 대상: {rel} (vendor {ver} 기준)\n# 생성: cys pack-merge --file {rel} --propose\n\n"
+    );
+    if let Err(e) = cys::pack::write_atomic(&out, format!("{header}{body}").as_bytes()) {
+        eprintln!("patch 쓰기 실패: {e}");
+        return 1;
+    }
+    println!("✅ 제안 patch 생성: {}", out.display());
+    if !secret_hits.is_empty() {
+        println!(
+            "⚠ 비밀/개인정보 의심 {}건 — 제출 전 반드시 검토·마스킹하세요:\n{}",
+            secret_hits.len(),
+            secret_hits.join("\n")
+        );
+    }
+    println!("제출: 위 파일을 지원 채널(홈페이지 문의/저장소 이슈)에 첨부 — 자동 전송은 하지 않습니다.");
+    0
+}
+
+/// diff -u 외부 명령으로 unified diff 생성(결정론) — 도구 부재·실행 실패면 None(호출측 폴백).
+fn unified_diff_via_cmd(vendor: &str, mine: &str, rel: &str) -> Option<String> {
+    let tmp = std::env::temp_dir().join(format!("cys-propose-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).ok()?;
+    let a = tmp.join("vendor");
+    let b = tmp.join("mine");
+    std::fs::write(&a, vendor).ok()?;
+    std::fs::write(&b, mine).ok()?;
+    let out = std::process::Command::new("diff")
+        .arg("-u")
+        .arg("--label").arg(format!("vendor/{rel}"))
+        .arg("--label").arg(format!("mine/{rel}"))
+        .arg(&a)
+        .arg(&b)
+        .output();
+    let _ = std::fs::remove_dir_all(&tmp);
+    match out {
+        // diff 종료코드: 0=동일, 1=차이(정상), 2+=오류.
+        Ok(o) if o.status.code() == Some(0) || o.status.code() == Some(1) => {
+            Some(String::from_utf8_lossy(&o.stdout).into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// ★W-E1(신뢰의 결정론 증명): 직전 설치 보존본(<pack>.prev — atomic_swap 이 1세대 보존)에서
+/// **파일 단위** 복원. 전량 스왑 롤백은 업데이트 후 쌓인 런타임 상태(memory/·SESSION_STATE)까지
+/// 과거로 되돌리는 신규 소실 사고를 만들므로 v1 은 파일 단위만 지원한다(전량은 오너 결정 보류).
+/// seed-once 경로는 복원 대상에서 제외(상태 불가침 대칭). system 파일 복원은 다음 부트 스윕이
+/// 재치유함을 정직하게 고지 — 영속 경로(--to-local/--propose)로 안내한다.
+fn run_pack_rollback(file: Option<String>, yes: bool) -> i32 {
+    let dir = cys::pack::pack_dir();
+    let prev = cys::pack::pack_prev_dir(&dir);
+    if !prev.is_dir() {
+        eprintln!("보존본 없음({}) — .prev 는 설치·업데이트가 1회 이상 실행된 뒤 생깁니다.", prev.display());
+        return 1;
+    }
+    let prev_ver = std::fs::read_to_string(prev.join(".pack-version")).unwrap_or_else(|_| "?".into());
+    let cur_ver = std::fs::read_to_string(dir.join(".pack-version")).unwrap_or_else(|_| "?".into());
+    let Some(rel) = file else {
+        // 목록 모드: .prev 와 현재 팩에서 내용이 다른 파일(복원 후보)을 표시. 읽기 전용.
+        println!(
+            "보존본: {} (팩 {} → 현재 {})\n차이 파일(복원 후보):",
+            prev.display(), prev_ver.trim(), cur_ver.trim()
+        );
+        let mut count = 0usize;
+        let mut stack = vec![prev.clone()];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else { continue };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    // 내부 관리 디렉터리(.pristine)는 복원 대상 아님.
+                    if p.file_name().and_then(|n| n.to_str()) == Some(".pristine") {
+                        continue;
+                    }
+                    stack.push(p);
+                    continue;
+                }
+                let Ok(rel_path) = p.strip_prefix(&prev) else { continue };
+                let rel_s = rel_path.to_string_lossy().replace('\\', "/");
+                // 관리 파일·병치 파일은 후보에서 제외(사용자 멘탈모델 = 팩 본 파일).
+                if rel_s.starts_with('.') || rel_s.ends_with(".user") || rel_s.ends_with(".new") {
+                    continue;
+                }
+                let prev_bytes = std::fs::read(&p).unwrap_or_default();
+                let cur_bytes = std::fs::read(dir.join(rel_path)).unwrap_or_default();
+                if prev_bytes != cur_bytes {
+                    let own = cys::pack::ownership_name(&rel_s);
+                    println!("  [{own}] {rel_s}");
+                    count += 1;
+                    if count >= 200 {
+                        println!("  … (200건 초과 — 생략)");
+                        return 0;
+                    }
+                }
+            }
+        }
+        if count == 0 {
+            println!("  (없음 — 보존본과 현재 팩이 동일)");
+        } else {
+            println!("복원: cys pack-rollback --file <경로>");
+        }
+        return 0;
+    };
+    if rel.contains("..") || rel.starts_with('/') {
+        eprintln!("잘못된 경로: {rel}");
+        return 1;
+    }
+    let own = cys::pack::ownership_name(&rel);
+    if own == "seed-once" {
+        eprintln!(
+            "⛔ '{rel}' 은 런타임 상태(seed-once) — 롤백이 업데이트 후 쌓인 기억·상태를 지우는 \
+             역방향 소실을 만들므로 파일 단위 복원 대상에서 제외합니다."
+        );
+        return 1;
+    }
+    let src = prev.join(&rel);
+    let content = match std::fs::read(&src) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("보존본에 '{rel}' 없음({e}) — cys pack-rollback 으로 후보 목록 확인");
+            return 1;
+        }
+    };
+    let confirm = |prompt: &str| -> bool {
+        if yes {
+            return true;
+        }
+        print!("{prompt} [y/N] ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        matches!(line.trim(), "y" | "Y" | "yes")
+    };
+    if !confirm(&format!("'{rel}' 을 보존본(팩 {})으로 복원?", prev_ver.trim())) {
+        println!("취소됨");
+        return 0;
+    }
+    let dest = dir.join(&rel);
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = cys::pack::write_atomic(&dest, &content) {
+        eprintln!("복원 쓰기 실패: {e}");
+        return 1;
+    }
+    match own {
+        "user" => println!("✅ {rel} 복원(user 소유 — 업데이트가 덮지 않으므로 이대로 유지됩니다)"),
+        _ => println!(
+            "✅ {rel} 복원(system 소유 — 다음 부트 설치 스윕이 vendor 본으로 재치유하며, 그때 \
+             이 복원본은 {rel}.user 로 보존됩니다. 영속화: cys pack-merge --file {rel} --to-local(스킬) \
+             또는 --propose(개선 제안)"
+        ),
+    }
+    0
+}
+
+/// ★W-F3(표본 수집 도구): 이 기계의 커스터마이즈 실태를 로컬 리포트로 산출 — 병합 원장·보존본·
+/// 오버레이·자작 파일 통계. 배포 사용자가 "무엇을 만들다 잃는가"의 실분포 표본을 자발 제출할 수
+/// 있게 한다(자동 전송 없음 — 파일 생성+출력까지만. 개인 경로 등은 파일명 수준만 담는다).
+fn run_doctor_custom_report() -> i32 {
+    let dir = cys::pack::pack_dir();
+    let local = cys::pack::local_dir();
+    let mut md = String::new();
+    md.push_str(&format!(
+        "# cys 커스터마이즈 실태 리포트\n\n- 바이너리: {}\n- 팩: {}\n\n",
+        env!("CARGO_PKG_VERSION"),
+        std::fs::read_to_string(dir.join(".pack-version")).unwrap_or_else(|_| "?".into()).trim()
+    ));
+    // ① 병합 원장(무엇이 치유/병치됐나 — 소실 체감의 1차 표본).
+    let pending = cys::pack::load_merge_pending(&dir);
+    md.push_str(&format!("## 병합 대기 원장 ({}건)\n", pending.len()));
+    for (rel, e) in pending.iter() {
+        let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+        let ver = e.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+        md.push_str(&format!("- [{kind}] {rel} (vendor {ver})\n"));
+    }
+    // ② 보존본(.user)·병치본(.new) 잔존 — 원장 밖 잔존물 포함(파일명만).
+    let mut users: Vec<String> = Vec::new();
+    let mut news: Vec<String> = Vec::new();
+    let mut stack = vec![dir.clone()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if p.file_name().and_then(|n| n.to_str()) == Some(".pristine") {
+                    continue;
+                }
+                stack.push(p);
+                continue;
+            }
+            let rel = p.strip_prefix(&dir).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            if rel.ends_with(".user") {
+                users.push(rel);
+            } else if rel.ends_with(".new") {
+                news.push(rel);
+            }
+        }
+    }
+    users.sort();
+    news.sort();
+    md.push_str(&format!("\n## 보존본 .user ({}건)\n", users.len()));
+    for r in &users {
+        md.push_str(&format!("- {r}\n"));
+    }
+    md.push_str(&format!("\n## 병치본 .new ({}건)\n", news.len()));
+    for r in &news {
+        md.push_str(&format!("- {r}\n"));
+    }
+    // ③ 오버레이(~/.cys/local) 실사용 — 카테고리별 파일 수만(내용 비수집).
+    md.push_str("\n## 오버레이(~/.cys/local) 사용\n");
+    for cat in ["skills", "directives", "hooks", "bin", "notes", "proposals"] {
+        let n = walk_count(&local.join(cat));
+        if n > 0 {
+            md.push_str(&format!("- {cat}: {n}개 파일\n"));
+        }
+    }
+    // ④ 팩 안 비임베드 자작 파일(생존 보증 대상) — 임베드·관리 파일 제외.
+    let embedded: std::collections::HashSet<&str> =
+        cys::pack::PACK_ALL.iter().map(|(r, _)| *r).collect();
+    let mut customs: Vec<String> = Vec::new();
+    let mut stack2 = vec![dir.clone()];
+    while let Some(d) = stack2.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if p.file_name().and_then(|n| n.to_str()) == Some(".pristine") {
+                    continue;
+                }
+                stack2.push(p);
+                continue;
+            }
+            let rel = p.strip_prefix(&dir).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            if rel.starts_with('.') || rel.ends_with(".user") || rel.ends_with(".new")
+                || rel.starts_with("memory/") || rel.starts_with("round/")
+                || embedded.contains(rel.as_str())
+            {
+                continue;
+            }
+            customs.push(rel);
+        }
+    }
+    customs.sort();
+    md.push_str(&format!("\n## 팩 안 비임베드 자작 파일 ({}건 — 업데이트 불가침 보증 대상)\n", customs.len()));
+    for r in customs.iter().take(100) {
+        md.push_str(&format!("- {r}\n"));
+    }
+    if customs.len() > 100 {
+        md.push_str(&format!("- … 외 {}건\n", customs.len() - 100));
+    }
+    let out_dir = local.join("reports");
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("reports 디렉터리 생성 실패: {e}");
+        return 1;
+    }
+    let out = out_dir.join(format!(
+        "custom-report-{}.md",
+        chrono::Local::now().format("%Y%m%dT%H%M%S")
+    ));
+    if let Err(e) = cys::pack::write_atomic(&out, md.as_bytes()) {
+        eprintln!("리포트 쓰기 실패: {e}");
+        return 1;
+    }
+    print!("{md}");
+    println!("\n✅ 저장: {} — 개선에 도움이 됩니다: 지원 채널에 자발 제출(자동 전송 없음)", out.display());
+    0
+}
+
+/// 디렉터리 트리의 파일 수(재귀·읽기 전용) — custom-report 보조.
+fn walk_count(root: &std::path::Path) -> usize {
+    let mut n = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// diff3 -m 3-way 병합(결정론) — base 부재·diff3 부재·충돌이면 None(호출측이 대안 안내).
@@ -8070,6 +8606,61 @@ mod tests {
     fn sha256_of(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// ★W-B 보완 핀(성찰 2 산물): agents.json 을 user 승격하면 사용자 수정본이 동결돼 vendor
+    /// **신규 어댑터**가 영영 안 보이는 게 대가다(schedule.json 의 ensure_builtin_jobs 등가물이
+    /// agents.json 엔 없음). load_agent_spec 이 ①디스크 정의 우선(수정 보존) ②디스크에 없는
+    /// 키만 임베드 폴백(신기능 즉시 사용) ③둘 다 없으면 거부 — 합집합을 박제한다.
+    #[test]
+    fn load_agent_spec_disk_wins_and_embed_fills_missing() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-agentspec-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&td);
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
+
+        // 임베드에 실재하는 어댑터 키 2개를 사료로 삼는다(하드코딩 금지 — 팩 진실에서 취득).
+        let embed: serde_json::Value = cys::pack::PACK_ALL
+            .iter()
+            .find(|(r, _)| *r == "agents.json")
+            .map(|(_, c)| serde_json::from_str(c).expect("임베드 agents.json 파싱"))
+            .expect("임베드에 agents.json 존재");
+        let keys: Vec<String> = embed
+            .as_object()
+            .expect("객체")
+            .keys()
+            .filter(|k| !k.starts_with('_'))
+            .cloned()
+            .collect();
+        assert!(keys.len() >= 2, "어댑터 2개 이상 전제: {keys:?}");
+        let (mine_key, vendor_only_key) = (&keys[0], &keys[1]);
+
+        // 사용자본: 첫 어댑터만 보유 + 수정 흔적. 둘째 어댑터는 없음(구버전 파일 재현).
+        let mut mine = serde_json::Map::new();
+        let mut spec = embed[mine_key].clone();
+        spec["notes"] = serde_json::Value::String("MY-EDIT".into());
+        mine.insert(mine_key.clone(), spec);
+        std::fs::write(
+            td.join("agents.json"),
+            serde_json::to_string(&serde_json::Value::Object(mine)).unwrap(),
+        )
+        .unwrap();
+
+        // ① 디스크 정의 우선 — 사용자 수정이 임베드에 덮이지 않는다.
+        let got = load_agent_spec(mine_key).expect("디스크 어댑터 로드");
+        assert_eq!(got["notes"].as_str(), Some("MY-EDIT"), "디스크본이 이겨야(수정 보존)");
+        // ② 디스크에 없는 vendor 신규 어댑터 → 임베드 폴백(동결 해소).
+        let filled = load_agent_spec(vendor_only_key).expect("임베드 폴백으로 로드돼야");
+        assert_eq!(filled, embed[vendor_only_key], "폴백은 임베드 정의 그대로");
+        // ③ 양쪽 모두 없음 → 거부(무음 통과 금지).
+        assert!(load_agent_spec("nosuch-agent-xyz").is_err(), "미지 어댑터는 거부");
+
+        let _ = std::fs::remove_dir_all(&td);
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
     }
 
     /// minisign keypair 생성 → (pubkey_base64_rawline, sign_fn).

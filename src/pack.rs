@@ -381,6 +381,17 @@ pub(crate) enum Ownership {
     SeedOnce,
 }
 
+/// 헌법 파일(디렉티브·soul·CLAUDE) 판정 — ownership() User 등급의 부분집합이며, 병합 시
+/// 추가 안전 게이트(안전핵 존재 검증·자동 병합 금지)가 붙는 대상. ownership() 이 이 함수를
+/// 호출해 패턴을 한 곳에 유지한다(SOT 분산 금지 — 술어 조건 직접 중복 금지 규칙과 동일 취지).
+pub fn is_constitution_file(rel: &str) -> bool {
+    rel.ends_with("_DIRECTIVE.md")
+        || rel == "soul.md"
+        || rel.ends_with("/soul.md")
+        || rel == "CLAUDE.md"
+        || rel.ends_with("/CLAUDE.md")
+}
+
 /// 소유권 분류 단일 SOT. 우선순위 **SeedOnce > User > System** — 상태 경로 밑에 user 패턴
 /// 이름이 오는 가상 케이스(예: memory/CLAUDE.md)에서 '상태 보존(불가침)'이 '병합 병치(.new)'보다
 /// 안전측이며, decide_file_action 의 기존 검사 순서(seed-once 조기 반환)와 동형이다.
@@ -391,19 +402,31 @@ pub(crate) fn ownership(rel: &str) -> Ownership {
     {
         return Ownership::SeedOnce;
     }
-    if rel.ends_with("_DIRECTIVE.md")
-        || rel == "soul.md"
-        || rel.ends_with("/soul.md")
-        || rel == "CLAUDE.md"
-        || rel.ends_with("/CLAUDE.md")
+    if is_constitution_file(rel)
         // ★B2-1(W3): schedule.json 은 사용자가 `cys schedule add` 로 편집하는 혼합 파일 — 팩 강제갱신이 덮으면
         // 사용자 잡이 소실(비가역 데이터 손실)된다. user 소유로 보존하고, built-in 잡(phoenix-*)은 데몬 부트 시
         // 코드가 idempotent ensure 한다(cysd schedule::ensure_builtin_jobs). 기본 잡 드리프트(복구 가능) < 사용자 잡 소실.
         || rel == "schedule.json"
+        // ★W-B(커스텀 생존 설계 2026-07-17): agents.json 은 파일 자신의 _doc 이 "사용자 환경에 맞게
+        // 수정 가능"이라 선언하는 혼합 설정인데 system 등급이라 매 스윕 치유돼 사용자 어댑터 수정이
+        // 소실됐다(실측: 병합 원장 healed 0.12.64). schedule.json 전례를 따라 user 승격 — vendor 신
+        // 어댑터는 .new 병치+병합으로 전달되고, 소비자(launch-agent·cysd)는 어댑터 결손 시 해당
+        // 어댑터만 비활성(전체 파손 아님)이라 동결 리스크 < 사용자 수정 소실.
+        || rel == "agents.json"
     {
         return Ownership::User;
     }
     Ownership::System
+}
+
+/// 소유권 분류의 CLI 노출용 이름(외부 crate 인 bin/cys.rs 는 pub(crate) ownership() 을 못 본다).
+/// pack-guard hook·pack-ownership 서브커맨드가 소비 — 분류 자체는 위 단일 SOT 를 그대로 통과.
+pub fn ownership_name(rel: &str) -> &'static str {
+    match ownership(rel) {
+        Ownership::System => "system",
+        Ownership::User => "user",
+        Ownership::SeedOnce => "seed-once",
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -895,9 +918,15 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         save_merge_pending(&dir, &pending);
     }
     if !pending.is_empty() {
+        // ★W-E2: 사용자 언어 요약 — "지워진 게 아니라 보존됐다"를 등급별 수치로 즉시 증명.
+        let healed_n = pending.values()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("healed"))
+            .count();
+        let new_n = pending.len() - healed_n;
         println!(
-            "[init-pack] 커스터마이즈 병합 대기 {}건 — `cys pack-merge` 로 검토 (신버전 .new 병치 / 치유 전 사용자본 .user 보존)",
-            pending.len()
+            "[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 {}건 (내 수정본 .user 보존 {}건 · vendor 신버전 .new 병치 {}건)\n\
+             \x20 검토·병합: `cys pack-merge` · 직전 상태 파일 복원: `cys pack-rollback`",
+            pending.len(), healed_n, new_n
         );
     }
     // prune: 임베드에서 사라진 옛 파일(폐기 스킬·디렉티브)을 제거해 '기능 제거 배포'를 가능케 한다.
@@ -2031,16 +2060,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&td);
     }
 
-    /// ★B2 분류 순수 함수: user 화이트리스트(디렉티브·헌법·CLAUDE.md)만 preserve, 나머지=system.
+    /// ★B2 분류 순수 함수: user 화이트리스트(디렉티브·헌법·CLAUDE.md·혼합 설정)만 preserve, 나머지=system.
     #[test]
     fn is_user_owned_classification() {
+        // agents.json: ★W-B 승격 핀 — _doc 이 "사용자 환경에 맞게 수정 가능"이라 선언하는 혼합
+        // 설정(schedule.json 동형). system 으로 되돌리면 사용자 어댑터 수정이 매 스윕 소실된다.
         for u in ["soul.md", "directives/MASTER_DIRECTIVE.md", "CLAUDE.md",
-                  "sub/dir/CSO_DIRECTIVE.md", "some/soul.md", "schedule.json"] {
+                  "sub/dir/CSO_DIRECTIVE.md", "some/soul.md", "schedule.json", "agents.json"] {
             assert!(is_user_owned(u), "user 여야: {u}");
         }
         for s in ["bin/javis_phoenix.py", "hooks/session_start.sh", "README.md",
                   "acl.json", "CLAUDE.md.template", "skills/x/SKILL.md",
-                  "directives/CEO_TEMPLATE.md", "sub/schedule.json"] {
+                  "directives/CEO_TEMPLATE.md", "sub/schedule.json", "sub/agents.json"] {
             assert!(!is_user_owned(s), "system 여야: {s}");
         }
     }
@@ -2937,6 +2968,63 @@ mod tests {
             std::fs::read_to_string(pd.join(sys_target)).unwrap(),
             sys_embed,
             "★B2: system 파일 편집은 임베드로 강제 갱신(스큐 동결 금지)"
+        );
+
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★W-A1(커스텀 생존 계약 2026-07-17): 비임베드 신규 파일(사용자 자작 도구·스킬 등 출하물이
+    /// 아닌 파일)은 재설치 스윕·원자 교체·prune 어디서도 소실되지 않는다 — "자작 신규 파일은
+    /// 절대 안전"을 제품 약속으로 박제하는 회귀 핀. 대조군으로 진짜 prune 대상(매니페스트에
+    /// 등재됐지만 임베드에서 사라진 stale vendor 파일)은 정리됨을 함께 증명해, 이 보증이
+    /// "prune 이 아예 안 도는" 우연이 아니라 판정(매니페스트 등재 여부)에 의한 것임을 고정한다.
+    #[test]
+    fn user_created_noembed_files_survive_install_and_prune() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let base = std::env::temp_dir().join(format!("cys-staged-noembed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        std::env::set_var(ENV_PACK_DIR, &pd);
+        std::env::set_var(ENV_CONFIG_DIR, base.join("claude"));
+
+        install_staged(false).unwrap();
+
+        // 자작 파일 3종(루트·bin·중첩 스킬) — 임베드·매니페스트 어디에도 없다.
+        let customs = [
+            ("USER-NOTES-ROOT.md", "내 메모"),
+            ("bin/my_custom_tool.py", "#!/usr/bin/env python3\nprint('mine')\n"),
+            ("skills/my-jarvis-skill/SKILL.md", "---\nname: my-jarvis-skill\n---\n"),
+        ];
+        for (rel, content) in customs {
+            let p = pd.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+        }
+        // 대조군: 임베드에서 제거된 stale vendor 파일(매니페스트 등재 + 해시 일치 → prune 대상).
+        let stale_rel = "bin/legacy_gone_tool.py";
+        std::fs::write(pd.join(stale_rel), "OLD-VENDOR").unwrap();
+        let mpath = pd.join(INSTALL_MANIFEST);
+        let mut manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+        manifest.insert(stale_rel.to_string(), content_hash("OLD-VENDOR"));
+        std::fs::write(&mpath, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        // force 재설치(가장 공격적인 스윕) + 원자 교체 경로 통과.
+        install_staged(true).unwrap();
+
+        for (rel, content) in customs {
+            assert_eq!(
+                std::fs::read_to_string(pd.join(rel)).unwrap(),
+                content,
+                "★생존 계약: 비임베드 자작 파일은 force 스윕·prune·원자 교체에서 불가침 — {rel}"
+            );
+        }
+        assert!(
+            !pd.join(stale_rel).exists(),
+            "대조군: 매니페스트 등재 stale vendor 파일은 prune 됨(판정이 살아있음의 증명)"
         );
 
         restore_env(saved, saved_cfg);
