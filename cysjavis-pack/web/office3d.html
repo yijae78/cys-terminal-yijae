@@ -2135,9 +2135,8 @@ async function postCommand(key, text, meeting){
 const raycaster = new THREE.Raycaster();
 const panel = document.getElementById('panel');
 let pendingCmd = null;
-canvas.addEventListener('click', e=>{
-  if (dragMoved) return;                                // 드래그는 회전
-  const m = new THREE.Vector2((e.clientX/innerWidth)*2-1, -(e.clientY/innerHeight)*2+1);
+function handleCanvasClick(clientX, clientY){    // 클릭 판정 코어 (리스너·DEBUG 훅 공용)
+  const m = new THREE.Vector2((clientX/innerWidth)*2-1, -(clientY/innerHeight)*2+1);
   raycaster.setFromCamera(m, camera);
   const hits = raycaster.intersectObjects(worldGroup ? worldGroup.children : [], true);
   for (const h of hits){
@@ -2157,6 +2156,10 @@ canvas.addEventListener('click', e=>{
     }
   }
   closePanel();
+}
+canvas.addEventListener('click', e=>{
+  if (dragMoved) return;                                // 드래그는 회전
+  handleCanvasClick(e.clientX, e.clientY);
 });
 // ---------- task 전문 말풍선 (hover/선택 · #4) ----------
 let taskTipKey = null, lastHover = 0;
@@ -2283,6 +2286,22 @@ if (dbg){
     const v = new THREE.Vector3(x, y, z).project(camera);
     return { x: (v.x*0.5 + 0.5)*innerWidth, y: (-v.y*0.5 + 0.5)*innerHeight,
       visible: v.z < 1 && Math.abs(v.x) <= 1 && Math.abs(v.y) <= 1 };
+  };
+  dbg.clickFirstShopItem = ()=>{              // 게이트 6b: 첫 상품을 실 raycast 클릭 경로로 눌러 owner 이동 미유발 단언
+    let target = null;
+    if (worldGroup) worldGroup.traverse(o=>{ if (!target && o.userData && o.userData.shopItem) target = o; });
+    if (!target) return { found:false };
+    const before = owner ? owner.plan.length : 0;
+    const shopWasHidden = document.getElementById('shop').style.display !== 'block';
+    const v = new THREE.Vector3(); target.getWorldPosition(v); v.project(camera);
+    const sx = (v.x*0.5 + 0.5)*innerWidth, sy = (-v.y*0.5 + 0.5)*innerHeight;
+    dragMoved = false;                        // 드래그 아님 보장(리스너 우회·핸들러 직접 구동)
+    handleCanvasClick(sx, sy);                // 캔버스 클릭 핸들러와 동일 raycast 경로
+    return { found:true, ownerPlanBefore:before,
+      ownerPlanAfter: owner ? owner.plan.length : 0,
+      ownerMoved: owner ? (owner.plan.length > before || owner.busy) : false,
+      opened: document.getElementById('shop').style.display === 'block',
+      shopWasHidden };
   };
 }
 document.getElementById('p-close').onclick = closePanel;
