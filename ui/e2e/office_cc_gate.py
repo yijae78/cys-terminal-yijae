@@ -259,6 +259,23 @@ def main() -> int:
             check(bool(stood) and seat_y is not None and stood.get("y", 0) > seat_y + 0.1,
                   f"4-기립 y=보행고 복원(좌면 {seat_y}보다 높음) (y={stood.get('y') if stood else None})")
 
+            # 4b: 키보드 입력 중 착석 스냅 미발동 (S1-3 — updateThroneSeat 입력 게이트 office3d.html:1794)
+            page.evaluate("()=>window.__officeDebug.setKey('up', true)")     # 입력 홀드
+            page.evaluate("()=>window.__officeDebug.teleportOwner(0.5, -3.0, null)")  # 자리 존 진입
+            page.wait_for_timeout(800)                                        # 스냅 발동 기회를 줘도
+            held = page.evaluate("()=>window.__officeDebug.ownerState()")
+            check(bool(held) and held.get("seated") is False,
+                  f"4b-키보드 입력 중 착석 스냅 미발동(입력 게이트) (state={held})")
+            page.evaluate("()=>window.__officeDebug.setKey('up', false)")     # 입력 해제
+            page.evaluate("()=>window.__officeDebug.teleportOwner(0.5, -3.0, null)")  # 홀드 중 이탈 대비 재진입
+            try:
+                page.wait_for_function("()=>window.__officeDebug.ownerSeated===true", timeout=4000)
+            except Exception:
+                pass
+            released = page.evaluate("()=>window.__officeDebug.ownerState()")
+            check(bool(released) and released.get("seated") is True,
+                  f"4b-입력 해제 후 자리 존 정지→착석 재개(게이트 조건부) (state={released})")
+
             # ── 그룹 5: 강아지 fx ────────────────────────────────────────────
             mode0 = page.evaluate("()=>window.__officeDebug.dogState && window.__officeDebug.dogState.mode")
             SSE.put({"t": "dog", "kind": "kill", "pid": None})   # kill → 서버룸 질주
