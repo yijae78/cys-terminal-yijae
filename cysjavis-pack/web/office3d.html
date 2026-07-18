@@ -2233,10 +2233,21 @@ if (dbg){
   };
   // e2e 게이트 배선 (master 규약 · DEBUG일 때만 · 프로덕션 무영향)
   dbg.floorPlans = floorPlans;          // D1: deptId→plan 라이브 맵(재빌드=clear+set, 참조 유지)
+  dbg.floorPlan = (deptId)=> floorPlans.get(deptId) || null;   // D1: 부서별 plan 접근자
   dbg.floorPlanOf = floorPlanOf;        // D1: 템플릿·불변식 직접 산출
   Object.defineProperty(dbg, 'ownerSeated', { configurable:true, get:()=> ownerSeated });   // D2 착석 상태
   dbg.ownerPos = ()=> owner ? { x:owner.pr.grp.position.x, y:owner.pr.grp.position.y,
     z:owner.pr.grp.position.z, planLen:owner.plan.length } : null;
+  dbg.ownerState = ()=> owner ? {       // D2 착석 상태기계 4단언(seated·좌표·manual·busy·planLen)
+    seated: ownerSeated, x:owner.pr.grp.position.x, y:owner.pr.grp.position.y, z:owner.pr.grp.position.z,
+    manual: !!owner.manual, busy: !!owner.busy, planLen: owner.plan.length } : null;
+  dbg.teleportOwner = (x, z, floorY)=>{ // D2 착석 시뮬 — 해당 층 보행고로 즉시 이동(기립 트리거 경유)
+    if (!owner) return null;
+    standFromThrone();                  // 착석 중이면 기립(y 보행고 복원)
+    const fy = (floorY != null ? floorY : curFloorY());
+    owner.plan = []; owner.manual = false; owner.busy = false;   // 진행 플랜 취소
+    owner.pr.grp.position.set(x, fy + 0.74, z);
+    return { x, y: fy + 0.74, z }; };
   Object.defineProperty(dbg, 'dogState', { configurable:true, get:()=> dog ? {   // D4 강아지 상태
     mode: dog.state, floorY: dog.grp.position.y,
     target: dog.state==='transit' ? ('floor@'+dog.trY)
