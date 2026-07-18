@@ -6524,6 +6524,279 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── W3 CEO 자동결재 (부정 케이스 §W3.9) ──────────────────────────────────────
+
+    /// CYS_APPROVE_AUTO_ROUTE를 세팅한 뒤 격리 데몬 생성(config 캡처 후 env 정리).
+    /// ACL_ENV_LOCK 하에서만 호출한다(프로세스 전역 env 경합 차단).
+    fn daemon_auto(tag: &str, on: bool) -> (Arc<Daemon>, std::path::PathBuf) {
+        if on {
+            std::env::set_var("CYS_APPROVE_AUTO_ROUTE", "1");
+        } else {
+            std::env::remove_var("CYS_APPROVE_AUTO_ROUTE");
+        }
+        let (d, dir) = daemon_with_acl(tag, r#"{"default":"allow","rules":[]}"#);
+        std::env::remove_var("CYS_APPROVE_AUTO_ROUTE"); // config 캡처 후 즉시 정리
+        (d, dir)
+    }
+
+    fn w3_push(id: i64, rid: &str, title: &str, body: &str, tier: Option<&str>) -> Request {
+        Request {
+            id: json!(id),
+            method: "feed.push".into(),
+            params: json!({"kind": "permission", "title": title, "body": body,
+                           "request_id": rid, "wait": false, "tier": tier}),
+        }
+    }
+
+    /// 구독 rx에서 전체 이벤트를 벡터로 뽑는다(name·payload 매칭 편의).
+    fn drain(rx: &mut tokio::sync::broadcast::Receiver<Value>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+    fn created_payload<'a>(evs: &'a [Value], rid: &str) -> Option<&'a Value> {
+        evs.iter().find(|e| {
+            e["name"].as_str() == Some("feed.item.created")
+                && e["payload"]["request_id"].as_str() == Some(rid)
+        })
+    }
+    fn count_named(evs: &[Value], name: &str) -> usize {
+        evs.iter().filter(|e| e["name"].as_str() == Some(name)).count()
+    }
+
+    /// ⑦ flag OFF: auto-eligible 서술이어도 자동 라우팅 없음(현행 동작). auto_route=false,
+    /// feed.auto_routed·approval.stalled 미발동, 항목은 pending 유지.
+    #[test]
+    fn w3_off_no_auto_route() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_auto("w3-off", false);
+        let mut rx = daemon.bus.subscribe();
+        let Reply::Single(resp) =
+            dispatch(&daemon, w3_push(1, "off1", "[CYCLE-VERIFY] 저장 검증", "확인", None), None)
+        else {
+            panic!("single");
+        };
+        assert_eq!(resp["ok"], json!(true), "{resp}");
+        let evs = drain(&mut rx);
+        let p = created_payload(&evs, "off1").expect("created");
+        assert_eq!(p["payload"]["auto_route"], json!(false), "OFF인데 auto_route=true");
+        assert_eq!(p["payload"]["risk_class"], json!("auto"), "risk 파생은 flag 무관");
+        assert_eq!(count_named(&evs, "feed.auto_routed"), 0, "OFF인데 CEO 배달됨");
+        assert_eq!(count_named(&evs, "approval.stalled"), 0, "OFF인데 escalation 발동");
+        // 항목 pending 유지.
+        let items = daemon.feed_items.lock().unwrap();
+        assert_eq!(items.iter().find(|i| i.request_id == "off1").unwrap().status, "pending");
+        drop(items);
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⑧ HumanOnly(사람 단계·TCC): flag ON → CEO 이행 불가 → 즉시 오너 escalation(human_only).
+    #[test]
+    fn w3_human_only_escalates() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_auto("w3-human", true);
+        let mut rx = daemon.bus.subscribe();
+        let _ = dispatch(
+            &daemon,
+            w3_push(1, "hum1", "★사람 단계 필수: TCC 재부여", "", None),
+            None,
+        );
+        let evs = drain(&mut rx);
+        let p = created_payload(&evs, "hum1").expect("created");
+        assert_eq!(p["payload"]["risk_class"], json!("human"));
+        assert_eq!(p["payload"]["auto_route"], json!(false), "HumanOnly는 auto 아님");
+        assert_eq!(count_named(&evs, "feed.auto_routed"), 0, "HumanOnly가 CEO 배달됨");
+        let stalled = evs
+            .iter()
+            .find(|e| e["name"].as_str() == Some("approval.stalled")
+                && e["payload"]["request_id"].as_str() == Some("hum1"))
+            .expect("human_only escalation 미발동");
+        assert_eq!(stalled["payload"]["reason"], json!("human_only"));
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ② CEO 좌석 부재: flag ON + auto-eligible → 즉시 escalation(ceo_seat_empty). auto_route=true.
+    #[test]
+    fn w3_ceo_seat_empty_escalates() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_auto("w3-empty", true);
+        let mut rx = daemon.bus.subscribe();
+        let _ = dispatch(&daemon, w3_push(1, "e1", "[CYCLE-VERIFY] 저장 검증", "확인", None), None);
+        let evs = drain(&mut rx);
+        let p = created_payload(&evs, "e1").expect("created");
+        assert_eq!(p["payload"]["auto_route"], json!(true), "ON+auto인데 auto_route=false");
+        assert_eq!(count_named(&evs, "feed.auto_routed"), 0, "좌석 없는데 배달됨");
+        let stalled = evs
+            .iter()
+            .find(|e| e["name"].as_str() == Some("approval.stalled")
+                && e["payload"]["request_id"].as_str() == Some("e1"))
+            .expect("seat-empty escalation 미발동");
+        assert_eq!(stalled["payload"]["reason"], json!("ceo_seat_empty"));
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⑥ tier 스푸핑: tier=a여도 denylist 서술(삭제)이면 auto로 안 샌다(risk=high·라우팅 없음).
+    #[test]
+    fn w3_tier_spoof_denylist_stays_human() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_auto("w3-spoof", true);
+        let mut rx = daemon.bus.subscribe();
+        let _ = dispatch(&daemon, w3_push(1, "s1", "백업본 삭제", "정리", Some("a")), None);
+        let evs = drain(&mut rx);
+        let p = created_payload(&evs, "s1").expect("created");
+        assert_eq!(p["payload"]["risk_class"], json!("high"), "denylist인데 high 아님");
+        assert_eq!(p["payload"]["auto_route"], json!(false), "denylist가 auto로 샘");
+        assert_eq!(count_named(&evs, "feed.auto_routed"), 0);
+        assert_eq!(count_named(&evs, "approval.stalled"), 0, "HighRisk는 현행 CC 경로(무 escalation)");
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// kind 위조: kind=notification이어도 denylist title이면 risk=high(kind는 판정 입력 아님).
+    #[test]
+    fn w3_kind_forgery_ignored() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_auto("w3-kind", true);
+        let mut rx = daemon.bus.subscribe();
+        let req = Request {
+            id: json!(1),
+            method: "feed.push".into(),
+            params: json!({"kind": "notification", "title": "gh release 발행", "body": "",
+                           "request_id": "k1", "wait": false}),
+        };
+        let _ = dispatch(&daemon, req, None);
+        let evs = drain(&mut rx);
+        let p = created_payload(&evs, "k1").expect("created");
+        assert_eq!(p["payload"]["risk_class"], json!("high"));
+        assert_eq!(p["payload"]["auto_route"], json!(false));
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ④ 멱등 의미 키: 같은 kind+title+publisher+body를 새 request_id로 재발행해도 CEO
+    /// 재주입(여기선 escalation)은 1회만(중복 억제). 좌석 부재로 첫 건만 escalation.
+    #[test]
+    fn w3_idempotent_semantic_key() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_auto("w3-idem", true);
+        let mut rx = daemon.bus.subscribe();
+        let _ = dispatch(&daemon, w3_push(1, "r1", "[CYCLE-VERIFY] 저장 검증", "동일본문", None), None);
+        let _ = dispatch(&daemon, w3_push(2, "r2", "[CYCLE-VERIFY] 저장 검증", "동일본문", None), None);
+        let evs = drain(&mut rx);
+        // 두 항목 모두 생성(pending)되지만 escalation은 의미 키로 1회만.
+        assert_eq!(count_named(&evs, "feed.item.created"), 2, "두 push 다 created 돼야");
+        assert_eq!(
+            count_named(&evs, "approval.stalled"),
+            1,
+            "같은 의미 키 재발행이 CEO 재주입/escalation을 이중 유발함(멱등 실패)"
+        );
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 정상(Delivered): CEO 좌석 점유(agent+seat=occupied) → auto-eligible 즉시 배달(feed.auto_routed)
+    /// + escalation 없음.
+    #[test]
+    fn w3_ceo_delivered_when_seat_occupied() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_auto("w3-deliver", true);
+        // CEO 좌석: 살아있는 에이전트 pane + 점유 좌석.
+        let ceo = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("ceo".into()), 24, 80)
+            .expect("ceo surface");
+        *ceo.agent_meta.lock().unwrap() = Some(("claude".into(), "/bin/claude".into()));
+        ceo.seat_cache.store(1, Ordering::Relaxed); // Occupied
+        daemon.surfaces.lock().unwrap().insert(ceo.id, ceo.clone());
+        daemon.roles.lock().unwrap().insert("ceo".into(), ceo.id);
+
+        let mut rx = daemon.bus.subscribe();
+        let _ = dispatch(&daemon, w3_push(1, "d1", "[RSI 학습 추천]", "제안", None), None);
+        let evs = drain(&mut rx);
+        assert_eq!(
+            count_named(&evs, "feed.auto_routed"),
+            1,
+            "점유 좌석인데 CEO 배달 안 됨"
+        );
+        assert_eq!(count_named(&evs, "approval.stalled"), 0, "배달됐는데 escalation도 발동");
+        let p = created_payload(&evs, "d1").expect("created");
+        assert_eq!(p["payload"]["auto_route"], json!(true));
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W3.5 감사: reply(allow, --reason) → approval_audit.jsonl에 req_id·decision·reason·risk 기록.
+    #[test]
+    fn w3_audit_record_written() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_auto("w3-audit", false);
+        let _ = dispatch(&daemon, w3_push(1, "a1", "[CYCLE-VERIFY] 저장 검증", "확인", None), None);
+        let rr = Request {
+            id: json!(2),
+            method: "feed.reply".into(),
+            params: json!({"request_id": "a1", "decision": "allow", "reason": "근거 대조 완료"}),
+        };
+        let _ = dispatch(&daemon, rr, None);
+        let audit = crate::state::state_dir(&daemon.socket_path).join("approval_audit.jsonl");
+        let content = std::fs::read_to_string(&audit).expect("audit 파일 부재");
+        let line = content.lines().find(|l| l.contains("\"a1\"")).expect("a1 감사 라인 부재");
+        let v: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["req_id"], json!("a1"));
+        assert_eq!(v["decision"], json!("allow"));
+        assert_eq!(v["reason"], json!("근거 대조 완료"));
+        assert_eq!(v["risk"], json!("auto"), "감사에 risk 파생 기록");
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W3.7 ABI Drift 확인: risk_class·auto_route가 실린 FeedItem을 응답 Value로 감싸도
+    /// wire::frame_response(producer self-verify)가 Drift 없이 통과한다(serde default 필드 round-trip).
+    #[test]
+    fn w3_feeditem_fields_survive_wire_frame() {
+        let item = crate::state::FeedItem {
+            request_id: "w1".into(),
+            kind: "permission".into(),
+            title: "t".into(),
+            body: "b".into(),
+            surface_id: Some(7),
+            status: "pending".into(),
+            decision: None,
+            created_at: crate::state::now_epoch(),
+            resolved_at: None,
+            tier: Some("c".into()),
+            publisher_pid: None,
+            publisher_pgid: None,
+            publisher_surface: Some(3),
+            risk_class: Some("auto".into()),
+            auto_route: true,
+        };
+        let resp = json!({"id": 1, "ok": true, "result": {"item": item}});
+        let framed = cys::wire::frame_response(&resp);
+        assert!(framed.is_ok(), "새 serde 필드가 ABI Drift 유발: {framed:?}");
+    }
+
+    /// W3.6 back-pressure: 임계 초과 시 approval.backpressure 이벤트 + org.status 노출 + deny 카운터.
+    #[test]
+    fn w3_back_pressure_counts_and_event() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        // 임계는 record_approval_request가 매 호출 env를 재조회하므로 push 시점까지 유지한다.
+        std::env::set_var("CYS_APPROVE_BACKPRESSURE_N", "2");
+        let (daemon, dir) = daemon_auto("w3-bp", false);
+        let mut rx = daemon.bus.subscribe();
+        // 같은 발행자(None=0) 2건 → 2번째에서 임계 교차 이벤트.
+        let _ = dispatch(&daemon, w3_push(1, "b1", "무언가 요청", "", None), None);
+        let _ = dispatch(&daemon, w3_push(2, "b2", "무언가 요청2", "", None), None);
+        let evs = drain(&mut rx);
+        assert_eq!(count_named(&evs, "approval.backpressure"), 1, "임계 교차 이벤트 1회");
+        std::env::remove_var("CYS_APPROVE_BACKPRESSURE_N");
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // §3.2 표면정책 — feed 자기승인 차단: 발행 pid == reply pid + allow 는 거부,
     // 다른 pid 승인·자기 거부(deny)는 허용.
     #[test]
