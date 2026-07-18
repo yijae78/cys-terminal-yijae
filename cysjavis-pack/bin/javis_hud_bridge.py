@@ -1634,6 +1634,16 @@ class Handler(BaseHTTPRequestHandler):
                     body = f.read()
                 if ctype.startswith("text/html"):   # 조작 토큰 주입 (동일 페이지 한정)
                     body = body.replace(b"__HUD_TOKEN__", (self.token or "").encode())
+                    # W1-c 조용한 실패 배너 부트 가드 주입 — __HUD_TOKEN__ 치환과 별개
+                    # 앵커(</head> 직전, 실측 존재). office3d.html 본문 무접촉 원칙 준수.
+                    body = body.replace(
+                        b"</head>",
+                        b'<script src="/office-boot.js"></script>\n</head>', 1)
+                    if b"/office-boot.js" not in body:  # 주입 self-check (침묵 실패 방지)
+                        sys.stderr.write(
+                            "[hud_bridge] WARN: office-boot.js 주입 실패 — "
+                            "%s 에 </head> 앵커 부재\n" % fp)
+                        sys.stderr.flush()
                 return self._send(200, ctype, body, cache)
             except OSError:
                 return self._send(404, "text/plain", b"missing asset")
@@ -1743,6 +1753,11 @@ def main():
         "/vendor/three.module.js":
             (os.path.join(WEB_DIR, "vendor", "three.module.js"),
              "text/javascript; charset=utf-8", True),
+        # W1-c 부트 가드 — 침묵 실패 복구 안내. cache=False(no-store): 보안·복구
+        # 자산이 WKWebView 휴리스틱 캐시로 구버전 잔존하면 안 됨(HTML과 동일 근거).
+        "/office-boot.js":
+            (os.path.join(WEB_DIR, "office-boot.js"),
+             "text/javascript; charset=utf-8", False),
     }
     load_heat(world)                       # 히트 링 복원 (재시작 생존)
     world.cost_cache = {"ts": time.time(), "value": read_cost_today(TRANSCRIPTS_DB)}
