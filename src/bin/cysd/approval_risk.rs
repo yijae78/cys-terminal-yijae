@@ -118,6 +118,32 @@ pub fn derive_risk(title: &str, body: &str) -> RiskClass {
     RiskClass::HighRisk
 }
 
+/// W3.2 멱등 의미 키: kind+title+publisher_surface+body의 SHA-256(hex). request_id 기준이
+/// 아니라 **의미** 기준이라, 재발행이 매번 새 request_id를 받아도 같은 요청을 한 키로 접는다.
+/// 필드 사이에 개행을 끼워 경계 위조(값에 구분자 삽입)를 막는다.
+pub fn semantic_key(kind: &str, title: &str, publisher_surface: Option<u64>, body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(kind.as_bytes());
+    h.update(b"\n");
+    h.update(title.as_bytes());
+    h.update(b"\n");
+    h.update(
+        publisher_surface
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    h.update(b"\n");
+    h.update(body.as_bytes());
+    let digest: [u8; 32] = h.finalize().into();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

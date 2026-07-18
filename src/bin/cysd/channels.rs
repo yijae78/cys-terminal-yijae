@@ -2485,6 +2485,8 @@ mod tests {
             publisher_pid: None,
             publisher_pgid: None,
             publisher_surface: None,
+            risk_class: None,
+            auto_route: false,
         });
         // 이미 sent된 approval_prompt(feed F1·nonce 미소각).
         {
@@ -3066,6 +3068,8 @@ mod tests {
             publisher_pid: None,
             publisher_pgid: None,
             publisher_surface: None,
+            risk_class: None,
+            auto_route: false,
         });
     }
 
