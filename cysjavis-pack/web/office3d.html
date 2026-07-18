@@ -917,29 +917,100 @@ function makePipes(y){
   return g;
 }
 function makeChairmanOffice(roofY){
-  // 루프탑 회장실 (주인 전용 펜트하우스)
+  // 루프탑 회장실 (주인 전용 펜트하우스) — w 5.0→7.0 확장·고급화. 왕좌·책상은 THRONE SOT 기준 상대.
   const g = new THREE.Group();
-  const cx = 0.5, cz = -2.5, w = 5.0, d = 3.0, h = 1.7;
-  g.add(mesh(new THREE.BoxGeometry(w, h, 0.05), M.meetGlass, cx, roofY+h/2, cz-d/2, false));
+  const cx = 0.5, cz = -2.5, w = 7.0, d = 3.0, h = 1.7;
+  const backZ = cz - d/2;                              // 뒷벽(-z) = -4.0
+  g.add(mesh(new THREE.BoxGeometry(w, h, 0.05), M.meetGlass, cx, roofY+h/2, backZ, false));
   g.add(mesh(new THREE.BoxGeometry(0.05, h, d), M.meetGlass, cx-w/2, roofY+h/2, cz, false));
   g.add(mesh(new THREE.BoxGeometry(0.05, h, d), M.meetGlass, cx+w/2, roofY+h/2, cz, false));
-  const rug = new THREE.Mesh(new THREE.CircleGeometry(1.9, 30),
-    new THREE.MeshStandardMaterial({ color:0x8a2f2f, roughness:0.95, transparent:true, opacity:0.5 }));
-  rug.rotation.x = -Math.PI/2; rug.position.set(cx, roofY+0.08, cz); rug.receiveShadow = true;
-  g.add(rug);
+  const gold = new THREE.MeshStandardMaterial({ color:0xc9a24a, roughness:0.32, metalness:0.72 });
   const goldWood = new THREE.MeshStandardMaterial({ color:0x9a7440, roughness:0.5, metalness:0.25 });
-  g.add(mesh(new THREE.BoxGeometry(2.2, 0.08, 0.95), goldWood, cx, roofY+0.78, cz-0.3));
-  g.add(mesh(new THREE.BoxGeometry(0.09, 0.74, 0.85), M.woodDark, cx-1.0, roofY+0.38, cz-0.3));
-  g.add(mesh(new THREE.BoxGeometry(0.09, 0.74, 0.85), M.woodDark, cx+1.0, roofY+0.38, cz-0.3));
+  // 카펫 확대(1.9→2.6) + 골드 트림 링
+  const rug = new THREE.Mesh(new THREE.CircleGeometry(2.6, 32),
+    new THREE.MeshStandardMaterial({ color:0x8a2f2f, roughness:0.95, transparent:true, opacity:0.5 }));
+  rug.rotation.x = -Math.PI/2; rug.position.set(cx, roofY+0.08, cz); rug.receiveShadow = true; g.add(rug);
+  const trim = new THREE.Mesh(new THREE.RingGeometry(2.55, 2.75, 40), gold);
+  trim.rotation.x = -Math.PI/2; trim.position.set(cx, roofY+0.09, cz); g.add(trim);
+  // 회장 책상(THRONE 기준 상대) — 골드 상판 + 골드 네임플레이트
+  g.add(mesh(new THREE.BoxGeometry(2.4, 0.08, 0.95), goldWood, THRONE.x, roofY+0.78, THRONE.z+0.85));
+  g.add(mesh(new THREE.BoxGeometry(0.09, 0.74, 0.85), M.woodDark, THRONE.x-1.1, roofY+0.38, THRONE.z+0.85));
+  g.add(mesh(new THREE.BoxGeometry(0.09, 0.74, 0.85), M.woodDark, THRONE.x+1.1, roofY+0.38, THRONE.z+0.85));
+  g.add(mesh(new THREE.BoxGeometry(0.5, 0.04, 0.12), gold, THRONE.x, roofY+0.83, THRONE.z+1.2, false));
+  // 왕좌(THRONE SOT 기준)
   const throne = new THREE.Group(); throne.position.set(THRONE.x, roofY, THRONE.z);
-  throne.rotation.y = Math.PI;   // 등받이를 유리벽(-z) 쪽으로 — 착석자가 책상·오피스를 본다(구: 뒤돌아 있음)
+  throne.rotation.y = Math.PI;   // 등받이를 유리벽(-z) 쪽으로 — 착석자가 책상·오피스를 본다
   throne.add(mesh(new THREE.BoxGeometry(0.6, 0.1, 0.55), goldWood, 0, 0.5, 0));
   throne.add(mesh(new THREE.BoxGeometry(0.58, 0.85, 0.09), goldWood, 0, 0.95, 0.26));
   throne.add(mesh(G.chairPost, M.metal, 0, 0.3, 0, false));
   g.add(throne);
+  // 게스트 체어 2 (책상 건너편, 회장을 바라봄 = -z)
+  [[-0.7],[0.7]].forEach(([dx])=>{ const c = makeChair();
+    c.position.set(THRONE.x+dx, roofY, THRONE.z+2.0); g.add(c); });
+  // 서측 책장 + 책 + 트로피
+  const shelfX = cx - w/2 + 0.45;
+  g.add(mesh(new THREE.BoxGeometry(0.3, 1.5, 1.6), M.woodDark, shelfX, roofY+0.75, cz-0.2, false));
+  for (let i=0;i<5;i++){ const bh = 0.28 + (i%2)*0.06;
+    const book = new THREE.Mesh(new THREE.BoxGeometry(0.18, bh, 0.22),
+      new THREE.MeshStandardMaterial({ color: ACCENTS[i%ACCENTS.length], roughness:0.8 }));
+    book.position.set(shelfX+0.02, roofY+0.55+ (i>2?0.5:0), cz-0.7+ (i%3)*0.32); g.add(book); }
+  const trophy = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.11, 0.16, 10), gold);
+  trophy.position.set(shelfX+0.02, roofY+1.5, cz+0.3); g.add(trophy);
+  g.add(mesh(new THREE.BoxGeometry(0.16, 0.05, 0.16), goldWood, shelfX+0.02, roofY+1.4, cz+0.3, false));
+  // 뒷벽 회장 대시보드(CanvasTexture — 부서별 진행%·비용·토큰잔량, ≥2s 스로틀)
+  chairDashCanvas = document.createElement('canvas'); chairDashCanvas.width = 512; chairDashCanvas.height = 256;
+  chairDashTex = new THREE.CanvasTexture(chairDashCanvas); chairDashTex.colorSpace = THREE.SRGBColorSpace;
+  lastChairDash = 0;
+  const dash = new THREE.Mesh(new THREE.PlaneGeometry(3.2, 1.5),
+    new THREE.MeshBasicMaterial({ map:chairDashTex, transparent:true }));
+  dash.position.set(cx, roofY+1.25, backZ+0.06); g.add(dash);   // 뒷벽 안쪽면(+z 향함)
+  g.add(mesh(new THREE.BoxGeometry(3.4, 1.7, 0.05), M.dark, cx, roofY+1.25, backZ+0.02, false));
+  drawChairDash(true);
   const lbl = textSprite('회 장 실', { size:26, color:'#ffd166' });
   lbl.position.set(cx, roofY+2.4, cz); g.add(lbl);
   return g;
+}
+// 회장 대시보드 렌더 — 전광판 drawBillboard 패턴 재사용(≥2s 스로틀).
+let chairDashCanvas = null, chairDashTex = null, lastChairDash = 0;
+function drawChairDash(force){
+  if (!chairDashCanvas) return;
+  const now = performance.now();
+  if (!force && now - lastChairDash < 2000) return;
+  lastChairDash = now;
+  const g = chairDashCanvas.getContext('2d');
+  g.clearRect(0,0,512,256);
+  g.fillStyle = 'rgba(10,14,26,0.96)'; g.fillRect(0,0,512,256);
+  g.strokeStyle = '#c9a24a'; g.lineWidth = 3; g.strokeRect(4,4,504,248);   // 골드 트림
+  g.fillStyle = '#ffd88a'; g.font = '600 26px Menlo,monospace';
+  g.fillText('👑 회장 대시보드', 20, 40);
+  const deps = (lastWorld && lastWorld.departments) || [];
+  let ry = 80; g.font = '18px Menlo,monospace';
+  deps.slice(0,5).forEach(d=>{
+    const ns = d.nodes || [];
+    let pSum=0, pN=0, tSum=0, tN=0;
+    ns.forEach(n=>{
+      if (n.progress && n.progress.pct != null){ pSum += n.progress.pct; pN++; }
+      const r = (n.rate||[]).find(x=>x.label==='5h') || (n.rate||[])[0];
+      const used = r && (r.used_pct ?? r.pct);
+      if (used != null){ tSum += Math.max(0, 100-used); tN++; }
+    });
+    const pct = pN ? Math.round(pSum/pN) : 0;
+    const tok = tN ? Math.round(tSum/tN) : null;
+    g.fillStyle = '#bfe6ff'; g.font = '18px Menlo,monospace'; g.fillText(String(d.id).slice(0,10), 20, ry);
+    g.fillStyle = '#132033'; g.fillRect(178, ry-15, 170, 16);
+    g.fillStyle = pct>=90 ? '#6ee1be' : '#3fa8e0'; g.fillRect(178, ry-15, 170*Math.min(pct,100)/100, 16);
+    g.fillStyle = '#cfeeff'; g.font = '15px Menlo,monospace'; g.fillText(pct+'%', 354, ry);
+    g.fillStyle = tok==null ? '#667788' : (tok<15 ? '#ff8a8a' : '#ffd88a');
+    g.fillText(tok==null ? '토큰 —' : ('토큰 '+tok+'%'), 400, ry);
+    ry += 32;
+  });
+  const cost = lastWorld && lastWorld.board && lastWorld.board.cost_today;
+  if (cost){ let t = '오늘 비용';
+    if (cost.usd != null) t += ` $${cost.usd.toFixed(2)}`;
+    if (cost.tokens != null) t += ` · ${Math.round(cost.tokens/10000)}만 tok`;
+    g.fillStyle = '#ffd88a'; g.font = '600 20px Menlo,monospace'; g.fillText(t, 20, 244);
+  }
+  chairDashTex.needsUpdate = true;
 }
 function makeRooftop(roofY){
   const g = new THREE.Group();
@@ -948,7 +1019,7 @@ function makeRooftop(roofY){
     transparent:true, opacity:0.5, depthWrite:false });   // 데크도 반투명 — 본부 층 가림 금지
   const deck = mesh(new THREE.BoxGeometry(SLAB_W-1, 0.12, SLAB_D-1), deckT, 0, roofY, 0, false);
   deck.receiveShadow = true; deck.userData.floorY = roofY; g.add(deck);
-  [[-4.2,1.6],[3.4,1.2]].forEach(([dx,dz],i)=>{
+  [[-4.9,1.6],[4.9,2.6]].forEach(([dx,dz],i)=>{   // 회장실 w 7.0 확장 충돌 해소 이동(라운지체어 동반)
     g.add(mesh(new THREE.CylinderGeometry(0.04, 0.04, 1.9, 8), M.metal, dx, roofY+0.95, dz, false));
     const top = new THREE.Mesh(new THREE.ConeGeometry(1.15, 0.5, 10),
       new THREE.MeshStandardMaterial({ color: ACCENTS[i], roughness:0.85 }));
@@ -960,8 +1031,7 @@ function makeRooftop(roofY){
       ch.rotation.x = -0.25; ch.position.set(dx+ox, roofY+0.3, dz+oz);
       ch.castShadow = true; g.add(ch); });
   });
-  const neon = textSprite('C Y S J A V I S', { size:34, color:'#5fe0ff' });
-  neon.position.set(0, roofY+2.9, 0); neon.scale.multiplyScalar(1.6); g.add(neon);
+  // R2: 옥상 네온 'C Y S J A V I S' 스프라이트 삭제 (좌상단 h1만 남김). '회 장 실' 라벨은 회장실에 유지.
   return g;
 }
 
@@ -2440,7 +2510,7 @@ function frame(now){
       entWalkTo(e, e.group.position.x, e.group.position.z + 0.52, 'seat'); });
     reviewGather = null;
   }
-  if (nowMs - lastLinkT > 1000){ lastLinkT = nowMs; updateLinks(nowMs); }
+  if (nowMs - lastLinkT > 1000){ lastLinkT = nowMs; updateLinks(nowMs); drawChairDash(); }   // 대시보드 ≥2s 스로틀 내장
   weatherTick(dt);
   dayNightTick(dt);
   if (replay.mode) replayTick(dt);
