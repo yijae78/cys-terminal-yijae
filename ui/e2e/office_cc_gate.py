@@ -20,6 +20,7 @@ office-cc v13 신규 유닛(D1 배치 SOT·D2 착석·D4 강아지·D5 개명·D
 """
 import http.server
 import json
+import os
 import queue
 import socket
 import sys
@@ -28,7 +29,9 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-WEB_DIR = Path(__file__).resolve().parents[2] / "cysjavis-pack" / "web"
+# OFFICE_WEB_DIR 로 웹 루트 오버라이드 가능(test-the-verifier: 수정 전 office3d.html 대조용).
+WEB_DIR = Path(os.environ.get("OFFICE_WEB_DIR")
+               or (Path(__file__).resolve().parents[2] / "cysjavis-pack" / "web"))
 NOW = int(time.time())
 STOP = threading.Event()
 SSE = queue.Queue()          # 테스트가 런타임에 프레임 주입(개명 world·dog fx·미지 fx)
@@ -139,44 +142,55 @@ LAYOUT_JS = r"""
   const aabbOf = dbg.furnitureAabbs || null;
   const overlap = (a,b)=> Math.abs(a.cx-b.cx) < (a.w+b.w)/2 && Math.abs(a.cz-b.cz) < (a.d+b.d)/2;
   const SLABX = 6.5, SLABZ = 4.3;
-  const labels = ['엔지니어링','디자인','마케팅'];
-  const counts = [1,5,12];
-  const fails = []; const planByLabel = {};
-  for (const L of labels){
+  // 템플릿 식별: plan에 tpl 필드 없음 → seed 불변 구조(meeting·lounge·kanban·amenity)로 시그니처 분류.
+  const sig = (p)=> [p.meeting.x, p.meeting.z, p.lounge?p.lounge.x:'∅', p.lounge?p.lounge.z:'∅',
+                     p.kanban.x, p.amenity||'none'].join(',');
+  // 라벨 후보 20종 × seed 변주 → 템플릿 5종 전수 커버 보장(seed=(s^hash(label))%5 로 5종 도달).
+  const labels = ['엔지니어링','디자인','마케팅','영업','기획','인사','재무','법무','연구','생산',
+                  '품질','물류','전략','홍보','고객','보안','데이터','운영','구매','총무'];
+  const seeds = [null,0,1,2,3,4,5,6];
+  const counts = [1,5,8,12];   // tpl4 순찰점 관통 재현대 n>=8 포함
+  const fails = []; const templatesSeen = new Set(); const planByLabel = {};
+  // 라벨 결정론·개성(seed=null)
+  for (const L of ['엔지니어링','디자인','마케팅']){
     const s1 = JSON.stringify(dbg.floorPlanOf(L, null, 5));
     const s2 = JSON.stringify(dbg.floorPlanOf(L, null, 5));
     if (s1 !== s2) fails.push(`⑤비결정론 L=${L}`);   // 같은 라벨=같은 plan
     planByLabel[L] = s1;
-    for (const n of counts){
-      const plan = dbg.floorPlanOf(L, null, n);
-      const m = plan.meeting;
-      const rx = m.w/2 - 0.4, rz = m.d/2 - 0.4;      // ③ 링 ∈ 회의실(유도반경)
-      if (!(rx > 0 && rz > 0 && plan.gather.x === m.x && plan.gather.z === m.z))
-        fails.push(`③링∉회의실 L=${L} n=${n} m=${JSON.stringify(m)}`);
-      // ① 데스크 쌍별 최소거리 > 0.9
-      for (let i=0;i<plan.desks.length;i++) for (let j=i+1;j<plan.desks.length;j++){
-        const a=plan.desks[i], b=plan.desks[j];
-        const dist = Math.hypot(a[0]-b[0], a[1]-b[1]);
-        if (dist <= 0.9) fails.push(`①데스크간격<=0.9 L=${L} n=${n} dist=${dist.toFixed(3)}`);
+  }
+  const distinct = new Set(Object.values(planByLabel)).size >= 2;   // 다른 라벨=상이 plan≥1
+  // AABB 불변식 — 템플릿 5종 전수(시그니처 수집) × 노드수
+  for (const L of labels) for (const seed of seeds) for (const n of counts){
+    const plan = dbg.floorPlanOf(L, seed, n);
+    templatesSeen.add(sig(plan));
+    const m = plan.meeting;
+    const rx = m.w/2 - 0.4, rz = m.d/2 - 0.4;         // ③ 링 ∈ 회의실(유도반경)
+    if (!(rx > 0 && rz > 0 && plan.gather.x === m.x && plan.gather.z === m.z))
+      fails.push(`③링∉회의실 L=${L} s=${seed} n=${n} m=${JSON.stringify(m)}`);
+    for (let i=0;i<plan.desks.length;i++) for (let j=i+1;j<plan.desks.length;j++){   // ① 데스크 간격 > 0.9
+      const a=plan.desks[i], b=plan.desks[j];
+      if (Math.hypot(a[0]-b[0], a[1]-b[1]) <= 0.9)
+        fails.push(`①데스크간격<=0.9 L=${L} s=${seed} n=${n}`);
+    }
+    if (aabbOf){
+      const fa = aabbOf(plan);
+      const nonDesk = [fa.meeting, fa.lounge, fa.kanban, fa.amenity].filter(Boolean);
+      for (const d of (fa.desks||[])){                // ② 데스크 ∩ 회의실·라운지 비겹침
+        if (fa.meeting && overlap(d, fa.meeting)) fails.push(`②데스크∩회의실 L=${L} s=${seed} n=${n}`);
+        if (fa.lounge && overlap(d, fa.lounge)) fails.push(`②데스크∩라운지 L=${L} s=${seed} n=${n}`);
       }
-      if (aabbOf){
-        const fa = aabbOf(plan);
-        const furn = [fa.meeting, fa.lounge, fa.kanban, fa.amenity].filter(Boolean);
-        for (const d of (fa.desks||[])){                // ② 데스크 ∩ 회의실·라운지 비겹침
-          if (fa.meeting && overlap(d, fa.meeting)) fails.push(`②데스크∩회의실 L=${L} n=${n}`);
-          if (fa.lounge && overlap(d, fa.lounge)) fails.push(`②데스크∩라운지 L=${L} n=${n}`);
-        }
-        for (const p of plan.patrol){                   // ④ patrol ∈ 슬랩 · 가구 외부
-          if (Math.abs(p[0])>SLABX || Math.abs(p[1])>SLABZ) fails.push(`④순찰∉슬랩 L=${L} n=${n} p=${JSON.stringify(p)}`);
-          const pt = {cx:p[0], cz:p[1], w:0.02, d:0.02};
-          for (const f of furn) if (overlap(pt, f)) fails.push(`④순찰∈가구 L=${L} n=${n} p=${JSON.stringify(p)}`);
-        }
+      // ③ 순찰점: 슬랩 내부 + 모든 가구 외부 — ★데스크 포함(누락+tpl4 미열거가 관통 false-green 유발, reviewer1)
+      const patrolFurn = nonDesk.concat(fa.desks || []);
+      for (const p of plan.patrol){
+        if (Math.abs(p[0])>SLABX || Math.abs(p[1])>SLABZ) fails.push(`③순찰∉슬랩 L=${L} s=${seed} n=${n} p=${JSON.stringify(p)}`);
+        const pt = {cx:p[0], cz:p[1], w:0.02, d:0.02};
+        for (const f of patrolFurn) if (overlap(pt, f)) fails.push(`③순찰∈가구 L=${L} s=${seed} n=${n} p=${JSON.stringify(p)} f=${JSON.stringify(f)}`);
       }
     }
   }
-  const distinct = new Set(Object.values(planByLabel)).size >= 2;   // 다른 라벨=상이 plan≥1
   return { failCount: fails.length, fails: fails.slice(0,20),
-           distinctLabels: distinct, hasAabb: !!aabbOf };
+           distinctLabels: distinct, hasAabb: !!aabbOf,
+           templateCount: templatesSeen.size, templates: [...templatesSeen] };
 }
 """
 
@@ -224,8 +238,11 @@ def main() -> int:
             check(lay.get("error") is None, f"1-배치 floorPlanOf 훅 가용 (err={lay.get('error')})")
             check(bool(lay.get("hasAabb")), "1-배치 furnitureAabbs 훅 존재(가구 footprint SOT)")
             check(bool(lay.get("distinctLabels")), "1-배치 다른 라벨=상이 plan≥1(개성)")
+            check(lay.get("templateCount", 0) >= 5,
+                  f"1-배치 템플릿 5종 전수 커버 (covered={lay.get('templateCount')}) — "
+                  f"<5면 게이트 FAIL(침묵 부분커버 금지) (sigs={lay.get('templates')})")
             check(lay.get("failCount") == 0,
-                  f"1-배치 불변식(데스크간격>0.9·데스크∩가구·링∈회의실·순찰·결정론) 위반 "
+                  f"1-배치 불변식(데스크간격>0.9·데스크∩가구·링∈회의실·순찰∩데스크포함·결정론) 위반 "
                   f"{lay.get('failCount')}건 (fails={lay.get('fails')})")
 
             # ── 그룹 4: 착석 상태기계 ────────────────────────────────────────
