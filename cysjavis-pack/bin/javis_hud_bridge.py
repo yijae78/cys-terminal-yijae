@@ -13,6 +13,7 @@ WorldState(§4)로 정규화해 127.0.0.1 전용 HTTP(+SSE)로 내보낸다.
 기동:  cys run --scoped -- python3 bin/javis_hud_bridge.py
 접속:  http://127.0.0.1:8765
 """
+import glob
 import json
 import os
 import re
@@ -1178,12 +1179,23 @@ def read_history(after_ts, limit=6000):
 
 
 # -------------------------------------------------- 스킬 카탈로그 (D6 · GET /skills)
-SKILL_SOURCES = [   # (스캔 디렉토리, 계정 라벨) — 팩 상대 + 계정 3곳
-    (os.path.join(ROOT, "skills"), "pack"),
-    (os.path.expanduser("~/.claude/skills"), "claude"),
-    (os.path.expanduser("~/.claude-cysinsight/skills"), "cysinsight"),
-    (os.path.expanduser("~/.claude-ysfuture/skills"), "ysfuture"),
-]
+def skill_sources(home=None):
+    """스킬 스캔 소스 [(디렉토리, 계정 라벨)] 동적 탐색.
+
+    <ROOT>/skills(pack) + ~/.claude/skills(claude) + glob ~/.claude-*/skills
+    (라벨 = 디렉토리명 'claude-' 뒤 접미사). 계정 프로필을 하드코딩하지 않아 임의 계정을
+    자동 지원하며(기능 확장), 소스에 개인 핸들 리터럴이 남지 않는다(라벨은 런타임 파생).
+    """
+    home = home or os.path.expanduser("~")
+    srcs = [(os.path.join(ROOT, "skills"), "pack"),
+            (os.path.join(home, ".claude", "skills"), "claude")]
+    prefix = ".claude-"
+    for d in sorted(glob.glob(os.path.join(home, prefix + "*", "skills"))):
+        suffix = os.path.basename(os.path.dirname(d))[len(prefix):]   # .claude-<라벨>
+        srcs.append((d, suffix or "claude"))
+    return srcs
+
+
 SKILLS_CACHE_SECS = 60.0
 SKILL_DESC_MAX = 200
 _skills_cache = {"ts": 0.0, "data": None}
@@ -1238,7 +1250,7 @@ def scan_skills(now=None, sources=None):
     """
     now = time.time() if now is None else now
     use_cache = sources is None
-    srcs = SKILL_SOURCES if sources is None else sources
+    srcs = skill_sources() if sources is None else sources
     if use_cache:
         with _skills_lock:
             if _skills_cache["data"] is not None \

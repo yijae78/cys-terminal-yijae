@@ -38,7 +38,7 @@ SSE = queue.Queue()          # 테스트가 런타임에 프레임 주입(개명
 PEEK_KEYS: list[str] = []
 SKILLS = {"skills": [
     {"name": "appbuild", "description": "웹/앱 자율 빌드 오케스트레이터",
-     "accounts": ["pack", "claude", "cysinsight", "ysfuture"]},
+     "accounts": ["acct-a", "acct-b", "acct-c", "acct-d"]},
     {"name": "deep-research", "description": "다출처 팩트체크 리서치", "accounts": ["claude"]},
     {"name": "diagnose", "description": "난해 버그 진단 루프", "accounts": ["pack", "claude"]},
 ]}

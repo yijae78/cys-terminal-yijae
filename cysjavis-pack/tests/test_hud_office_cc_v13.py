@@ -216,6 +216,19 @@ class ScanSkills(unittest.TestCase):
                                         (os.path.join(self.tmp, "nope"), "claude")])["skills"]
         self.assertEqual([s["name"] for s in skills], ["solo"])
 
+    def test_skill_sources_dynamic_discovery(self):
+        # skill_sources(home): ~/.claude/skills(claude) + glob ~/.claude-*/skills
+        # (라벨=디렉토리명 'claude-' 뒤 접미사) — 하드코딩 핸들 없이 임의 계정 자동 지원
+        home = os.path.join(self.tmp, "home")
+        for sub in (".claude", ".claude-acctx", ".claude-accty"):
+            os.makedirs(os.path.join(home, sub, "skills"), exist_ok=True)
+        srcs = dict((label, path) for path, label in B.skill_sources(home=home))
+        self.assertEqual(srcs["claude"], os.path.join(home, ".claude", "skills"))
+        self.assertEqual(srcs["acctx"], os.path.join(home, ".claude-acctx", "skills"))
+        self.assertEqual(srcs["accty"], os.path.join(home, ".claude-accty", "skills"))
+        self.assertIn("pack", srcs)                       # <ROOT>/skills 항상 포함
+        self.assertNotIn("", srcs)                        # 빈 라벨 없음
+
 
 if __name__ == "__main__":
     unittest.main()
