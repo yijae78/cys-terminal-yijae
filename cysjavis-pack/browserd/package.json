@@ -1,0 +1,14 @@
+{
+  "name": "cys-browserd",
+  "version": "0.1.0",
+  "private": true,
+  "description": "자비스 browserd — 워커 웹 자기검증용 실제 크로미움 엔진 사이드카 (클린룸·팩 인큐베이션)",
+  "type": "module",
+  "scripts": {
+    "start": "bun run server.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "playwright-core": "1.49.1"
+  }
+}
