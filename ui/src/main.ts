@@ -70,7 +70,19 @@ const LAYOUT_KEY = "cys-layout-v2";
 // pane 식별 복합키 — 서로 다른 데몬이 같은 surface_id를 독립 발급하므로 (socket, sid)로 구분한다.
 const paneKey = (sid: number, socket?: string): string => `${socket ?? ""}#${sid}`;
 
-interface PaneRuntime {
+// pane 런타임의 종류 무관 이음새 — 일반 순회 루프(테마·포커스·리사이즈·정리)가 xterm 구체
+// 타입(rt.term) 대신 이 메서드만 경유하게 해, 다음 커밋에서 비터미널 pane을 안전히 편입한다.
+// 터미널 특화 경로(IME·send-text·PTY 배선·스크롤백·폰트·refresh)는 PaneRuntime 필드로 그대로 접근한다.
+interface PaneView {
+  el: HTMLElement;
+  resize(): void;
+  applyTheme(bg: string, fg: string): void;
+  setFocused(focused: boolean): void;
+  dispose(): void;
+}
+
+// PaneRuntime = PaneView의 터미널 구현(TerminalPaneView). 아래 필드는 터미널 전용 경로가 직접 쓴다.
+interface PaneRuntime extends PaneView {
   sid: number;
   socket?: string;
   el: HTMLElement;
@@ -1557,7 +1569,7 @@ function applyBgColor(color: string | null): void {
   const fg = readableForeground(bg);
   document.documentElement.style.setProperty("--bg", bg);
   document.documentElement.style.setProperty("--canvas-text", fg);
-  for (const rt of panes.values()) rt.term.options.theme = { background: bg, foreground: fg };
+  for (const rt of panes.values()) rt.applyTheme(bg, fg);
   if (color === null) localStorage.removeItem("cys-bg-color");
   else localStorage.setItem("cys-bg-color", color);
 }
@@ -2069,7 +2081,21 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   });
   observer.observe(termHost);
 
-  const rt: PaneRuntime = { sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom, lastOutputAt: () => outStamp.t, imeBusy: () => imeState.pending !== "" };
+  const rt: PaneRuntime = {
+    sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom,
+    lastOutputAt: () => outStamp.t,
+    imeBusy: () => imeState.pending !== "",
+    // ── PaneView 이음새(일반 순회 루프 진입점) — 아래 구현은 기존 직접 조작과 동작 동일 ──
+    resize: () => fitPane(rt),
+    applyTheme: (bg, fg) => { rt.term.options.theme = { background: bg, foreground: fg }; },
+    setFocused: (focused) => { rt.el.classList.toggle("focused", focused); if (focused) rt.term.focus(); },
+    dispose: () => {
+      rt.observer.disconnect();
+      rt.unlisten.forEach((u) => u());
+      rt.term.dispose();
+      rt.el.remove();
+    },
+  };
   panes.set(paneKey(sid, socket), rt);
   return rt;
 }
@@ -2085,10 +2111,7 @@ function fitPane(rt: PaneRuntime) {
 function destroyPaneRuntime(sid: number, socket?: string) {
   const rt = panes.get(paneKey(sid, socket));
   if (!rt) return;
-  rt.observer.disconnect();
-  rt.unlisten.forEach((u) => u());
-  rt.term.dispose();
-  rt.el.remove();
+  rt.dispose();
   panes.delete(paneKey(sid, socket));
 }
 
@@ -2372,8 +2395,7 @@ function movePane(sid: number, targetSid: number, side: DropSide) {
 function setFocus(sid: number) {
   focusedSid = sid;
   const key = paneKey(sid, current()?.socket);
-  for (const [id, rt] of panes) rt.el.classList.toggle("focused", id === key);
-  panes.get(key)?.term.focus();
+  for (const [id, rt] of panes) rt.setFocused(id === key);
   updateFtRoot(); // 파일 트리가 열려 있으면 선택한 surface의 폴더로 전환
 }
 
@@ -2403,7 +2425,7 @@ function render() {
   requestAnimationFrame(() => {
     for (const sid of collectSids(current()?.tree ?? null)) {
       const rt = panes.get(paneKey(sid, current()?.socket));
-      if (rt) fitPane(rt);
+      if (rt) rt.resize();
     }
   });
   saveLayout();
@@ -2480,7 +2502,7 @@ function attachDividerDrag(
       saveLayout();
       for (const sid of collectSids(node)) {
         const rt = panes.get(paneKey(sid, current()?.socket));
-        if (rt) fitPane(rt);
+        if (rt) rt.resize();
       }
     };
     window.addEventListener("mousemove", move);
@@ -5581,7 +5603,7 @@ applyWsbarVars(); // 마운트 시 저장값 복원
 
 function refitAllPanes() {
   for (const rt of panes.values()) {
-    fitPane(rt); // 숨김/미배치 pane은 fitPane 내부 가드가 거른다
+    rt.resize(); // 숨김/미배치 pane은 fitPane 내부 가드가 거른다
     rt.term.refresh(0, rt.term.rows - 1); // PTY rows/cols 불변이어도 화면 재렌더 보장
   }
 }
