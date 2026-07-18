@@ -110,13 +110,14 @@ def pick_ctx(node):
 
 
 # ------------------------------------------------------------ 코얼레싱 (§6.3)
-NOISE_NAMES = {"watchdog.duplicate_procs", "watchdog.proc_count"}
+NOISE_NAMES = {"watchdog.proc_count"}   # watchdog.* 는 dog_fx 가 선처리(kill/alert 변환·나머지 차단)
 ALERT_COALESCE = {  # (이벤트명 → 동일 surface 재발화 억제 윈도 s)
     "health.alert": 30.0,
     "master.deadman": 60.0,
     "pane.idle": 120.0,
     "schedule.fired": 10.0,
     "schedule.error": 30.0,
+    "watchdog.dog": 10.0,   # D4 강아지 fx (kill·alert 공유) ≤1건/10s
 }
 FX_BUDGET_PER_SEC = 20
 
@@ -436,8 +437,10 @@ class World:
                             for s in d.get("surfaces", [])}
                 new_keys = {node_key(s) for d in new_deps
                             for s in d.get("surfaces", [])}
-                old_shape = [d.get("_slug") for d in self.departments]
-                new_shape = [d.get("_slug") for d in new_deps]
+                # D5: (slug, label) 튜플 비교 — display_name 개명만 바뀌어도 structural=True
+                # → 전체 재빌드 유발(층 라벨 재시작 없이 반영). 개명은 드문 이벤트, 재빌드 비용 수용.
+                old_shape = [(d.get("_slug"), d.get("_dept_label")) for d in self.departments]
+                new_shape = [(d.get("_slug"), d.get("_dept_label")) for d in new_deps]
                 structural = (old_keys != new_keys) or (old_shape != new_shape)
                 # 출력량 변화율 (line_count 델타)
                 now = time.time()
@@ -680,6 +683,32 @@ TOOL_HOOKS = {"agent.hook.PreToolUse": "pre", "agent.hook.PostToolUse": "post",
               "agent.hook.PermissionRequest": "perm"}
 
 
+def dog_fx(name, ev, coal, now):
+    """watchdog kill/alert 이벤트 → 강아지 fx 프레임 (D4). 그 외 watchdog.* 는 차단(틱 피드 유지).
+
+    · watchdog.duplicate_procs → {t:'dog', kind:'kill', pid:<pids 첫번째 or None>, count:N}
+    · watchdog.proc_count_high → {t:'dog', kind:'alert', sid:<surface id>, count:N}
+    코얼레싱: kill·alert 공유 10s 창(ALERT_COALESCE['watchdog.dog']) — 초과분 폐기.
+    백로그(BACKLOG_FX_SECS 초과 과거 이벤트)는 억제. t:'dog' 라 구 프론트는 무시(additive·v2 유지).
+    """
+    p = ev.get("payload") or {}
+    if name == "watchdog.duplicate_procs":
+        pids = p.get("pids") if isinstance(p.get("pids"), list) else []
+        frame = {"t": "dog", "kind": "kill", "pid": pids[0] if pids else None,
+                 "count": p.get("count")}
+    elif name == "watchdog.proc_count_high":
+        frame = {"t": "dog", "kind": "alert", "sid": ev.get("surface_id"),
+                 "count": p.get("count")}
+    else:
+        return []   # tick_panic·load_high·duplicates_killed 등 그 외 watchdog.* 차단
+    ts = ev.get("timestamp") or now
+    if (now - ts) > BACKLOG_FX_SECS:
+        return []   # 과거 이벤트: 연출 억제 (콜드스타트 폭주 방지)
+    if not coal.allow("watchdog.dog", "dog", now):
+        return []   # 코얼레싱 창 내 초과분 폐기
+    return [frame]
+
+
 def route_event(ev, world, coal, slug="main", now=None):
     """데몬 이벤트 1건 → 방출 프레임 목록 (+월드 반영). 순수 로직 (테스트 대상).
 
@@ -691,9 +720,11 @@ def route_event(ev, world, coal, slug="main", now=None):
     fx 프레임은 억제한다 — "켜는 순간"의 과거 연출 폭주 방지, 상태는 손실 0.
     """
     name = ev.get("name") or ""
-    if name in NOISE_NAMES or name.startswith("watchdog."):
-        return [], False
     now = time.time() if now is None else now
+    if name.startswith("watchdog."):
+        return dog_fx(name, ev, coal, now), False   # kill/alert 만 강아지 fx, 그 외 차단
+    if name in NOISE_NAMES:
+        return [], False
     ts = ev.get("timestamp") or now
     backlog = (now - ts) > BACKLOG_FX_SECS
     sid = ev.get("surface_id")
@@ -1138,6 +1169,102 @@ def read_history(after_ts, limit=6000):
     return out[-limit:]
 
 
+# -------------------------------------------------- 스킬 카탈로그 (D6 · GET /skills)
+SKILL_SOURCES = [   # (스캔 디렉토리, 계정 라벨) — 팩 상대 + 계정 3곳
+    (os.path.join(ROOT, "skills"), "pack"),
+    (os.path.expanduser("~/.claude/skills"), "claude"),
+    (os.path.expanduser("~/.claude-cysinsight/skills"), "cysinsight"),
+    (os.path.expanduser("~/.claude-ysfuture/skills"), "ysfuture"),
+]
+SKILLS_CACHE_SECS = 60.0
+SKILL_DESC_MAX = 200
+_skills_cache = {"ts": 0.0, "data": None}
+_skills_lock = threading.Lock()
+_SKILL_FM_RE = re.compile(r"^\s*(name|description)\s*:\s*(.*)$")
+
+
+def parse_skill_md(path, dirname):
+    """SKILL.md → (name, description). frontmatter name/description 우선, 없으면 디렉토리명·첫 문단.
+
+    description 은 SKILL_DESC_MAX(200) 자 절단. 파일 부재·오류 시 (dirname, "").
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return dirname, ""
+    name = desc = None
+    body = text
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            body = text[end + 4:]
+            for line in text[3:end].splitlines():
+                m = _SKILL_FM_RE.match(line)
+                if not m:
+                    continue
+                k, v = m.group(1), m.group(2).strip()
+                if len(v) >= 2 and v[0] in "\"'" and v[-1] == v[0]:
+                    v = v[1:-1]
+                if k == "name" and v:
+                    name = v
+                elif k == "description" and v:
+                    desc = v
+    if not name:
+        name = dirname
+    if not desc:
+        for line in body.splitlines():   # 첫 문단(비어있지·헤딩·구분선 아닌 첫 줄)
+            s = line.strip()
+            if s and not s.startswith("#") and not s.startswith("---"):
+                desc = s
+                break
+        desc = desc or ""
+    return name, desc[:SKILL_DESC_MAX]
+
+
+def scan_skills(now=None, sources=None):
+    """4개 소스의 SKILL.md 스캔 → 병합 스킬 목록 {"skills":[{name,description,accounts}]}.
+
+    동일 name 은 accounts 병합(마스터·워커 계정 스킬 편차 표기). 60s 캐시(시각 비교) —
+    sources 명시(테스트) 시 캐시 우회. 각 소스는 하위 디렉토리의 SKILL.md 만 채택('_'·'.' 접두 skip).
+    """
+    now = time.time() if now is None else now
+    use_cache = sources is None
+    srcs = SKILL_SOURCES if sources is None else sources
+    if use_cache:
+        with _skills_lock:
+            if _skills_cache["data"] is not None \
+               and (now - _skills_cache["ts"]) < SKILLS_CACHE_SECS:
+                return _skills_cache["data"]
+    merged = {}   # name → {"name","description","accounts":[...]}
+    for base, account in srcs:
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for dirname in entries:
+            if dirname.startswith("_") or dirname.startswith("."):
+                continue
+            sk = os.path.join(base, dirname, "SKILL.md")
+            if not os.path.isfile(sk):
+                continue
+            nm, desc = parse_skill_md(sk, dirname)
+            ent = merged.get(nm)
+            if ent is None:
+                merged[nm] = {"name": nm, "description": desc, "accounts": [account]}
+            else:
+                if account not in ent["accounts"]:
+                    ent["accounts"].append(account)
+                if not ent["description"] and desc:   # 앞 소스가 빈 설명이면 뒤 소스로 보강
+                    ent["description"] = desc
+    data = {"skills": sorted(merged.values(), key=lambda e: e["name"])}
+    if use_cache:
+        with _skills_lock:
+            _skills_cache["ts"] = now
+            _skills_cache["data"] = data
+    return data
+
+
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
 
@@ -1241,7 +1368,7 @@ class SubscriptionSupervisor:
                     frames, want_poke = route_event(ev, self.world, self.coal, slug)
                     for fr in frames:
                         self.hub.publish(fr)
-                        if fr.get("t") == "fx":
+                        if fr.get("t") in ("fx", "dog"):   # D4 강아지 fx 도 /history 리플레이 포함
                             archive_fx(ev.get("timestamp"), fr)
                     if want_poke:
                         self.poke.set()
@@ -1462,6 +1589,9 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 after = 0.0
             body = json.dumps({"events": read_history(after)}, ensure_ascii=False).encode()
+            return self._send(200, "application/json; charset=utf-8", body)
+        if path == "/skills":   # D6: 카페 팝업스토어 진열용 스킬 카탈로그 (127.0.0.1·60s 캐시)
+            body = json.dumps(scan_skills(), ensure_ascii=False).encode()
             return self._send(200, "application/json; charset=utf-8", body)
         if path == "/peek":
             tok = self.headers.get("X-HUD-Token")
