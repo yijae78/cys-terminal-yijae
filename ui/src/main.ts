@@ -5162,6 +5162,17 @@ async function start() {
     stickyToast("boot-warn", "health", "팀 기동 경고", msg);
   });
 
+  // ★T2 안전모드(translocation/비정규 경로): 앱이 임시/비정규 위치에서 실행돼 데몬·launchd·팩 등록을
+  // 전부 skip 한 경우(백엔드 조기 반환) 침묵하지 않고 설치 복구 절차를 sticky 로 안내한다. 이 경로에선
+  // daemon-ready 가 오지 않아 상단바가 대기 상태로 남으므로, sticky 안내가 유일한 사용자 신호다.
+  await listen("translocation-blocked", (e) => {
+    const msg =
+      typeof e.payload === "string"
+        ? e.payload
+        : "cys.app을 응용 프로그램(Applications) 폴더로 옮긴 뒤 다시 열어 주세요.";
+    stickyToast("safe-mode", "health", "안전모드 — 설치 위치를 옮겨 주세요", msg);
+  });
+
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)
   checkForUpdate(true);
   setInterval(() => checkForUpdate(true), 6 * 3600 * 1000);

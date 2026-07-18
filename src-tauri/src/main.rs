@@ -715,6 +715,78 @@ fn autoregister_allowed(kind: &BundleKind) -> bool {
     matches!(kind, BundleKind::Canonical)
 }
 
+/// T2 부트 안전모드 판정 결과. autoregister 만 가리던 `autoregister_allowed` 보다 상위의 **부트 전면
+/// 게이트**로, 데몬 기동·launchd 등록·팩/hook 쓰기 등 자기경로 부수효과 전체를 조건화한다.
+#[derive(PartialEq, Debug, Clone, Copy)]
+enum BootPathVerdict {
+    Canonical,    // 정규 설치(/Applications·~/Applications) — 기존 부트 그대로 진행
+    Translocated, // Gatekeeper AppTranslocation 휘발 경로 — 안전모드
+    NonCanonical, // /Volumes(DMG 직실행)·Downloads·백업·개발 target/ 등 비정규 — 안전모드
+}
+
+/// 부트 경로 판정(순수): 실행 파일 경로와 escape env 플래그만으로 안전모드 진입 여부를 결정한다.
+///
+/// - `env_escape`(CYS_ALLOW_NONCANONICAL=1)이면 **무조건 Canonical** — 개발 빌드·CI·e2e 는 target/
+///   등 비정규 경로에서 실행되므로 이 탈출구가 없으면 테스트 하네스 자신이 안전모드에 갇힌다.
+/// - 그 외에는 `classify_bundle_dir` 4분류를 3분류로 접는다: Canonical→Canonical,
+///   Translocated→Translocated, Backup·NonStandard(=/Volumes·Downloads·개발 target/ 포함)→NonCanonical.
+///   판정 로직을 `classify_bundle_dir` 에 위임해 autoregister 가드와 divergence 하지 않게 한다
+///   (동일 경로 → 동일 안전성 판단·단일 SOT).
+///
+/// exe_path 는 `.../Contents/MacOS/cys-app`(current_exe) — 그 parent 가 classify_bundle_dir 입력이다.
+/// parent 가 없는 비정상 입력은 보수적으로 NonCanonical(정규 설치 근거 없음).
+fn boot_path_verdict(exe_path: &std::path::Path, env_escape: bool) -> BootPathVerdict {
+    if env_escape {
+        return BootPathVerdict::Canonical;
+    }
+    let macos_dir = match exe_path.parent() {
+        Some(d) => d,
+        None => return BootPathVerdict::NonCanonical,
+    };
+    match classify_bundle_dir(macos_dir) {
+        BundleKind::Canonical => BootPathVerdict::Canonical,
+        BundleKind::Translocated => BootPathVerdict::Translocated,
+        BundleKind::Backup | BundleKind::NonStandard => BootPathVerdict::NonCanonical,
+    }
+}
+
+/// 실행 중 프로세스의 부트 판정(비순수 래퍼) — current_exe + CYS_ALLOW_NONCANONICAL env 를 읽어
+/// `boot_path_verdict` 에 넘긴다. current_exe() 실패는 **fail-open(Canonical)**: 판정 근거가 전무할
+/// 때 정규 설치를 안전모드로 오무력화하지 않는다("오탐=앱 무력화" 회피). 이 fail-open 은
+/// maybe_autoregister_launchd 의 autoregister_allowed 가드(launchd 경로 독립 재검)로 방어심층이 유지된다.
+#[cfg(target_os = "macos")]
+fn current_boot_verdict() -> BootPathVerdict {
+    let env_escape = std::env::var("CYS_ALLOW_NONCANONICAL")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    match std::env::current_exe() {
+        Ok(p) => boot_path_verdict(&p, env_escape),
+        Err(_) => BootPathVerdict::Canonical,
+    }
+}
+
+/// 안전모드 사용자 안내 문구(순수). 자동 이동(자기 복사)은 오탐 시 파괴 위험이라 이번 범위에서
+/// 구현하지 않고, 복구 절차만 안내한다 — 설계 폴백 경로가 항상 성립. GUI 에서는
+/// `translocation-blocked` 이벤트로 stickyToast 에 실리고, 비-GUI(CI 등)에서는 stderr 로그로 나간다.
+#[cfg(target_os = "macos")]
+fn translocation_guidance(verdict: BootPathVerdict) -> String {
+    let cause = match verdict {
+        BootPathVerdict::Translocated => {
+            "Safari 등에서 내려받은 DMG 안의 앱을 곧바로 열어 macOS가 cys.app을 임시 위치에서 실행 중입니다."
+        }
+        _ => "cys.app이 정규 설치 위치(Applications) 밖에서 실행 중입니다.",
+    };
+    format!(
+        "{cause} 이 상태로는 백그라운드 서비스를 안전하게 등록할 수 없어 안전모드로 멈췄습니다.\n\n\
+         다음 순서로 설치해 주세요:\n\
+         1) Finder에서 cys.app을 응용 프로그램(Applications) 폴더로 드래그해 복사합니다.\n\
+         2) 이미 설치된 구버전 cys.app이 실행 중이면 먼저 종료한 뒤 새 버전으로 교체합니다.\n\
+         3) 그래도 '손상됨'으로 열리지 않으면 터미널에서 아래를 한 번 실행하세요:\n\
+         \u{2003}xattr -d com.apple.quarantine /Applications/cys.app\n\n\
+         설치 후 응용 프로그램 폴더의 cys.app을 다시 열면 정상 부팅됩니다."
+    )
+}
+
 /// `do shell script` 본문: target_dir 생성 + cys·cysd 심볼릭 멱등 생성(`ln -sf`).
 fn build_install_script(
     cys: &std::path::Path,
@@ -2927,6 +2999,25 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // ★T2 안전모드 게이트(translocation/비정규 경로 · 앱 자기삭제·"손상됨" 근본수리) —
+                // 데몬 기동·launchd 등록·팩/hook 쓰기 등 **자기경로 부수효과 전체보다 먼저** 실행 번들
+                // 위치를 판정한다. Canonical(정규 설치)이 아니면 부수효과를 전부 skip 하고 안내만 표시한
+                // 뒤 조기 반환한다(자동 이동 없음 — 오탐 시 파괴 위험 회피, 안내 폴백이 항상 성립).
+                // Canonical 이면 아래 기존 부트 흐름을 그대로 통과한다(정상 부트 무영향). 기존 설치본이
+                // 실행 중이면 single-instance 플러그인이 새 인스턴스를 접고, 그와 별개로 이 게이트가
+                // 비정규 인스턴스의 데몬 스폰 자체를 막는다(방어심층).
+                #[cfg(target_os = "macos")]
+                {
+                    let verdict = current_boot_verdict();
+                    if verdict != BootPathVerdict::Canonical {
+                        let msg = translocation_guidance(verdict);
+                        eprintln!(
+                            "[cys-app] 안전모드: 비정규 실행 위치({verdict:?}) — 데몬·launchd·팩 등록 skip\n{msg}"
+                        );
+                        let _ = handle.emit("translocation-blocked", msg);
+                        return;
+                    }
+                }
                 // ★온보딩 게이트(v4) — GUI 전용 완료 마커(.gui-onboarded) 기준. 팩 마커(.pack-version)
                 // 기준이던 v3는 CLI autostart·잔존 schtasks 등으로 cysd가 GUI보다 먼저 돈 머신에서
                 // 게이트가 선점돼 ~/.claude hook이 영구 미설치됐다(0.12.52 cys-neo 실사고 — "너는
@@ -3354,6 +3445,99 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         assert!(!autoregister_allowed(&BundleKind::Translocated), "임시 경로는 자동등록 거부");
         assert!(!autoregister_allowed(&BundleKind::Backup), "백업 번들은 자동등록 거부");
         assert!(!autoregister_allowed(&BundleKind::NonStandard), "비표준(Downloads·USB 등)도 자동등록 거부");
+    }
+
+    // ── T4: 부트 안전모드 감지 게이트 ─────────────────────────────────────
+    #[test]
+    fn boot_path_verdict_positive_and_negative_cases() {
+        use std::path::Path;
+        // 양성 3케이스(비-Canonical=안전모드 진입) — escape env 없음(false).
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/private/var/folders/ab/AppTranslocation/CD12/d/cys.app/Contents/MacOS/cys-app"),
+                false,
+            ),
+            BootPathVerdict::Translocated,
+            "AppTranslocation 임시 경로 = Translocated",
+        );
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Volumes/cys 0.12.91/cys.app/Contents/MacOS/cys-app"),
+                false,
+            ),
+            BootPathVerdict::NonCanonical,
+            "DMG(/Volumes) 직실행 = NonCanonical",
+        );
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Users/cys/Downloads/cys.app/Contents/MacOS/cys-app"),
+                false,
+            ),
+            BootPathVerdict::NonCanonical,
+            "임의(Downloads) 경로 = NonCanonical",
+        );
+        // 음성 2케이스(Canonical=정상 부트 그대로).
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Applications/cys.app/Contents/MacOS/cys-app"),
+                false,
+            ),
+            BootPathVerdict::Canonical,
+            "/Applications 정규 설치 = Canonical",
+        );
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Users/cys/dev/cys/target/release/cys-app"),
+                true,
+            ),
+            BootPathVerdict::Canonical,
+            "CYS_ALLOW_NONCANONICAL=1(escape env) = 무조건 Canonical(개발·CI 자기감금 방지)",
+        );
+    }
+
+    #[test]
+    fn boot_path_verdict_escape_overrides_and_user_applications() {
+        use std::path::Path;
+        // ~/Applications 도 Canonical(정규 allowlist).
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Users/cys/Applications/cys.app/Contents/MacOS/cys-app"),
+                false,
+            ),
+            BootPathVerdict::Canonical,
+        );
+        // escape env 는 translocation 경로마저 Canonical 로 덮는다(무조건 = 최우선 단락).
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/private/var/folders/ab/AppTranslocation/x/cys.app/Contents/MacOS/cys-app"),
+                true,
+            ),
+            BootPathVerdict::Canonical,
+        );
+        // escape 없는 개발 target/ 는 NonCanonical(하네스가 env 로 스스로 풀어야 함).
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Users/cys/dev/cys/target/debug/cys-app"),
+                false,
+            ),
+            BootPathVerdict::NonCanonical,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translocation_guidance_carries_recovery_steps() {
+        // 안내는 ①Applications 드래그 ②구버전 종료·교체 ③xattr quarantine 제거를 모두 담아야 한다.
+        let g = translocation_guidance(BootPathVerdict::Translocated);
+        assert!(g.contains("Applications"), "① Applications 드래그 설치 안내 포함");
+        assert!(g.contains("구버전") && g.contains("종료"), "② 구버전 종료·교체 안내 포함");
+        assert!(
+            g.contains("xattr -d com.apple.quarantine /Applications/cys.app"),
+            "③ quarantine 제거 명령 포함",
+        );
+        // NonCanonical 도 동일 복구 절차를 안내한다(원인 문구만 일반화).
+        let n = translocation_guidance(BootPathVerdict::NonCanonical);
+        assert!(n.contains("xattr -d com.apple.quarantine /Applications/cys.app"));
     }
 
     #[test]
