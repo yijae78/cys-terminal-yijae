@@ -3406,6 +3406,9 @@ interface FeedItem {
   surface_id: number | null;
   status: string;
   decision: string | null;
+  // W3: cysd가 title·body에서 파생한 위험 클래스("auto"|"high"|"human") + 자동결재 라우팅 여부.
+  risk_class?: string | null;
+  auto_route?: boolean;
 }
 
 // 승인 Feed는 Control Center의 '승인 Feed' 탭으로 편입됨(독립 패널 폐기).
@@ -3415,16 +3418,43 @@ function openFeed() {
   setCcTab("feed");
 }
 
-// 승인 자동 화면전환 유예: master가 이 시간 안에 자동 승인(reply)하면 전환하지 않는다.
+// 승인 자동 화면전환 유예: master/CEO가 이 시간 안에 자동 승인(reply)하면 전환하지 않는다.
 // 유예 후에도 pending인 항목 = 사람 수동 승인 필요 → 그때만 승인 Feed 탭으로 전환.
-const FEED_SWITCH_GRACE_MS = 30_000;
-function scheduleFeedSwitchIfStillPending(requestId: string) {
+const FEED_SWITCH_GRACE_MS = 30_000; // 비대상(현행) 유예
+// W3.4: auto_route 항목은 CEO 심의형 turn이 90초 초과가 흔하므로 기본 유예를 90초로 둔다.
+const FEED_SWITCH_GRACE_AUTO_MS = 90_000;
+// approval.stalled(5분) 경로가 사람 소환을 담당하므로 그 전까지만 동적 연장한다(그 뒤엔 escalation).
+const FEED_SWITCH_MAX_MS = 300_000;
+
+// W3.4: CEO 좌석이 살아서 생성 중(working·저idle)이면 결재 심의가 진행 중으로 본다 —
+// nodeSig(refreshSidebarStatus가 org_status에서 채움)를 재갱신한 뒤 판정한다.
+async function ceoIsActivelyGenerating(): Promise<boolean> {
+  await refreshSidebarStatus().catch(() => {});
+  for (const sig of nodeSig.values()) {
+    if (sig.role === "ceo") {
+      const alive = sig.agent_alive !== false; // null(미상)은 살아있다고 본다
+      const working = sig.state === "working" || sig.idle_secs < 30;
+      return alive && working;
+    }
+  }
+  return false; // ceo 좌석 신호 부재 = 비활성 → 즉시 전환(사람 소환)
+}
+
+// autoRoute=true면 90초 기본 + CEO 활성 시 wait timeout 내 동적 연장, 아니면 30초 고정.
+function scheduleFeedSwitchIfStillPending(requestId: string, autoRoute = false, elapsedMs = 0) {
   if (!requestId) return;
+  const grace = autoRoute ? FEED_SWITCH_GRACE_AUTO_MS : FEED_SWITCH_GRACE_MS;
   setTimeout(async () => {
     const r = (await invoke("feed_list", { status: null }).catch(() => null)) as { items: FeedItem[] } | null;
     const item = r?.items.find((i) => i.request_id === requestId);
-    if (item?.status === "pending") openFeed();
-  }, FEED_SWITCH_GRACE_MS);
+    if (item?.status !== "pending") return; // 이미 결재됨 — 전환 없음
+    // auto_route: CEO가 살아서 생성 중이고 상한 이내면 유예 연장(전환 보류).
+    if (autoRoute && elapsedMs + grace < FEED_SWITCH_MAX_MS && (await ceoIsActivelyGenerating())) {
+      scheduleFeedSwitchIfStillPending(requestId, true, elapsedMs + grace);
+      return;
+    }
+    openFeed(); // 유예 후에도 pending + CEO 비활성/상한 → 사람 개입
+  }, grace);
 }
 
 // ---------- file tree (오른쪽 섹션 — 선택한 surface의 폴더 탐색) ----------
@@ -4980,9 +5010,12 @@ function onDaemonEvent(event: Record<string, unknown>) {
   } else if (category === "feed") {
     if (name === "feed.item.created") {
       toast("feed", "📥 승인 요청", String(payload.title ?? ""));
-      // 즉시 전환하지 않는다 — master 자동 승인 유예 후에도 pending인 항목만
+      // 즉시 전환하지 않는다 — master/CEO 자동 승인 유예 후에도 pending인 항목만
       // 사람 개입 필요로 보고 전환한다(자동 승인분은 무전환).
-      if (payload.wait === true) scheduleFeedSwitchIfStillPending(String(payload.request_id ?? ""));
+      // W3.4: auto_route 항목은 90초 기본 + CEO 활성 동적 연장, 비대상 wait 항목은 30초.
+      const autoRoute = payload.auto_route === true;
+      if (payload.wait === true || autoRoute)
+        scheduleFeedSwitchIfStillPending(String(payload.request_id ?? ""), autoRoute);
     }
     refreshFeed();
     refreshSidebarStatus(); // 피드 이벤트 시 집계 배지 갱신(멀티부서 정합)
