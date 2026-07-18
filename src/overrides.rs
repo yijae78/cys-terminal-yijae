@@ -266,13 +266,9 @@ mod tests {
         if let Some((name, body)) = write_json {
             std::fs::write(td.join("overrides").join(name), body).unwrap();
         }
-        let saved = std::env::var(crate::pack::ENV_PACK_DIR).ok();
-        std::env::set_var(crate::pack::ENV_PACK_DIR, &td);
+        // ★W0-b: EnvGuard로 이전 값 복원형 격리 — f()가 패닉해도 drop이 복원(미설정 창 제거).
+        let _g_pack = crate::pack::EnvGuard::set(crate::pack::ENV_PACK_DIR, &td);
         let out = f();
-        match saved {
-            Some(v) => std::env::set_var(crate::pack::ENV_PACK_DIR, v),
-            None => std::env::remove_var(crate::pack::ENV_PACK_DIR),
-        }
         let _ = std::fs::remove_dir_all(&td);
         out
     }
