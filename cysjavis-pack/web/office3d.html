@@ -1315,6 +1315,7 @@ function buildWorld(w){
   worldGroup.add(makeRooftop(roofY));      // 루프탑 데크 (파라솔·라운지체어)
   worldGroup.add(makeChairmanOffice(roofY)); // 회장실 (주인 전용)
   buildOwner(roofY);                        // 👑 주인 아바타 + 엘리베이터
+  buildDog();                               // 🐶 watchdog 강아지 (로비 리셋 · 순찰 시작)
   scene.add(worldGroup);
   baseTy = roofY / 2 + 1.2;
   worldMeta = { seq:w.seq, daemonv:w.daemon?.version||'', deps:deps.length, total };
@@ -1685,7 +1686,9 @@ function addChat(cls, name, text){
 
 // ---------- 주인(오너) 아바타 · 엘리베이터 · 강림 (#2) ----------
 const ELEV = { x: -SLAB_W/2+0.9, z: SLAB_D/2-0.8 };
+const SERVER_Y = -2.6;                      // 지하 서버룸 슬랩 y (buildWorld sy와 동일값)
 let owner = null, elevCar = null, ownerHome = new THREE.Vector3();
+let dog = null, dogRoute = [];              // D4 watchdog 강아지 · 순찰 루트(로비→각층→지하)
 // 👑 왕좌 근접 자동 착석 — 주인이 옥상 왕좌 반경 안에서 멈추면 앉고, 이동을 시작하면 일어선다.
 let ownerSeated = false;
 // 자리 존 AABB — 책상+왕좌를 포함. 존 안에서 정지(idle)하면 왕좌로 스냅 걷기 후 착석.
@@ -1886,6 +1889,138 @@ function ownerManualTick(dt){
   g.rotation.y = Math.atan2(dir.x, dir.z);
   owner.walkPh += dt*9; owner.pr.swing(owner.walkPh);
   owner.manual = false; owner.busy = false;
+}
+
+// ---------- D4. watchdog 강아지 (저폴리 · 순찰 · kill/alert 반응) ----------
+//  메시에 nodeKey·floorY userData 비부여(클릭 오염 방지). 층간 이동=승강 코어 페이드(elevCar 미사용).
+function makeDog(){
+  const g = new THREE.Group();
+  const fur  = new THREE.MeshStandardMaterial({ color:0xb98a52, roughness:0.85, transparent:true });
+  const furD = new THREE.MeshStandardMaterial({ color:0x8a5f34, roughness:0.85, transparent:true });
+  g.add(mesh(new THREE.BoxGeometry(0.26, 0.28, 0.5), fur, 0, 0.34, 0));          // 몸(전후=z, 머리 +z)
+  g.add(mesh(new THREE.BoxGeometry(0.24, 0.24, 0.22), fur, 0, 0.46, 0.34));      // 머리
+  g.add(mesh(new THREE.BoxGeometry(0.12, 0.1, 0.12), furD, 0, 0.42, 0.47, false));   // 주둥이
+  g.add(mesh(new THREE.BoxGeometry(0.06, 0.12, 0.05), furD,  0.09, 0.60, 0.30, false));  // 귀
+  g.add(mesh(new THREE.BoxGeometry(0.06, 0.12, 0.05), furD, -0.09, 0.60, 0.30, false));
+  const legG = new THREE.BoxGeometry(0.07, 0.22, 0.07);
+  [[0.10,0.18],[-0.10,0.18],[0.10,-0.18],[-0.10,-0.18]].forEach(([lx,lz])=>
+    g.add(mesh(legG, furD, lx, 0.11, lz, false)));
+  const tail = new THREE.Group(); tail.position.set(0, 0.44, -0.25);             // 꼬리(-z 후방)
+  tail.add(mesh(new THREE.BoxGeometry(0.05, 0.05, 0.22), fur, 0, 0.06, -0.10, false));
+  g.add(tail);
+  g.scale.setScalar(0.95);
+  return { grp:g, tail };
+}
+function buildDog(){
+  const d = makeDog();
+  worldGroup.add(d.grp);                     // userData 미부여 — 클릭/층 판정 오염 없음
+  dogRoute = [];
+  const lob = floorPlans.get('로비');
+  dogRoute.push({ y:0, patrol: (lob && lob.patrol) || [[0,3.4],[3.6,0],[-3.6,0]] });
+  (lastWorld.departments||[]).forEach(dep=>{
+    const pl = floorPlans.get(dep.id);
+    if (pl && pl.patrol) dogRoute.push({ y: dep.floor*FLOOR_H, patrol: pl.patrol });
+  });
+  dogRoute.push({ y: SERVER_Y, patrol: [[-2,1.6],[2,1.6],[0,-1.2]] });   // 지하 서버룸
+  dog = { grp:d.grp, tail:d.tail, wag:0, state:'patrol', ri:0, wi:0, op:1,
+    trY:0, trPhase:'out', trThen:'patrol', killPid:null, killPopped:false,
+    barks:0, barkTimer:0, holdMs:0 };
+  const p0 = dogRoute[0].patrol[0];
+  d.grp.position.set(p0[0], 0, p0[1]);       // 로비 리셋(재빌드 규약)
+}
+const DOG_SPEED = 2.2;
+function dogSetOpacity(o){ dog.grp.traverse(m=>{ if (m.material) m.material.opacity = o; }); }
+function dogStepTo(g, x, y, z, dt, speed=DOG_SPEED){
+  g.position.y = y;
+  const dx = x - g.position.x, dz = z - g.position.z, dist = Math.hypot(dx, dz);
+  if (dist < 0.08) return true;
+  const s = Math.min(speed*dt, dist);
+  g.position.x += dx/dist*s; g.position.z += dz/dist*s;
+  g.rotation.y = Math.atan2(dx, dz);         // 머리 +z 전방 — 직원 규약과 동일
+  return false;
+}
+function dogPop(txt, color){
+  const s = textSprite(txt, { size:19, color, bg:'rgba(8,26,46,.92)' });
+  s.position.copy(dog.grp.position).add(new THREE.Vector3(0, 1.15, 0));
+  worldGroup.add(s); pops.push({ s, life:1.6 });
+}
+function flashRack(pid){                      // pid가 racks에 등록됐을 때만 — 통상 miss가 정상(fallback 기본)
+  const led = racks.get(pid); if (!led) return;
+  const orig = led.material.color.getHex(); let n = 0;
+  const iv = setInterval(()=>{ if (!led.material){ clearInterval(iv); return; }
+    led.material.color.setHex(n%2 ? 0xff3030 : 0x330808); n++;
+    if (n > 12){ clearInterval(iv); led.material.color.setHex(orig); } }, 250);   // 3s
+}
+function dogEnter(state){
+  if (state === 'kill_run') dog.killPopped = false;
+  else if (state === 'alert_bark'){ dog.barks = 2; dog.barkTimer = 0; }
+}
+function dogTransitTo(targetY, thenState){    // 승강 코어 페이드 전환(elevCar 미사용)
+  if (Math.abs(dog.grp.position.y - targetY) < 0.2){ dog.state = thenState; dogEnter(thenState); return; }
+  dog.trY = targetY; dog.trThen = thenState; dog.trPhase = 'out'; dog.state = 'transit';
+}
+function dogResume(){
+  const y = dog.grp.position.y;
+  const ri = dogRoute.findIndex(r=>Math.abs(r.y - y) < 0.3);
+  dog.ri = ri >= 0 ? ri : 0; dog.wi = 0; dog.op = 1; dogSetOpacity(1); dog.state = 'patrol';
+}
+function dogTick(dt){
+  if (!dog || !dogRoute.length) return;
+  dog.wag += dt*10; dog.tail.rotation.y = Math.sin(dog.wag)*0.5;   // 꼬리 흔들기
+  const g = dog.grp;
+  if (dog.state === 'transit'){
+    if (dog.trPhase === 'out'){
+      const arr = dogStepTo(g, ELEV.x, g.position.y, ELEV.z, dt);
+      dog.op = Math.max(0, dog.op - dt*2.4); dogSetOpacity(dog.op);
+      if (arr && dog.op <= 0.05){ g.position.set(ELEV.x, dog.trY, ELEV.z); dog.trPhase = 'in'; }
+    } else {
+      dog.op = Math.min(1, dog.op + dt*2.4); dogSetOpacity(dog.op);
+      if (dog.op >= 1){ dog.state = dog.trThen; dogEnter(dog.trThen); }
+    }
+    return;
+  }
+  if (dog.state === 'patrol'){
+    const route = dogRoute[dog.ri]; const wp = route.patrol[dog.wi] || [0,0];
+    if (dogStepTo(g, wp[0], route.y, wp[1], dt)){
+      dog.wi++;
+      if (dog.wi >= route.patrol.length){
+        dog.ri = (dog.ri + 1) % dogRoute.length; dog.wi = 0;
+        dogTransitTo(dogRoute[dog.ri].y, 'patrol');
+      }
+    }
+    return;
+  }
+  if (dog.state === 'kill_run'){
+    if (dogStepTo(g, 0, SERVER_Y, 0, dt, 3.4)){                    // 서버룸 중앙 질주(기본 타깃)
+      if (!dog.killPopped){ dog.killPopped = true; dogPop('💢', '#ff6a6a');
+        if (dog.killPid != null) flashRack(dog.killPid); dog.holdMs = performance.now() + 1600; }
+      if (performance.now() > dog.holdMs) dogResume();
+    }
+    return;
+  }
+  if (dog.state === 'alert_bark'){
+    dog.barkTimer -= dt;
+    if (dog.barks > 0 && dog.barkTimer <= 0){ dog.barks--; dog.barkTimer = 0.6; dogPop('🐶 멍!', '#ffd166'); }
+    if (dog.barks <= 0 && dog.barkTimer <= 0.15) dogResume();
+    return;
+  }
+}
+function fxDog(f){                             // {t:'dog', kind:'kill'|'alert', pid?/sid?, count?}
+  if (!dog) return;
+  if (dog.state === 'transit') return;         // 이동 중엔 신규 반응 무시(코얼레싱은 브리지가 담당)
+  if (f.kind === 'kill'){
+    dog.killPid = f.pid;
+    addTick(`🐶 watchdog: 중복 프로세스 감지 — 강아지 출동${f.pid!=null?' (pid '+f.pid+')':''}`, 1);
+    dogTransitTo(SERVER_Y, 'kill_run');
+  } else if (f.kind === 'alert'){
+    addTick(`🐶 watchdog 경보: 프로세스 과다${f.count?' ('+f.count+')':''}`, 1);
+    let ty = dog.grp.position.y;               // sid → 노드 층(있으면), 없으면 현재 층에서 짖기
+    if (f.sid != null){
+      for (const e of nodes.values()){ if (String(e.data.key).includes(String(f.sid))){ ty = e.group.position.y; break; } }
+    }
+    if (Math.abs(ty - dog.grp.position.y) < 0.3){ dog.state = 'alert_bark'; dogEnter('alert_bark'); }
+    else dogTransitTo(ty, 'alert_bark');
+  }
 }
 
 async function postCommand(key, text, meeting){
@@ -2272,7 +2407,9 @@ function exitReplay(){ replay.mode = false; tlSlider.value = 1000; tlLabel.textC
 function replayTick(dt){
   replay.simT += dt*90;   // 90배속
   while (replay.idx < replay.events.length && replay.events[replay.idx].ts <= replay.simT){
-    handleFx(replay.events[replay.idx].fx); replay.idx++;
+    const ev = replay.events[replay.idx].fx;
+    if (ev && ev.t === 'dog') fxDog(ev); else handleFx(ev);   // 강아지 fx는 t로 분리 라우팅
+    replay.idx++;
   }
   tlLabel.textContent = '⏪ ' + new Date(replay.simT*1000).toLocaleTimeString('ko-KR',{hour12:false});
   tlSlider.value = Math.min(1000, Math.round((replay.simT - replay.t0)/(replay.t1 - replay.t0)*1000));
@@ -2425,6 +2562,7 @@ function connect(){
       case 'patch': patchNode(f.key, f.node); break;
       case 'patch_top': handlePatchTop(f); break;   // #8 #9 #10 #12 상단 필드 갱신
       case 'fx': if (!replay.mode){ handleFx(f); worldMeta.seq++; refreshStats(); } break;
+      case 'dog': if (!replay.mode) fxDog(f); break;   // D4 강아지 fx (kind='alert'가 handleFx rate-limit와 충돌 → t로 분리)
       case 'resync': fetchWorld(); break;
     }
   };
@@ -2483,6 +2621,7 @@ function frame(now){
     pts.needsUpdate = true; }
   advanceOwner(dt, t);
   ownerManualTick(dt);
+  dogTick(dt);
   proxT += dt;
   if (proxT > 0.2){ proxT = 0; proximityTick(); }
   if (talkKey) positionTalk();
