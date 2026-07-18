@@ -1031,7 +1031,7 @@ function makeRooftop(roofY){
       ch.rotation.x = -0.25; ch.position.set(dx+ox, roofY+0.3, dz+oz);
       ch.castShadow = true; g.add(ch); });
   });
-  // R2: 옥상 네온 'C Y S J A V I S' 스프라이트 삭제 (좌상단 h1만 남김). '회 장 실' 라벨은 회장실에 유지.
+  // R2: 옥상 네온 회사명 로고 스프라이트 삭제 (좌상단 h1만 남김). '회 장 실' 라벨은 회장실에 유지.
   return g;
 }
 
@@ -1312,7 +1312,7 @@ function buildWorld(w){
   FLOOR_NAMES.set(0, '로비');
   deps.forEach(d=>FLOOR_NAMES.set(Math.round(d.floor*FLOOR_H*10)/10, d.id));
   FLOOR_NAMES.set(Math.round(roofY*10)/10, '옥상 · 회장실');
-  worldGroup.add(makeRooftop(roofY));      // 루프탑 데크 (파라솔·라운지체어·네온)
+  worldGroup.add(makeRooftop(roofY));      // 루프탑 데크 (파라솔·라운지체어)
   worldGroup.add(makeChairmanOffice(roofY)); // 회장실 (주인 전용)
   buildOwner(roofY);                        // 👑 주인 아바타 + 엘리베이터
   scene.add(worldGroup);
