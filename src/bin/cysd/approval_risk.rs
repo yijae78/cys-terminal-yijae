@@ -86,7 +86,12 @@ fn has_denylist(norm: &str, lower: &str) -> bool {
         return true;
     }
     // 외부발행 정규화 매칭(비연속 회피 차단): gitpush·ghrelease·credit·크레딧.
-    for m in ["gitpush", "ghrelease", "credit"] {
+    // + 영문 파괴 동사(F3): delete·wipe·drop·truncate·destroy·overwrite. 부분일치 오탐
+    // (dropdown 등)은 HighRisk=fail-closed라 안전측 — 자동화 과소보다 유출 차단이 우선.
+    for m in [
+        "gitpush", "ghrelease", "credit", "delete", "wipe", "drop", "truncate", "destroy",
+        "overwrite",
+    ] {
         if norm.contains(m) {
             return true;
         }
@@ -202,6 +207,21 @@ mod tests {
         assert_eq!(derive_risk("gh release v1 발행", ""), RiskClass::HighRisk);
         assert_eq!(derive_risk("credit 반영", ""), RiskClass::HighRisk);
         assert_eq!(derive_risk("크레딧 반영", ""), RiskClass::HighRisk);
+    }
+
+    /// F3: 영문 파괴 동사 6종 각각 HighRisk(fail-closed).
+    #[test]
+    fn english_destructive_verbs_caught() {
+        for phrase in [
+            "delete stale records",
+            "wipe the cache",
+            "drop table users",
+            "truncate the log",
+            "destroy the volume",
+            "overwrite config file",
+        ] {
+            assert_eq!(derive_risk(phrase, ""), RiskClass::HighRisk, "미포착: {phrase}");
+        }
     }
 
     #[test]
