@@ -2231,12 +2231,19 @@ if (dbg){
     return { ctx: e.data.ctx?.pct ?? null, presence: e.data.presence,
              ringVisible: !!(e.set.progRing && e.set.progRing.visible) };
   };
-  dbg.ownerState = ()=> owner ? {       // D2 착석 상태기계 단언(좌면고·기립고·존)
-    seated: ownerSeated,
-    x: owner.pr.grp.position.x, y: owner.pr.grp.position.y, z: owner.pr.grp.position.z,
-    planLen: owner.plan.length } : null;
-  dbg.floorPlan = (deptId)=> floorPlans.get(deptId) || null;   // D1 배치 불변식 단언
-  dbg.floorPlanOf = floorPlanOf;
+  // e2e 게이트 배선 (master 규약 · DEBUG일 때만 · 프로덕션 무영향)
+  dbg.floorPlans = floorPlans;          // D1: deptId→plan 라이브 맵(재빌드=clear+set, 참조 유지)
+  dbg.floorPlanOf = floorPlanOf;        // D1: 템플릿·불변식 직접 산출
+  Object.defineProperty(dbg, 'ownerSeated', { configurable:true, get:()=> ownerSeated });   // D2 착석 상태
+  dbg.ownerPos = ()=> owner ? { x:owner.pr.grp.position.x, y:owner.pr.grp.position.y,
+    z:owner.pr.grp.position.z, planLen:owner.plan.length } : null;
+  Object.defineProperty(dbg, 'dogState', { configurable:true, get:()=> dog ? {   // D4 강아지 상태
+    mode: dog.state, floorY: dog.grp.position.y,
+    target: dog.state==='transit' ? ('floor@'+dog.trY)
+          : dog.state==='kill_run' ? 'server-center'
+          : dog.state==='patrol' ? ('wp'+dog.wi) : dog.state } : null });
+  dbg.shopItems = ()=>{ let n=0; if (worldGroup) worldGroup.traverse(o=>{   // D6 진열 상품 수
+    if (o.userData && o.userData.shopItem) n++; }); return n; };
 }
 document.getElementById('p-close').onclick = closePanel;
 function setPanelStatus(msg, cls){
