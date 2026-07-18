@@ -3806,6 +3806,62 @@ class Preflight:
         else:
             self.add(cid, PASS, "게이트 대장 최신(%.1f분 전) — 델타게이트 생존" % age_min)
 
+    # ── C70 launchd 스테일 잡 탐지 (macOS · 탐지·보고 전용 — 자동 수정 절대 금지) ──
+    # W2(DESIGN_triple-fix_20260718 §W2): 본부 데몬 launchd 잡이 ①penalty box(재시작 폭풍
+    # 억제) ②last exit code=78(EX_CONFIG — plist config 부적합) ③program 경로가 소멸한 backup
+    # 번들로 유추 채택(inferred stale — /Applications/cys.app 아님) 상태에 빠지면 오피스·승인
+    # 채널이 조용히 죽는다. 이 체크는 그 3징후를 `launchctl print` 출력에서 탐지해 WARN 보고만
+    # 한다(WARN은 exit 0 불변 — 부트 게이트 NOT READY 미차단, 탐지·보고 전용 규약).
+    # ★--fix 에서도 이 체크는 절대 자동 수정하지 않는다(bootout·bootstrap 재부트스트랩을
+    # 자동화하면 매 업데이트 세션마다 sibling 스폰·데몬 대학살이 파생된다 — 2R 판정). 수리는
+    # 오너 지정 정지창의 CSO 집행 런북(§W2)으로만. launchctl 부재·권한 실패·잡 미등록은
+    # 오탐 방지로 SKIP(스테일이 아니라 판정 불가 상태).
+    def c70_launchd_job(self):
+        cid = "C70.launchd-job"
+        if self.skipped(cid):
+            return
+        if sys.platform != "darwin":
+            self.add(cid, SKIP, "macOS 아님 — launchd 미해당")
+            return
+        launchctl = shutil.which("launchctl")
+        if not launchctl:
+            self.add(cid, SKIP, "launchctl 부재 — 판정 불가")
+            return
+        label = "gui/%d/com.cysjavis.cysd" % os.getuid()
+        try:
+            r = subprocess.run([launchctl, "print", label],
+                               capture_output=True, timeout=10, env=_utf8_env())
+        except Exception as e:
+            self.add(cid, SKIP, "launchctl print 실행 실패 — 판정 불가: %s" % e)
+            return
+        out = ((r.stdout or b"").decode("utf-8", "replace")
+               + (r.stderr or b"").decode("utf-8", "replace"))
+        # 잡 미등록(bootstrap 안 됨)·권한 거부는 스테일이 아니라 '판정 불가'다 → SKIP(오탐 금지).
+        # launchctl print 는 미등록 잡에 nonzero + "Could not find service" 를 낸다(잡 이름 미출현).
+        if r.returncode != 0 and "com.cysjavis.cysd" not in out:
+            self.add(cid, SKIP,
+                     "launchd 잡 미등록/조회 불가(rc=%d) — 스테일 판정 대상 아님" % r.returncode)
+            return
+        low = out.lower()
+        symptoms = []
+        if "penalty box" in low:
+            symptoms.append("penalty box(재시작 억제)")
+        # `last exit code = 78: EX_CONFIG` (공백 변주 허용, 78 뒤는 ':' 등 비단어 경계).
+        if re.search(r"last exit code\s*=\s*78\b", low):
+            symptoms.append("last exit code=78(EX_CONFIG)")
+        # program 경로가 /Applications/cys.app 이 아니면 소멸 번들 유추 채택(inferred stale).
+        m = re.search(r"^\s*program\s*=\s*(.+?)\s*$", out, re.MULTILINE | re.IGNORECASE)
+        if m and "/Applications/cys.app/" not in m.group(1):
+            symptoms.append("program=%s (inferred stale — /Applications/cys.app 아님)"
+                            % m.group(1).strip())
+        if symptoms:
+            self.add(cid, WARN,
+                     "launchd 스테일 징후 — %s · 수리는 오너 정지창 CSO 런북(DESIGN §W2)으로만, "
+                     "자동 재부트스트랩 금지(탐지·보고 전용)" % "; ".join(symptoms))
+        else:
+            self.add(cid, PASS,
+                     "launchd 잡 정상(penalty box·EX_CONFIG·inferred stale 징후 없음)")
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -3837,6 +3893,7 @@ class Preflight:
             self.c57_temp_hook_leak, self.c58_trust_harden, self.c59_guard_wiring,
             self.c60_gate_wiring, self.c61_doc_code_sot, self.c65_drain_verify,
             self.c66_board_catalog, self.c67_learn_wiring, self.c69_gate_ledger,
+            self.c70_launchd_job,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,
