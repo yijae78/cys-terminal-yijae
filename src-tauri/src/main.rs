@@ -697,7 +697,13 @@ fn classify_bundle_dir(macos_dir: &std::path::Path) -> BundleKind {
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-            if parent == "/Applications" || parent.ends_with("/Applications") {
+            // ★/Volumes 가드: DMG·외장 마운트 안의 Applications 폴더/심링크(예: /Volumes/<dmg>/Applications/
+            // cys.app)는 ends_with("/Applications")를 만족해도 Canonical 이 아니다 — 언마운트·이젝트 시
+            // 죽은 경로가 되어 자기삭제·"손상됨" 결함이 재발한다(DMG 안 Applications 심링크 경유 실행 오판
+            // 차단). 정규 /Applications·~/Applications 만 Canonical(둘 다 /Volumes 하위가 아니므로 불변).
+            if !parent.starts_with("/Volumes/")
+                && (parent == "/Applications" || parent.ends_with("/Applications"))
+            {
                 return BundleKind::Canonical;
             }
         }
@@ -763,6 +769,23 @@ fn current_boot_verdict() -> BootPathVerdict {
         Ok(p) => boot_path_verdict(&p, env_escape),
         Err(_) => BootPathVerdict::Canonical,
     }
+}
+
+/// 프론트 **pull 경로**(emit-before-listen 레이스 회피 · reviewer1 major). setup 의 안전모드
+/// `translocation-blocked` emit 은 프론트 listen 등록 전에 발화할 수 있고 Tauri v2 는 미등록 리스너에
+/// 버퍼링하지 않아 안내가 유실될 수 있다. start() 초기에 이 커맨드를 조회해 Some(안내문구)=안전모드면
+/// 즉시 표시한다(emit 은 벨트앤서스펜더로 유지). 데몬 무관 순수 조회라 daemon-ready 이전에도 응답한다.
+/// Canonical·비-macOS 는 None(정상 부트).
+#[tauri::command]
+fn boot_verdict() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let v = current_boot_verdict();
+        if v != BootPathVerdict::Canonical {
+            return Some(translocation_guidance(v));
+        }
+    }
+    None
 }
 
 /// 안전모드 사용자 안내 문구(순수). 자동 이동(자기 복사)은 오탐 시 파괴 위험이라 이번 범위에서
@@ -2995,6 +3018,7 @@ fn main() {
             read_dept_catalog,
             install_cli_to_path,
             app_version,
+            boot_verdict,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -3410,6 +3434,42 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
     }
 
     #[test]
+    fn classify_bundle_dir_volumes_applications_is_not_canonical() {
+        use std::path::Path;
+        // ★/Volumes 가드(reviewer1): DMG·외장 마운트 안의 Applications 폴더/심링크 경유 실행은
+        // ends_with("/Applications")를 만족해도 Canonical 이 아니다(언마운트 시 죽은 경로 → 자기삭제 재발).
+        assert_ne!(
+            classify_bundle_dir(Path::new("/Volumes/cys 0.12.91/Applications/cys.app/Contents/MacOS")),
+            BundleKind::Canonical,
+            "/Volumes 하위 Applications 는 Canonical 오판 금지",
+        );
+        assert_eq!(
+            classify_bundle_dir(Path::new("/Volumes/cys 0.12.91/Applications/cys.app/Contents/MacOS")),
+            BundleKind::NonStandard,
+        );
+        // 정규 경로 불변(회귀 핀).
+        assert_eq!(
+            classify_bundle_dir(Path::new("/Applications/cys.app/Contents/MacOS")),
+            BundleKind::Canonical,
+            "/Applications 는 Canonical 불변",
+        );
+        assert_eq!(
+            classify_bundle_dir(Path::new("/Users/x/Applications/cys.app/Contents/MacOS")),
+            BundleKind::Canonical,
+            "~/Applications 는 Canonical 불변",
+        );
+        // boot_path_verdict 도 델리게이션 결과로 안전모드 진입(비-Canonical=NonCanonical).
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Volumes/cys 0.12.91/Applications/cys.app/Contents/MacOS/cys-app"),
+                false,
+            ),
+            BootPathVerdict::NonCanonical,
+            "/Volumes 하위 Applications 는 부트 안전모드 진입",
+        );
+    }
+
+    #[test]
     fn parse_which_a_returns_precedence_ordered_paths() {
         let out = "/Users/x/.local/bin/cys\n/opt/homebrew/bin/cys\n\n/usr/local/bin/cys\n";
         assert_eq!(
@@ -3538,6 +3598,25 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         // NonCanonical 도 동일 복구 절차를 안내한다(원인 문구만 일반화).
         let n = translocation_guidance(BootPathVerdict::NonCanonical);
         assert!(n.contains("xattr -d com.apple.quarantine /Applications/cys.app"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn boot_verdict_command_feeds_pull_path() {
+        // 프론트 pull 경로(emit-before-listen 회피)의 백엔드 반쪽을 커맨드 레벨로 검증한다: start()가
+        // invoke("boot_verdict")로 받는 값이 안전모드면 Some(안내)·정상이면 None 이어야 안내 표시가 성립.
+        // 테스트 프로세스 exe(target/…/deps/cys_app-*)는 비정규 경로 → escape env 없으면 Some.
+        // CYS_ALLOW_NONCANONICAL 은 이 커맨드 외 어떤 테스트도 읽지 않아 병렬 간섭 없음.
+        std::env::remove_var("CYS_ALLOW_NONCANONICAL");
+        let g = boot_verdict();
+        assert!(g.is_some(), "비정규 실행(test 하네스 경로)에서 pull 은 안내 문구를 반환");
+        assert!(
+            g.unwrap().contains("xattr -d com.apple.quarantine /Applications/cys.app"),
+            "pull 이 반환한 안내에 복구 명령 포함(프론트 stickyToast 본문)",
+        );
+        std::env::set_var("CYS_ALLOW_NONCANONICAL", "1");
+        assert!(boot_verdict().is_none(), "escape env 에서는 None(정상 부트 — 안내 미표시)");
+        std::env::remove_var("CYS_ALLOW_NONCANONICAL");
     }
 
     #[test]

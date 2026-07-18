@@ -4999,6 +4999,18 @@ function onDaemonEvent(event: Record<string, unknown>) {
 
 async function start() {
   const info = document.getElementById("daemon-info")!;
+  // ★T2 안전모드 pull(emit-before-listen 레이스 회피): 백엔드가 비정규 실행 위치(translocation/DMG 등)
+  // 면 데몬이 뜨지 않아 아래 daemon-ready await 가 영원히 안 풀린다. 그 await **전에** 백엔드를 직접
+  // 조회해(데몬 무관 순수 커맨드) 안내를 확정 표시한다. translocation-blocked 이벤트는 벨트앤서스펜더
+  // 로 유지되며, 같은 토스트 id("safe-mode")라 중복 발화해도 dedupe 된다.
+  try {
+    const guidance = await invoke("boot_verdict");
+    if (typeof guidance === "string" && guidance) {
+      stickyToast("safe-mode", "health", "안전모드 — 설치 위치를 옮겨 주세요", guidance);
+    }
+  } catch {
+    /* 비-macOS·조회 실패는 정상 부트로 흘려보냄(안전모드는 macOS 전용 게이트) */
+  }
   await new Promise<void>((resolve) => {
     listen("daemon-ready", () => resolve());
     listen("daemon-error", (e) => {
