@@ -12,7 +12,8 @@ office-cc v13 신규 유닛(D1 배치 SOT·D2 착석·D4 강아지·D5 개명·D
   3) raw 키 — 렌더 DOM 텍스트(패널 열기 포함)에 dept-\\d+@surface 패턴 부재.
   4) 착석 — dbg.teleportOwner(자리 존)→정지→ownerSeated=true·좌면 좌표 / dbg.setKey 이동→기립·보행고.
   5) 강아지 — /stream {t:'dog',kind:'kill'} → dbg.dogState.mode 전이(kill_run) · 미지 {t:'zzz'} 무예외.
-  6) 상점 — dbg.shopItems()>0 (mock /skills). ※클릭 우선순위 런타임 단언은 훅 부재로 보고(§한계).
+  6) 상점 — dbg.shopItems()>0 (mock /skills) · 상품(라떼) 실클릭(dbg.projectToScreen 투영→
+     Playwright 클릭)→상점 패널 열림 + owner 미이동(우선순위 nodeKey>shopItem>floorY).
 
 사전:  pip install playwright && playwright install chromium
 실행:  python3 ui/e2e/office_cc_gate.py     # exit 0 = PASS
@@ -301,8 +302,29 @@ def main() -> int:
             page.wait_for_timeout(300)   # /skills fetch 반영
             shop_n = page.evaluate("()=>window.__officeDebug.shopItems()")
             check(isinstance(shop_n, int) and shop_n > 0,
-                  f"6-상점 진열 상품 수 shopItems()={shop_n} (>0, mock /skills 반영)")
-            # ※6b(상품 클릭이 owner 이동 유발 안 함)는 런타임 단언 불가 — 아래 §한계 보고.
+                  f"6a-상점 진열 상품 수 shopItems()={shop_n} (>0, mock /skills 반영)")
+            # 6b: 클릭 우선순위 — 라떼(월드 -1.2,0.99,-2.5) 실클릭 경로 → owner 미이동 + 상점 패널 열림
+            # (dbg.projectToScreen 로 월드→화면픽셀 투영 후 Playwright 실클릭 — 클릭 핸들러 raycast 구동)
+            before = page.evaluate("()=>window.__officeDebug.ownerState()")
+            open_before = page.evaluate(
+                "()=>{const s=document.getElementById('shop');"
+                "return !!s && getComputedStyle(s).display==='block';}")
+            proj = page.evaluate("()=>window.__officeDebug.projectToScreen(-1.2, 0.99, -2.5)")
+            print("  상점 라떼 투영:", json.dumps(proj, ensure_ascii=False), "· shop_open_before=", open_before)
+            clicked = False
+            if proj and proj.get("visible"):
+                page.mouse.click(proj["x"], proj["y"])
+                page.wait_for_timeout(400)
+                clicked = True
+            after = page.evaluate("()=>window.__officeDebug.ownerState()")
+            shop_open = page.evaluate(
+                "()=>{const s=document.getElementById('shop');"
+                "return !!s && getComputedStyle(s).display==='block';}")
+            check(clicked and (not open_before) and shop_open,
+                  f"6b-상품 클릭 → 상점 패널 열림(openShop) (visible={proj.get('visible') if proj else None}, open={shop_open})")
+            check(bool(after) and after.get("planLen") == 0 and after.get("busy") is False,
+                  f"6b-상품 클릭이 owner 이동 미유발(planLen=0·busy=false·우선순위 nodeKey>shopItem>floorY) "
+                  f"(before={before}, after={after})")
 
             # ── 그룹 2: 개명 → 재빌드 → 라벨 갱신 ────────────────────────────
             page.evaluate("()=>window.__officeDebug.openPanel('eng@surface:5')")
@@ -335,14 +357,7 @@ def main() -> int:
     print(f"\n{'PASS' if not failures else 'FAIL'} — 단언 {asserted}종 · 실패 {len(failures)}건")
     for f in failures:
         print(f"  ✗ {f}")
-    if failures:
-        return 1
-    print("\n§한계(보고): 6b '상품 클릭이 owner 이동 유발 안 함'은 런타임 단언 불가 — office3d.html "
-          "메인이 <script type=module>이라 camera/worldGroup/raycaster가 모듈 스코프에 갇혀 "
-          "page.evaluate로 상품 화면좌표 투영·클릭 시뮬이 불가하다. 클릭 우선순위(nodeKey>shopItem>"
-          "floorY)는 소스(office3d.html:2148-2151)에 구현돼 있으나, 게이트 자동화하려면 프론트에 "
-          "dbg.clickShopItem() 또는 dbg.projectToScreen(x,y,z) 훅이 필요. (수정 금지·보고만)")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
