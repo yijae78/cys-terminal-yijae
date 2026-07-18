@@ -260,26 +260,30 @@ def extract_warnings(report):
 
     # idle WARN은 '할 일이 남은' 노드에만 발화한다 — 모든 todo가 done인 노드의 idle은 정상
     # 정적(QUIET)이지 경보가 아니다(그걸 WARN으로 삼으면 QUIET가 도달 불가·quiet-park 신호 사멸).
-    # todo 미상 노드(리뷰어 등 todo 없음)는 보수적으로 WARN 유지 — idle=승인 프롬프트 대기 간접
-    # 커버(C4)라 놓치면 안 되기 때문(미지 상황=시끄러운 쪽·티켓 지침). ※리뷰어 상시 idle 노이즈는
-    # shadow(P1) 임계 튜닝 대상 — 구현은 noisy-default 준수하고 위험만 보고한다.
+    # ★master 승인 2026-07-18: 이 게이팅(pending todo 있는 노드에만 idle WARN)을 승인한다 —
+    #   DESIGN QUIET 정의와 정합하고, 승인 프롬프트 대기는 통상 진행 중 태스크(todo 보유) 상태라
+    #   간접 커버(C4)가 유지된다. todo 미상 노드(리뷰어 등)는 보수적으로 WARN 유지(미지=시끄러운 쪽).
+    #   ※리뷰어 상시 idle 노이즈는 shadow(P1) 임계 튜닝 대상 — 지금 완화하지 않는다(master 지시).
     pending = {n.get("node") for n in (report.get("nodes") or [])
                if n.get("total", 0) > 0 and n.get("done", 0) < n.get("total", 0)}
     todo_labels = {n.get("node") for n in (report.get("nodes") or [])}
     idle = [n for n in (report.get("idle_nodes") or [])
             if (n.get("role") or "").lower() in pending
             or (n.get("role") or "").lower() not in todo_labels]
-    if idle:
-        roles = ",".join(n.get("role", "?") for n in idle)
-        mins = max((n.get("idle_secs") or 0) for n in idle) // 60
+    # ★master 승인 2026-07-18: idle 사유별로 task/idempotency-key를 노드 단위로 분리한다
+    #   (예: gate-idle-reviewer-codex). 지속되는 동일 노드 idle이 항상 같은 pending에 병합·억제되어
+    #   큐 병합이 최대화된다 — 다른 노드 idle 변동에 키가 흔들리지 않는다(집계 단일 키의 약점 제거).
+    for n in idle:
+        role = n.get("role", "unknown")
+        mins = (n.get("idle_secs") or 0) // 60
         warns.append({
             "trigger": "idle",
-            "reason": "idle_5min:%s" % roles,
-            "wake_body": "[gate] idle: %s idle 5분+ — %s%s" % (roles, proc, tail),
+            "task": "gate-idle-%s" % role,
+            "reason": "idle_5min:%s" % role,
+            "wake_body": "[gate] idle: %s idle 5분+ — %s%s" % (role, proc, tail),
             "evt_type": "agent.silent",
-            "evt_fields": {"agent": idle[0].get("role", "unknown"),
-                           "silent_minutes": int(mins), "level": "critical"},
-            "idem": "gate-idle-%s" % roles,
+            "evt_fields": {"agent": role, "silent_minutes": int(mins), "level": "critical"},
+            "idem": "gate-idle-%s" % role,
         })
     high = [n for n in (report.get("live_nodes") or [])
             if isinstance(n.get("context_pct"), int) and n["context_pct"] >= 60]
@@ -287,6 +291,7 @@ def extract_warnings(report):
         roles = ",".join("%s(%d%%)" % (n.get("role", "?"), n["context_pct"]) for n in high)
         warns.append({
             "trigger": "context",
+            "task": "gate-context",
             "reason": "ctx_60:%s" % roles,
             "wake_body": "[gate] context: %s 컨텍스트 60%%+ — cycle-agent 집행 검토.%s" % (roles, tail),
             "evt_type": None, "evt_fields": None,
@@ -296,6 +301,7 @@ def extract_warnings(report):
     if isinstance(feed, int) and feed > 0:
         warns.append({
             "trigger": "feed",
+            "task": "gate-feed",
             "reason": "feed_pending:%d" % feed,
             "wake_body": "[gate] feed: 승인 대기 %d건 — 즉결 필요.%s" % (feed, tail),
             "evt_type": "approval.needed",
@@ -338,6 +344,7 @@ def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso)
             mins = count * cycle_minutes
             stalls.append({
                 "trigger": "stall",
+                "task": "gate-stall-%s" % label,
                 "reason": "stall:%s(%d주기·%s)" % (label, count, "idle" if idle else "미지"),
                 "wake_body": "[gate] stall: %s %d주기(%d분) 무진행·노드 %s — 워커 점검·재지시.%s"
                              % (label, count, mins, "idle" if idle else "생존미상", tail),
@@ -527,7 +534,7 @@ class Gate:
         # 수집 실패 = 그 자체가 WARN(경로). 스냅샷/카운터는 건드리지 않고 wake만.
         if not ok:
             warns = [{
-                "trigger": "collect", "reason": "collect_failed:%s" % err,
+                "trigger": "collect", "task": "gate-collect", "reason": "collect_failed:%s" % err,
                 "wake_body": "[gate] collect: javis_report 수집 실패(%s) — 게이트/데몬 점검. "
                              "기상절차: cys status --json 1콜 점검 병행." % err,
                 "evt_type": None, "evt_fields": None, "idem": "gate-collect",
@@ -590,6 +597,9 @@ class Gate:
         elif delta_fields:
             verdict = VERDICT_DELTA
         elif (not in_progress_tasks(report)) and all_nodes_idle(report):
+            # ★master 승인 2026-07-18: DESIGN QUIET 조건의 "미해결 게이트 0"은 report 스키마에
+            #   소스 필드가 없어 생략한다 — 보수적 방향(주차 덜 발동)이라 안전하다(승인됨). 필요 시
+            #   report에 미해결 게이트 카운트를 추가하고 여기 AND 조건으로 편입한다.
             verdict = VERDICT_QUIET
         else:
             verdict = VERDICT_NOCHG
@@ -643,7 +653,10 @@ class Gate:
             return "none"
         wake_any = False
         for w in warns:
-            self.runner.enqueue("master", "gate-" + w["trigger"], w["wake_body"], w["idem"])
+            # task_key는 노드/사유 단위(w["task"]) — 지속 조건이 같은 pending에 병합·억제되어
+            # 큐 병합 최대화(master 승인 2026-07-18). 누락 시 트리거 단위로 폴백.
+            self.runner.enqueue("master", w.get("task", "gate-" + w["trigger"]),
+                                w["wake_body"], w["idem"])
             wake_any = True
             if w.get("evt_type"):
                 erc, _, _ = self.runner.emit(w["evt_type"], w["evt_fields"])

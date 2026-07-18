@@ -142,6 +142,21 @@ class GateCore(unittest.TestCase):
             self.assertEqual(r.drains, ["master"])            # 배달 체인 완결(drain 필수)
             self.assertEqual(e["delivered"], "wake")
 
+    def test_multi_idle_nodes_separate_per_node_wake_keys(self):
+        # master 승인 2026-07-18: idle 노드별로 task/idem 분리 → 큐 병합 최대화.
+        with tempfile.TemporaryDirectory() as t:
+            rep = report(nodes=[{"node": "worker", "done": 1, "total": 5, "pct": 20}],
+                         idle_nodes=[{"role": "reviewer-codex", "idle_secs": 600},
+                                     {"role": "reviewer-gemini", "idle_secs": 700}])
+            r = FakeRunner(rep=rep)
+            gate(t, r).run()                                  # baseline
+            gate(t, r).run()
+            tasks = sorted(task for _to, task, _reason, _idem in r.enqueues)
+            idems = sorted(idem for _to, _task, _reason, idem in r.enqueues)
+            self.assertEqual(tasks, ["gate-idle-reviewer-codex", "gate-idle-reviewer-gemini"])
+            self.assertEqual(idems, ["gate-idle-reviewer-codex", "gate-idle-reviewer-gemini"])
+            self.assertEqual(r.drains, ["master"])            # 여러 enqueue·drain 1회
+
     def test_feed_pending_warns_with_approval_evt(self):
         with tempfile.TemporaryDirectory() as t:
             rep = report(feed=2)
