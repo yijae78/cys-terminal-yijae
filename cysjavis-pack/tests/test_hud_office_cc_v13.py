@@ -69,22 +69,35 @@ class DogFx(unittest.TestCase):
         self.assertTrue(frames)
         self.assertFalse(any(fr.get("t") == "dog" for fr in frames))
 
-    def test_coalesce_second_within_window_dropped(self):
-        # 음성: 10s 창 내 2건째 폐기, 창 경과 후 재허용 (kill·alert 공유 창)
+    def test_coalesce_same_kind_second_within_window_dropped(self):
+        # 음성: 동일 kind 10s 창 내 2건째 폐기, 창 경과 후 재허용 (kind별 독립 창)
         coal = B.Coalescer()
         t0 = 1000.0
         f1, _ = B.route_event(self._ev("watchdog.duplicate_procs",
                               timestamp=t0, payload={"count": 2, "pids": [1]}),
                               None, coal, now=t0)
         self.assertEqual(len(f1), 1)
-        f2, _ = B.route_event(self._ev("watchdog.proc_count_high",
-                              timestamp=t0 + 5, surface_id=3, payload={"count": 30}),
+        f2, _ = B.route_event(self._ev("watchdog.duplicate_procs",
+                              timestamp=t0 + 5, payload={"count": 3, "pids": [2]}),
                               None, coal, now=t0 + 5)
-        self.assertEqual(f2, [])   # 5s < 10s 창 → 2건째 폐기(공유 창)
-        f3, _ = B.route_event(self._ev("watchdog.proc_count_high",
-                              timestamp=t0 + 11, surface_id=3, payload={"count": 31}),
+        self.assertEqual(f2, [])   # 5s < 10s 창(kill) → 2건째 폐기
+        f3, _ = B.route_event(self._ev("watchdog.duplicate_procs",
+                              timestamp=t0 + 11, payload={"count": 4, "pids": [3]}),
                               None, coal, now=t0 + 11)
         self.assertEqual(len(f3), 1)   # 11s > 10s → 재허용
+
+    def test_kill_passes_immediately_after_alert(self):
+        # master 판정: kill(실 프로세스 강제종료)은 직전 alert 창에 밀리면 안 된다 → kind별 분리
+        coal = B.Coalescer()
+        t0 = 2000.0
+        fa, _ = B.route_event(self._ev("watchdog.proc_count_high",
+                              timestamp=t0, surface_id=3, payload={"count": 40}),
+                              None, coal, now=t0)
+        self.assertEqual(fa, [{"t": "dog", "kind": "alert", "sid": 3, "count": 40}])
+        fk, _ = B.route_event(self._ev("watchdog.duplicate_procs",
+                              timestamp=t0 + 1, payload={"count": 2, "pids": [9]}),
+                              None, coal, now=t0 + 1)
+        self.assertEqual(fk, [{"t": "dog", "kind": "kill", "pid": 9, "count": 2}])  # 통과
 
     def test_backlog_suppressed(self):
         coal = B.Coalescer()
