@@ -121,6 +121,12 @@ impl PackWriteAuth {
     /// 프로덕션 진입점 전용 라이브 쓰기 인가. 호출처 = cys init-pack·pack-update·pack-downgrade
     /// CLI 핸들러 + cysd 부팅 자동설치. (테스트에서 라이브를 실제로 쓰려 이걸 부르면 안 된다 —
     /// 테스트는 temp 대상이라 인가 자체가 불필요하다.)
+    ///
+    /// 실경계 고지: `pub`은 바이너리 crate(cys·cysd)가 접근해야 하는 구조적 필요이며, 언어
+    /// 차원에서 "프로덕션 4곳만 생성 가능"을 강제하지는 못한다. 실효 방어는 W0-a(cfg-test
+    /// fail-closed)+W0-c(.cargo env 샌드박스)+W0-d(라이브 경로 인가 게이트)의 조합이고,
+    /// 테스트 코드가 이 토큰을 의도적으로 위조해 라이브 경로를 직접 겨냥하는 벡터까지는
+    /// 막지 않는다 — 그 벡터는 코드리뷰 게이트 소관이다.
     pub fn production() -> Self {
         PackWriteAuth { _seal: () }
     }
