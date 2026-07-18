@@ -741,27 +741,27 @@ function floorPlanOf(deptKey, seed, nodeCount){
   let plan;
   if (tpl === 0){            // 격자형 — 회의실 우후 · 라운지 우전 · 데스크 좌측 격자
     plan = { meeting:{x:4.4,z:-2.2,w:3.6,d:2.9}, lounge:{x:4.6,z:2.4},
-      kanban:{x:-3.2}, amenity:'plants', amenityPos:{x:-1.0,z:3.5},
+      kanban:{x:-3.2}, amenity:'plants', amenityPos:{x:-2.0,z:3.9},
       desks: fillGrid(n, -4.6, 1.5, -3.2+jz, 2.3+jz, 0),
       patrol: [[-4.2,3.6],[0,3.6],[2.5,0],[2.5,-3.0]] };
   } else if (tpl === 1){     // 4인 클러스터형 — 데스크가 포드로 묶여 마주봄
     plan = { meeting:{x:4.4,z:-2.2,w:3.6,d:2.9}, lounge:{x:4.6,z:2.4},
-      kanban:{x:-3.2}, amenity:'pingpong', amenityPos:{x:-5.2,z:-3.0},
+      kanban:{x:-3.2}, amenity:'pingpong', amenityPos:{x:5.5,z:0.4},
       desks: fillPods(n, -4.2, 0.8, -2.4, 1.9),
       patrol: [[-4.2,3.6],[0,3.6],[2.5,0],[2.5,-3.0]] };
   } else if (tpl === 2){     // 창가 일렬형 — 회의실 후중앙 · 데스크 앞창가(창 바라봄)
-    plan = { meeting:{x:-0.2,z:-2.6,w:3.4,d:2.6}, lounge:{x:5.0,z:-1.4},
+    plan = { meeting:{x:-0.2,z:-2.6,w:3.4,d:2.6}, lounge:{x:4.5,z:-1.4},
       kanban:{x:3.4}, amenity:'plants', amenityPos:{x:5.4,z:3.2},
-      desks: fillRow(n, -4.6, 3.2, 3.3, 1.5, Math.PI),
+      desks: fillRow(n, -4.6, 1.7, 3.3, 1.5, Math.PI),
       patrol: [[-4.0,-3.6],[4.0,-3.6],[5.5,1.5],[-5.2,-0.5]] };
   } else if (tpl === 3){     // 미러 반전형 — 회의실 좌후 · 라운지 좌전 · 데스크 우측 격자
     plan = { meeting:{x:-4.4,z:-2.2,w:3.6,d:2.9}, lounge:{x:-4.6,z:2.4},
-      kanban:{x:3.2}, amenity:'plants', amenityPos:{x:1.0,z:3.5},
+      kanban:{x:3.2}, amenity:'plants', amenityPos:{x:2.0,z:3.9},
       desks: fillGrid(n, -1.5, 4.6, -3.2+jz, 2.3+jz, 0),
       patrol: [[4.2,3.6],[0,3.6],[-2.5,0],[-2.5,-3.0]] };
   } else {                   // 중앙 광장형 — 라운지 전중앙(광장) · 데스크 압축 격자
     plan = { meeting:{x:4.4,z:-2.2,w:3.6,d:2.9}, lounge:{x:0.2,z:3.4},
-      kanban:{x:-3.4}, amenity:'plants', amenityPos:{x:-5.2,z:-2.8},
+      kanban:{x:-3.4}, amenity:'plants', amenityPos:{x:5.5,z:2.0},
       desks: fillGrid(n, -4.6, 1.5, -3.2, 0.7, 0),
       patrol: [[-4.2,-3.4],[-1.0,-3.4],[2.5,0],[2.5,-3.2]] };
   }
@@ -2235,6 +2235,25 @@ if (dbg){
   dbg.floorPlans = floorPlans;          // D1: deptId→plan 라이브 맵(재빌드=clear+set, 참조 유지)
   dbg.floorPlan = (deptId)=> floorPlans.get(deptId) || null;   // D1: 부서별 plan 접근자
   dbg.floorPlanOf = floorPlanOf;        // D1: 템플릿·불변식 직접 산출
+  dbg.furnitureAabbs = (plan)=>{        // D8-2 게이트: 실 렌더 가구 footprint (make* 상수와 드리프트 0)
+    const box = (cx,cz,w,d)=>({ cx, cz, w, d });
+    const amW = { pingpong:1.9, plants:1.2, popup:2.8 };   // amenity별 footprint
+    const amD = { pingpong:1.1, plants:0.5, popup:1.8 };
+    const dW = 1.62, dFront = 0.75, dBack = 0.49;    // 데스크: 파티션 폭 ↔ 의자/사람(앞)·뒷패널(뒤)
+    return {
+      meeting: box(plan.meeting.x, plan.meeting.z, plan.meeting.w, plan.meeting.d),
+      lounge: plan.lounge ? box(plan.lounge.x+0.08, plan.lounge.z+0.22, 3.7, 2.3) : null,
+      kanban: box(plan.kanban.x, -SLAB_D/2+0.12, 4.2, 0.3),   // 뒷벽 부착 벽면 보드
+      amenity: plan.amenity ? box(plan.amenityPos.x, plan.amenityPos.z,
+        amW[plan.amenity]||1.2, amD[plan.amenity]||0.5) : null,
+      desks: plan.desks.map(d=>{
+        const rot = d[2] || 0;
+        if (Math.abs(Math.sin(rot)) < 0.01)          // rot∈{0,π}: z축 정렬 유지, 중심만 앞뒤 이동
+          return box(d[0], d[1] + ((dFront-dBack)/2)*Math.cos(rot), dW, dFront+dBack);
+        return box(d[0], d[1], Math.max(dW, dFront+dBack), Math.max(dW, dFront+dBack));  // 그 외=보수 정사각
+      }),
+    };
+  };
   Object.defineProperty(dbg, 'ownerSeated', { configurable:true, get:()=> ownerSeated });   // D2 착석 상태
   dbg.ownerPos = ()=> owner ? { x:owner.pr.grp.position.x, y:owner.pr.grp.position.y,
     z:owner.pr.grp.position.z, planLen:owner.plan.length } : null;
