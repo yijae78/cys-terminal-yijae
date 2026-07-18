@@ -1,0 +1,28 @@
+# Design Principles — 시각 검증 기준 (`context/design-principles.md`)
+
+> PROPOSAL v3 §4-I 시각 검증 루프의 참조 파일 1/2. NLC의 FDS(`/docs/rules/fds.md`, 4-1)와 접합한다.
+> `design-reviewer` 서브에이전트가 스크린샷을 이 문서와 대조한다. 토큰 값은 style-guide.md.template로 위임한다.
+
+<!-- [채움 지시] 프로젝트 디자인 철학을 채운다. FDS ethos를 상속하되, 화면 심사에 쓸 "판정 원칙"으로 구체화한다. -->
+
+## Design Ethos (FDS 상속)
+- clarity_over_complexity — 명료함이 화려함보다 우선.
+- function_over_aesthetics — 기능이 미학보다 우선.
+- predictable_over_surprising — 예측 가능함이 놀라움보다 우선.
+- accessible_over_exclusive — 접근성이 배타성보다 우선.
+
+## 시각 판정 원칙 (채움)
+- 정보 위계: [FILL: h1/h2/h3·강조·여백으로 위계가 즉시 읽히는가]
+- 일관성: [FILL: 같은 역할의 요소가 화면 간 동일하게 보이는가]
+- 여백·정렬: [FILL: 그리드·간격 토큰 준수]
+- 반응성: [FILL: mobile_first·breakpoint별 무결성]
+- 상태 가시성: [FILL: 로딩·성공·실패·빈 상태가 모두 시각적으로 구분되는가]
+
+## 접근성 원칙 (WCAG 2.1 AA)
+- 대비비 ≥ 4.5:1(본문) / 3:1(큰 텍스트·UI).
+- 포커스 링 상시 가시 · 키보드 내비게이션 완결.
+- motion-safe(prefers-reduced-motion 존중).
+- 모든 이미지 alt · 폼 요소 라벨.
+
+## Anti-Patterns (심사 시 감점)
+- [FILL: 하드코딩 색/치수 · 토큰 미참조 · 콘솔 에러 · 잘림/오버플로 · 대비 부족]

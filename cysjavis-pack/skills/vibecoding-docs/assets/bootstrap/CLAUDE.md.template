@@ -1,0 +1,47 @@
+# =========================================================
+# Claude Code Bootstrap Loader
+# (Single Entry Point for Project Constitution)
+# =========================================================
+#
+# NLC 최상위 경고: "md 문서를 만들어 놓는 것만으로는 아무 일도 자동으로 일어나지 않는다.
+# '언제, 어떤 경로로, 어떤 AI에게 먹일 것인가'를 명시적으로 수행해야 비로소 작동한다."
+# 이 브릿지 개조를 하지 않으면 지금까지 만든 모든 md 문서 작업이 무의미하다.
+#
+# 이 파일은 Claude Code가 실행 시 자동 로드하는 진입점이다(`./CLAUDE.md` 또는 `./.claude/CLAUDE.md`).
+# `@path/to/file` import로 헌법 계층을 프로젝트에 "깔아둔다".
+
+# --- 1. Agent Identity (WHO) ---
+@AGENT.md
+
+# --- 2. Global Immutable Rules (WHAT MUST NEVER BREAK) ---
+@rules.md
+
+# --- 3. Root Source of Truth (WHY) ---
+@docs/_root-sot.md
+
+# --- 4. Meta-Constitution (HOW RULES PROPAGATE) ---
+@docs/rules/uepp.md
+@docs/rules/scdp.md
+@docs/rules/rcmp.md
+
+# --- 5. Always-On Execution Rules (OPTIONAL, CAREFUL) ---
+# 아래는 "항상 적용해도 되는 것만" 넣어라. 조건부 규칙을 여기 넣으면 헌법이 오염된다.
+# @ruler/security.md
+# @ruler/state.md
+
+# =========================================================
+# 부트스트랩 이후 규율 (필수)
+# =========================================================
+#
+# [ruler apply 시점] 규칙·헌법·설계 문서 변경 후엔 반드시 `ruler apply`.
+#   단, 코드/env 변경만으로는 불필요(별개 층위).
+#
+# [세션 첫 턴 sanity check — 필수]
+#   매 새 세션의 첫 턴에 다음을 물어 "규칙 미적용 세션" 참사를 예방한다:
+#     "지금 로드된 규칙/메모리 요약을 말해봐."
+#   AI가 위 @import 문서(AGENT/rules/_root-sot/uepp/scdp/rcmp)를 실제로 로드했는지 확인한다.
+#   로드되지 않았으면 상위 문서를 재주입한 뒤 작업을 시작한다(재로드 확인 의식 = ritual).
+#   (참고: 실제 미로딩 이슈 리포트 존재 — anthropics/claude-code#7953)
+#
+# [철학] 이 시스템은 '자동화된 AI 프레임워크'가 아니라 '인간이 통제권을 유지하기 위한 헌법 체계'다.
+#   AI가 자율적으로 읽으면 실패, 인간이 적용 시점을 통제하면 성공.

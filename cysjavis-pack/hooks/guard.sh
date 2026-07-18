@@ -119,7 +119,8 @@ def basename(t):
 
 def protected(name):
     n = basename(name).lower()
-    return n in ("soul.md", "claude.md") or n.endswith("_directive.md")
+    return n in ("soul.md", "claude.md", "vibecoding_constitution.md",
+                 "vibecoding_enforcement.md", "route_contract.md") or n.endswith("_directive.md")
 
 # 잔여3(R3): STRICT Write/Edit 가 건드리면 안 되는 guard 인프라(디렉터리 전체)
 def guard_infra(fp):
