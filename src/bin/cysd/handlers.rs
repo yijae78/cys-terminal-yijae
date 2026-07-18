@@ -800,9 +800,10 @@ enum CeoDelivery {
     SeatEmpty,
 }
 
-/// W3.2 CEO 자동결재 라우팅: 멱등(의미 키) 확인 후 CEO 좌석 즉시 주입(steer)하거나,
-/// 좌석 부재·중복·불능이면 즉시 escalation(approval.stalled급)한다. AutoEligible 전용.
-fn route_auto_approval(daemon: &Arc<Daemon>, item: &crate::state::FeedItem, over_pressure: bool) {
+/// W3.2 멱등 게이트: 이 항목의 의미 키가 최근 창 안에 이미 처리됐으면 false(중복 억제),
+/// 아니면 키를 기록하고 true. AutoEligible 배달과 HumanOnly escalation이 공유한다(F5) —
+/// 동일 재발행이 매번 새 request_id를 받아도 CEO 재주입·중복 escalation을 한 번으로 접는다.
+fn auto_route_idem_ok(daemon: &Arc<Daemon>, item: &crate::state::FeedItem) -> bool {
     let key = crate::approval_risk::semantic_key(
         &item.kind,
         &item.title,
@@ -811,14 +812,21 @@ fn route_auto_approval(daemon: &Arc<Daemon>, item: &crate::state::FeedItem, over
     );
     let now = crate::state::now_epoch();
     let window = auto_route_idem_window_secs();
-    {
-        let mut seen = daemon.auto_route_seen.lock().unwrap();
-        seen.retain(|_, t| now - *t < window); // 만료 청소(무한 성장 방지)
-        if seen.get(&key).map(|prev| now - *prev < window).unwrap_or(false) {
-            // 중복 의미 요청(짧은 창) — CEO 재주입 억제. 항목은 이미 feed에 존재한다.
-            return;
-        }
-        seen.insert(key, now);
+    let mut seen = daemon.auto_route_seen.lock().unwrap();
+    seen.retain(|_, t| now - *t < window); // 만료 청소(무한 성장 방지)
+    if seen.get(&key).map(|prev| now - *prev < window).unwrap_or(false) {
+        return false; // 중복 의미 요청(짧은 창)
+    }
+    seen.insert(key, now);
+    true
+}
+
+/// W3.2 CEO 자동결재 라우팅: 멱등(의미 키) 확인 후 CEO 좌석 즉시 주입(steer)하거나,
+/// 좌석 부재·중복·불능이면 즉시 escalation(approval.stalled급)한다. AutoEligible 전용.
+fn route_auto_approval(daemon: &Arc<Daemon>, item: &crate::state::FeedItem, over_pressure: bool) {
+    if !auto_route_idem_ok(daemon, item) {
+        // 중복 의미 요청 — CEO 재주입 억제. 항목은 이미 feed에 존재한다.
+        return;
     }
     match deliver_to_ceo(daemon, item, over_pressure) {
         CeoDelivery::Delivered => {}
@@ -2331,19 +2339,23 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 &body,
                 tier.as_deref(),
             );
-            // W3.6 back-pressure: 발행자별 요청 카운터 증가(모든 push) + 임계 초과 경고 플래그 산출.
-            let over_pressure = record_approval_request(daemon, publisher_surface);
-            // W3.2 자동결재 라우팅 — flag ON일 때만 발동(OFF=현행 100% 보존, C-4).
+            // W3.2/3.6 자동결재 라우팅·back-pressure — flag ON일 때만 발동(OFF=현행 100% 보존,
+            // C-4). ⚠back-pressure 카운터·이벤트도 반드시 이 게이트 안이어야 한다 — 밖에 두면
+            // OFF에서도 카운터가 돌고 approval.backpressure가 발행돼 현행 동작을 바꾼다(C-4 위반).
             //  · AutoEligible → CEO 좌석 즉시 배달(멱등·좌석부재 escalation)
-            //  · HumanOnly    → CEO 이행 불가 → 즉시 오너 escalation(결재의 한 형태, W3.8-①)
+            //  · HumanOnly    → CEO 이행 불가 → 즉시 오너 escalation(결재의 한 형태, W3.8-①·멱등)
             //  · HighRisk     → v1 사람 결재 유지(현행 CC 경로 — 무개입)
             if daemon.config.approve_auto_route {
+                let over_pressure = record_approval_request(daemon, publisher_surface);
                 match risk {
                     crate::approval_risk::RiskClass::AutoEligible => {
                         route_auto_approval(daemon, &item, over_pressure)
                     }
                     crate::approval_risk::RiskClass::HumanOnly => {
-                        escalate_no_ceo(daemon, &item, "human_only")
+                        // AutoEligible과 동일한 의미 키 멱등 — 동일 재발행 중복 escalation 차단(F5).
+                        if auto_route_idem_ok(daemon, &item) {
+                            escalate_no_ceo(daemon, &item, "human_only")
+                        }
                     }
                     crate::approval_risk::RiskClass::HighRisk => {}
                 }
@@ -2445,7 +2457,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             ) {
                 Some(_) => {
                     // W3.6 거부 카운터(형해화 back-pressure) — deny 계열 결재만 집계.
-                    if matches!(decision.as_str(), "deny" | "no" | "reject") {
+                    // flag ON일 때만(C-4: OFF=현행 100% 동일 — 카운터도 미기록).
+                    if daemon.config.approve_auto_route
+                        && matches!(decision.as_str(), "deny" | "no" | "reject")
+                    {
                         record_approval_deny(daemon, pub_sid);
                     }
                     Reply::Single(ok_response(
@@ -6571,6 +6586,8 @@ mod tests {
     #[test]
     fn w3_off_no_auto_route() {
         let _g = ACL_ENV_LOCK.lock().unwrap();
+        // 임계 1로 좁혀, 게이트가 없으면 단 1건에도 backpressure가 터지게 만든다(C-4 진짜 증명).
+        std::env::set_var("CYS_APPROVE_BACKPRESSURE_N", "1");
         let (daemon, dir) = daemon_auto("w3-off", false);
         let mut rx = daemon.bus.subscribe();
         let Reply::Single(resp) =
@@ -6585,10 +6602,27 @@ mod tests {
         assert_eq!(p["payload"]["risk_class"], json!("auto"), "risk 파생은 flag 무관");
         assert_eq!(count_named(&evs, "feed.auto_routed"), 0, "OFF인데 CEO 배달됨");
         assert_eq!(count_named(&evs, "approval.stalled"), 0, "OFF인데 escalation 발동");
+        // C-4: OFF면 back-pressure 카운터·이벤트가 상시 작동하지 않는다(임계 1인데도 무발행).
+        assert_eq!(
+            count_named(&evs, "approval.backpressure"),
+            0,
+            "OFF인데 back-pressure 이벤트 발행(C-4 위반)"
+        );
         // 항목 pending 유지.
-        let items = daemon.feed_items.lock().unwrap();
-        assert_eq!(items.iter().find(|i| i.request_id == "off1").unwrap().status, "pending");
-        drop(items);
+        {
+            let items = daemon.feed_items.lock().unwrap();
+            assert_eq!(items.iter().find(|i| i.request_id == "off1").unwrap().status, "pending");
+        }
+        // C-4: OFF에서 결재해도 audit 파일이 생성되지 않는다.
+        let rr = Request {
+            id: json!(2),
+            method: "feed.reply".into(),
+            params: json!({"request_id": "off1", "decision": "allow", "reason": "x"}),
+        };
+        let _ = dispatch(&daemon, rr, None);
+        let audit = crate::state::state_dir(&daemon.socket_path).join("approval_audit.jsonl");
+        assert!(!audit.exists(), "OFF인데 approval_audit.jsonl 생성됨(C-4 위반)");
+        std::env::remove_var("CYS_APPROVE_BACKPRESSURE_N");
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6615,6 +6649,26 @@ mod tests {
                 && e["payload"]["request_id"].as_str() == Some("hum1"))
             .expect("human_only escalation 미발동");
         assert_eq!(stalled["payload"]["reason"], json!("human_only"));
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F5: HumanOnly escalation도 의미 키 멱등 — 동일 재발행(새 request_id)이 중복 escalation을
+    /// 유발하지 않는다(AutoEligible과 동일 게이트).
+    #[test]
+    fn w3_human_only_idempotent() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_auto("w3-human-idem", true);
+        let mut rx = daemon.bus.subscribe();
+        let _ = dispatch(&daemon, w3_push(1, "h1", "★사람 단계 필수: TCC 재부여", "동일", None), None);
+        let _ = dispatch(&daemon, w3_push(2, "h2", "★사람 단계 필수: TCC 재부여", "동일", None), None);
+        let evs = drain(&mut rx);
+        assert_eq!(count_named(&evs, "feed.item.created"), 2, "두 push 다 created 돼야");
+        assert_eq!(
+            count_named(&evs, "approval.stalled"),
+            1,
+            "동일 HumanOnly 재발행이 escalation을 이중 유발함(F5 멱등 실패)"
+        );
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6733,7 +6787,8 @@ mod tests {
     #[test]
     fn w3_audit_record_written() {
         let _g = ACL_ENV_LOCK.lock().unwrap();
-        let (daemon, dir) = daemon_auto("w3-audit", false);
+        // 감사는 flag ON일 때만 기록된다(C-4 게이트). 따라서 ON으로 데몬 생성.
+        let (daemon, dir) = daemon_auto("w3-audit", true);
         let _ = dispatch(&daemon, w3_push(1, "a1", "[CYCLE-VERIFY] 저장 검증", "확인", None), None);
         let rr = Request {
             id: json!(2),
@@ -6783,11 +6838,12 @@ mod tests {
     #[test]
     fn w3_back_pressure_counts_and_event() {
         let _g = ACL_ENV_LOCK.lock().unwrap();
+        // back-pressure는 flag ON일 때만 작동(C-4 게이트) — ON으로 생성.
         // 임계는 record_approval_request가 매 호출 env를 재조회하므로 push 시점까지 유지한다.
         std::env::set_var("CYS_APPROVE_BACKPRESSURE_N", "2");
-        let (daemon, dir) = daemon_auto("w3-bp", false);
+        let (daemon, dir) = daemon_auto("w3-bp", true);
         let mut rx = daemon.bus.subscribe();
-        // 같은 발행자(None=0) 2건 → 2번째에서 임계 교차 이벤트.
+        // 같은 발행자(None=0) 2건 → 2번째에서 임계 교차 이벤트. HighRisk 서술로 라우팅 부작용 회피.
         let _ = dispatch(&daemon, w3_push(1, "b1", "무언가 요청", "", None), None);
         let _ = dispatch(&daemon, w3_push(2, "b2", "무언가 요청2", "", None), None);
         let evs = drain(&mut rx);

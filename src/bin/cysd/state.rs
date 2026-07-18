@@ -1459,7 +1459,11 @@ impl Daemon {
             item.clone()
         };
         self.persist_feed_item(&snapshot);
-        self.append_approval_audit(&snapshot, decision, reason, caller_pid);
+        // W3.5 감사 append는 자동결재 기능의 일부 — flag ON일 때만 기록한다(C-4: OFF=현행
+        // 100% 동일, audit 파일도 미생성). OFF면 해소만 하고 감사는 건너뛴다.
+        if self.config.approve_auto_route {
+            self.append_approval_audit(&snapshot, decision, reason, caller_pid);
+        }
         if let Some(tx) = self.feed_waiters.lock().unwrap().remove(request_id) {
             let _ = tx.send(decision.to_string());
         }
@@ -1523,6 +1527,7 @@ impl Daemon {
         };
         let dir = state_dir(&self.socket_path);
         let _guard = self.feed_persist_lock.lock().unwrap();
+        // v1 의도적 무제한 append(승인은 사람 페이스 저볼륨) — size/age 캡은 별건 티켓(#7).
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
