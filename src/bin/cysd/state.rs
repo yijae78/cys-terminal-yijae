@@ -293,6 +293,14 @@ pub struct FeedItem {
     /// 인메모리 Vec이라 마이그레이션 불요. serde default 하위호환.
     #[serde(default)]
     pub publisher_surface: Option<u64>,
+    /// W3.1 서버측 위험 파생 태그("auto"|"high"|"human"). cysd가 title·body에서 파생한다
+    /// (발행자 tier/kind 자기신고 무관). None=구 영속 라인·파생 전. serde default 하위호환.
+    #[serde(default)]
+    pub risk_class: Option<String>,
+    /// W3.2 이 항목이 CEO 자동결재 경로로 배달됐는가(flag ON + risk=auto). UI가 CC 전환 유예
+    /// 연장(90초) 판단에 쓴다. serde default 하위호환(구 라인·비대상=false).
+    #[serde(default)]
+    pub auto_route: bool,
 }
 
 pub struct Config {
@@ -305,6 +313,9 @@ pub struct Config {
     pub idle_seconds: u64,
     /// (E-a) 동시 살아있는 worker-* 한도. 0=무제한(하위호환 escape hatch).
     pub max_active_workers: usize,
+    /// W3 CEO 자동결재 라우팅 게이트. 기본 OFF(미설정) — 현행 동작 100% 보존(C-4 부트스트랩
+    /// 안전). ON일 때만 risk=auto 항목을 CEO 좌석으로 즉시 배달한다. `CYS_APPROVE_AUTO_ROUTE=1`.
+    pub approve_auto_route: bool,
 }
 
 impl Config {
@@ -322,6 +333,10 @@ impl Config {
                 .unwrap_or(false),
             idle_seconds: env_f64("CYS_IDLE_SECONDS", 300.0) as u64,
             max_active_workers: env_f64("CYS_MAX_ACTIVE_WORKERS", 8.0) as usize,
+            // 미설정=OFF(fail-safe). "1"만 ON — 그 외 값·부재는 현행 동작 보존.
+            approve_auto_route: cys::env_compat("CYS_APPROVE_AUTO_ROUTE")
+                .map(|v| v == "1")
+                .unwrap_or(false),
         }
     }
 }
@@ -808,6 +823,14 @@ pub struct Daemon {
     /// 실패하던 dept-4 결함을 좁게 연다 — surface.create 임의-cmd 자식·HUD bridge는 이 목록에
     /// 오르지 않으므로 면제 대상이 아니다. (pid, start_time)로 pid 재사용을 fail-closed 구분한다.
     pub restore_roots: Mutex<Vec<(u32, u64)>>,
+    /// W3.6 형해화 back-pressure: 발행자(surface)별 승인 (요청 수, 거부 수) 누적. 키=발행
+    /// surface id(미상 발행자=0). org.status에 노출 + 임계 초과 시 이벤트·경고 플래그. 인메모리
+    /// 세션 카운터(재시작 시 리셋 — 저볼륨·근사 신호라 영속 불요).
+    pub approval_stats: Mutex<HashMap<u64, (u64, u64)>>,
+    /// W3.2 CEO 자동배달 멱등: 의미 키(kind+title+publisher_surface+body sha256) → 마지막
+    /// 배달 epoch. 재발행이 매번 새 request_id를 받아도(id 기준 억제 실패) 같은 의미 요청의
+    /// CEO 이중 주입을 억제한다. 인메모리(세션 한정 — 저볼륨).
+    pub auto_route_seen: Mutex<HashMap<String, f64>>,
 }
 
 /// ★T6 RAII: auto-restore가 스폰한 phoenix restore 프로세스를 restore_roots에 등록하고, Drop에서
@@ -1311,6 +1334,8 @@ impl Daemon {
             learn_assets_cache: Mutex::new(None),
             learn_write: Mutex::new(()),
             restore_roots: Mutex::new(Vec::new()),
+            approval_stats: Mutex::new(HashMap::new()),
+            auto_route_seen: Mutex::new(HashMap::new()),
         });
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.
         crate::analytics::seed_consumption(&daemon);
@@ -1345,6 +1370,9 @@ impl Daemon {
             publisher_pid: None, // 데몬 발행 — 외부 caller 없음(자기승인 판정 비적용).
             publisher_pgid: None,
             publisher_surface: None,
+            // 데몬 자동 알림은 자동결재 대상이 아니다(notification 축약 경로) — 무파생·무라우팅.
+            risk_class: None,
+            auto_route: false,
         };
         self.feed_items.lock().unwrap().push(item.clone());
         self.persist_feed_item(&item);
@@ -1354,7 +1382,7 @@ impl Daemon {
             surface_id,
             json!({"request_id": request_id, "kind": kind, "title": title,
                    // 데몬 자동 알림은 항상 무태그(=D·미러 제외) — tier 필드 계약 균일성(§2.4-3).
-                   "body": body, "wait": false, "tier": "d"}),
+                   "body": body, "wait": false, "tier": "d", "auto_route": false}),
         );
     }
 
@@ -1403,7 +1431,22 @@ impl Daemon {
     /// 반환, pending이 아니거나 없으면 None(멱등 — 중복 해소는 None). ★락 순서: feed_items →
     /// feed_waiters(feed.push와 동일). channels 락을 잡은 채 호출돼도 안전하다(feed_items→channels
     /// 역순 경로 없음 — mirror는 feed_items 해제 후 호출).
+    /// 얇은 래퍼(하위호환 — reason·caller 미상 경로: stale-clear·채널 미러). 감사에는
+    /// decision만 남고 reason/caller는 null이 된다.
     pub fn resolve_feed_item(&self, request_id: &str, decision: &str) -> Option<FeedItem> {
+        self.resolve_feed_item_audited(request_id, decision, None, None)
+    }
+
+    /// 단일 해소 경로(M7) + W3.5 감사(producer≠auditor). 모든 결재는 이 코어를 지나며 cysd가
+    /// approval_audit.jsonl에 자동 append한다(CEO 자기기록 아님). reason·caller는 feed.reply
+    /// 경로에서만 Some.
+    pub fn resolve_feed_item_audited(
+        &self,
+        request_id: &str,
+        decision: &str,
+        reason: Option<&str>,
+        caller_pid: Option<u32>,
+    ) -> Option<FeedItem> {
         let snapshot = {
             let mut items = self.feed_items.lock().unwrap();
             let item = items.iter_mut().find(|i| i.request_id == request_id)?;
@@ -1416,6 +1459,7 @@ impl Daemon {
             item.clone()
         };
         self.persist_feed_item(&snapshot);
+        self.append_approval_audit(&snapshot, decision, reason, caller_pid);
         if let Some(tx) = self.feed_waiters.lock().unwrap().remove(request_id) {
             let _ = tx.send(decision.to_string());
         }
@@ -1449,6 +1493,42 @@ impl Daemon {
             let _ = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes());
             // §9.1-1: append 후 fsync — 재부팅에도 미배달 승인요청(feed)이 디스크에 확정된다.
             // (파일별 내구성 불균일 해소: topology는 이미 fsync, feed.jsonl은 누락돼 있었다.)
+            let _ = f.sync_all();
+        }
+    }
+
+    /// W3.5 승인 감사 append(producer≠auditor): 해소된 항목 스냅샷 + decision·reason·caller를
+    /// approval_audit.jsonl에 한 줄 기록한다. CEO가 자기 결재를 기록하는 게 아니라 cysd가 단일
+    /// 해소 경로에서 자동 기록한다. ⚠v1 로테이션 부재 명시 수용(승인=사람 페이스 저볼륨) —
+    /// size/age 캡은 후속 티켓(§5 리스크 대장). feed_persist_lock 재사용으로 append 직렬화.
+    fn append_approval_audit(
+        &self,
+        item: &FeedItem,
+        decision: &str,
+        reason: Option<&str>,
+        caller_pid: Option<u32>,
+    ) {
+        let record = json!({
+            "ts": now_epoch(),
+            "req_id": item.request_id,
+            "kind": item.kind,
+            "risk": item.risk_class,
+            "publisher": item.publisher_surface,
+            "caller": caller_pid,
+            "decision": decision,
+            "reason": reason,
+        });
+        let Ok(line) = serde_json::to_string(&record) else {
+            return;
+        };
+        let dir = state_dir(&self.socket_path);
+        let _guard = self.feed_persist_lock.lock().unwrap();
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("approval_audit.jsonl"))
+        {
+            let _ = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes());
             let _ = f.sync_all();
         }
     }
@@ -3510,6 +3590,8 @@ mod tests {
             publisher_pid: None,
             publisher_pgid: None,
             publisher_surface: None,
+            risk_class: None,
+            auto_route: false,
         }
     }
 

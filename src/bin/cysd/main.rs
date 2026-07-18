@@ -10,6 +10,7 @@ mod accounts;
 mod alerts;
 mod analytics;
 mod approval;
+mod approval_risk;
 mod caps;
 mod channels;
 mod classifier;

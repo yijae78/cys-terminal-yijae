@@ -913,6 +913,9 @@ enum FeedAction {
     Reply {
         request_id: String,
         decision: String,
+        /// 결재 사유(W3.3 감사 기록용). 한글·공백은 셸에서 단일 인용으로 감싼다.
+        #[arg(long)]
+        reason: Option<String>,
     },
 }
 
@@ -2213,12 +2216,16 @@ fn run_feed(action: FeedAction) -> i32 {
             }
             0
         }),
-        FeedAction::Reply { request_id, decision } => {
-            request("feed.reply", json!({"request_id": request_id, "decision": decision}))
-                .map(|_| {
-                    println!("OK");
-                    0
-                })
+        FeedAction::Reply { request_id, decision, reason } => {
+            // reason은 Some일 때만 실어 보낸다(None=키 부재 → 데몬에서 null 처리).
+            request(
+                "feed.reply",
+                json!({"request_id": request_id, "decision": decision, "reason": reason}),
+            )
+            .map(|_| {
+                println!("OK");
+                0
+            })
         }
     };
     match result {
