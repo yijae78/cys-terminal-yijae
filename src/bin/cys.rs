@@ -3104,7 +3104,8 @@ fn run_init_pack(force: bool, no_install_hook: bool, claude_settings: Option<Str
     let dir = cys::pack::pack_dir();
     // §3.1 팩 atomic swap: 파일별 in-place write(중단 시 반쯤 쓰인 팩) 대신 staging 전개→검증→
     // 원자 rename 교체(pack_dir.prev 1세대 보존). 중단은 기존 팩을 건드리지 않는다.
-    let (written, kept) = match cys::pack::install_staged(force) {
+    // W0-d: cys init-pack CLI 핸들러는 라이브 팩 쓰기 프로덕션 진입점 — 인가 부여.
+    let (written, kept) = match cys::pack::install_staged(force, Some(cys::pack::PackWriteAuth::production())) {
         Ok(wk) => wk,
         Err(e) => {
             eprintln!("error: {e}");
@@ -7091,9 +7092,14 @@ fn pack_update_from_dir(
         let res = with_apply_lock(lock_path, move || {
             let items: Vec<(&str, &str)> =
                 tree.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
-            cys::pack::apply_pack_transactional(&items, &pv, &new_state, || {
-                cys::packsig::record_accepted(&acc_path, &manifest_acc)
-            })
+            // W0-d: pack-update는 라이브 팩 쓰기 프로덕션 진입점 — 인가 부여.
+            cys::pack::apply_pack_transactional(
+                &items,
+                &pv,
+                &new_state,
+                Some(cys::pack::PackWriteAuth::production()),
+                || cys::packsig::record_accepted(&acc_path, &manifest_acc),
+            )
         })?;
         let (w, k, post_ok) = res?;
         written = w;
@@ -7210,7 +7216,8 @@ fn run_pack_downgrade_to_free(yes: bool, override_valid_license: bool) -> i32 {
         eprintln!("error: state 전환 실패 — {e}");
         return 1;
     }
-    match cys::pack::install(false) {
+    // W0-d: pack-downgrade는 라이브 팩 재설치 프로덕션 진입점 — 인가 부여.
+    match cys::pack::install(false, Some(cys::pack::PackWriteAuth::production())) {
         Ok((written, kept)) => {
             println!("[downgrade] free 전환 완료 — 내장 팩 재설치: {written} written, {kept} preserved.");
             0
@@ -10367,6 +10374,11 @@ mod tests {
         }
     }
 
+    /// staging-residue 진단은 프로세스 전역 env `CYS_DOCTOR_STAGING_MIN_IDLE_SECS`(보호창)를 읽는다.
+    /// 이 값을 set/remove하는 doctor 테스트가 병렬로 겹치면 서로의 값을 읽어 오탐(사전 존재한 레이스)이
+    /// 나므로, 해당 env를 만지는 테스트를 이 락으로 직렬화한다(W0 테스트 격리 정신 — 전역 env 교대 창 제거).
+    static DOCTOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn doctor_pack_version_ok_and_skew() {
         let base = std::env::temp_dir().join(format!("cys-doc-ver-{}", std::process::id()));
@@ -10420,7 +10432,9 @@ mod tests {
     #[test]
     fn doctor_staging_residue_fix_keeps_prev() {
         // L5 보호 해제(방금 만든 staging이 <60s라 보호에 걸리지 않게) — 이 테스트는 삭제 동작 검증.
-        std::env::set_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "0");
+        // ★직렬화 + RAII 복원(사전 존재 레이스 봉인): 겹치는 doctor 테스트의 전역 env 교대 창 제거.
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = cys::pack::EnvGuard::set("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "0");
         let base = std::env::temp_dir().join(format!("cys-doc-stg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -10437,13 +10451,14 @@ mod tests {
         assert!(!base.join(".pack-staging").exists());
         assert!(base.join("pack.prev").exists(), ".prev 롤백 세대 보존(삭제 금지)");
         let _ = std::fs::remove_dir_all(&base);
-        std::env::remove_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS");
+        // _env drop → 이전 값 복원(remove_var 창 없음).
     }
 
     // L5: 진행중(최근 수정) staging은 doctor --fix가 삭제하지 않고 보호한다.
     #[test]
     fn doctor_staging_residue_protects_in_progress() {
-        std::env::set_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "3600"); // 1시간 보호창
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = cys::pack::EnvGuard::set("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "3600"); // 1시간 보호창
         let base = std::env::temp_dir().join(format!("cys-doc-stg-prot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -10456,7 +10471,7 @@ mod tests {
         assert!(base.join(".pack-staging").exists(), "진행중 staging은 삭제되지 않는다");
         assert!(d.action.contains("진행중 보호"), "보호 사유 보고: {}", d.action);
         let _ = std::fs::remove_dir_all(&base);
-        std::env::remove_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS");
+        // _env drop → 이전 값 복원.
     }
 
     #[test]
@@ -10504,7 +10519,8 @@ mod tests {
     #[test]
     fn doctor_fix_then_rediag_ok() {
         // L5 보호 해제 — 방금 만든 staging(<60s)이 진행중 보호에 걸려 정리 안 되는 것을 방지(정리 검증).
-        std::env::set_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "0");
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = cys::pack::EnvGuard::set("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "0");
         let base = std::env::temp_dir().join(format!("cys-doc-fix-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -10525,7 +10541,7 @@ mod tests {
         assert_eq!(by("staging-residue"), DiagStatus::Ok, "잔재 정리됨");
         assert_eq!(by("hook"), DiagStatus::Ok, "hook 재등록됨");
         let _ = std::fs::remove_dir_all(&base);
-        std::env::remove_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS");
+        // _env drop → 이전 값 복원.
     }
 
     // ───────────────────────── W1: 계정 dir 영속 + resume 재현 ─────────────────────────

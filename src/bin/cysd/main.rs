@@ -184,7 +184,12 @@ async fn main() {
     if !cys::pack::pack_current_for(env!("CARGO_PKG_VERSION")) {
         // ★리뷰어1 F1: install(false)도 동기 블로킹(최대 320파일 read+해시+write)이라 위 heartbeat 굶김
         // 위험이 동일 — spawn_blocking 으로 분리한다. (pack_current_for 게이트는 stat 2회라 동기 유지.)
-        match tokio::task::spawn_blocking(|| cys::pack::install(false)).await {
+        // W0-d: cysd 부팅 자동설치는 라이브 팩 쓰기 프로덕션 진입점 — 인가 부여.
+        match tokio::task::spawn_blocking(|| {
+            cys::pack::install(false, Some(cys::pack::PackWriteAuth::production()))
+        })
+        .await
+        {
             Ok(Ok((written, _))) if written > 0 => eprintln!(
                 "[cysd] CYSJavis Pack: {written} file(s) installed at {}",
                 cys::pack::pack_dir().display()
