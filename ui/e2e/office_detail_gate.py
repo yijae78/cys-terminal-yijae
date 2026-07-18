@@ -20,7 +20,6 @@
 """
 import http.server
 import json
-import re
 import socket
 import sys
 import threading
@@ -212,58 +211,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 SNAP = "window.__officeDebug ? window.__officeDebug.snapshot() : null"
 
-# ── D8-2 불변식 열거 (office-cc v13) — 픽셀 스냅샷 대신 FloorPlan 불변식을 전수 단언 ──
-# dbg.floorPlanOf(순수함수)로 템플릿 5종 × seed 대표값 × 노드수를 열거하고,
-# ① 데스크∩가구 비겹침 ② 링∈회의실 ③ 순찰점 가구 외부 를 단언한다.
-# ①③ 는 실제 렌더 가구 footprint(=geometry SOT)가 필요 → dbg.furnitureAabbs(plan) 훅 소비.
-# 훅 부재 시 hasAabb=false 로 보고(게이트가 명시 FAIL — 침묵 skip 금지).
-INVARIANTS_JS = r"""
-() => {
-  const dbg = window.__officeDebug;
-  if (!dbg || !dbg.floorPlanOf) return { error: 'floorPlanOf 훅 부재' };
-  const hashStr = (s)=>{ let h=2166136261; const t=String(s);
-    for(let i=0;i<t.length;i++){ h^=t.charCodeAt(i); h=Math.imul(h,16777619);} return h>>>0; };
-  const aabbOf = dbg.furnitureAabbs || null;
-  const SLABX = 6.5, SLABZ = 4.3;
-  const keys = ['dept-a','부서-B','팀감마','q','zzzz','본부X','engineering','디자인부'];
-  const seeds = [null,0,1,2,3,4,5,7,11,13,17,23,42];
-  const counts = [1,2,4,6,9,12];
-  const overlap = (a,b)=> Math.abs(a.cx-b.cx) < (a.w+b.w)/2 && Math.abs(a.cz-b.cz) < (a.d+b.d)/2;
-  const templatesSeen = new Set();
-  const fails = []; let combos = 0;
-  for (const k of keys) for (const seed of seeds) for (const n of counts){
-    const es = (seed==null ? hashStr(k) : (seed ^ hashStr(k))) >>> 0;
-    const tpl = es % 5; templatesSeen.add(tpl);
-    const plan = dbg.floorPlanOf(k, seed, n); combos++;
-    const m = plan.meeting;
-    // ② 링 ∈ 회의실: 반경은 plan.meeting 치수 유도(rx=w/2-0.4) — 상수 반경 회귀 차단(§10 S1-4)
-    const rx = m.w/2 - 0.4, rz = m.d/2 - 0.4;
-    if (!(rx > 0 && rz > 0)) fails.push(`②ring<=0 k=${k} s=${seed} m=${JSON.stringify(m)}`);
-    if (plan.gather.x !== m.x || plan.gather.z !== m.z) fails.push(`②gather!=회의실중심 k=${k} s=${seed}`);
-    if (!(rx <= m.w/2 && rz <= m.d/2)) fails.push(`②ring∉회의실 k=${k} s=${seed}`);
-    // 데스크: 정확히 n개 · 슬랩 내부
-    if (plan.desks.length !== n) fails.push(`desks ${plan.desks.length}!=${n} k=${k} s=${seed} tpl=${tpl}`);
-    for (const d of plan.desks) if (Math.abs(d[0])>SLABX || Math.abs(d[1])>SLABZ)
-      fails.push(`desk∉슬랩 k=${k} s=${seed} d=${JSON.stringify(d)}`);
-    for (const p of plan.patrol) if (Math.abs(p[0])>SLABX || Math.abs(p[1])>SLABZ)
-      fails.push(`patrol∉슬랩 k=${k} s=${seed} p=${JSON.stringify(p)}`);
-    if (aabbOf){
-      const fa = aabbOf(plan);
-      const furn = [fa.meeting, fa.lounge, fa.kanban, fa.amenity].filter(Boolean);
-      // ① 데스크 ∩ 가구 비겹침
-      for (const d of (fa.desks||[])) for (const f of furn) if (overlap(d, f))
-        fails.push(`①데스크∩가구 k=${k} s=${seed} tpl=${tpl} d=${JSON.stringify(d)} f=${JSON.stringify(f)}`);
-      // ③ 순찰점 가구 외부(점 AABB≈0)
-      for (const p of plan.patrol){ const pt={cx:p[0],cz:p[1],w:0.02,d:0.02};
-        for (const f of furn) if (overlap(pt, f))
-          fails.push(`③순찰∈가구 k=${k} s=${seed} p=${JSON.stringify(p)} f=${JSON.stringify(f)}`); }
-    }
-  }
-  return { templatesSeen:[...templatesSeen].sort((a,b)=>a-b), combos,
-           failCount: fails.length, fails: fails.slice(0,20), hasAabb: !!aabbOf };
-}
-"""
-
 failures: list[str] = []
 asserted = 0
 
@@ -374,38 +321,7 @@ def main() -> int:
             title = page.evaluate("window.__officeDebug.panelTitle()")
             check("본부" in title and "@surface" not in title and "main" not in title,
                   f"④ 패널 dept_label 표기('본부 · role', raw 키 비노출) (title={title!r})")
-
-            # ══ D8-2 불변식 게이트 (office-cc v13) — 스냅샷 픽셀 비교 → 불변식 전수 단언 ══
-            # (office_detail_snapshot.png 는 참고물로 강등 — 랜덤 배치와 픽셀 비교 양립 불가, 설계 D8-2)
-            inv = page.evaluate(INVARIANTS_JS)
-            print("  불변식:", json.dumps(inv, ensure_ascii=False))
-            check(inv.get("error") is None, f"D1 floorPlanOf 훅 가용 (err={inv.get('error')})")
-            check(inv.get("templatesSeen") == [0, 1, 2, 3, 4],
-                  f"D1 템플릿 5종 전수 seed 커버 (seen={inv.get('templatesSeen')}, combos={inv.get('combos')})")
-            check(bool(inv.get("hasAabb")),
-                  "①③ furnitureAabbs 훅 존재(worker-front geometry SOT) — 부재 시 데스크∩가구·순찰∈가구 검증 불가")
-            check(inv.get("failCount") == 0,
-                  f"D1 불변식(②링∈회의실·데스크수/슬랩·①데스크∩가구·③순찰∈가구) 위반 "
-                  f"{inv.get('failCount')}건 (fails={inv.get('fails')})")
-
-            # ⑤ 착석 상태기계 (D2) — owner idle → 자동 착석(자리 존 진입·R3 핵심)
-            try:
-                page.wait_for_function(
-                    "()=>{const s=window.__officeDebug.ownerState();return s&&s.seated===true;}",
-                    timeout=8000)
-            except Exception:
-                pass
-            ost = page.evaluate("window.__officeDebug.ownerState()")
-            print("  ownerState:", json.dumps(ost, ensure_ascii=False))
-            check(bool(ost) and ost.get("seated") is True,
-                  f"⑤ owner idle→자동 착석(seated=true) (state={ost})")
-            check(bool(ost) and abs(ost.get("x", 9) - 0.5) < 0.06 and abs(ost.get("z", 9) - (-3.65)) < 0.06,
-                  f"⑤ 착석 좌표=왕좌 SOT(THRONE x=0.5,z=-3.65) (state={ost})")
-
-            # ④(전수) 화면 DOM 텍스트에 raw dept-N@surface 패턴 부재 (설계 D5 게이트)
-            body_text = page.evaluate("document.body.innerText")
-            raw_hits = re.findall(r"dept-\d+@surface", body_text)
-            check(not raw_hits, f"④ 화면 DOM 텍스트 raw 'dept-N@surface' 패턴 부재 (hits={raw_hits[:5]})")
+            # office-cc v13 배치·착석·강아지·상점 불변식은 전용 게이트(office_cc_gate.py)로 분리.
 
             check(len(page_errors) == 0, f"콘솔 pageerror 0건 (got {page_errors})")
             check(len(console_errors) == 0, f"콘솔 error 0건 (got {console_errors[:3]})")
