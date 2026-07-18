@@ -3530,7 +3530,7 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         );
         assert_eq!(
             boot_path_verdict(
-                Path::new("/Users/cys/Downloads/cys.app/Contents/MacOS/cys-app"),
+                Path::new("/Users/x/Downloads/cys.app/Contents/MacOS/cys-app"),
                 false,
             ),
             BootPathVerdict::NonCanonical,
@@ -3547,7 +3547,7 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         );
         assert_eq!(
             boot_path_verdict(
-                Path::new("/Users/cys/dev/cys/target/release/cys-app"),
+                Path::new("/Users/x/dev/cys/target/release/cys-app"),
                 true,
             ),
             BootPathVerdict::Canonical,
@@ -3561,7 +3561,7 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         // ~/Applications 도 Canonical(정규 allowlist).
         assert_eq!(
             boot_path_verdict(
-                Path::new("/Users/cys/Applications/cys.app/Contents/MacOS/cys-app"),
+                Path::new("/Users/x/Applications/cys.app/Contents/MacOS/cys-app"),
                 false,
             ),
             BootPathVerdict::Canonical,
@@ -3577,7 +3577,7 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
         // escape 없는 개발 target/ 는 NonCanonical(하네스가 env 로 스스로 풀어야 함).
         assert_eq!(
             boot_path_verdict(
-                Path::new("/Users/cys/dev/cys/target/debug/cys-app"),
+                Path::new("/Users/x/dev/cys/target/debug/cys-app"),
                 false,
             ),
             BootPathVerdict::NonCanonical,
