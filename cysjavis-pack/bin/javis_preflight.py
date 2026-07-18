@@ -1429,16 +1429,34 @@ class Preflight:
             return
         jobs = data.get("jobs", [])
         # 절대지침 "매 5분" — every_minutes는 5 이하만 충족(더 자주는 명세 이상, 더 길면 위반).
-        # 결정론 환원: text_command(데몬이 javis_report 실행)가 권장이나, text도 허용한다.
-        def is_report(j):
+        # 5분 보고 체계는 두 형태를 허용한다(체계 존재 보장이 의도·형태는 확장):
+        #   ①구 push 보고 잡: action=="push" to=="master" text|text_command (하위호환)
+        #   ②델타게이트 잡: action=="command" command에 'javis_report_gate.py' 포함
+        #     (하트비트 델타게이트로 마이그레이션 — 게이트가 javis_report를 소비·판정·배달 소유).
+        # 게이트 잡을 인식하지 못하면 --fix가 부팅마다 구 push 잡을 재생성해 마이그레이션을
+        # 되돌리고 구/신 이중발화를 만든다 — 그래서 두 형태를 모두 report 체계로 판정한다.
+        def is_push_report(j):
             return (isinstance(j.get("every_minutes"), int)
                     and j.get("action") == "push" and j.get("to") == "master"
                     and (j.get("text") or j.get("text_command")))
+
+        def is_gate_report(j):
+            return (isinstance(j.get("every_minutes"), int)
+                    and j.get("action") == "command"
+                    and "javis_report_gate.py" in (j.get("command") or ""))
+
+        def is_report(j):
+            return is_push_report(j) or is_gate_report(j)
         rep = [j for j in jobs if is_report(j) and 1 <= j.get("every_minutes") <= 5]
         too_slow = [j for j in jobs if is_report(j) and j.get("every_minutes") > 5]
         if rep:
             j = rep[0]
-            mode = "text_command(결정론 직접산출)" if j.get("text_command") else "text(master 산출)"
+            if is_gate_report(j):
+                mode = "command(하트비트 델타게이트)"
+            elif j.get("text_command"):
+                mode = "text_command(결정론 직접산출)"
+            else:
+                mode = "text(master 산출)"
             self.add(cid, PASS, "5분 보고 job 존재: %s (every_minutes=%s ≤5, %s)"
                      % (j.get("id"), j.get("every_minutes"), mode))
             return
@@ -3752,6 +3770,43 @@ class Preflight:
         else:
             self.add(cid, PASS, "학습 기록 배선됨 (마지막 갱신 %.1f일 전)" % age_days)
 
+    # ── C69 하트비트 게이트 대장 최신성 (WARN-only·부트 비차단 — 데드맨 2차 · DESIGN §C6) ──
+    # 게이트가 5분마다 대장에 append하므로 대장 mtime이 ≤15분이면 게이트 생존이다. 정체는
+    # ①게이트 사망(스크립트/인터프리터 부재) ②kill-switch pause(정상) 둘 중 하나 — pause면
+    # 스케줄 발화가 동결이라 정체가 정상이므로 `cys gate-check` exit 4=pause면 skip한다(오경보 금지).
+    # ★비차단 필수: preflight는 부트 시퀀스 ⓪라 이 검사의 버그가 부트를 막아선 안 된다 → 전부 WARN.
+    def c69_gate_ledger(self):
+        cid = "C69.gate-ledger"
+        if self.skipped(cid):
+            return
+        # pause 존중 — pause 중이면 대장 정체가 정상이므로 검사 자체를 건너뛴다(gate-check exit 4).
+        cys = shutil.which("cys") or os.environ.get("CYS_BIN")
+        if cys:
+            try:
+                r = subprocess.run([cys, "gate-check"], capture_output=True, timeout=10)
+                if r.returncode == 4:
+                    self.add(cid, PASS, "kill-switch pause 중 — 게이트 대장 최신성 검사 skip(정체 정상)")
+                    return
+            except Exception:
+                pass  # gate-check 실패는 무시하고 대장 검사 계속(비차단)
+        ledger = os.path.join(os.path.expanduser("~"), ".cys", "state", "report_gate", "ledger.jsonl")
+        if os.environ.get("CYS_REPORT_GATE_DIR"):
+            ledger = os.path.join(os.environ["CYS_REPORT_GATE_DIR"], "ledger.jsonl")
+        if not os.path.isfile(ledger):
+            self.add(cid, WARN, "게이트 대장 부재(%s) — 델타게이트 미배선/미가동일 수 있음(비차단)" % ledger)
+            return
+        try:
+            age_min = (time.time() - os.path.getmtime(ledger)) / 60.0
+        except OSError as e:
+            self.add(cid, WARN, "게이트 대장 mtime 조회 실패(%s) — 최신성 확인 불가" % e)
+            return
+        if age_min > 15:
+            self.add(cid, WARN,
+                     "게이트 대장 정체 %.0f분(>15분) — 게이트 사망 의심(스크립트/인터프리터 점검). "
+                     "pause가 아니면 CSO 점검 필요" % age_min)
+        else:
+            self.add(cid, PASS, "게이트 대장 최신(%.1f분 전) — 델타게이트 생존" % age_min)
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -3782,7 +3837,7 @@ class Preflight:
             self.c54_loc_cap, self.c55_grill_gate, self.c56_dept_hook_leak,
             self.c57_temp_hook_leak, self.c58_trust_harden, self.c59_guard_wiring,
             self.c60_gate_wiring, self.c61_doc_code_sot, self.c65_drain_verify,
-            self.c66_board_catalog, self.c67_learn_wiring,
+            self.c66_board_catalog, self.c67_learn_wiring, self.c69_gate_ledger,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,
