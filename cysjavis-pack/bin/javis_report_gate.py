@@ -38,6 +38,7 @@ STALL_CYCLES_DEFAULT = 6       # 6주기=30분 무진행 → stall 승격(DESIGN
 QUIET_CYCLES_DEFAULT = 12      # 12주기=60분 QUIET → 세션 주차 후보(P2·CSO 집행)
 GAP_CYCLES = 3                 # 직전 대장과 간격 >3주기 = GAP(슬립·재부팅 복귀 위양성 강등)
 SCHEMA_VERSION = 1
+LEDGER_MAX_BYTES = 5 * 1024 * 1024   # 대장 5MB 도달 시 ledger.jsonl.1로 1세대 로테이션
 
 # 정규화 블랙리스트 — 타임스탬프·수집시각·순서 비결정 항목만 제거한다. 화이트리스트 금지
 # (신호 유실 단일 실패점). 미지의 새 필드는 자동으로 diff 대상 = 변화로 감지된다(fail-noisy).
@@ -95,9 +96,14 @@ def resolve_cys_bin():
 #   출처: cysjavis-pack/bin/javis_wakeup.py class _FileLock (mkdir 원자성·stale 30초 회수).
 #   다중 cysd 데몬·장기 실행 겹침이 stall/quiet 카운터를 이중 증가시키는 경로를 차단한다.
 class _FileLock:
-    """mkdir 원자성 기반 락. stale(30초+)은 rename으로 원자적 회수."""
+    """mkdir 원자성 기반 락. stale(270초+)은 rename으로 원자적 회수.
 
-    def __init__(self, path, timeout=2.0, stale_sec=30.0):
+    ★stale_sec=270(5분 주기 직하): 최악의 직렬 실행(report 수집 + N개 emit + drain)이 30초를
+    넘길 수 있다 — stale 30초면 아직 살아 실행 중인 게이트의 락을 다른 인스턴스가 탈취해 카운터를
+    이중 증가시킨다(S2-3 재유입). 주기(300초) 직하로 잡아 정상 실행은 절대 stale 판정되지 않게 하되,
+    진짜 죽은 락(주기 초과 잔존)은 다음 주기에 회수되게 한다."""
+
+    def __init__(self, path, timeout=2.0, stale_sec=270.0):
         self.path, self.timeout, self.stale_sec = path, timeout, stale_sec
 
     def __enter__(self):
@@ -148,10 +154,16 @@ def _write_json_atomic(path, obj):
 
 
 def ledger_append(state_dir, entry):
-    """O_APPEND 단일 write 원자 append(동시 방출 안전). schema_version 자동 부착."""
+    """O_APPEND 단일 write 원자 append(동시 방출 안전). schema_version 자동 부착.
+    크기 임계(5MB) 도달 시 ledger.jsonl.1로 1세대 로테이션(무한 성장 차단)."""
     entry.setdefault("schema_version", SCHEMA_VERSION)
     path = os.path.join(state_dir, "ledger.jsonl")
     os.makedirs(state_dir, exist_ok=True)
+    try:
+        if os.path.getsize(path) >= LEDGER_MAX_BYTES:
+            os.replace(path, path + ".1")   # 원자적 로테이션(기존 .1 덮어씀 = 1세대 보관)
+    except OSError:
+        pass                                # 부재·경합은 무해 — 이번 append로 새 파일 생성
     line = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
@@ -161,17 +173,22 @@ def ledger_append(state_dir, entry):
 
 
 def last_ledger(state_dir):
+    """마지막 대장 항목 — seek 기반 tail 읽기(전체 readlines 금지·대용량 내성). 파일 끝에서
+    최대 64KB만 읽어 마지막 파싱 가능한 줄을 반환한다(한 항목은 <1KB라 충분)."""
     path = os.path.join(state_dir, "ledger.jsonl")
     try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.readlines()
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            tail = f.read()
     except OSError:
         return None
-    for line in reversed(lines):
+    for line in reversed(tail.split(b"\n")):
         line = line.strip()
         if line:
             try:
-                return json.loads(line)
+                return json.loads(line.decode("utf-8", "replace"))
             except ValueError:
                 continue
     return None
@@ -258,12 +275,15 @@ def extract_warnings(report):
     proc = ("read-screen 확인·재지시.")
     tail = " 기상절차: cys status --json 1콜 점검 병행."
 
-    # idle WARN은 '할 일이 남은' 노드에만 발화한다 — 모든 todo가 done인 노드의 idle은 정상
-    # 정적(QUIET)이지 경보가 아니다(그걸 WARN으로 삼으면 QUIET가 도달 불가·quiet-park 신호 사멸).
-    # ★master 승인 2026-07-18: 이 게이팅(pending todo 있는 노드에만 idle WARN)을 승인한다 —
-    #   DESIGN QUIET 정의와 정합하고, 승인 프롬프트 대기는 통상 진행 중 태스크(todo 보유) 상태라
-    #   간접 커버(C4)가 유지된다. todo 미상 노드(리뷰어 등)는 보수적으로 WARN 유지(미지=시끄러운 쪽).
-    #   ※리뷰어 상시 idle 노이즈는 shadow(P1) 임계 튜닝 대상 — 지금 완화하지 않는다(master 지시).
+    # idle WARN은 pending-todo(진행 중 할 일이 남은) 노드 + todo 미상 노드에만 발화한다.
+    # ★master 승인 2026-07-18(동작 현행 유지 — 리뷰어 노이즈 재유입 방지):
+    #   - C4 간접 커버 주장은 **pending-todo 노드의 승인 프롬프트 대기에 한정**한다. done 노드
+    #     (진행 완료·total==0 포함)는 억제되고, 무배정 노드(todo 없음)는 noisy-default로 발화하나
+    #     프롬프트↔idle 매핑이 보장되지 않는다 → **done/무배정 노드의 프롬프트는 미커버**(직접
+    #     감지기는 후속 과제). done 노드 idle 억제가 QUIET 도달성·quiet-park 신호를 살린다.
+    #   - ※리뷰어 상시 idle 노이즈는 현행 유지(완화 금지·master 지시), 임계 튜닝은 shadow(P1) 소관.
+    #   - ⚠P2-info(취약 결합): nodes[].node(=node_label, role 소문자)와 idle_nodes[].role을
+    #     문자열 라벨공간으로 조인한다 — role 명명 규칙이 바뀌면 이 조인이 조용히 깨진다.
     pending = {n.get("node") for n in (report.get("nodes") or [])
                if n.get("total", 0) > 0 and n.get("done", 0) < n.get("total", 0)}
     todo_labels = {n.get("node") for n in (report.get("nodes") or [])}
@@ -468,24 +488,54 @@ class Gate:
         print("verdict=%s delivered=%s reasons=%s"
               % (verdict, delivered, ",".join(reasons) if reasons else "-"))
 
+    # ── 스냅샷은 래퍼로 저장(schema_version·S2-4) — 상수 키가 diff 본문에 섞여 오탐 DELTA를
+    #    내지 않도록 {"schema_version":1,"data":<정규화 스냅샷>}로 감싼다. 로드는 구 포맷 하위호환. ──
+    def _load_snapshot(self):
+        raw = _load_json(self.snap_path, None)
+        if isinstance(raw, dict) and "schema_version" in raw and "data" in raw:
+            return raw["data"]
+        return raw
+
+    def _write_snapshot(self, snap):
+        _write_json_atomic(self.snap_path, {"schema_version": SCHEMA_VERSION, "data": snap})
+
+    def _write_counters(self, counters):
+        counters["schema_version"] = SCHEMA_VERSION     # S2-4: 상태 파일 스키마 버전(추가-전용 마이그레이션)
+        _write_json_atomic(self.counters_path, counters)
+
     def run(self, shadow=False):
-        lock_path = os.path.join(self.state_dir, "lock")
+        # ★최상위 fail-open(P1): 락 획득·state_dir 접근의 OSError(PermissionError/ENOSPC/EROFS
+        #   포함)가 exit 1로 죽는 경로를 봉쇄한다 — 대장 기록이 불가한 상황이라도 최소한 master에
+        #   직송을 시도하고 exit 0으로 종료한다(schedule.error만으론 아무도 안 깨기 때문).
         try:
             os.makedirs(self.state_dir, exist_ok=True)
-        except OSError:
-            pass
+            lock_path = os.path.join(self.state_dir, "lock")
+            try:
+                with _FileLock(lock_path):
+                    return self._run_locked(shadow)
+            except TimeoutError:
+                # 단일 비행 위반(다중 데몬·겹침) — 카운터 이중 증가 차단, 기록 후 조용히 종료.
+                ledger_append(self.state_dir, {"ts": self.now_iso_fn(),
+                                               "ts_epoch": self.now_epoch_fn(),
+                                               "verdict": "SKIPPED_CONCURRENT",
+                                               "reasons": ["lock_held"], "delta_fields": [],
+                                               "delivered": "none"})
+                self._summary("SKIPPED_CONCURRENT", "none", ["lock_held"])
+                return 0
+        except Exception as e:                          # noqa: BLE001 — state/락 접근 실패 최상위 fail-open
+            return self._fail_open_no_state(e)
+
+    def _fail_open_no_state(self, exc):
+        """state_dir/락 접근 불가(대장·카운터 기록 불능) → master 직송만 시도 + exit 0.
+        대장에 남길 수 없으므로 직송 본문에 사유를 명시한다(reviewer1 P1)."""
+        body = ("[gate] state 기록 불가(%s) — 대장/카운터 기록 불능 fail-open. "
+                "게이트 state_dir 권한·용량(Permission/ENOSPC/EROFS) 점검 필요." % exc)
         try:
-            with _FileLock(lock_path):
-                return self._run_locked(shadow)
-        except TimeoutError:
-            # 단일 비행 위반(다중 데몬·겹침) — 카운터 이중 증가 차단, 기록 후 조용히 종료.
-            ledger_append(self.state_dir, {"ts": self.now_iso_fn(),
-                                           "ts_epoch": self.now_epoch_fn(),
-                                           "verdict": "SKIPPED_CONCURRENT",
-                                           "reasons": ["lock_held"], "delta_fields": [],
-                                           "delivered": "none"})
-            self._summary("SKIPPED_CONCURRENT", "none", ["lock_held"])
-            return 0
+            self.runner.send_queued("master", body)
+        except Exception:                               # noqa: BLE001 — 직송 실패도 삼키고 exit 0(차기 재판정 복원)
+            pass
+        self._summary("FAILOPEN", "send", ["state_unwritable:%s" % (str(exc)[:60])])
+        return 0
 
     def _run_locked(self, shadow):
         counters = _load_json(self.counters_path, {})
@@ -493,7 +543,7 @@ class Gate:
         try:
             report = self._judge_and_route(shadow, counters)
             counters["failopen_streak"] = 0
-            _write_json_atomic(self.counters_path, counters)
+            self._write_counters(counters)
             return 0
         except Exception as e:                                   # noqa: BLE001 (최상위 fail-open)
             return self._fail_open(e, report, counters)
@@ -503,7 +553,7 @@ class Gate:
         streak = counters.get("failopen_streak", 0) + 1
         counters["failopen_streak"] = streak
         try:
-            _write_json_atomic(self.counters_path, counters)
+            self._write_counters(counters)
         except OSError:
             pass
         detail = json.dumps(report, ensure_ascii=False) if report else "수집 전 오류"
@@ -550,11 +600,11 @@ class Gate:
             return report
 
         new_snap = normalize(report)
-        old_snap = _load_json(self.snap_path, None)
+        old_snap = self._load_snapshot()
 
         # ── BASELINE: 스냅샷 부재(최초 실행·재설치) → 기록만, 배달 없음(DELTA 폭주 차단) ──
         if old_snap is None:
-            _write_json_atomic(self.snap_path, new_snap)
+            self._write_snapshot(new_snap)
             counters.setdefault("consecutive_nochg", 0)
             counters.setdefault("consecutive_quiet", 0)
             ledger_append(self.state_dir, {"ts": now_iso, "ts_epoch": now_epoch,
@@ -571,11 +621,11 @@ class Gate:
                 last_epoch = _parse_iso_epoch(last.get("ts"))
             if isinstance(last_epoch, (int, float)) and \
                     (now_epoch - last_epoch) > GAP_CYCLES * self.cycle_minutes * 60:
-                _write_json_atomic(self.snap_path, new_snap)
+                self._write_snapshot(new_snap)
                 counters["nodes"] = {}                          # 연속성 상실 → stall 카운터 리셋
                 counters["consecutive_nochg"] = 0
                 counters["consecutive_quiet"] = 0
-                _write_json_atomic(self.counters_path, counters)
+                self._write_counters(counters)
                 ledger_append(self.state_dir, {"ts": now_iso, "ts_epoch": now_epoch,
                                                "verdict": "GAP", "reasons": ["interval>3cycles"],
                                                "delta_fields": [], "delivered": "none",
@@ -637,7 +687,7 @@ class Gate:
         if not shadow and last is not None:
             self._maybe_briefing(last, now_epoch, report, warns, reasons)
 
-        _write_json_atomic(self.snap_path, new_snap)
+        self._write_snapshot(new_snap)
         ledger_append(self.state_dir, {"ts": now_iso, "ts_epoch": now_epoch, "verdict": verdict,
                                        "reasons": reasons + [w["reason"] for w in warns],
                                        "delta_fields": delta_fields, "delivered": delivered,

@@ -1466,20 +1466,19 @@ class Preflight:
                      % (j.get("id"), j.get("every_minutes")))
             return
         if self.fix:
+            # ★reviewer1 P1 교정: 보고 잡 전무 시 추가하는 잡은 구 push 보고 잡이 아니라 델타게이트
+            #   잡(action:command)이다 — 구 push 잡 부활은 이 프로젝트가 제거하는 대상 그 자체다.
             jobs.append({
-                "id": "owner-progress-report-5min",
+                "id": "owner-progress-gate-5min",
                 "every_minutes": 5,
-                "action": "push",
-                "to": "master",
-                "text_command": ('printf \'[heartbeat] 5분 보고 — 아래 진행%%는 결정론 산출값이다. '
-                                 '그대로(수치 불변) 주인님에게 보고하라.\\n\'; '
-                                 'python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report.py"'),
+                "action": "command",
+                "command": 'python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py" run',
                 "if_absent": "skip",
             })
             data["jobs"] = jobs
             open(p, "w", encoding="utf-8").write(
                 json.dumps(data, ensure_ascii=False, indent=2))
-            self.add(cid, FIXED, "5분 보고 job(owner-progress-report-5min) 추가")
+            self.add(cid, FIXED, "5분 보고 job(owner-progress-gate-5min·델타게이트) 추가")
         else:
             self.add(cid, FAIL, "5분 주기 master 보고 job 부재 — --fix로 추가 가능")
 

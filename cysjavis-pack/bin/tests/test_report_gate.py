@@ -227,6 +227,23 @@ class GateCore(unittest.TestCase):
                 gate(t, r).run()
             self.assertIn("게이트 자체 수리 필요", r.sends[-1][1])
 
+    # ── P1-1: state_dir 접근 불가(권한/락 OSError)도 최상위 fail-open으로 exit 0 + 직송 ──
+    @unittest.skipIf(os.geteuid() == 0, "root는 파일권한 무시 — chmod 555 재현 불가")
+    def test_fail_open_when_state_dir_unwritable(self):
+        with tempfile.TemporaryDirectory() as t:
+            sd = os.path.join(t, "state")
+            os.makedirs(sd)
+            r = FakeRunner(rep=report(nodes=[{"node": "worker", "done": 1, "total": 3, "pct": 33}]))
+            os.chmod(sd, 0o555)                               # 읽기·실행만 — 락 mkdir 불가
+            try:
+                rc = gate(sd, r).run()
+            finally:
+                os.chmod(sd, 0o755)                           # 정리 위해 복구
+            self.assertEqual(rc, 0)                            # 죽지 않는다(exit 1 금지)
+            self.assertEqual(len(r.sends), 1)                  # master 직송 시도
+            self.assertEqual(r.sends[0][0], "master")
+            self.assertIn("state 기록 불가", r.sends[0][1])
+
     # ── ⑦ 블랙리스트 정규화(타임스탬프만 다른 입력 = 무변화) ──
     def test_blacklist_normalization_timestamp_only_no_change(self):
         with tempfile.TemporaryDirectory() as t:
@@ -273,6 +290,50 @@ class GateCore(unittest.TestCase):
             self.assertEqual(e["delivered"], "none")          # emit 실패 → 배달 없음
             self.assertTrue(any("evt_reject:task_progress(6)" in x for x in e["reasons"]))
             self.assertEqual(r.enqueues, [])                  # DELTA는 WARN급 아님 → 폴백 wake 안 함
+
+    # ── P2-3: schema_version 부착(counters·snapshot·ledger) ──
+    def test_schema_version_on_state_files(self):
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner(rep=report(nodes=[{"node": "worker", "done": 1, "total": 3, "pct": 33}]))
+            gate(t, r).run()
+            counters = json.load(open(os.path.join(t, "counters.json"), encoding="utf-8"))
+            snap = json.load(open(os.path.join(t, "last_snapshot.json"), encoding="utf-8"))
+            self.assertEqual(counters.get("schema_version"), 1)
+            self.assertEqual(snap.get("schema_version"), 1)
+            self.assertIn("data", snap)                       # 스냅샷 본문은 래퍼 안(diff 오탐 방지)
+            self.assertEqual(ledger_entries(t)[-1]["schema_version"], 1)
+
+    def test_wrapped_snapshot_roundtrips_no_false_delta(self):
+        # 래핑 스냅샷 로드→재정규화→diff가 schema_version 때문에 오탐 DELTA를 내지 않아야 한다.
+        with tempfile.TemporaryDirectory() as t:
+            rep = report(nodes=[{"node": "worker", "done": 1, "total": 3, "pct": 33}],
+                         live_nodes=[{"role": "worker", "agent_alive": True, "idle_secs": 10}])
+            r = FakeRunner(rep=rep)
+            gate(t, r).run()                                  # baseline (wrapped snapshot)
+            gate(t, r).run()                                  # 무변화
+            e = ledger_entries(t)[-1]
+            self.assertEqual(e["verdict"], "NOCHG")
+            self.assertEqual(e["delta_fields"], [])
+
+    # ── P2-4: ledger tail-read + 5MB 로테이션 ──
+    def test_ledger_rotation_at_threshold(self):
+        with tempfile.TemporaryDirectory() as t:
+            saved = G.LEDGER_MAX_BYTES
+            G.LEDGER_MAX_BYTES = 200
+            try:
+                for _ in range(20):
+                    G.ledger_append(t, {"ts": "x", "verdict": "NOCHG", "pad": "y" * 40})
+            finally:
+                G.LEDGER_MAX_BYTES = saved
+            self.assertTrue(os.path.isfile(os.path.join(t, "ledger.jsonl")))
+            self.assertTrue(os.path.isfile(os.path.join(t, "ledger.jsonl.1")))  # 1세대 보관
+
+    def test_last_ledger_tail_read_returns_last(self):
+        with tempfile.TemporaryDirectory() as t:
+            for i in range(5):
+                G.ledger_append(t, {"ts": "x", "verdict": "NOCHG", "seq": i})
+            last = G.last_ledger(t)
+            self.assertEqual(last["seq"], 4)                  # 마지막 줄
 
     # ── ⑩ 동시 실행 락 ──
     def test_concurrent_lock_skips(self):
@@ -420,13 +481,19 @@ class C16ReportScheduleGate(unittest.TestCase):
             ids = [j["id"] for j in after["jobs"]]
             self.assertEqual(ids, ["owner-progress-gate-5min"])   # 구 push 잡 재생성 안 됨
 
-    def test_no_report_job_fails_and_fix_readds(self):
+    def test_no_report_job_fails_and_fix_adds_gate_job(self):
+        # reviewer1 P1: --fix는 구 push 잡이 아니라 게이트 잡을 추가해야 한다.
         with tempfile.TemporaryDirectory() as t:
             res, _ = self._c16(t, [])
             self.assertEqual(res["status"], "FAIL", res)
             res2, after = self._c16(t, [], fix=True)
             self.assertEqual(res2["status"], "FIXED")
-            self.assertTrue(any(j["id"] == "owner-progress-report-5min" for j in after["jobs"]))
+            added = [j for j in after["jobs"] if j["id"] == "owner-progress-gate-5min"]
+            self.assertEqual(len(added), 1, after)
+            self.assertEqual(added[0]["action"], "command")
+            self.assertIn("javis_report_gate.py", added[0]["command"])
+            # 구 push 보고 잡은 부활하지 않는다(제거 대상).
+            self.assertFalse(any(j["id"] == "owner-progress-report-5min" for j in after["jobs"]))
 
     def test_legacy_push_job_still_passes(self):
         with tempfile.TemporaryDirectory() as t:
