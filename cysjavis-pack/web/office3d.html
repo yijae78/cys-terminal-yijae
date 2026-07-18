@@ -1618,22 +1618,38 @@ const ELEV = { x: -SLAB_W/2+0.9, z: SLAB_D/2-0.8 };
 let owner = null, elevCar = null, ownerHome = new THREE.Vector3();
 // 👑 왕좌 근접 자동 착석 — 주인이 옥상 왕좌 반경 안에서 멈추면 앉고, 이동을 시작하면 일어선다.
 let ownerSeated = false;
-function updateThroneSeat(){
+// 자리 존 AABB — 책상+왕좌를 포함. 존 안에서 정지(idle)하면 왕좌로 스냅 걷기 후 착석.
+const SEAT_ZONE = { x0:-0.7, x1:1.7, z0:-3.9, z1:-2.2 };
+function updateThroneSeat(dt){
+  if (ownerSeated) return;
   const g = owner.pr.grp;
   const roofY = FLOORS.length ? FLOORS[FLOORS.length-1] : 0;
-  const near = Math.abs(g.position.y - (roofY + 0.74)) < 0.45 &&
-               Math.hypot(g.position.x - THRONE.x, g.position.z - THRONE.z) < THRONE.nearR;
-  if (near && !ownerSeated){
-    ownerSeated = true;
-    g.position.set(THRONE.x, roofY + THRONE.seatY, THRONE.z);
-    g.rotation.y = Math.PI;            // ㄴ자 다리(-z)가 책상(+z)으로 — 직원 착석과 동일 패턴
-    owner.pr.setStanding(false);       // 착석 포즈
+  const onRoof = Math.abs(g.position.y - (roofY + 0.74)) < 0.45;
+  const inZone = onRoof && g.position.x > SEAT_ZONE.x0 && g.position.x < SEAT_ZONE.x1
+                        && g.position.z > SEAT_ZONE.z0 && g.position.z < SEAT_ZONE.z1;
+  if (!inZone) return;
+  const dx = THRONE.x - g.position.x, dz = THRONE.z - g.position.z;
+  const dist = Math.hypot(dx, dz);
+  if (dist > 0.06){                    // 왕좌 핀포인트로 짧은 스냅 걷기(다음 프레임 계속)
+    const step = Math.min(WALK_SPEED*(dt||0.016), dist);
+    g.position.x += dx/dist*step; g.position.z += dz/dist*step;
+    g.rotation.y = Math.atan2(dx, dz);
+    owner.walkPh += (dt||0.016)*9; owner.pr.swing(owner.walkPh);
+    return;
   }
+  ownerSeated = true;                  // 도착 → 착석
+  g.position.set(THRONE.x, roofY + THRONE.seatY, THRONE.z);
+  g.rotation.y = Math.PI;              // ㄴ자 다리(-z)가 책상(+z)으로 — 직원 착석과 동일 패턴
+  owner.pr.setStanding(false);         // 착석 포즈
+  owner.pr.swing(0);
 }
 function standFromThrone(){
   if (!ownerSeated) return;
   ownerSeated = false;
-  owner.pr.setStanding(true);          // 기립 — 방향·높이는 walk 스텝이 자연 복귀
+  owner.pr.setStanding(true);          // 기립 포즈
+  const roofY = FLOORS.length ? FLOORS[FLOORS.length-1] : 0;
+  owner.pr.grp.position.y = roofY + 0.74;   // 좌면고(seatY)→층 보행고 복원(침하 보행 결함 수리)
+  owner.pr.swing(0);
 }
 function buildOwner(roofY){
   const pr = makePerson('owner', 0);
@@ -1644,7 +1660,7 @@ function buildOwner(roofY){
   crown.position.set(0, 0.24, 0); pr.headG.add(crown);
   const lbl = textSprite('👑 주인', { size:22, color:'#ffd166' });
   lbl.position.set(0, 1.15, 0); pr.grp.add(lbl);
-  ownerHome.set(1.7, roofY+0.74, -2.6);   // 회장실 데스크 옆 (옥좌 존)
+  ownerHome.set(THRONE.x, roofY+0.74, THRONE.z+0.65);   // 자리 존 안(THRONE 파생) — idle 착석 트리거
   pr.grp.position.copy(ownerHome);
   worldGroup.add(pr.grp);
   elevCar = new THREE.Mesh(new THREE.BoxGeometry(1.15, 1.95, 1.05),
@@ -1680,7 +1696,7 @@ function ownerDeliver(key, text, opts={}){
 }
 function advanceOwner(dt, t){
   if (!owner || !owner.plan.length){
-    if (owner){ owner.busy = false; updateThroneSeat(); }   // 정지 상태 — 왕좌 근접이면 착석
+    if (owner){ owner.busy = false; updateThroneSeat(dt); }   // 정지 상태 — 자리 존이면 스냅 착석
     return;
   }
   standFromThrone();                                        // 이동 계획 생김 — 앉아 있었다면 기립
@@ -1783,6 +1799,7 @@ function ownerManualTick(dt){
     return;
   }
   if (ax === 0 && az === 0) return;
+  standFromThrone();                                        // 키보드 이동도 기립 트리거(스케이팅 결함 수리)
   if (owner.manual && owner.plan.length){
     if (owner.plan[0].t === 'ride' || owner.plan[0].t === 'arrive') return; // 승강 중 보행 불가
     owner.plan = [];                                        // 키 입력이 클릭 이동을 대체
@@ -1911,6 +1928,12 @@ if (dbg){
     return { ctx: e.data.ctx?.pct ?? null, presence: e.data.presence,
              ringVisible: !!(e.set.progRing && e.set.progRing.visible) };
   };
+  dbg.ownerState = ()=> owner ? {       // D2 착석 상태기계 단언(좌면고·기립고·존)
+    seated: ownerSeated,
+    x: owner.pr.grp.position.x, y: owner.pr.grp.position.y, z: owner.pr.grp.position.z,
+    planLen: owner.plan.length } : null;
+  dbg.floorPlan = (deptId)=> floorPlans.get(deptId) || null;   // D1 배치 불변식 단언
+  dbg.floorPlanOf = floorPlanOf;
 }
 document.getElementById('p-close').onclick = closePanel;
 function setPanelStatus(msg, cls){

@@ -117,7 +117,8 @@ ALERT_COALESCE = {  # (이벤트명 → 동일 surface 재발화 억제 윈도 s
     "pane.idle": 120.0,
     "schedule.fired": 10.0,
     "schedule.error": 30.0,
-    "watchdog.dog": 10.0,   # D4 강아지 fx (kill·alert 공유) ≤1건/10s
+    "watchdog.dog.kill": 10.0,    # D4 강아지 fx kill ≤1건/10s (kind별 분리 — kill 이 alert 에 안 밀림)
+    "watchdog.dog.alert": 10.0,   # D4 강아지 fx alert ≤1건/10s
 }
 FX_BUDGET_PER_SEC = 20
 
@@ -688,7 +689,8 @@ def dog_fx(name, ev, coal, now):
 
     · watchdog.duplicate_procs → {t:'dog', kind:'kill', pid:<pids 첫번째 or None>, count:N}
     · watchdog.proc_count_high → {t:'dog', kind:'alert', sid:<surface id>, count:N}
-    코얼레싱: kill·alert 공유 10s 창(ALERT_COALESCE['watchdog.dog']) — 초과분 폐기.
+    코얼레싱: kind별 독립 10s 창(watchdog.dog.kill / watchdog.dog.alert) — 초과분 폐기.
+    kill(실 프로세스 강제종료 사건)은 alert 창에 밀리지 않는다(각 kind 자기 창만 소비).
     백로그(BACKLOG_FX_SECS 초과 과거 이벤트)는 억제. t:'dog' 라 구 프론트는 무시(additive·v2 유지).
     """
     p = ev.get("payload") or {}
@@ -704,8 +706,8 @@ def dog_fx(name, ev, coal, now):
     ts = ev.get("timestamp") or now
     if (now - ts) > BACKLOG_FX_SECS:
         return []   # 과거 이벤트: 연출 억제 (콜드스타트 폭주 방지)
-    if not coal.allow("watchdog.dog", "dog", now):
-        return []   # 코얼레싱 창 내 초과분 폐기
+    if not coal.allow("watchdog.dog." + frame["kind"], "dog", now):
+        return []   # kind별 코얼레싱 창 내 초과분 폐기
     return [frame]
 
 
