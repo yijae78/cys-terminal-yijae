@@ -2279,6 +2279,11 @@ if (dbg){
   dbg.shopItems = ()=>{ let n=0; if (worldGroup) worldGroup.traverse(o=>{   // D6 진열 상품 수
     if (o.userData && o.userData.shopItem) n++; }); return n; };
   dbg.setKey = (k, v)=>{ keys[k] = !!v; };   // D2: 헤드리스 키 입력 시뮬(스냅 입력 게이트 단언용)
+  dbg.projectToScreen = (x, y, z)=>{          // 게이트 6b: 월드→화면 픽셀(실클릭 시뮬 — camera.project 래핑)
+    const v = new THREE.Vector3(x, y, z).project(camera);
+    return { x: (v.x*0.5 + 0.5)*innerWidth, y: (-v.y*0.5 + 0.5)*innerHeight,
+      visible: v.z < 1 && Math.abs(v.x) <= 1 && Math.abs(v.y) <= 1 };
+  };
 }
 document.getElementById('p-close').onclick = closePanel;
 function setPanelStatus(msg, cls){
