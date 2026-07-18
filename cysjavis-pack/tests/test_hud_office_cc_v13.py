@@ -69,22 +69,34 @@ class DogFx(unittest.TestCase):
         self.assertTrue(frames)
         self.assertFalse(any(fr.get("t") == "dog" for fr in frames))
 
-    def test_coalesce_same_kind_second_within_window_dropped(self):
-        # 음성: 동일 kind 10s 창 내 2건째 폐기, 창 경과 후 재허용 (kind별 독립 창)
+    def test_dog_coalesce_window_registered_10s(self):
+        # kind별 10s 창이 Coalescer 에 등록됐는지 직접 단언 — Coalescer.allow 는 now 파라미터 지원
+        # (dog_fx 는 이제 now 를 안 넘기므로 창 타이밍은 Coalescer 단위로 검증한다)
         coal = B.Coalescer()
-        t0 = 1000.0
+        self.assertTrue(coal.allow("watchdog.dog.kill", "dog", now=1000.0))
+        self.assertFalse(coal.allow("watchdog.dog.kill", "dog", now=1005.0))   # 5s < 10s → 폐기
+        self.assertTrue(coal.allow("watchdog.dog.kill", "dog", now=1011.0))    # 11s > 10s → 재허용
+        self.assertTrue(coal.allow("watchdog.dog.alert", "dog", now=1005.0))   # alert 는 독립 창
+
+    def test_dog_rapid_same_kind_second_dropped(self):
+        # route_event 경로(monotonic): 즉시 재발한 동일 kind 는 10s 창에 걸려 폐기
+        coal = B.Coalescer()
         f1, _ = B.route_event(self._ev("watchdog.duplicate_procs",
-                              timestamp=t0, payload={"count": 2, "pids": [1]}),
-                              None, coal, now=t0)
-        self.assertEqual(len(f1), 1)
+                              payload={"count": 2, "pids": [1]}), None, coal)
         f2, _ = B.route_event(self._ev("watchdog.duplicate_procs",
-                              timestamp=t0 + 5, payload={"count": 3, "pids": [2]}),
-                              None, coal, now=t0 + 5)
-        self.assertEqual(f2, [])   # 5s < 10s 창(kill) → 2건째 폐기
-        f3, _ = B.route_event(self._ev("watchdog.duplicate_procs",
-                              timestamp=t0 + 11, payload={"count": 4, "pids": [3]}),
-                              None, coal, now=t0 + 11)
-        self.assertEqual(len(f3), 1)   # 11s > 10s → 재허용
+                              payload={"count": 3, "pids": [2]}), None, coal)
+        self.assertEqual(len(f1), 1)
+        self.assertEqual(f2, [])   # 같은 kind 창 내 2건째 폐기
+
+    def test_exhausted_bucket_not_refilled_by_dog(self):
+        # reviewer1 회귀: 버킷 소진 후 dog 이벤트가 전역 fx 예산을 리필하면 안 된다.
+        # 구버그 = dog_fx 가 epoch now 를 coal.allow 에 넘겨 monotonic 버킷을 풀리필(flood 보호 무력화).
+        coal = B.Coalescer()
+        for i in range(B.FX_BUDGET_PER_SEC):      # window 없는 이름 → 버킷만 소비(monotonic 기본)
+            self.assertTrue(coal.allow("drain", i))
+        ev = self._ev("watchdog.duplicate_procs", payload={"count": 2, "pids": [1]})
+        frames, _ = B.route_event(ev, None, coal)   # now=None → 내부 time.time(); coal.allow 는 monotonic
+        self.assertEqual(frames, [])   # 소진된 버킷 → dog 억제(리필 없음)
 
     def test_kill_passes_immediately_after_alert(self):
         # master 판정: kill(실 프로세스 강제종료)은 직전 alert 창에 밀리면 안 된다 → kind별 분리

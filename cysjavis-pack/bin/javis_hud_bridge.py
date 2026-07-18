@@ -110,7 +110,10 @@ def pick_ctx(node):
 
 
 # ------------------------------------------------------------ 코얼레싱 (§6.3)
-NOISE_NAMES = {"watchdog.proc_count"}   # watchdog.* 는 dog_fx 가 선처리(kill/alert 변환·나머지 차단)
+# watchdog.* 는 route_event 가 startswith 로 선차단·dog_fx 가 kill/alert 변환 — NOISE_NAMES 는
+# 그 외 소음용(현재 비어 있음). "watchdog.proc_count" 는 실이벤트명이 proc_count_high 라 도달불가
+# 死엔트리였으므로 제거(reviewer1 minor).
+NOISE_NAMES = set()
 ALERT_COALESCE = {  # (이벤트명 → 동일 surface 재발화 억제 윈도 s)
     "health.alert": 30.0,
     "master.deadman": 60.0,
@@ -705,8 +708,11 @@ def dog_fx(name, ev, coal, now):
         return []   # tick_panic·load_high·duplicates_killed 등 그 외 watchdog.* 차단
     ts = ev.get("timestamp") or now
     if (now - ts) > BACKLOG_FX_SECS:
-        return []   # 과거 이벤트: 연출 억제 (콜드스타트 폭주 방지)
-    if not coal.allow("watchdog.dog." + frame["kind"], "dog", now):
+        return []   # 과거 이벤트: 연출 억제 (콜드스타트 폭주 방지) — 백로그 판정은 epoch(now vs ts)
+    # coal.allow 는 now 를 넘기지 않는다: Coalescer 버킷·창은 monotonic 시계축이라 epoch now 를
+    # 주입하면 (epoch-monotonic ≈ +1.78e9) 매 dog 이벤트가 전역 fx 예산을 풀리필해 flood 보호가
+    # 무력화된다(reviewer1 실측). 나머지 9개 호출과 동일하게 monotonic 기본에 정렬한다.
+    if not coal.allow("watchdog.dog." + frame["kind"], "dog"):
         return []   # kind별 코얼레싱 창 내 초과분 폐기
     return [frame]
 
