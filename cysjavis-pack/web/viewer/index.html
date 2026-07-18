@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>자비스 뷰어</title>
+<link rel="stylesheet" href="./style.css">
+<!-- hljs 테마: 다크/라이트 둘 다 로드, body[data-theme] 로 토글 (§14 테마 전파) -->
+<link rel="stylesheet" href="./vendor/github-dark.min.css" id="hljs-dark">
+<link rel="stylesheet" href="./vendor/github.min.css" id="hljs-light" disabled>
+</head>
+<body data-theme="dark">
+<div id="layout">
+  <aside id="sidebar">
+    <div class="side-head">
+      <span id="side-title">파일</span>
+      <button id="side-refresh" title="새로고침">⟳</button>
+    </div>
+    <div id="side-path"></div>
+    <ul id="file-list"></ul>
+  </aside>
+  <main id="main">
+    <header id="topbar">
+      <span id="doc-title">자비스 산출물 뷰어</span>
+      <span id="live-badge" class="badge" hidden>LIVE</span>
+      <span id="status" class="status"></span>
+    </header>
+    <article id="content">
+      <div class="empty">
+        <p>산출물 md/diff 뷰어</p>
+        <p class="hint">
+          <code>?path=&lt;파일&gt;</code> md 렌더 ·
+          <code>?diff=&lt;repo&gt;&amp;base=&lt;ref&gt;</code> diff 뷰
+        </p>
+      </div>
+    </article>
+  </main>
+</div>
+<script src="./vendor/marked.min.js"></script>
+<script src="./vendor/highlight.min.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>
