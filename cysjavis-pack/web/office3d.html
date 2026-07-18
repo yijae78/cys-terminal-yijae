@@ -44,6 +44,22 @@
     color:#6d93b5;font-size:14px;padding:2px 6px}
   #panel .status{font-size:15px;margin-top:7px;min-height:14px;color:#8ccdf0}
   #panel .status.ok{color:#35e0c0} #panel .status.err{color:#ff8080}
+  /* 카페·상점 선물 패널 (D6) */
+  #shop{position:fixed;left:16px;bottom:70px;width:420px;z-index:21;display:none;
+    background:rgba(14,10,7,.95);border:1px solid rgba(255,183,90,.55);border-radius:8px;
+    padding:14px;box-shadow:0 0 24px rgba(220,150,40,.25)}
+  #shop h2{margin:0 0 6px;font-size:19px;color:#ffd88a}
+  #shop .meta{font-size:15px;color:#e2c79a;line-height:1.6;margin-bottom:8px}
+  #shop button{background:#3a2c10;color:#ffd88a;border:1px solid rgba(255,183,90,.6);
+    border-radius:5px;padding:6px 12px;font:600 15px 'SF Mono',Menlo,monospace;cursor:pointer;margin:3px 4px 0 0}
+  #shop button:hover{background:#55420f} #shop button:disabled{opacity:.35;cursor:default}
+  #shop #shop-close{background:transparent;border:none;position:absolute;top:8px;right:8px;color:#b58a55;font-size:14px}
+  #shop #shop-targets{margin-top:8px;max-height:150px;overflow-y:auto}
+  #shop .status{font-size:14px;margin-top:8px;min-height:14px;color:#e2c79a}
+  #shop .status.ok{color:#35e0c0} #shop .status.err{color:#ff8080}
+  .embed #shop{width:min(80vw,360px);bottom:52px;padding:10px}
+  .embed #shop h2{font-size:14px} .embed #shop .meta{font-size:11px}
+  .embed #shop button{font-size:12px;padding:5px 9px}
   /* 근접 대화 팝업 (#talk — 주인이 아바타에 다가가면 자동) */
   #talk{position:fixed;z-index:18;width:360px;display:none;
     background:rgba(10,18,32,.94);border:1.5px solid rgba(255,209,102,.75);border-radius:9px;
@@ -168,6 +184,14 @@ if (window.self !== window.top) document.documentElement.classList.add("embed");
   </div>
   <div class="note">전송 = cys send + Return (해당 pane에 즉시 타이핑됨). 배달은
     surface.input_injected 이벤트로 이 화면에 되돌아와 확인된다(동시성 루프).</div>
+</div>
+<div id="shop">
+  <button id="shop-close">✕</button>
+  <h2 id="shop-title">—</h2>
+  <div class="meta" id="shop-desc">—</div>
+  <button id="shop-gift">🎁 선물하기</button>
+  <div id="shop-targets"></div>
+  <div class="status" id="shop-status"></div>
 </div>
 
 <script type="module">
@@ -847,8 +871,58 @@ function makeCafe(y){
   for (let i=0;i<3;i++)
     g.add(mesh(new THREE.CylinderGeometry(0.16, 0.13, 0.55, 10), M.chair, cx-0.8+i*0.8, y+0.28, cz+0.85, false));
   const sign = textSprite('☕ CAFE', { size:20, color:'#ffd77a' });
-  sign.position.set(cx, y+1.7, cz); g.add(sign);
+  sign.position.set(cx, y+1.9, cz); g.add(sign);
+  // D6 메뉴판 (CanvasTexture — 오늘의 원두=부서별 토큰 잔량 + 라떼 가격표, ≥2s 스로틀)
+  cafeMenuCanvas = document.createElement('canvas'); cafeMenuCanvas.width = 512; cafeMenuCanvas.height = 256;
+  cafeMenuTex = new THREE.CanvasTexture(cafeMenuCanvas); cafeMenuTex.colorSpace = THREE.SRGBColorSpace;
+  lastCafeMenu = 0;
+  const menu = new THREE.Mesh(new THREE.PlaneGeometry(2.0, 1.0),
+    new THREE.MeshBasicMaterial({ map:cafeMenuTex, transparent:true }));
+  menu.position.set(cx, y+1.55, cz-0.36); g.add(menu);   // 카운터 뒤(+z 향함=손님 쪽)
+  g.add(mesh(new THREE.BoxGeometry(2.2, 1.2, 0.05), M.dark, cx, y+1.55, cz-0.4, false));
+  drawCafeMenu(true);
+  // D6 클릭 상품: 토큰 라떼 (선물하기 트리거) — 카운터 위 컵
+  const latte = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.075, 0.16, 12),
+    new THREE.MeshStandardMaterial({ color:0xf2ead6, roughness:0.5, emissive:0x6a4a20, emissiveIntensity:0.2 }));
+  latte.position.set(cx+1.0, y+0.99, cz+0.1);
+  latte.userData.shopItem = { kind:'latte', name:'토큰 라떼',
+    desc:'주인이 직원에게 보내는 격려의 토큰 라떼 한 잔. 알림만 전달됩니다(회신 불요).' };
+  g.add(latte);
+  const ltag = textSprite('토큰 라떼', { size:13, color:'#ffd88a', bg:'rgba(30,20,6,.8)' });
+  ltag.position.set(cx+1.0, y+1.25, cz+0.1); g.add(ltag);
   return g;
+}
+// 카페 메뉴판 렌더 — 부서별 5h/7d 토큰 잔량("오늘의 원두") + 라떼 가격표(≥2s 스로틀).
+let cafeMenuCanvas = null, cafeMenuTex = null, lastCafeMenu = 0;
+function drawCafeMenu(force){
+  if (!cafeMenuCanvas) return;
+  const now = performance.now();
+  if (!force && now - lastCafeMenu < 2000) return;
+  lastCafeMenu = now;
+  const g = cafeMenuCanvas.getContext('2d');
+  g.clearRect(0,0,512,256);
+  g.fillStyle = 'rgba(18,12,6,0.96)'; g.fillRect(0,0,512,256);
+  g.strokeStyle = '#c98a3a'; g.lineWidth = 3; g.strokeRect(4,4,504,248);
+  g.fillStyle = '#ffd88a'; g.font = '600 24px Menlo,monospace';
+  g.fillText('☕ 오늘의 원두 (토큰 잔량)', 18, 36);
+  const deps = (lastWorld && lastWorld.departments) || [];
+  let ry = 72; g.font = '17px Menlo,monospace';
+  deps.slice(0,4).forEach(d=>{
+    const roast = (lbl)=>{
+      let s=0, nn=0; (d.nodes||[]).forEach(n=>{ const r=(n.rate||[]).find(x=>x.label===lbl);
+        const u = r && (r.used_pct ?? r.pct); if (u!=null){ s+=Math.max(0,100-u); nn++; } });
+      return nn ? Math.round(s/nn) : null; };
+    const h5 = roast('5h'), d7 = roast('7d');
+    g.fillStyle = '#e2c79a'; g.fillText(String(d.id).slice(0,8), 18, ry);
+    g.fillStyle = h5==null?'#667':(h5<15?'#ff8a8a':'#6ee1be');
+    g.fillText('5h '+(h5==null?'—':h5+'%'), 190, ry);
+    g.fillStyle = d7==null?'#667':(d7<15?'#ff8a8a':'#8cc3eb');
+    g.fillText('7d '+(d7==null?'—':d7+'%'), 340, ry);
+    ry += 30;
+  });
+  g.fillStyle = '#ffd88a'; g.font = '600 18px Menlo,monospace';
+  g.fillText('라떼 ☕ 격려 1잔 · 스킬 🎁 추천 (팝업스토어)', 18, 240);
+  cafeMenuTex.needsUpdate = true;
 }
 function makePingPong(y, cx=2.6, cz=1.6){
   const g = new THREE.Group();
@@ -889,19 +963,38 @@ function makePopupStore(y, cx=-4.6, cz=0.8){
   g.add(awn);
   g.add(mesh(new THREE.BoxGeometry(2.2, 0.5, 0.6), M.woodDark, cx, y+0.25, cz+0.15));
   g.add(mesh(new THREE.BoxGeometry(2.2, 0.05, 0.6), M.wood, cx, y+0.53, cz+0.15));
-  for (let i=0;i<3;i++){
-    const item = new THREE.Mesh(new THREE.BoxGeometry(0.22,0.22,0.22),
-      new THREE.MeshStandardMaterial({ color:0x101820, roughness:0.4,
-        emissive: ACCENTS[i], emissiveIntensity: 0.6 }));
-    item.position.set(cx-0.7+i*0.7, y+0.67, cz+0.15); item.castShadow = true;
-    g.add(item);
-  }
+  const shelfSign = textSprite('🎁 스킬 상점', { size:16, color:'#ffd88a' });
+  shelfSign.position.set(cx, y+1.15, cz+0.35); g.add(shelfSign);
+  populateShopSkills(g, y, cx, cz);          // GET /skills → 진열(비동기·실패 시 빈 선반 우아 강등)
+  // 하네스 코너 (표시 전용 — 클릭 상품 아님, shopItem 미부여)
+  const hx = cx + 1.55;
+  g.add(mesh(new THREE.BoxGeometry(0.7, 0.5, 0.5), M.woodDark, hx, y+0.25, cz+0.15));
+  g.add(mesh(new THREE.BoxGeometry(0.7, 0.05, 0.5), M.wood, hx, y+0.53, cz+0.15));
+  [0,1].forEach(i=> g.add(mesh(new THREE.BoxGeometry(0.2,0.2,0.2), M.metal, hx-0.18+i*0.36, y+0.67, cz+0.15, false)));
+  const htag = textSprite('🔧 하네스', { size:13, color:'#9fd8ff', bg:'rgba(8,20,36,.8)' });
+  htag.position.set(hx, y+1.0, cz+0.15); g.add(htag);
   const neon = textSprite('✦ POP-UP ✦', { size:24, color:'#ff8fb8' });
   neon.position.set(cx, y+2.35, cz-0.6); g.add(neon);
   const ver = textSprite('신상: cys v' + (lastWorld?.daemon?.version || '—'),
     { size:16, color:'#ffd77a' });
-  ver.position.set(cx, y+1.05, cz+0.35); g.add(ver);
+  ver.position.set(cx-0.9, y+1.05, cz+0.35); g.add(ver);
   return g;
+}
+async function populateShopSkills(g, y, cx, cz){
+  let skills = [];
+  try { const j = await (await fetch('/skills')).json(); skills = (j && j.skills) || []; }
+  catch(e){ skills = []; }                    // 실패 = 빈 선반 우아 강등
+  if (!g.parent) return;                       // 그 사이 재빌드됐으면 폐기(stale 그룹 오염 방지)
+  skills.slice(0, 6).forEach((sk, i)=>{
+    const item = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.2, 0.2),
+      new THREE.MeshStandardMaterial({ color:0x101820, roughness:0.4,
+        emissive: ACCENTS[i%ACCENTS.length], emissiveIntensity:0.6 }));
+    item.position.set(cx-0.7 + (i%3)*0.7, y+0.67 - Math.floor(i/3)*0.0, cz+0.15 - Math.floor(i/3)*0.32);
+    item.castShadow = true;
+    item.userData.shopItem = { kind:'skill', name: sk.name || '스킬',
+      desc: (sk.description || '설명 없음'), accounts: sk.accounts || [] };
+    g.add(item);
+  });
 }
 function makePipes(y){
   // 성수동 인더스트리얼 — 천장 노출 배관
@@ -2048,6 +2141,11 @@ canvas.addEventListener('click', e=>{
     while (o && !o.userData.nodeKey) o = o.parent;
     if (o && o.userData.nodeKey){ openPanel(o.userData.nodeKey); return; }
   }
+  for (const h of hits){                                  // D6 상점 상품 (nodeKey > shopItem > floorY)
+    let o = h.object;
+    while (o && !o.userData.shopItem) o = o.parent;
+    if (o && o.userData.shopItem){ openShop(o.userData.shopItem); return; }
+  }
   for (const h of hits){                                  // 바닥 클릭 → 주인 이동 (MMORPG)
     if (h.object.userData.floorY !== undefined){
       moveOwnerTo(h.object.userData.floorY, h.point.x, h.point.z);
@@ -2165,6 +2263,62 @@ document.getElementById('p-send').onclick = async ()=>{
   } catch(e){ setPanelStatus('전송 실패: ' + e.message, 'err'); }
   btn.disabled = false;
 };
+
+// ---------- D6 카페·상점 선물 흐름 (Phase B — 알림 텍스트만 발송) ----------
+const shopEl = document.getElementById('shop');
+let shopItem = null;
+function setShopStatus(msg, cls){ const el = document.getElementById('shop-status');
+  el.textContent = msg; el.className = 'status ' + (cls||''); }
+function openShop(item){
+  shopItem = item;
+  document.getElementById('shop-title').textContent = (item.kind==='latte'?'☕ ':'🎁 ') + item.name;
+  const acc = (item.accounts && item.accounts.length)
+    ? `<br><span style="color:#b58a55">가용 계정: ${item.accounts.join(', ')}</span>` : '';
+  document.getElementById('shop-desc').innerHTML = item.desc + acc;
+  document.getElementById('shop-targets').innerHTML = '';
+  setShopStatus('', '');
+  const gift = document.getElementById('shop-gift'); gift.style.display = '';
+  shopEl.style.display = 'block';
+}
+function closeShop(){ shopEl.style.display = 'none'; shopItem = null; }
+document.getElementById('shop-close').onclick = closeShop;
+document.getElementById('shop-gift').onclick = ()=>{
+  if (!shopItem) return;
+  if (HUD_TOKEN.startsWith('__')){ setShopStatus('조작 비활성 — 브리지 경유 접속 필요', 'err'); return; }
+  const wrap = document.getElementById('shop-targets'); wrap.innerHTML = '';
+  const hint = document.createElement('div'); hint.className = 'meta';
+  hint.textContent = '받을 직원 선택 (대기/꾸벅만 활성):'; wrap.appendChild(hint);
+  let any = false;
+  nodes.forEach(ent=>{
+    const p = ent.data.presence, eligible = (p==='waiting' || p==='drowsy');
+    const b = document.createElement('button');
+    b.textContent = labelOf(ent.data.key); b.disabled = !eligible;
+    if (eligible){ any = true; b.onclick = ()=> giftTo(ent.data.key); }
+    else { b.style.opacity = '0.4'; b.title = `상태 ${PRESENCE_KO[p]||p} — 작업 중/불가`; }
+    wrap.appendChild(b);
+  });
+  if (!any){ const d = document.createElement('div'); d.className = 'meta';
+    d.textContent = '지금 선물 가능한(대기/꾸벅) 직원이 없습니다.'; wrap.appendChild(d); }
+  document.getElementById('shop-gift').style.display = 'none';
+};
+async function giftTo(key){
+  if (!shopItem) return;
+  const text = shopItem.kind==='latte'
+    ? '[카페 알림] ☕ 주인이 토큰라떼를 보냈습니다 — 회신 불요'
+    : `[카페 알림] 🎁 스킬 '${shopItem.name}' 추천 — 필요 시 사용`;
+  setShopStatus('전송 중…', '');
+  const ok = await postCommand(key, text, false);       // 알림 텍스트만 (실명령 아님 — Phase C 제외)
+  if (ok){ setShopStatus(`✅ ${labelOf(key)}에게 전달됨 — cys-terminal 반영 대기`, 'ok');
+    addTick(`${shopItem.kind==='latte'?'☕':'🎁'} 카페 선물 → ${labelOf(key)}`, 0);
+    showGiftMug(key); }
+  else setShopStatus('게이트 거부 또는 브리지 오류', 'err');
+}
+function showGiftMug(key){
+  const ent = nodes.get(key); if (!ent) return;
+  ent.set.mug.visible = true;                           // 기존 rate-limit 머그 재사용 (60s)
+  clearTimeout(ent.giftMugTimer);
+  ent.giftMugTimer = setTimeout(()=>{ if (!ent.anim.rateLimited) ent.set.mug.visible = false; }, 60000);
+}
 
 // ---------- 협업 광섬유 아크 (#5) ----------
 const links = new Map(); let lastLinkT = 0;
@@ -2649,7 +2803,7 @@ function frame(now){
       entWalkTo(e, e.group.position.x, e.group.position.z + 0.52, 'seat'); });
     reviewGather = null;
   }
-  if (nowMs - lastLinkT > 1000){ lastLinkT = nowMs; updateLinks(nowMs); drawChairDash(); }   // 대시보드 ≥2s 스로틀 내장
+  if (nowMs - lastLinkT > 1000){ lastLinkT = nowMs; updateLinks(nowMs); drawChairDash(); drawCafeMenu(); }   // 대시보드·메뉴판 ≥2s 스로틀 내장
   weatherTick(dt);
   dayNightTick(dt);
   if (replay.mode) replayTick(dt);
