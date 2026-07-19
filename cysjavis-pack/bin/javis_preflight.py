@@ -3906,6 +3906,64 @@ class Preflight:
             self.add(cid, PASS,
                      "launchd 잡 정상(penalty box·EX_CONFIG·inferred stale 징후 없음)")
 
+    def c71_gate_guard_behavior(self):
+        """게이트 외부 데몬 가드의 **행동** 회귀 검사(D-게이트 자기검증·DESIGN §3.7).
+
+        문자열 grep이 아니라 실제 게이트를 --shadow·tempdir state로 실행해 판정한다:
+          - 케이스 F(foreign): 본사 팩 컨텍스트(CYS_PACK_DIR=$HOME/.cys/pack) + CYS_SOCKET에 dept 토큰
+            → 대장 마지막 verdict == SKIPPED_FOREIGN_DAEMON(가드가 collect 전 조기 return).
+          - 케이스 L(legit): 팩 자기 컨텍스트 + 소켓 unset → verdict != SKIPPED_FOREIGN_DAEMON(느슨 —
+            collect 실패 WARN/BASELINE도 "skip 아님"으로 통과. 데몬 미가동 시 위양 FAIL 없음).
+        가드 부재(F가 skip 안 냄) = FAIL "가드 회귀 — 팩 재설치 필요"(--fix 수리 불가·팩 발행 사안).
+        예외·timeout·환경 이상은 WARN 강등(FAIL 아님·부트 비차단). 예산 상한 = 2케이스×20s.
+        """
+        cid = "C71.gate-guard-behavior"
+        if self.skipped(cid):
+            return
+        script = os.path.join(pack_dir(), "bin", "javis_report_gate.py")
+        if not os.path.isfile(script):
+            self.add(cid, WARN, "게이트 스크립트 부재(%s) — 가드 행동 검사 불가(C15 먼저)" % script)
+            return
+        hq = os.path.realpath(os.path.expanduser(os.path.join("~", ".cys", "pack")))
+
+        def _run(env_over, state_dir):
+            env = dict(os.environ)
+            env.pop("CYS_SOCKET", None)
+            env.pop("CYS_REPORT_GATE_DIR", None)
+            env.update(env_over)
+            try:
+                subprocess.run([sys.executable, script, "run", "--shadow", "--state-dir", state_dir],
+                               capture_output=True, text=True, timeout=20, env=env)
+            except (subprocess.SubprocessError, OSError) as e:
+                return None, str(e)
+            led = os.path.join(state_dir, "ledger.jsonl")
+            try:
+                with open(led, encoding="utf-8") as f:
+                    lines = [l for l in f if l.strip()]
+                return json.loads(lines[-1]).get("verdict"), None
+            except (OSError, ValueError, IndexError) as e:
+                return None, "대장 회수 실패: %s" % e
+
+        try:
+            with tempfile.TemporaryDirectory() as tf, tempfile.TemporaryDirectory() as tl:
+                vf, ef = _run({"CYS_PACK_DIR": hq,           # 케이스 F: 본사 팩 + dept 소켓 토큰
+                               "CYS_SOCKET": os.path.join(tf, "cys-dept-simfake", "cys.sock")}, tf)
+                vl, el = _run({"CYS_PACK_DIR": pack_dir()}, tl)   # 케이스 L: 팩 자기 컨텍스트 + 소켓 unset
+        except OSError as e:
+            self.add(cid, WARN, "가드 행동 검사 환경 준비 실패(%s) — 비차단 강등" % e)
+            return
+
+        if vf is None:
+            self.add(cid, WARN, "케이스 F 실행/대장 회수 실패(%s) — 가드 검사 보류(비차단)" % ef)
+            return
+        if vf != "SKIPPED_FOREIGN_DAEMON":
+            self.add(cid, FAIL, "가드 회귀 — 케이스 F가 SKIP 아님(verdict=%s) — 팩 재설치 필요" % vf)
+            return
+        if vl == "SKIPPED_FOREIGN_DAEMON":
+            self.add(cid, FAIL, "케이스 L 오탐 SKIP(정합 env인데 외부 데몬 판정) — 가드 로직 회귀")
+            return
+        self.add(cid, PASS, "게이트 외부 데몬 가드 행동 정상(F=SKIP·L=%s)" % (vl or "collect-fail"))
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -3937,7 +3995,7 @@ class Preflight:
             self.c57_temp_hook_leak, self.c58_trust_harden, self.c59_guard_wiring,
             self.c60_gate_wiring, self.c61_doc_code_sot, self.c65_drain_verify,
             self.c66_board_catalog, self.c67_learn_wiring, self.c69_gate_ledger,
-            self.c70_launchd_job,
+            self.c70_launchd_job, self.c71_gate_guard_behavior,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,

@@ -931,5 +931,28 @@ class C16ReportScheduleGate(unittest.TestCase):
             self.assertTrue(cmd.rstrip().endswith("run --shadow"))    # 후행 토큰 보존
 
 
+class C71GateGuardBehavior(unittest.TestCase):
+    """c71 게이트 가드 행동 회귀 — 가드 포함 게이트에 대해 PASS(DESIGN §3.7)."""
+
+    import importlib
+    P = importlib.import_module("javis_preflight")
+
+    @unittest.skipUnless(os.path.isdir(os.path.expanduser("~/.cys/pack")),
+                         "본사 팩(~/.cys/pack) 부재 — hq realpath 대조 불가")
+    def test_c71_passes_on_guarded_worktree_gate(self):
+        saved = dict(os.environ)
+        os.environ["CYS_PACK_DIR"] = os.path.dirname(BIN)      # worktree 팩(가드 포함 게이트)
+        os.environ.pop("CYS_SOCKET", None)
+        os.environ.pop("CYS_REPORT_GATE_DIR", None)
+        try:
+            pf = self.P.Preflight(fix=False, skips=set(), mode="report")
+            pf.c71_gate_guard_behavior()
+            res = pf.results[-1]
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        self.assertEqual(res["status"], "PASS", res)           # F=SKIP·L=not-SKIP
+
+
 if __name__ == "__main__":
     unittest.main()
