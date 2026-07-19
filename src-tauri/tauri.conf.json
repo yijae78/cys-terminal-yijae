@@ -5,7 +5,7 @@
   "identifier": "com.cysjavis.terminal",
   "build": {
     "frontendDist": "../ui/dist",
-    "beforeBuildCommand": "sh ../scripts/bundle-prep.sh"
+    "beforeBuildCommand": { "script": "sh ../scripts/bundle-prep.sh", "cwd": "." }
   },
   "app": {
     "withGlobalTauri": true,
