@@ -3,14 +3,18 @@
 // 불변식: ①원자성 — 실패(null 반환) 시 호출측이 두 트리 모두 무변경 유지 ②sid 유일성 —
 // src에서 제거한 노드만 dest에 붙이고, dest에 같은 sid가 이미 있으면 거부(유령 pane 차단).
 
+import type { WebNode } from "./webpane";
+
 export type TNode =
   | { type: "split"; dir: "row" | "col"; ratio?: number; a: TNode; b: TNode }
-  | { type: "pane"; sid: number };
+  | { type: "pane"; sid: number }
+  // web pane 리프 — 전출은 터미널 sid만 옮기고 web 노드는 제자리 보존(sid 없음 → 순회 스킵).
+  | WebNode;
 
 export function treeSids(node: TNode | null, out: number[] = []): number[] {
   if (!node) return out;
   if (node.type === "pane") out.push(node.sid);
-  else {
+  else if (node.type === "split") {
     treeSids(node.a, out);
     treeSids(node.b, out);
   }
@@ -20,6 +24,7 @@ export function treeSids(node: TNode | null, out: number[] = []): number[] {
 // sid pane 노드를 제거하고 형제로 붕괴시킨다(main.ts replaceNode의 제거 특수형과 동일 의미).
 function removeSid(node: TNode, sid: number): TNode | null {
   if (node.type === "pane") return node.sid === sid ? null : node;
+  if (node.type === "web") return node; // web 리프: 전출 대상 아님 — 제자리 보존
   const a = removeSid(node.a, sid);
   const b = removeSid(node.b, sid);
   if (a && b) return { ...node, a, b };

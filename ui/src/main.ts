@@ -17,6 +17,15 @@ import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purge
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
+import {
+  type WebNode,
+  isAllowedWebPaneUrl,
+  makeWebNode,
+  viewerAppUrl,
+  extractViewerPath,
+  loadPersistedLayout,
+  persistLayout,
+} from "./webpane";
 
 declare global {
   interface Window {
@@ -39,7 +48,9 @@ const listen = (name: string, handler: (e: { payload: unknown }) => void) =>
 
 type Node =
   | { type: "split"; dir: "row" | "col"; ratio?: number; a: Node; b: Node }
-  | { type: "pane"; sid: number };
+  | { type: "pane"; sid: number }
+  // web pane — 뷰어 사이드카 iframe(§2D). sid 없음(PTY/데몬 무접점) → 순회 유틸은 wid로 별도 취급.
+  | WebNode;
 
 interface Workspace {
   id: number;
@@ -65,7 +76,8 @@ interface GroupMeta {
   anchorSocket?: string; // 부서 그룹이면 부서 데몬 socket
 }
 
-const LAYOUT_KEY = "cys-layout-v2";
+// 레이아웃 저장/로드는 webpane.ts로 이관(v3 저장 · v2 마이그레이션 읽기 · 다운그레이드 안전).
+// LAYOUT_KEY_V2/V3 상수·loadPersistedLayout/persistLayout 참조.
 
 // pane 식별 복합키 — 서로 다른 데몬이 같은 surface_id를 독립 발급하므로 (socket, sid)로 구분한다.
 const paneKey = (sid: number, socket?: string): string => `${socket ?? ""}#${sid}`;
@@ -1549,6 +1561,10 @@ let groups: GroupMeta[] = []; // 06: 그룹 메타 배열(진실원=localStorage
 let groupCounter = 1; // 06: 그룹 id 발급(ws의 wsCounter와 분리)
 let focusedSid: number | null = null;
 const panes = new Map<string, PaneRuntime>(); // 키 = paneKey(sid, socket)
+// web pane(뷰어 iframe) 런타임 — 터미널 panes와 분리(최소 침습). 키 = wid(단조증가 고유 id).
+// PaneView 이음새를 공유하므로 테마·포커스·리사이즈·정리 순회는 두 맵을 함께 돈다.
+const webPanes = new Map<number, WebPaneView>();
+let webWidCounter = 1;
 // 부서 데몬 socket_slug(F3 백엔드 단일진실) → socket 경로. launch_dept_daemon 반환·daemon-event로 채운다.
 const socketForSlug = new Map<string, string>();
 // 사이드바 노드 신호 캐시(B3) — org.status 응답을 워크스페이스 행 집계용으로 보관.
@@ -1570,6 +1586,7 @@ function applyBgColor(color: string | null): void {
   document.documentElement.style.setProperty("--bg", bg);
   document.documentElement.style.setProperty("--canvas-text", fg);
   for (const rt of panes.values()) rt.applyTheme(bg, fg);
+  for (const wp of webPanes.values()) wp.applyTheme(bg, fg); // web pane도 동일 테마 전파(§14)
   if (color === null) localStorage.removeItem("cys-bg-color");
   else localStorage.setItem("cys-bg-color", color);
 }
@@ -1628,18 +1645,35 @@ function saveLayout() {
   groups = normG; // 06: 멤버0 그룹을 모듈 상태에서도 즉시 해체(유령 누적 방지 · 적대검증 교정)
   const activeId = workspaces[activeWs]?.id;
   const a = Math.max(0, norm.findIndex((w) => w.id === activeId));
-  localStorage.setItem(
-    LAYOUT_KEY,
-    JSON.stringify({ workspaces: norm, groups: normG, active: a, counter: wsCounter, groupCounter }),
-  );
+  // v3에만 저장 — v2는 다운그레이드용으로 프리즈(webpane.persistLayout이 키를 봉인).
+  persistLayout((k, v) => localStorage.setItem(k, v), {
+    workspaces: norm,
+    groups: normG,
+    active: a,
+    counter: wsCounter,
+    groupCounter,
+    webWidCounter,
+  });
 }
 
 function collectSids(node: Node | null, out: number[] = []): number[] {
   if (!node) return out;
   if (node.type === "pane") out.push(node.sid);
-  else {
+  else if (node.type === "split") {
     collectSids(node.a, out);
     collectSids(node.b, out);
+  }
+  // web 노드는 sid가 없는 리프 — 터미널/데몬 순회에서 스킵(입양·리사이즈 로직 오염 방지).
+  return out;
+}
+
+// web pane 고유 id 수집 — 정리(고아 dispose)·close 경로가 쓴다. collectSids의 web 짝.
+function collectWids(node: Node | null, out: number[] = []): number[] {
+  if (!node) return out;
+  if (node.type === "web") out.push(node.wid);
+  else if (node.type === "split") {
+    collectWids(node.a, out);
+    collectWids(node.b, out);
   }
   return out;
 }
@@ -1648,10 +1682,21 @@ function replaceNode(node: Node, target: number, make: (old: Node) => Node | nul
   if (node.type === "pane") {
     return node.sid === target ? make(node) : node;
   }
+  if (node.type === "web") return node; // web 리프: sid 대상과 무관 — 그대로 보존
   const a = replaceNode(node.a, target, make);
   const b = replaceNode(node.b, target, make);
   if (a && b) return { ...node, a, b };
   return a ?? b; // one side removed → collapse to sibling
+}
+
+// web 노드를 wid로 트리에서 제거(닫기 경로) — replaceNode의 sid 대응. collapse 규칙 동일.
+function removeWebNode(node: Node, wid: number): Node | null {
+  if (node.type === "web") return node.wid === wid ? null : node;
+  if (node.type === "pane") return node;
+  const a = removeWebNode(node.a, wid);
+  const b = removeWebNode(node.b, wid);
+  if (a && b) return { ...node, a, b };
+  return a ?? b;
 }
 
 // ---------- pane lifecycle ----------
@@ -2115,6 +2160,150 @@ function destroyPaneRuntime(sid: number, socket?: string) {
   panes.delete(paneKey(sid, socket));
 }
 
+// ---------- web pane (뷰어 사이드카 iframe) ----------
+// 터미널 pane과 동일 PaneView 이음새를 구현하되 xterm 대신 iframe을 얹는다. 타이틀 스트립은
+// cross-origin/loopback iframe 키보드 데드존(§8-1#12) 대응 포커스 캐처 + 제목·URL 표시 + 닫기.
+// 마운트 시 사이드카 미기동/로드 실패면 "계기 대기 중" 플레이스홀더 + 5s 재시도(§8-1#13).
+interface WebPaneView extends PaneView {
+  wid: number;
+  node: WebNode;
+}
+
+const VIEW_BRIDGE_RETRY_MS = 5000;
+
+function makeWebPane(node: WebNode): WebPaneView {
+  const el = document.createElement("div");
+  el.className = "pane web-pane";
+  el.dataset.wid = String(node.wid);
+
+  const header = document.createElement("div");
+  header.className = "pane-title";
+  header.tabIndex = 0; // 포커스 캐처 — iframe 밖 키 핸드오프 지점
+  const titleEl = document.createElement("span");
+  titleEl.className = "pane-title-text";
+  titleEl.textContent = node.title ?? "뷰어";
+  const urlEl = document.createElement("span");
+  urlEl.className = "pane-usage web-url";
+  const closeBtn = document.createElement("span");
+  closeBtn.className = "pane-close";
+  closeBtn.textContent = "×";
+  closeBtn.title = "web pane 닫기";
+  header.append(titleEl, urlEl, closeBtn);
+
+  const body = document.createElement("div");
+  body.className = "web-body";
+  const frame = document.createElement("iframe");
+  frame.className = "web-frame";
+  // 로컬 뷰어 앱 스크립트·동일출처 fetch(/api)만 허용, top-navigation·popup·폼은 차단(하드 가드 보완).
+  frame.setAttribute("sandbox", "allow-scripts allow-same-origin");
+  const placeholder = document.createElement("div");
+  placeholder.className = "web-placeholder";
+  body.append(placeholder, frame);
+  el.append(header, body);
+
+  let retryTimer: number | undefined;
+  let disposed = false;
+  let themeCache: { bg: string; fg: string } | null = null;
+
+  const showPlaceholder = (msg: string) => {
+    placeholder.textContent = msg;
+    placeholder.style.display = "";
+    frame.style.visibility = "hidden";
+  };
+  const postTheme = () => {
+    if (!themeCache) return;
+    frame.contentWindow?.postMessage(
+      { type: "cys-theme", vars: { "--bg": themeCache.bg, "--fg": themeCache.fg } },
+      "*",
+    );
+  };
+  frame.addEventListener("load", () => {
+    placeholder.style.display = "none";
+    frame.style.visibility = "";
+    postTheme(); // 뷰어 색 = 터미널 테마(§14)
+  });
+
+  const scheduleRetry = () => {
+    clearTimeout(retryTimer);
+    retryTimer = window.setTimeout(() => { if (!disposed) ensureAndLoad(); }, VIEW_BRIDGE_RETRY_MS);
+  };
+  // 사이드카 확보 → 최신 {port,token}으로 URL 재조립 → iframe 로드. 실패=플레이스홀더+재시도.
+  const ensureAndLoad = async () => {
+    if (disposed) return;
+    const path = extractViewerPath(node.url);
+    if (path === null) return showPlaceholder("잘못된 뷰어 경로 — 열 수 없음");
+    let bridge: { port: number; token: string };
+    try {
+      bridge = (await invoke("ensure_view_bridge")) as { port: number; token: string };
+    } catch {
+      showPlaceholder("계기 대기 중 — 재시도…");
+      return scheduleRetry();
+    }
+    if (disposed) return;
+    const url = viewerAppUrl(bridge.port, bridge.token, path);
+    if (!isAllowedWebPaneUrl(url)) return showPlaceholder("차단된 URL — 로드 거부"); // 하드 가드
+    node.url = url; // 저장 시 최신 URL 유지(토큰 회전 반영)
+    urlEl.textContent = `127.0.0.1:${bridge.port}`;
+    urlEl.title = url;
+    showPlaceholder("로딩 중…");
+    frame.src = url;
+  };
+
+  closeBtn.addEventListener("click", () => closeWebPane(node.wid));
+  header.addEventListener("mousedown", () => focusWebPane(node.wid));
+  showPlaceholder("계기 대기 중…");
+  ensureAndLoad();
+
+  const view: WebPaneView = {
+    wid: node.wid,
+    node,
+    el,
+    resize: () => { /* iframe은 CSS flex로 자동 리사이즈 — no-op */ },
+    applyTheme: (bg, fg) => { themeCache = { bg, fg }; postTheme(); },
+    setFocused: (focused) => { el.classList.toggle("focused", focused); },
+    dispose: () => { disposed = true; clearTimeout(retryTimer); el.remove(); },
+  };
+  webPanes.set(node.wid, view);
+  return view;
+}
+
+function destroyWebPane(wid: number) {
+  const v = webPanes.get(wid);
+  if (!v) return;
+  v.dispose();
+  webPanes.delete(wid);
+}
+
+// web pane 포커스 — 터미널·다른 web 포커스 해제 후 자신만 focused(단일 포커스 불변식).
+function focusWebPane(wid: number) {
+  focusedSid = null;
+  for (const rt of panes.values()) rt.setFocused(false);
+  for (const [id, v] of webPanes) v.setFocused(id === wid);
+}
+
+function closeWebPane(wid: number) {
+  const ws = current();
+  destroyWebPane(wid);
+  if (ws?.tree) ws.tree = removeWebNode(ws.tree, wid);
+  render();
+  const first = collectSids(ws?.tree ?? null)[0];
+  if (first != null) setFocus(first);
+}
+
+// 개발자 진입점 — 파일 경로를 뷰어 web pane으로 연다(포커스 pane 우측 분할). window.cysOpenViewer 노출.
+async function openViewerPane(path: string): Promise<void> {
+  const ws = current();
+  if (!ws || ws.pending) return;
+  const wid = webWidCounter++;
+  // 초기 URL엔 경로만 담는다(port 0·token pending) — makeWebPane의 ensureAndLoad가 실제로 재조립.
+  const node = makeWebNode(wid, viewerAppUrl(0, "pending", path), baseName(path) || "뷰어");
+  makeWebPane(node);
+  ws.tree = ws.tree ? { type: "split", dir: "row", a: ws.tree, b: node } : node;
+  render();
+  focusWebPane(wid);
+}
+(window as unknown as { cysOpenViewer: (p: string) => Promise<void> }).cysOpenViewer = openViewerPane;
+
 // ---------- pane drag 이동 (탭을 끌어 자유 배치) ----------
 
 type DropSide = "left" | "right" | "top" | "bottom";
@@ -2396,6 +2585,7 @@ function setFocus(sid: number) {
   focusedSid = sid;
   const key = paneKey(sid, current()?.socket);
   for (const [id, rt] of panes) rt.setFocused(id === key);
+  for (const wp of webPanes.values()) wp.setFocused(false); // 단일 포커스 — web pane 강조 해제
   updateFtRoot(); // 파일 트리가 열려 있으면 선택한 surface의 폴더로 전환
 }
 
@@ -2460,6 +2650,11 @@ function renderNode(node: Node): HTMLElement {
     placeholder.className = "pane";
     placeholder.textContent = `surface:${node.sid} (없음)`;
     return placeholder;
+  }
+  if (node.type === "web") {
+    // 런타임이 이미 있으면 그 el 재사용, 없으면(복원 직후) 생성한다.
+    const v = webPanes.get(node.wid) ?? makeWebPane(node);
+    return v.el;
   }
   const div = document.createElement("div");
   div.className = `split ${node.dir}`;
@@ -5262,13 +5457,15 @@ async function start() {
   // Session restore (멀티마스터 F4): 저장본 먼저 로드(ws.socket 포함) → 부서 데몬 확보를 list 대조보다
   // 선행 → 소켓별 대조. 데몬 일시 미가동 ws는 보존(영구 삭제 방지, 검증 mustFix).
   try {
-    const saved = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? "null");
+    // v3 우선 로드, 없으면 v2 마이그레이션(webpane.loadPersistedLayout — 구조 동일 passthrough).
+    const saved = loadPersistedLayout((k) => localStorage.getItem(k));
     if (saved && Array.isArray(saved.workspaces)) {
       workspaces = saved.workspaces;
       groups = Array.isArray(saved.groups) ? saved.groups : []; // 06: 하위호환 — 옛 저장본엔 groups 없음
       activeWs = saved.active ?? 0;
       wsCounter = saved.counter ?? 1;
       groupCounter = saved.groupCounter ?? 1; // 06
+      webWidCounter = saved.webWidCounter ?? 1; // web pane 고유 id 카운터(v2 저장본엔 없음)
     }
   } catch {
     workspaces = [];
@@ -5279,6 +5476,9 @@ async function start() {
   workspaces = normalizeWorkspaces(workspaces);
   // 카운터 보정: 신규 id/이름이 항상 기존 최댓값 초과하도록(중복·손상 저장본에도 강건)
   wsCounter = Math.max(wsCounter, 0, ...workspaces.map((w) => w.id)) + 1;
+  // web pane wid 카운터도 복원 트리의 최대 wid 초과로 보정(중복 발급 차단).
+  const restoredWids = workspaces.flatMap((w) => collectWids(w.tree));
+  webWidCounter = Math.max(webWidCounter, 0, ...restoredWids) + 1;
   // 06: 고아 그룹 청소 + groupCounter를 기존 최대 id+1로 보정(중복·손상 저장본에도 강건).
   groups = normalizeGroups(workspaces, groups);
   groupCounter = Math.max(groupCounter, 0, ...groups.map((g) => g.id)) + 1;

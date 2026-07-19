@@ -569,6 +569,55 @@ fn read_text_head(path: String, max_bytes: Option<u64>) -> Result<String, String
     Ok(String::from_utf8_lossy(head).into_owned())
 }
 
+/// ~/.cys/viewer/state.json 을 읽어 pid 생존이면 {port, token} 반환, 스테일/부재면 None.
+/// 사이드카(javis_view_bridge.py)가 {pid, port, token, ts} 를 원자 기록한다.
+fn read_live_view_state(path: &std::path::Path) -> Option<Value> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let pid = v.get("pid").and_then(|p| p.as_i64())?;
+    let port = v.get("port").and_then(|p| p.as_u64())?;
+    let token = v.get("token").and_then(|t| t.as_str())?.to_string();
+    // pid 생존 확인 — kill(pid, 0): 0=생존(권한 있음), ESRCH=사멸. (windows는 생존 가정 — 스테일이면 재기동 대기 타임아웃이 흡수)
+    #[cfg(unix)]
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return None;
+    }
+    let _ = pid;
+    Some(json!({"port": port, "token": token}))
+}
+
+/// 뷰어 사이드카 확보(§8-1#13) — 살아있으면 {port, token} 즉시 반환, 아니면 detached spawn 후
+/// state.json(생존 pid) 을 최대 10초 대기해 반환. lazy 기동(부트체인 무접점)·읽기 전용 loopback.
+#[tauri::command]
+fn ensure_view_bridge() -> Result<Value, String> {
+    let state_path = cys::home_dir().join(".cys/viewer/state.json");
+    if let Some(v) = read_live_view_state(&state_path) {
+        return Ok(v);
+    }
+    let script = cys::pack::pack_dir().join("bin").join("javis_view_bridge.py");
+    if !script.exists() {
+        return Err(format!("view bridge 스크립트 없음: {}", script.display()));
+    }
+    let mut cmd = std::process::Command::new("python3");
+    inject_runtime_path(&mut cmd); // 동봉 runtime(python3) PATH 주입
+    cmd.arg(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    no_console(&mut cmd);
+    cmd.spawn().map_err(|e| format!("view bridge 기동 실패: {e}"))?;
+    // state 대기(0.2s 간격·최대 10s) — 사이드카가 0-bind 포트 확정 후 state.json 을 원자 기록한다.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if let Some(v) = read_live_view_state(&state_path) {
+            return Ok(v);
+        }
+    }
+    Err("view bridge state 대기 타임아웃(10s)".into())
+}
+
 /// 파일 관리자에서 해당 항목을 선택해 보여준다 (macOS Finder reveal / Windows explorer select).
 /// open_path와 동일한 실재 경로 게이트 — URL 스킴·비존재 문자열 차단.
 #[tauri::command]
@@ -2989,6 +3038,7 @@ fn main() {
             open_path,
             reveal_path,
             read_text_head,
+            ensure_view_bridge,
             home_dir_path,
             open_url,
             send_key,
