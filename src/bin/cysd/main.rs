@@ -60,6 +60,16 @@ fn scrub_claude_session_env() {
             eprintln!("[cysd] scrubbed leaky claude session env: {k}");
         }
     }
+    // ★데몬 root env에 PYTHONUTF8=1 주입(정밀진단 diagnose-utf8-fix (a) 확정).
+    // ⓐ근거: Windows embeddable python은 기본 코드페이지(cp1252/cp949)로 파일을 열어 한글 UTF-8
+    //   팩파일 open().read()가 UnicodeDecodeError로 크래시한다. 데몬 root에서 1회 설정하면 데몬이
+    //   spawn하는 **전 파이썬 자식**(fire_command 스케줄 잡·office-bridge·phoenix·auto-restore 등)이
+    //   상속으로 자동 커버된다 — spawn 지점 개별 주입 금지(누락 시 6곳 산발). state.rs:1705의 pane
+    //   builder.env("PYTHONUTF8","1") 주입과 정합(pane 밖 데몬 자식까지 root가 커버). unix는 이미
+    //   UTF-8이라 no-op(무영향).
+    // ⓑ2024 edition 마이그레이션 시: std::env::set_var는 2024부터 unsafe fn이므로 `unsafe { … }`
+    //   래핑이 필요하다(현 edition은 safe — 위 scrub 루프의 remove_var와 동일 계약).
+    std::env::set_var("PYTHONUTF8", "1");
 }
 
 #[tokio::main]
@@ -1767,6 +1777,14 @@ mod env_scrub_tests {
             "무관 env까지 지우면 안 된다"
         );
         std::env::remove_var("CYS_SCRUB_TEST_KEEP");
+    }
+
+    /// 데몬 root env 정규화가 PYTHONUTF8=1을 주입하는지 박제(Windows cp1252/cp949 크래시 방지 —
+    /// spawn 전 파이썬 자식 상속 커버). set_var는 "1"로만 설정되므로 병렬 테스트 간 경합 무해.
+    #[test]
+    fn sets_pythonutf8_for_spawned_python_children() {
+        super::scrub_claude_session_env();
+        assert_eq!(std::env::var("PYTHONUTF8").as_deref(), Ok("1"));
     }
 }
 
