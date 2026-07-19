@@ -13,6 +13,7 @@ import {
   extractViewerPath,
   loadPersistedLayout,
   persistLayout,
+  collectWebWids,
 } from "./webpane";
 
 // 테스트용 in-memory localStorage 대역(getItem/setItem만).
@@ -136,6 +137,35 @@ describe("④ URL 하드 가드", () => {
     expect(isAllowedWebPaneUrl("http://127.0.0.1:80.evil.com/")).toBe(false); // port 위장
     expect(isAllowedWebPaneUrl("http://127.0.0.1.evil.com:80/")).toBe(false); // host 위장
     expect(isAllowedWebPaneUrl("")).toBe(false);
+  });
+});
+
+describe("⑤ web pane 정리(teardown) — collectWebWids", () => {
+  it("split 아래 섞인 web 노드 wid를 전부 수집한다", () => {
+    const tree = {
+      type: "split",
+      dir: "row",
+      ratio: 0.5,
+      a: makeWebNode(3, "http://127.0.0.1:1/tok/app/?path=a", "a"),
+      b: {
+        type: "split",
+        dir: "col",
+        ratio: 0.5,
+        a: { type: "pane", sid: 7 }, // 터미널 pane은 건너뛴다
+        b: makeWebNode(9, "http://127.0.0.1:1/tok/app/?path=b", "b"),
+      },
+    };
+    expect(collectWebWids(tree).sort((x, y) => x - y)).toEqual([3, 9]);
+  });
+
+  it("web 노드 없는 트리(터미널만)는 빈 배열", () => {
+    const tree = { type: "split", dir: "row", ratio: 0.5, a: { type: "pane", sid: 1 }, b: { type: "pane", sid: 2 } };
+    expect(collectWebWids(tree)).toEqual([]);
+  });
+
+  it("단일 web 리프·null 처리", () => {
+    expect(collectWebWids(makeWebNode(5, "http://127.0.0.1:1/t/app/?path=x"))).toEqual([5]);
+    expect(collectWebWids(null)).toEqual([]);
   });
 });
 

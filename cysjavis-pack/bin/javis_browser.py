@@ -8,7 +8,8 @@
 - P1은 cys 데몬·제품 코드 무변경. 제품 `cys browser` 승격은 제품화 게이트 이후.
 
 결정론 exit 코드:
-  0 성공 · 2 BUSY · 3 APPROVAL_REQUIRED · 4 기동실패 · 5 verify FAIL · 6 HUMAN_ACTIVE · 1 기타
+  0 성공 · 2 BUSY · 3 APPROVAL_REQUIRED · 4 기동실패 · 5 verify FAIL · 6 HUMAN_ACTIVE
+  · 7 HUMAN_PROFILE_PROTECTED · 8 PICK_TIMEOUT · 1 기타
 
 stdlib only (오피스 브리지 계보).
 """
@@ -33,11 +34,19 @@ EXIT_BY_ERROR = {
     "BUSY": 2,
     "APPROVAL_REQUIRED": 3,
     "HUMAN_ACTIVE": 6,
+    "HUMAN_PROFILE_PROTECTED": 7,
+    "PICK_TIMEOUT": 8,
 }
 EXIT_OK = 0
 EXIT_OTHER = 1
 EXIT_START_FAIL = 4
 EXIT_VERIFY_FAIL = 5
+EXIT_APPROVAL_REQUIRED = 3
+EXIT_HUMAN_PROFILE_PROTECTED = 7
+EXIT_PICK_TIMEOUT = 8
+
+BRIEFS_DIR = BROWSER_ROOT / "briefs"
+NOTEBOOKLM_URL = "https://notebooklm.google.com/"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -147,7 +156,7 @@ def rpc(st, verb: str, args: dict):
         return json.loads(resp.read().decode("utf8"))
 
 
-def audit(verb: str, args: dict, evidence_path, exit_code: int):
+def audit(verb: str, args: dict, evidence_path, exit_code: int, extra: dict = None):
     try:
         BROWSER_ROOT.mkdir(parents=True, exist_ok=True)
         row = {
@@ -159,10 +168,68 @@ def audit(verb: str, args: dict, evidence_path, exit_code: int):
             "evidence_path": evidence_path,
             "exit": exit_code,
         }
+        if extra:
+            row.update(extra)
         with open(AUDIT_PATH, "a") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+def request_human_approval(verb: str, url: str):
+    """human 프로필 요청 = CEO 결재(cys feed push --wait). fail-closed.
+
+    반환 (approved: bool, decision: str). cys 부재/오류/deny/timeout → 전부 거부.
+    feed push exit: 0=allow · 2=deny · 3=timeout.
+    """
+    cys = _which("cys")
+    if not cys:
+        return False, "no_cys"  # 개발 환경 등 cys 부재 → 기본 거부(fail-closed)
+    body = f"{verb} {url}"
+    try:
+        r = subprocess.run(
+            [cys, "feed", "push", "--wait", "--title", "browserd human 프로필 요청", "--body", body],
+            timeout=130,  # feed --wait 자체 120s + 여유
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except Exception as e:
+        return False, f"error:{e}"
+    if r.returncode == 0:
+        return True, "allow"
+    if r.returncode == 2:
+        return False, "deny"
+    if r.returncode == 3:
+        return False, "timeout"
+    return False, f"exit:{r.returncode}"
+
+
+def write_pick_brief(picked: dict, screenshot_path, url: str) -> Path:
+    """P4: pick 결과 → 워커 브리프 md. 반환 md 경로."""
+    BRIEFS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    md_path = BRIEFS_DIR / f"{ts}-pick.md"
+    sel = picked.get("selector", "")
+    text = picked.get("text", "")
+    rect = picked.get("rect", {})
+    lines = [
+        f"# 디자인 모드 브리프 — {ts}",
+        "",
+        f"- 대상 URL: {url or picked.get('url', '')}",
+        f"- 선택 요소 selector: `{sel}`",
+        f"- 요소 텍스트: {text!r}",
+        f"- 요소 위치(rect): x={rect.get('x')} y={rect.get('y')} w={rect.get('width')} h={rect.get('height')}",
+        f"- 스크린샷: {screenshot_path or '(없음)'}",
+        "",
+        "## 수정 지시",
+        "",
+        "<!-- 사람이 채울 칸: 이 요소를 어떻게 바꿀지 구체적으로 적으세요 -->",
+        "",
+    ]
+    md_path.write_text("\n".join(lines), encoding="utf8")
+    return md_path
 
 
 def _emit(obj):
@@ -245,7 +312,7 @@ def build_args(a) -> dict:
     keys = [
         "url", "profile", "context", "ref", "selector", "value", "text", "key",
         "expression", "path", "timeout", "load", "expect_text", "expect_selector",
-        "action", "actor", "evidence_dir", "full_page",
+        "action", "actor", "evidence_dir", "full_page", "approved",
     ]
     out = {}
     for k in keys:
@@ -278,8 +345,14 @@ def main():
     sp = sub.add_parser("eval"); sp.add_argument("--expression", required=True); add_common(sp)
     sp = sub.add_parser("screenshot"); sp.add_argument("--path", required=True); sp.add_argument("--full-page", dest="full_page", action="store_true", default=None); add_common(sp)
     sp = sub.add_parser("wait"); sp.add_argument("--selector"); sp.add_argument("--text"); sp.add_argument("--url"); sp.add_argument("--load"); sp.add_argument("--timeout", type=int); add_common(sp)
-    sp = sub.add_parser("verify"); sp.add_argument("--expect-text", dest="expect_text"); sp.add_argument("--expect-selector", dest="expect_selector"); add_common(sp)
+    sp = sub.add_parser("verify"); sp.add_argument("--expect-text", dest="expect_text", action="append", help="기대 텍스트(반복 지정 가능 — 전부 대조)"); sp.add_argument("--expect-selector", dest="expect_selector", action="append", help="기대 셀렉터(반복 지정 가능 — 전부 대조)"); add_common(sp)
     sp = sub.add_parser("control"); sp.add_argument("action", choices=["acquire", "release"]); sp.add_argument("--actor", choices=["agent", "human"], default=None); add_common(sp)
+    # P2-a 관측: headful로 열고 관측 상태 반환. --profile human 은 CEO 결재 경유.
+    sp = sub.add_parser("observe", help="headful 관측(사람이 창을 직접 봄)"); sp.add_argument("url"); sp.add_argument("--profile", default=None); add_common(sp)
+    # SOT 헬퍼: observe --profile human https://notebooklm.google.com/ 축약(결재 경로 경유).
+    sub.add_parser("sot", help="박사님 생각 SOT(NotebookLM) human 프로필 관측 — 결재 경유")
+    # P4 디자인 모드: 사람이 요소 클릭 → 워커 브리프 md 생성.
+    sp = sub.add_parser("pick", help="디자인 모드 — 요소 선택→브리프 md"); sp.add_argument("--timeout", type=int); add_common(sp)
 
     a = p.parse_args()
     headless = a.headless
@@ -307,8 +380,101 @@ def main():
         _emit({"ok": True, "result": f"SIGTERM → pid {st['pid']}"})
         sys.exit(EXIT_OK)
 
+    # --- sot = observe --profile human notebooklm 축약 ---
+    if a.cmd == "sot":
+        sys.exit(cmd_observe("sot", NOTEBOOKLM_URL, "human", None, headless))
+
+    # --- observe (P2-a) ---
+    if a.cmd == "observe":
+        sys.exit(cmd_observe("observe", a.url, a.profile, a.evidence_dir, headless))
+
+    # --- pick (P4) ---
+    if a.cmd == "pick":
+        sys.exit(cmd_pick(a, headless))
+
     args = build_args(a)
+
+    # --- human 프로필 결재 게이트 (open 등 --profile human) ---
+    if getattr(a, "profile", None) == "human":
+        rc = gate_human(a.cmd, args)
+        if rc is not None:
+            sys.exit(rc)
+
     sys.exit(run_verb(a.cmd, args, headless))
+
+
+def gate_human(verb: str, args: dict):
+    """--profile human 요청에 CEO 결재를 강제. 통과 시 args['approved']=True 세팅 후 None 반환.
+    거부/오류 시 emit+audit 후 exit 코드 반환(EXIT_APPROVAL_REQUIRED)."""
+    url = args.get("url", "")
+    approved, decision = request_human_approval(verb, url)
+    audit(verb, args, None, EXIT_APPROVAL_REQUIRED if not approved else EXIT_OK,
+          extra={"human_approval": decision})
+    if not approved:
+        msg = {
+            "no_cys": "cys 바이너리 부재 — human 프로필 거부(fail-closed)",
+            "deny": "CEO 결재 거부(deny)",
+            "timeout": "CEO 결재 타임아웃(미결재)",
+        }.get(decision, f"결재 실패({decision})")
+        _emit({"ok": False, "error": {"code": "APPROVAL_REQUIRED", "message": msg}})
+        return EXIT_APPROVAL_REQUIRED
+    args["approved"] = True
+    return None
+
+
+def cmd_observe(verb_label: str, url: str, profile, evidence_dir, headless_flag: bool) -> int:
+    """P2-a 관측 — headful로 열고 관측 상태 반환. human 프로필은 결재 경유.
+    관측은 headful이 본질(사람이 창을 봄) → --headless 무시하고 headful 강제."""
+    args = {"url": url, "context": None}
+    args = {k: v for k, v in args.items() if v is not None}
+    if evidence_dir:
+        args["evidence_dir"] = evidence_dir
+    if profile == "human":
+        args["profile"] = "human"
+        rc = gate_human("observe", args)
+        if rc is not None:
+            return rc
+    # 관측은 headful 강제(headless면 사람이 볼 창이 없음).
+    return run_verb("observe", args, headless=False)
+
+
+def cmd_pick(a, headless_flag: bool) -> int:
+    """P4 디자인 모드 — 요소 선택→브리프 md. headless엔 클릭할 사람이 없어 거부."""
+    if headless_flag:
+        _emit({"ok": False, "error": {"code": "PICK_HEADLESS", "message": "pick은 headful 필요 — 사람이 요소를 클릭한다(--headless 불가)"}})
+        return EXIT_OTHER
+    BRIEFS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    shot = str(BRIEFS_DIR / f"{ts}-pick.png")
+    args = {"path": shot}
+    if a.context:
+        args["context"] = a.context
+    if a.timeout:
+        args["timeout"] = a.timeout
+    st, err = ensure_browserd(headless=False)
+    if not st:
+        audit("pick", args, None, EXIT_START_FAIL)
+        _emit({"ok": False, "error": {"code": "START_FAIL", "message": err}})
+        return EXIT_START_FAIL
+    try:
+        resp = rpc(st, "pick", args)
+    except urllib.error.URLError as e:
+        audit("pick", args, None, EXIT_OTHER)
+        _emit({"ok": False, "error": {"code": "RPC_FAIL", "message": str(e)}})
+        return EXIT_OTHER
+    if not resp.get("ok"):
+        code = resp.get("error", {}).get("code", "ERROR")
+        exit_code = EXIT_BY_ERROR.get(code, EXIT_OTHER)
+        audit("pick", args, None, exit_code)
+        _emit(resp)
+        return exit_code
+    result = resp.get("result", {})
+    picked = result.get("picked", {})
+    md_path = write_pick_brief(picked, result.get("screenshot_path"), result.get("url", ""))
+    audit("pick", args, str(md_path), EXIT_OK)
+    _emit({"ok": True, "result": {"picked": picked, "brief": str(md_path), "screenshot": result.get("screenshot_path")}})
+    print(f"\n브리프: {md_path}")
+    return EXIT_OK
 
 
 if __name__ == "__main__":

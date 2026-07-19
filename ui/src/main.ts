@@ -25,6 +25,7 @@ import {
   extractViewerPath,
   loadPersistedLayout,
   persistLayout,
+  collectWebWids,
 } from "./webpane";
 
 declare global {
@@ -1668,14 +1669,9 @@ function collectSids(node: Node | null, out: number[] = []): number[] {
 }
 
 // web pane 고유 id 수집 — 정리(고아 dispose)·close 경로가 쓴다. collectSids의 web 짝.
+// 순수 walk는 webpane.collectWebWids(단위 테스트 대상)에 위임 — teardown/복원이 같은 로직을 공유한다.
 function collectWids(node: Node | null, out: number[] = []): number[] {
-  if (!node) return out;
-  if (node.type === "web") out.push(node.wid);
-  else if (node.type === "split") {
-    collectWids(node.a, out);
-    collectWids(node.b, out);
-  }
-  return out;
+  return collectWebWids(node, out);
 }
 
 function replaceNode(node: Node, target: number, make: (old: Node) => Node | null): Node | null {
@@ -3105,6 +3101,8 @@ function buildTab(ws: Workspace): HTMLElement {
       await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
       destroyPaneRuntime(sid, ws.socket);
     }
+    // web pane도 정리 — ws 통째 삭제 시 iframe·webPanes 엔트리가 고아로 남지 않게 dispose.
+    for (const wid of collectWids(ws.tree)) destroyWebPane(wid);
     const i = workspaces.indexOf(ws); // 캡처된 idx는 stale일 수 있음 — 실시간 위치로 식별
     if (i < 0) { render(); return; } // 이미 제거된 ws 재클릭 — no-op
     workspaces.splice(i, 1);
@@ -3315,6 +3313,8 @@ async function confirmDeleteGroup(g: GroupMeta) {
       await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
       destroyPaneRuntime(sid, ws.socket);
     }
+    // web pane 정리(ws close 핸들러와 동일 정합) — 그룹 삭제로 사라지는 ws의 iframe·엔트리 dispose.
+    for (const wid of collectWids(ws.tree)) destroyWebPane(wid);
     const i = workspaces.indexOf(ws);
     if (i < 0) continue;
     workspaces.splice(i, 1);

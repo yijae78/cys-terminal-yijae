@@ -58,6 +58,23 @@ RC_BROKEN=$?
 echo "broken verify exit=$RC_BROKEN"
 [ "$RC_BROKEN" -eq 5 ] || fail "결함 페이지 verify exit=$RC_BROKEN (기대 5=FAIL)"
 
+# --- 다중 기대값: 2개 중 1개만 존재 → FAIL(exit 5) (Fix①: append 침묵 덮어씀 방지) ---
+log "정상 페이지 open + verify 다중 기대값(1 존재·1 부재 → 기대 exit 5)"
+python3 "$CLI" --headless open "$OK_URL" >/dev/null
+MULTI_OUT="$(python3 "$CLI" --headless verify --expect-text "PAYMENT CONFIRMED" --expect-text "REFUND ISSUED")"
+RC_MULTI=$?
+echo "multi verify exit=$RC_MULTI"
+[ "$RC_MULTI" -eq 5 ] || fail "다중 기대값(1부재) verify exit=$RC_MULTI (기대 5=FAIL — 마지막 값만 검증되면 오통과)"
+# reasons에 존재·부재 항목이 둘 다 기록되는지(전부 대조 증거)
+echo "$MULTI_OUT" | grep -q "expect_text 확인" || fail "multi verify: 존재 항목 reason 누락"
+echo "$MULTI_OUT" | grep -q "expect_text 미발견" || fail "multi verify: 부재 항목 reason 누락"
+
+# --- 다중 기대값: 둘 다 존재 → PASS(exit 0) ---
+log "정상 페이지 verify 다중 기대값(2 존재 → 기대 exit 0)"
+python3 "$CLI" --headless verify --expect-text "PAYMENT CONFIRMED" --expect-text "주문 상태" >/dev/null
+RC_MULTI_OK=$?
+[ "$RC_MULTI_OK" -eq 0 ] || fail "다중 기대값(2존재) verify exit=$RC_MULTI_OK (기대 0=PASS)"
+
 # --- 정상 페이지: verify PASS(exit 0) + evidence 번들 ---
 log "정상 페이지 open + verify --evidence-dir (기대 exit 0 + 4파일)"
 python3 "$CLI" --headless open "$OK_URL" >/dev/null

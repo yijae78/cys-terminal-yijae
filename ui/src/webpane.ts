@@ -38,6 +38,18 @@ export function extractViewerPath(url: string): string | null {
   }
 }
 
+// 레이아웃 트리에서 web 노드 wid를 전부 수집(순수 walk — DOM 무의존). teardown/복원 경로가
+// 이걸로 dispose 대상을 뽑는다. split은 양쪽 재귀, pane(터미널 sid)·null은 건너뛴다.
+export function collectWebWids(node: any, out: number[] = []): number[] {
+  if (!node) return out;
+  if (node.type === "web") out.push(node.wid);
+  else if (node.type === "split") {
+    collectWebWids(node.a, out);
+    collectWebWids(node.b, out);
+  }
+  return out;
+}
+
 // 레이아웃 로드 — v3 우선, 없으면 v2 읽어 마이그레이션(구조 동일 passthrough). 손상 저장본은 null.
 // v2는 절대 쓰지/지우지 않는다(다운그레이드 안전).
 export function loadPersistedLayout(getItem: (key: string) => string | null): any | null {

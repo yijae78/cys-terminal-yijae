@@ -13,6 +13,7 @@ import {
   BrowserState,
   IDLE_TIMEOUT_MS,
   MAX_CONTEXTS,
+  PICK_OVERLAY_JS,
   SNAPSHOT_LIMIT,
   UNTRUSTED_HEADER,
   browserRoot,
@@ -32,10 +33,15 @@ interface Ctx {
 }
 
 // --- 상태 ---
-let persistentCtx: BrowserContext | null = null;
+let persistentCtx: BrowserContext | null = null; // agent 프로필(무세션·기본)
+let humanCtx: BrowserContext | null = null; // human 프로필(인증·SOT) — CEO 결재 통과 시에만 생성
 const contexts = new Map<string, Ctx>();
 let lastActivity = Date.now();
+let lastEvidencePath: string | null = null; // 최근 evidence 번들 경로(관측 status·observe 반환용)
 const dialogLog: string[] = [];
+// P4 pick: exposeBinding은 페이지당 1회만 등록 가능 → 등록 여부와 현재 resolver를 페이지별로 추적.
+const pickBound = new WeakSet<Page>();
+const pickResolvers = new Map<Page, (data: any) => void>();
 
 function touch() {
   lastActivity = Date.now();
@@ -50,9 +56,10 @@ class RpcError extends Error {
 }
 
 // --- 브라우저 기동 (Chrome 채널 우선, 폴백 chromium) ---
-async function ensureBrowser(): Promise<BrowserContext> {
-  if (persistentCtx) return persistentCtx;
-  const dir = profileDir("agent");
+// 프로필별 persistentContext를 각각 기동한다. agent/human user-data-dir가 분리되어
+// human 인증 세션(SOT)이 agent 검증 트래픽과 섞이지 않는다(§2A 프로필 2원화).
+async function launchProfileCtx(profile: "agent" | "human"): Promise<BrowserContext> {
+  const dir = profileDir(profile);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const common = {
     headless: HEADLESS,
@@ -60,11 +67,19 @@ async function ensureBrowser(): Promise<BrowserContext> {
     args: ["--no-first-run", "--no-default-browser-check"],
   };
   try {
-    persistentCtx = await chromium.launchPersistentContext(dir, { ...common, channel: "chrome" });
+    return await chromium.launchPersistentContext(dir, { ...common, channel: "chrome" });
   } catch (e) {
     // 설치된 Chrome 없음 → playwright chromium 폴백
-    persistentCtx = await chromium.launchPersistentContext(dir, common);
+    return await chromium.launchPersistentContext(dir, common);
   }
+}
+
+async function ensureBrowser(profile: "agent" | "human" = "agent"): Promise<BrowserContext> {
+  if (profile === "human") {
+    if (!humanCtx) humanCtx = await launchProfileCtx("human");
+    return humanCtx;
+  }
+  if (!persistentCtx) persistentCtx = await launchProfileCtx("agent");
   return persistentCtx;
 }
 
@@ -78,6 +93,15 @@ function getCtx(id: string): Ctx {
 function assertAgentControl(c: Ctx) {
   if (c.control === "human") {
     throw new RpcError("HUMAN_ACTIVE", "사람이 조작 중(control=human) — 에이전트 동사 거부");
+  }
+}
+
+// 프로필 격리 게이트: human 프로필 컨텍스트는 읽기 전용(open/wait/screenshot/snapshot만).
+// 에이전트 자동화 동사(click/fill/type/press/eval)는 사람이 로그인·브라우징하는 세션을
+// 조작 못 하게 기본 거부한다(§2A · P3 예외 없음).
+function assertNotHumanProfile(c: Ctx, verb: string) {
+  if (c.profile === "human") {
+    throw new RpcError("HUMAN_PROFILE_PROTECTED", `human 프로필은 읽기 전용 — 에이전트 동사 '${verb}' 거부`);
   }
 }
 
@@ -166,6 +190,7 @@ async function writeEvidence(
   };
   // meta.json 반드시 마지막에 — 반쪽 번들 차단(완결 마커)
   writeFileSync(join(dir, "meta.json"), JSON.stringify(meta, null, 2), "utf8");
+  lastEvidencePath = dir; // 관측(observe·status)이 마지막 증거 위치를 노출
   return dir;
 }
 
@@ -182,19 +207,23 @@ async function dispatch(verb: string, args: any): Promise<any> {
         contexts: [...contexts.entries()].map(([id, c]) => ({ id, control: c.control, profile: c.profile, url: c.page.url() })),
         dialogs: dialogLog.length,
         idle_ms: Date.now() - lastActivity,
+        last_evidence_path: lastEvidencePath,
       };
     }
 
     case "open": {
-      if (args.profile === "human") {
-        throw new RpcError("APPROVAL_REQUIRED", "human 프로필은 CEO 결재 필요 (P1 미배선) — 거부");
+      const profile: "agent" | "human" = args.profile === "human" ? "human" : "agent";
+      // human 프로필은 CEO 결재 경유(CLI가 cys feed push --wait exit 0 시 args.approved 전달)만 허용.
+      // 결재 없이 온 요청은 거부 — 배선 부재가 아니라 정책적 거부.
+      if (profile === "human" && !args.approved) {
+        throw new RpcError("APPROVAL_REQUIRED", "human 프로필은 CEO 결재 필요 — 미결재 거부");
       }
       const url: string = args.url;
       if (!url) throw new RpcError("BAD_ARGS", "url 필요");
       if (!contexts.has(cid) && contexts.size >= MAX_CONTEXTS) {
         throw new RpcError("BUSY", `context 동시 상한 ${MAX_CONTEXTS} 초과 — backoff 후 재시도`);
       }
-      const bc = await ensureBrowser();
+      const bc = await ensureBrowser(profile);
       let c = contexts.get(cid);
       if (!c) {
         const page = await bc.newPage();
@@ -202,14 +231,28 @@ async function dispatch(verb: string, args: any): Promise<any> {
           dialogLog.push(`${new Date().toISOString()} ${d.type()}: ${d.message()}`);
           d.dismiss().catch(() => {});
         });
-        c = { page, control: "agent", profile: "agent" };
+        c = { page, control: "agent", profile };
         contexts.set(cid, c);
       }
       assertAgentControl(c);
       await c.page.goto(url, { waitUntil: "load", timeout: 30000 });
       let evidence_path: string | undefined;
       if (args.evidence_dir) evidence_path = await writeEvidence(c.page, args.evidence_dir, verb, args);
-      return { context: cid, url: c.page.url(), title: await c.page.title(), evidence_path };
+      return { context: cid, url: c.page.url(), title: await c.page.title(), profile: c.profile, evidence_path };
+    }
+
+    case "observe": {
+      // P2-a 관측: 에이전트 동사와 동일 경로(open)로 headful 열되, 관측 상태를 반환한다.
+      // 사람이 터미널 옆 headful 창을 직접 본다(창 배치 AppleScript 없음 — 런북 절차 참조).
+      await dispatch("open", args);
+      const c = getCtx(cid);
+      return {
+        context: cid,
+        url: c.page.url(),
+        control: c.control,
+        profile: c.profile,
+        last_evidence_path: lastEvidencePath,
+      };
     }
 
     case "snapshot": {
@@ -222,6 +265,7 @@ async function dispatch(verb: string, args: any): Promise<any> {
 
     case "click": {
       const c = getCtx(cid);
+      assertNotHumanProfile(c, verb);
       assertAgentControl(c);
       await c.page.click(selectorFor(args), { timeout: args.timeout || 10000 });
       return { ok: true };
@@ -229,6 +273,7 @@ async function dispatch(verb: string, args: any): Promise<any> {
 
     case "fill": {
       const c = getCtx(cid);
+      assertNotHumanProfile(c, verb);
       assertAgentControl(c);
       await c.page.fill(selectorFor(args), String(args.value ?? ""), { timeout: args.timeout || 10000 });
       return { ok: true };
@@ -236,6 +281,7 @@ async function dispatch(verb: string, args: any): Promise<any> {
 
     case "type": {
       const c = getCtx(cid);
+      assertNotHumanProfile(c, verb);
       assertAgentControl(c);
       const text = String(args.text ?? "");
       if (args.ref || args.selector) await c.page.locator(selectorFor(args)).pressSequentially(text, { timeout: args.timeout || 10000 });
@@ -245,6 +291,7 @@ async function dispatch(verb: string, args: any): Promise<any> {
 
     case "press": {
       const c = getCtx(cid);
+      assertNotHumanProfile(c, verb);
       assertAgentControl(c);
       await c.page.keyboard.press(String(args.key));
       return { ok: true };
@@ -252,6 +299,7 @@ async function dispatch(verb: string, args: any): Promise<any> {
 
     case "eval": {
       const c = getCtx(cid);
+      assertNotHumanProfile(c, verb);
       assertAgentControl(c);
       const result = await c.page.evaluate(String(args.expression));
       return { result };
@@ -281,28 +329,75 @@ async function dispatch(verb: string, args: any): Promise<any> {
       const c = getCtx(cid);
       const reasons: string[] = [];
       let pass = true;
-      if (args.expect_text) {
+      // 다중 기대값 계약: expect_text/expect_selector는 배열(여러 개)일 수 있고 전부 대조한다.
+      // 하나라도 미발견이면 FAIL. 단수 문자열도 허용(하위호환) — asList가 정규화한다.
+      const asList = (v: any): string[] =>
+        v == null ? [] : (Array.isArray(v) ? v.map(String) : [String(v)]);
+      const texts = asList(args.expect_text);
+      const selectors = asList(args.expect_selector);
+      if (texts.length === 0 && selectors.length === 0) {
+        throw new RpcError("BAD_ARGS", "expect_text 또는 expect_selector 필요");
+      }
+      if (texts.length) {
         // 가시 텍스트(innerText)+title만 대조 — 주석·스크립트·속성 안의 문자열이
         // 게이트를 오통과(false PASS)시키지 않도록 raw HTML은 쓰지 않는다.
-        const visible = await c.page.evaluate(
-          "((document.body ? document.body.innerText : '') + ' ' + (document.title || ''))"
+        const visible = String(
+          await c.page.evaluate(
+            "((document.body ? document.body.innerText : '') + ' ' + (document.title || ''))"
+          )
         );
-        const found = String(visible).includes(args.expect_text);
-        if (!found) { pass = false; reasons.push(`expect_text 미발견: "${args.expect_text}"`); }
-        else reasons.push(`expect_text 확인: "${args.expect_text}"`);
+        for (const t of texts) {
+          if (visible.includes(t)) reasons.push(`expect_text 확인: "${t}"`);
+          else { pass = false; reasons.push(`expect_text 미발견: "${t}"`); }
+        }
       }
-      if (args.expect_selector) {
-        const el = await c.page.$(args.expect_selector);
-        if (!el) { pass = false; reasons.push(`expect_selector 미발견: "${args.expect_selector}"`); }
-        else reasons.push(`expect_selector 확인: "${args.expect_selector}"`);
-      }
-      if (!args.expect_text && !args.expect_selector) {
-        throw new RpcError("BAD_ARGS", "expect_text 또는 expect_selector 필요");
+      for (const sel of selectors) {
+        const el = await c.page.$(sel);
+        if (el) reasons.push(`expect_selector 확인: "${sel}"`);
+        else { pass = false; reasons.push(`expect_selector 미발견: "${sel}"`); }
       }
       const verdict = pass ? "PASS" : "FAIL";
       let evidence_path: string | undefined;
       if (args.evidence_dir) evidence_path = await writeEvidence(c.page, args.evidence_dir, verb, args);
       return { verdict, reasons, evidence_path };
+    }
+
+    case "pick": {
+      // P4 디자인 모드: 오버레이 주입 → 사람이 요소 클릭 → {selector,text,rect,url} 회수.
+      // headless엔 클릭할 사람이 없어 timeout 후 에러(브리프 미생성).
+      const c = getCtx(cid);
+      const timeout = args.timeout || 60000;
+      if (!pickBound.has(c.page)) {
+        // 바인딩은 페이지당 1회 — 콜백은 그 시점 등록된 resolver로 위임(재-pick 지원).
+        await c.page.exposeBinding("__cysPick", (_src: any, data: any) => {
+          const r = pickResolvers.get(c.page);
+          if (r) r(data);
+        });
+        pickBound.add(c.page);
+      }
+      const picked = await new Promise<any>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pickResolvers.delete(c.page);
+          c.page.evaluate("window.__cysPickCleanup && window.__cysPickCleanup()").catch(() => {});
+          reject(new RpcError("PICK_TIMEOUT", `pick 타임아웃(${timeout}ms) — 클릭 없음`));
+        }, timeout);
+        pickResolvers.set(c.page, (data) => {
+          clearTimeout(timer);
+          pickResolvers.delete(c.page);
+          resolve(data);
+        });
+        c.page.evaluate(PICK_OVERLAY_JS).catch((e: any) => {
+          clearTimeout(timer);
+          pickResolvers.delete(c.page);
+          reject(e);
+        });
+      });
+      let screenshot_path: string | undefined;
+      if (args.path) {
+        await c.page.screenshot({ path: args.path, fullPage: false });
+        screenshot_path = args.path;
+      }
+      return { picked, screenshot_path, url: c.page.url() };
     }
 
     case "control": {
