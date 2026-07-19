@@ -334,6 +334,20 @@ def pack_dir():
     return os.path.join(os.path.expanduser("~"), ".cys/pack")
 
 
+def gate_state_dir_for_pack(pd):
+    """게이트 state_dir 파생 규칙의 공용 SOT(DESIGN §3.6 D2 — 파생 site 단일화).
+
+    pack basename이 `pack-dept-<id>`면 `$HOME/.cys/state/report_gate-<id>`, 그 외(본사·worktree)면
+    기본 `$HOME/.cys/state/report_gate`. 반환은 셸 리터럴($HOME) — C16이 command에 bake하면 fire 시점의
+    셸이 확장하고(기존 command의 ${CYS_PACK_DIR:-...} 관례와 동일), C69·c71 등 실경로 소비자는
+    expandvars/expanduser로 확장한다. 이 3 site 외 신규 파생 금지(샷건 서저리 봉인)."""
+    base = os.path.basename(os.path.normpath(pd))
+    m = re.match(r"pack-dept-(.+)$", base)
+    if m:
+        return "$HOME/.cys/state/report_gate-%s" % m.group(1)
+    return "$HOME/.cys/state/report_gate"
+
+
 def _cys_hook_cmd(script_name):
     """Claude settings.json hook 명령 문자열(단일 진실 — 모든 등록부 공용).
     Windows: git-bash `bash`로 명시 호출 + **정슬래시 + 따옴표**. 미따옴표 역슬래시 경로는 bash가
@@ -1452,7 +1466,32 @@ class Preflight:
         if rep:
             j = rep[0]
             if is_gate_report(j):
-                mode = "command(하트비트 델타게이트)"
+                # §3.6 상태격리 배선 마이그레이션: 게이트 잡 command에 CYS_REPORT_GATE_DIR가 없으면
+                #   command 앞에 env 프리픽스만 삽입한다(재생성 금지·기존 토큰 전부 보존 — dept-5의
+                #   `run --shadow` 등 후행 인자 소실 방지). 미배선 dept는 본사 기본 대장을 오염
+                #   (split-brain)시키므로 배선이 필수다. 멱등(2회차엔 이미 포함 → PASS).
+                cmd = j.get("command") or ""
+                if "CYS_REPORT_GATE_DIR" not in cmd:
+                    prefix = 'CYS_REPORT_GATE_DIR="%s" ' % gate_state_dir_for_pack(pack_dir())
+                    if self.fix:
+                        try:
+                            shutil.copyfile(p, "%s.bak-%d" % (p, int(time.time())))
+                        except OSError:
+                            pass
+                        j["command"] = prefix + cmd
+                        data["jobs"] = jobs
+                        text = json.dumps(data, ensure_ascii=False, indent=2)
+                        json.loads(text)                    # 재파스 검증(파손 쓰기 방지)
+                        open(p, "w", encoding="utf-8").write(text)
+                        self.add(cid, FIXED,
+                                 "게이트 잡 상태격리 배선(CYS_REPORT_GATE_DIR 프리픽스 삽입·토큰 보존): %s"
+                                 % j.get("id"))
+                    else:
+                        self.add(cid, FAIL,
+                                 "게이트 잡 상태격리 미배선(CYS_REPORT_GATE_DIR 부재) — --fix로 배선 가능: %s"
+                                 % j.get("id"))
+                    return
+                mode = "command(하트비트 델타게이트·격리배선)"
             elif j.get("text_command"):
                 mode = "text_command(결정론 직접산출)"
             else:
@@ -1472,7 +1511,9 @@ class Preflight:
                 "id": "owner-progress-gate-5min",
                 "every_minutes": 5,
                 "action": "command",
-                "command": 'python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py" run',
+                "command": 'CYS_REPORT_GATE_DIR="%s" python3 '
+                           '"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py" run'
+                           % gate_state_dir_for_pack(pack_dir()),   # §3.6 상태격리 배선(리터럴 bake)
                 "if_absent": "skip",
             })
             data["jobs"] = jobs
@@ -3788,9 +3829,12 @@ class Preflight:
                     return
             except Exception:
                 pass  # gate-check 실패는 무시하고 대장 검사 계속(비차단)
-        ledger = os.path.join(os.path.expanduser("~"), ".cys", "state", "report_gate", "ledger.jsonl")
+        # §3.6-4: 데드맨 대장 경로를 공용 헬퍼 파생값 기본 + env 명시 오버라이드로 해석한다. 현행처럼
+        #   고정 기본값만 보면 격리된 dept 게이트의 stale 공유 대장을 감시하는 split-brain이 확정된다.
+        gate_dir = os.path.expanduser(os.path.expandvars(gate_state_dir_for_pack(pack_dir())))
         if os.environ.get("CYS_REPORT_GATE_DIR"):
-            ledger = os.path.join(os.environ["CYS_REPORT_GATE_DIR"], "ledger.jsonl")
+            gate_dir = os.environ["CYS_REPORT_GATE_DIR"]
+        ledger = os.path.join(gate_dir, "ledger.jsonl")
         if not os.path.isfile(ledger):
             self.add(cid, WARN, "게이트 대장 부재(%s) — 델타게이트 미배선/미가동일 수 있음(비차단)" % ledger)
             return

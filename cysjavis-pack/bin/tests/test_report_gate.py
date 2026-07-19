@@ -863,9 +863,13 @@ class C16ReportScheduleGate(unittest.TestCase):
             os.environ.clear()
             os.environ.update(saved)
 
+    _GATE_CMD = ('CYS_REPORT_GATE_DIR="$HOME/.cys/state/report_gate" python3 '
+                 '"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py" run')
     GATE_JOB = {"id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
-                "command": "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py\" run",
-                "if_absent": "skip"}
+                "command": _GATE_CMD, "if_absent": "skip"}                 # 상태격리 배선된 게이트 잡
+    UNWIRED_GATE_JOB = {"id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
+                        "command": 'python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py" run',
+                        "if_absent": "skip"}                               # 미배선(구 잡)
     PUSH_JOB = {"id": "owner-progress-report-5min", "every_minutes": 5, "action": "push",
                 "to": "master", "text_command": "python3 x", "if_absent": "skip"}
 
@@ -873,7 +877,7 @@ class C16ReportScheduleGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             res, _ = self._c16(t, [dict(self.GATE_JOB)])
             self.assertEqual(res["status"], "PASS", res)
-            # --fix: 게이트 잡 존재 → 재추가 없음(마이그레이션 보존)
+            # --fix: 배선된 게이트 잡 존재 → 재추가·재삽입 없음(마이그레이션 보존)
             res2, after = self._c16(t, [dict(self.GATE_JOB)], fix=True)
             self.assertEqual(res2["status"], "PASS")
             ids = [j["id"] for j in after["jobs"]]
@@ -890,6 +894,7 @@ class C16ReportScheduleGate(unittest.TestCase):
             self.assertEqual(len(added), 1, after)
             self.assertEqual(added[0]["action"], "command")
             self.assertIn("javis_report_gate.py", added[0]["command"])
+            self.assertIn("CYS_REPORT_GATE_DIR", added[0]["command"])   # 상태격리 배선 포함
             # 구 push 보고 잡은 부활하지 않는다(제거 대상).
             self.assertFalse(any(j["id"] == "owner-progress-report-5min" for j in after["jobs"]))
 
@@ -897,6 +902,33 @@ class C16ReportScheduleGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             res, _ = self._c16(t, [dict(self.PUSH_JOB)])
             self.assertEqual(res["status"], "PASS", res)   # 하위호환
+
+    # ── T14: 미배선 게이트 잡 → FAIL(report) / --fix prepend 배선 / 멱등(2회차 PASS) ──
+    def test_t14_unwired_gate_migrates_prepend_idempotent(self):
+        with tempfile.TemporaryDirectory() as t:
+            res, _ = self._c16(t, [dict(self.UNWIRED_GATE_JOB)])
+            self.assertEqual(res["status"], "FAIL", res)              # 미배선 → 배선 요구
+            res2, after = self._c16(t, [dict(self.UNWIRED_GATE_JOB)], fix=True)
+            self.assertEqual(res2["status"], "FIXED", res2)
+            cmd = after["jobs"][0]["command"]
+            self.assertTrue(cmd.startswith('CYS_REPORT_GATE_DIR='))    # 프리픽스 삽입
+            self.assertIn("javis_report_gate.py", cmd)                # 기존 토큰 보존
+            self.assertTrue(cmd.rstrip().endswith("run"))
+            res3, after2 = self._c16(t, after["jobs"], fix=True)      # 멱등
+            self.assertEqual(res3["status"], "PASS", res3)
+            self.assertEqual(after2["jobs"][0]["command"].count("CYS_REPORT_GATE_DIR"), 1)
+
+    # ── T14+: --shadow·후행 토큰 보존(재생성 금지 — 삽입만) ──
+    def test_t14plus_shadow_and_trailing_tokens_preserved(self):
+        with tempfile.TemporaryDirectory() as t:
+            job = {"id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
+                   "command": 'python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py" run --shadow',
+                   "if_absent": "skip"}
+            res, after = self._c16(t, [job], fix=True)
+            self.assertEqual(res["status"], "FIXED", res)
+            cmd = after["jobs"][0]["command"]
+            self.assertTrue(cmd.startswith('CYS_REPORT_GATE_DIR='))
+            self.assertTrue(cmd.rstrip().endswith("run --shadow"))    # 후행 토큰 보존
 
 
 if __name__ == "__main__":
