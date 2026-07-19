@@ -930,6 +930,31 @@ class C16ReportScheduleGate(unittest.TestCase):
             self.assertTrue(cmd.startswith('CYS_REPORT_GATE_DIR='))
             self.assertTrue(cmd.rstrip().endswith("run --shadow"))    # 후행 토큰 보존
 
+    # ── FIX-2: 본사값 bake된 dept command → dept 파생값으로 값 교정 재작성 + 멱등 ──
+    _HQ_CMD = ('CYS_REPORT_GATE_DIR="$HOME/.cys/state/report_gate" python3 '
+               '"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py" run')
+
+    def test_fix2_hq_value_in_dept_pack_corrected_to_dept_derived(self):
+        with tempfile.TemporaryDirectory() as base:
+            deptpack = os.path.join(base, "pack-dept-dept-1")         # dept 팩(파생값=report_gate-dept-1)
+            os.makedirs(deptpack)
+            job = {"id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
+                   "command": self._HQ_CMD, "if_absent": "skip"}       # 본사값 bake(잘못 든 상황)
+            # report 모드: 값 부정합 → FAIL
+            res0, _ = self._c16(deptpack, [dict(job)])
+            self.assertEqual(res0["status"], "FAIL", res0)
+            self.assertIn("값 부정합", res0["detail"])
+            # --fix: dept 파생값으로 값 교정
+            res, after = self._c16(deptpack, [dict(job)], fix=True)
+            self.assertEqual(res["status"], "FIXED", res)
+            cmd = after["jobs"][0]["command"]
+            self.assertTrue(cmd.startswith('CYS_REPORT_GATE_DIR="$HOME/.cys/state/report_gate-dept-1"'), cmd)
+            self.assertEqual(cmd.count("CYS_REPORT_GATE_DIR"), 1)      # 이중 프리픽스 없음
+            self.assertIn("javis_report_gate.py", cmd)                # 후행 토큰 보존
+            # 멱등: 2회차 → PASS
+            res2, _ = self._c16(deptpack, after["jobs"], fix=True)
+            self.assertEqual(res2["status"], "PASS", res2)
+
 
 class C71GateGuardBehavior(unittest.TestCase):
     """c71 게이트 가드 행동 회귀 — 가드 포함 게이트에 대해 PASS(DESIGN §3.7)."""

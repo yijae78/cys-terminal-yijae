@@ -1471,25 +1471,32 @@ class Preflight:
                 #   `run --shadow` 등 후행 인자 소실 방지). 미배선 dept는 본사 기본 대장을 오염
                 #   (split-brain)시키므로 배선이 필수다. 멱등(2회차엔 이미 포함 → PASS).
                 cmd = j.get("command") or ""
-                if "CYS_REPORT_GATE_DIR" not in cmd:
-                    prefix = 'CYS_REPORT_GATE_DIR="%s" ' % gate_state_dir_for_pack(pack_dir())
+                expected_prefix = 'CYS_REPORT_GATE_DIR="%s" ' % gate_state_dir_for_pack(pack_dir())
+                # 존재 검사가 아니라 **값 정합** 검사(FIX-2): 프리픽스가 있어도 값이 팩 파생 기대값과
+                #   다르면(예: 본사값이 bake된 게이트 잡이 dept 팩에 든 install-before-seed 창) 교정한다 —
+                #   잘못된 값 프리픽스만 제거 후 기대값으로 재삽입(나머지 토큰 전부 보존)·백업·재파스·멱등.
+                if not cmd.startswith(expected_prefix):
+                    stripped = re.sub(r'^CYS_REPORT_GATE_DIR=(?:"[^"]*"|\S+)\s+', '', cmd)
+                    had_prefix = stripped != cmd
+                    new_cmd = expected_prefix + stripped
                     if self.fix:
                         try:
                             shutil.copyfile(p, "%s.bak-%d" % (p, int(time.time())))
                         except OSError:
                             pass
-                        j["command"] = prefix + cmd
+                        j["command"] = new_cmd
                         data["jobs"] = jobs
                         text = json.dumps(data, ensure_ascii=False, indent=2)
                         json.loads(text)                    # 재파스 검증(파손 쓰기 방지)
                         open(p, "w", encoding="utf-8").write(text)
                         self.add(cid, FIXED,
-                                 "게이트 잡 상태격리 배선(CYS_REPORT_GATE_DIR 프리픽스 삽입·토큰 보존): %s"
-                                 % j.get("id"))
+                                 "게이트 잡 상태격리 %s(토큰 보존): %s"
+                                 % ("값 교정" if had_prefix else "배선(프리픽스 삽입)", j.get("id")))
                     else:
                         self.add(cid, FAIL,
-                                 "게이트 잡 상태격리 미배선(CYS_REPORT_GATE_DIR 부재) — --fix로 배선 가능: %s"
-                                 % j.get("id"))
+                                 "게이트 잡 상태격리 %s — --fix로 교정 가능: %s"
+                                 % ("값 부정합(CYS_REPORT_GATE_DIR≠팩 파생 기대값)" if had_prefix
+                                    else "미배선(CYS_REPORT_GATE_DIR 부재)", j.get("id")))
                     return
                 mode = "command(하트비트 델타게이트·격리배선)"
             elif j.get("text_command"):
