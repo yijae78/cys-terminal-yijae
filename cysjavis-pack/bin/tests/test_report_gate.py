@@ -547,6 +547,83 @@ class IdleEdge(unittest.TestCase):
             self.assertEqual(r.enqueues, [])                          # 재-파도 0(미적용 시 4발화)
 
 
+class ParkEdge(unittest.TestCase):
+    """park 후보 통보 엣지화 + 배달 완결 + in_progress 재무장(DESIGN §3.4 v2.2·D4·D5)."""
+
+    def _quiet_rep(self, status=True):
+        return report(nodes=[{"node": "worker", "done": 3, "total": 3, "pct": 100}],
+                      live_nodes=[{"role": "worker", "agent_alive": True, "idle_secs": 600}],
+                      idle_nodes=[{"role": "worker", "idle_secs": 600}],
+                      status_available=status)
+
+    def _parks(self, state_dir):
+        return sum(1 for e in ledger_entries(state_dir) if "park_candidate" in (e.get("reasons") or []))
+
+    # ── T10: QUIET 임계 도달 → park 1회 + drain("cso") 호출 + notified / 이후 0회 ──
+    def test_t10_park_fires_once_with_cso_drain(self):
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner(rep=self._quiet_rep())
+            for _ in range(6):                                        # quiet_cycles=3 → 도중 park 1회
+                gate(t, r).run()
+            self.assertEqual(len([e for e in r.enqueues if e[0] == "cso"]), 1)   # park 1회
+            self.assertIn("cso", r.drains)                            # 배달 완결 drain(cso)
+            self.assertTrue(_counters(t)["park_notified"])
+            self.assertEqual(self._parks(t), 1)
+
+    # ── T11: notified 후 status 토글 DELTA 진동 → 재통보 0(유지) ──
+    def test_t11_park_notified_held_through_status_toggle_delta(self):
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner(rep=self._quiet_rep())
+            for _ in range(6):
+                gate(t, r).run()                                      # park 1회
+            self.assertEqual(self._parks(t), 1)
+            for i in range(8):                                        # status 토글 DELTA(in_progress 없음)
+                r.rep = self._quiet_rep(status=(i % 2 == 0))
+                gate(t, r).run()
+            self.assertTrue(_counters(t)["park_notified"])            # DELTA 진동에 해제 안 됨
+            r.rep = self._quiet_rep()
+            for _ in range(5):                                        # 정상 quiet 재누적
+                gate(t, r).run()
+            self.assertEqual(self._parks(t), 1)                       # 재통보 0
+
+    # ── T16: master 포함 전-플릿 idle → QUIET 도달 → park 1회(도달성 인과) ──
+    def test_t16_full_fleet_idle_reaches_quiet_and_parks(self):
+        with tempfile.TemporaryDirectory() as t:
+            rep = report(nodes=[{"node": "master", "done": 1, "total": 1, "pct": 100},
+                                {"node": "worker", "done": 2, "total": 2, "pct": 100}],
+                         live_nodes=[{"role": "master", "agent_alive": True, "idle_secs": 600},
+                                     {"role": "worker", "agent_alive": True, "idle_secs": 600}],
+                         idle_nodes=[{"role": "master", "idle_secs": 600},
+                                     {"role": "worker", "idle_secs": 600}])
+            r = FakeRunner(rep=rep)
+            for _ in range(6):
+                gate(t, r).run()
+            self.assertEqual(ledger_entries(t)[-1]["verdict"], "QUIET")
+            self.assertEqual(len([e for e in r.enqueues if e[0] == "cso"]), 1)
+
+    # ── T24: park_notified 재무장 — in_progress → 해제 / status DELTA → 유지 (D-FIX-1 이중) ──
+    def test_t24_park_rearm_on_in_progress_not_on_status_delta(self):
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner(rep=self._quiet_rep())
+            for _ in range(6):
+                gate(t, r).run()                                      # park #1 → notified True
+            self.assertTrue(_counters(t)["park_notified"])
+            # (A) status 토글 DELTA(in_progress 없음) → 유지
+            r.rep = self._quiet_rep(status=False)
+            gate(t, r).run()
+            self.assertTrue(_counters(t)["park_notified"])
+            # (B) task 배정(in_progress 비공백) → 재무장 해제
+            r.rep = report(nodes=[{"node": "worker", "done": 1, "total": 3, "pct": 33}],
+                           live_nodes=[{"role": "worker", "agent_alive": True, "idle_secs": 600}])
+            gate(t, r).run()
+            self.assertFalse(_counters(t)["park_notified"])
+            # (C) 작업 완료 후 재-조용 → 2차 park 재발화(1회성 사망 아님·S1-4)
+            r.rep = self._quiet_rep()
+            for _ in range(5):
+                gate(t, r).run()
+            self.assertEqual(self._parks(t), 2)
+
+
 class DeathEdge(unittest.TestCase):
     """사망 엣지 WARN — 시딩/확정 분리·"fired" sentinel·부활 cleanup 독립(DESIGN §3.3 v2.2)."""
 

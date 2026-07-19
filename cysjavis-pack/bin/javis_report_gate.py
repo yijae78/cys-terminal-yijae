@@ -850,6 +850,13 @@ class Gate:
             counters["consecutive_quiet"] = counters.get("consecutive_quiet", 0) + 1
             counters["consecutive_nochg"] = 0
 
+        # park_notified 재무장(§3.4 v2.2·D-FIX-1): verdict가 아니라 결정론 활동 신호에 건다.
+        #   task 배정·진행은 WARN이 아니라 DELTA로 나타나므로 "WARN 시 해제"는 park 영구 고착(1회성 사망)을
+        #   낳고, "DELTA 시 해제"는 status 토글 진동(S2-5)에 뚫린다. in_progress_tasks가 둘을 동시 만족
+        #   (S1-3 실제 활동=해제 ✓ · S2-5 status 노이즈=유지 ✓).
+        if in_progress_tasks(report):
+            counters["park_notified"] = False
+
         # ── 라우팅 ──
         delivered = "none"
         if verdict == VERDICT_WARN:
@@ -858,14 +865,20 @@ class Gate:
             delivered = self._route_delta(old_snap, new_snap, shadow, reasons)
         # QUIET/NOCHG → 대장 기록만
 
-        # QUIET 연속 임계 도달 → 세션 주차 후보(P2 반자율·CSO 집행): enqueue만, 배달은 CSO 소관
-        if verdict == VERDICT_QUIET and not shadow and \
-                counters["consecutive_quiet"] >= self.quiet_cycles:
+        # QUIET 연속 임계 도달 → 세션 주차 후보 통보 엣지화(§3.4·D4·D5): 임계 교차 시 1회 + notified 비트.
+        #   현행 레벨(매 주기 발동) 대신 엣지로 전환 — park_notified가 재통보를 억제하고, 진짜 활동
+        #   재개(위 in_progress 재무장)에서만 해제된다. enqueue만 하던 현행에 drain("cso")를 더해 배달을
+        #   완결한다(CSO 큐를 drain하는 상시 주체 부재 = 죽은 편지함 위험 봉쇄. 집행은 여전히 CSO 소관).
+        if verdict == VERDICT_QUIET and not shadow \
+                and counters["consecutive_quiet"] >= self.quiet_cycles \
+                and not counters.get("park_notified"):
             self.runner.enqueue("cso", "master-park",
                                 "QUIET %d주기(%d분) 지속 — 세션 주차 후보(cycle-agent 집행 검토)"
                                 % (counters["consecutive_quiet"],
                                    counters["consecutive_quiet"] * self.cycle_minutes),
                                 "gate-park")
+            self.runner.drain("cso")                        # D4: 배달 완결(배달≠집행)
+            counters["park_notified"] = True
             reasons.append("park_candidate")
 
         # 날짜 변경 → 일 1회 briefing 백스톱(빌트인 fleet-digest 수정 불가 F3 → 게이트가 소유)
