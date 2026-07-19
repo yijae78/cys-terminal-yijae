@@ -35,10 +35,11 @@ def report(nodes=None, live_nodes=None, idle_nodes=None, feed=None,
 
 class FakeRunner:
     def __init__(self, report_ok=True, rep=None, err=None, emit_rc=0,
-                 drain_delivered=1, collect_raises=False):
+                 drain_delivered=1, collect_raises=False, enqueue_rc=0):
         self.report_ok, self.rep, self.err = report_ok, rep, err
         self.emit_rc, self.drain_delivered = emit_rc, drain_delivered
         self.collect_raises = collect_raises
+        self.enqueue_rc = enqueue_rc            # enqueue 실패 주입(T21 원자성 검증용)
         self.emits, self.enqueues, self.drains, self.sends = [], [], [], []
         self.collect_calls = 0
 
@@ -54,7 +55,7 @@ class FakeRunner:
 
     def enqueue(self, to, task, reason, idem, payload=None):
         self.enqueues.append((to, task, reason, idem))
-        return 0
+        return self.enqueue_rc
 
     def drain(self, target):
         self.drains.append(target)
@@ -77,11 +78,12 @@ class Clock:
         return "2026-07-18T%02d:00:00+0900" % (int(self.epoch // 3600) % 24)
 
 
-def gate(state_dir, runner, clock=None, stall_cycles=2, quiet_cycles=3):
+def gate(state_dir, runner, clock=None, stall_cycles=2, quiet_cycles=3, edge_cooldown=None):
     clk = clock or Clock(1_000_000.0)
+    kw = {} if edge_cooldown is None else {"edge_cooldown": edge_cooldown}
     return G.Gate(state_dir, runner, cycle_minutes=5, stall_cycles=stall_cycles,
                   quiet_cycles=quiet_cycles,
-                  now_epoch_fn=clk.now_epoch, now_iso_fn=clk.now_iso)
+                  now_epoch_fn=clk.now_epoch, now_iso_fn=clk.now_iso, **kw)
 
 
 def ledger_entries(state_dir):
@@ -146,18 +148,23 @@ class GateCore(unittest.TestCase):
 
     def test_multi_idle_nodes_separate_per_node_wake_keys(self):
         # master 승인 2026-07-18: idle 노드별로 task/idem 분리 → 큐 병합 최대화.
+        # [v5 엣지] 무배정 리뷰어는 active→idle '전이' 시 엣지 1회. baseline에 이미 idle이면 disarm
+        #   초기화라 발화하지 않으므로(§3.2·D7), baseline은 active·2주기에 idle 진입으로 셋업한다.
         with tempfile.TemporaryDirectory() as t:
-            rep = report(nodes=[{"node": "worker", "done": 1, "total": 5, "pct": 20}],
+            base = report(live_nodes=[{"role": "reviewer-codex", "agent_alive": True, "idle_secs": 10},
+                                      {"role": "reviewer-gemini", "agent_alive": True, "idle_secs": 10}])
+            gate(t, FakeRunner(rep=base)).run()               # baseline: 리뷰어 active(idle_nodes 없음)
+            rep = report(live_nodes=[{"role": "reviewer-codex", "agent_alive": True, "idle_secs": 600},
+                                     {"role": "reviewer-gemini", "agent_alive": True, "idle_secs": 700}],
                          idle_nodes=[{"role": "reviewer-codex", "idle_secs": 600},
                                      {"role": "reviewer-gemini", "idle_secs": 700}])
             r = FakeRunner(rep=rep)
-            gate(t, r).run()                                  # baseline
-            gate(t, r).run()
+            gate(t, r).run()                                  # 무배정 idle 전이 → 엣지 각 1회
             tasks = sorted(task for _to, task, _reason, _idem in r.enqueues)
             idems = sorted(idem for _to, _task, _reason, idem in r.enqueues)
             self.assertEqual(tasks, ["gate-idle-reviewer-codex", "gate-idle-reviewer-gemini"])
             self.assertEqual(idems, ["gate-idle-reviewer-codex", "gate-idle-reviewer-gemini"])
-            self.assertEqual(r.drains, ["master"])            # 여러 enqueue·drain 1회
+            self.assertEqual(r.drains, ["master"])            # 여러 enqueue·drain 1회(WARN 주기)
 
     def test_feed_pending_warns_with_approval_evt(self):
         with tempfile.TemporaryDirectory() as t:
@@ -376,6 +383,168 @@ class GateCore(unittest.TestCase):
             self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
             self.assertTrue(p.stdout.strip().splitlines()[-1].startswith("verdict="),
                             p.stdout)
+
+
+def _counters(state_dir):
+    return json.load(open(os.path.join(state_dir, "counters.json"), encoding="utf-8"))
+
+
+class IdleEdge(unittest.TestCase):
+    """무배정 idle 엣지 1회 wake(DESIGN §3.2 v2.2) — T1~T7·T15·T21~T23."""
+
+    ACTIVE = {"role": "worker", "agent_alive": True, "idle_secs": 10}
+    IDLE = {"role": "worker", "agent_alive": True, "idle_secs": 600}
+
+    def _idle_rep(self):
+        return report(live_nodes=[dict(self.IDLE)], idle_nodes=[{"role": "worker", "idle_secs": 600}])
+
+    def _active_rep(self):
+        return report(live_nodes=[dict(self.ACTIVE)])
+
+    # ── T1: 무배정 idle 진입 → wake 1회 + armed=False ──
+    def test_t1_unassigned_idle_edge_fires_once_and_disarms(self):
+        with tempfile.TemporaryDirectory() as t:
+            gate(t, FakeRunner(rep=self._active_rep())).run()          # baseline active
+            r = FakeRunner(rep=self._idle_rep())
+            gate(t, r).run()                                           # idle 전이 → 엣지 발화
+            e = ledger_entries(t)[-1]
+            self.assertEqual(e["verdict"], "WARN")
+            self.assertEqual([task for _to, task, _r, _i in r.enqueues], ["gate-idle-worker"])
+            self.assertTrue(any("idle_edge:worker" in x for x in e["reasons"]))
+            self.assertFalse(_counters(t)["idle_edge"]["worker"]["armed"])
+
+    # ── T2: 동일 상태 지속 → 추가 wake 0 + QUIET 누적 ──
+    def test_t2_persisting_idle_no_extra_wake_quiet_accumulates(self):
+        with tempfile.TemporaryDirectory() as t:
+            gate(t, FakeRunner(rep=self._active_rep())).run()
+            r = FakeRunner(rep=self._idle_rep())
+            gate(t, r).run()                                           # 엣지 1
+            master_wakes = lambda: [e for e in r.enqueues if e[0] == "master"]
+            self.assertEqual(len(master_wakes()), 1)
+            for _ in range(3):
+                gate(t, r).run()
+            self.assertEqual(len(master_wakes()), 1)                   # 추가 master idle wake 0
+            e = ledger_entries(t)[-1]
+            self.assertEqual(e["verdict"], "QUIET")
+            self.assertGreaterEqual(e["consecutive_quiet"], 1)
+
+    # ── T3: 활동 재개 → re-arm → 쿨다운 경과 후 재진입 시 다시 1회 ──
+    def test_t3_reactivate_rearms_and_refires_after_cooldown(self):
+        with tempfile.TemporaryDirectory() as t:
+            clk = Clock(1_000_000.0)
+            gate(t, FakeRunner(rep=self._active_rep()), clock=clk, edge_cooldown=60).run()
+            clk.epoch += 300
+            r1 = FakeRunner(rep=self._idle_rep())
+            gate(t, r1, clock=clk, edge_cooldown=60).run()             # 발화 #1
+            self.assertEqual(len(r1.enqueues), 1)
+            clk.epoch += 300
+            gate(t, FakeRunner(rep=self._active_rep()), clock=clk, edge_cooldown=60).run()  # 활동 재개→재무장
+            clk.epoch += 300
+            r2 = FakeRunner(rep=self._idle_rep())
+            gate(t, r2, clock=clk, edge_cooldown=60).run()             # 쿨다운 경과 재진입 → 발화 #2
+            self.assertEqual(len(r2.enqueues), 1)
+
+    # ── T4: pending-todo idle → 레벨 WARN 유지(현행 동등) ──
+    def test_t4_pending_todo_idle_level_warn_persists(self):
+        with tempfile.TemporaryDirectory() as t:
+            rep = report(nodes=[{"node": "worker", "done": 1, "total": 5, "pct": 20}],
+                         live_nodes=[dict(self.IDLE)],
+                         idle_nodes=[{"role": "worker", "idle_secs": 600}])
+            r = FakeRunner(rep=rep)
+            gate(t, r).run()                                           # baseline
+            for _ in range(3):
+                gate(t, r).run()
+            warns = [e for e in ledger_entries(t) if e["verdict"] == "WARN"]
+            self.assertGreaterEqual(len(warns), 3)                     # 레벨: 매 주기 발화
+            self.assertTrue(all(any("idle_5min:worker" in x for x in e["reasons"]) for e in warns))
+
+    # ── T5: done==total idle → 무발화(현행 동등) ──
+    def test_t5_done_total_idle_no_fire(self):
+        with tempfile.TemporaryDirectory() as t:
+            rep = report(nodes=[{"node": "worker", "done": 3, "total": 3, "pct": 100}],
+                         live_nodes=[dict(self.IDLE)],
+                         idle_nodes=[{"role": "worker", "idle_secs": 600}])
+            r = FakeRunner(rep=rep)
+            gate(t, r).run()
+            gate(t, r).run()
+            self.assertEqual(r.enqueues, [])
+            self.assertEqual(ledger_entries(t)[-1]["verdict"], "QUIET")
+
+    # ── T6: BASELINE에 이미 idle이던 role → disarmed(파도 없음) ──
+    def test_t6_baseline_idle_disarmed_no_flood(self):
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner(rep=self._idle_rep())
+            gate(t, r).run()                                           # baseline: 이미 idle → disarm
+            gate(t, r).run()                                           # 차기: disarmed → 발화 0
+            self.assertEqual(r.enqueues, [])
+            self.assertFalse(_counters(t)["idle_edge"]["worker"]["armed"])
+
+    # ── T7: GAP 후 → disarmed + 사망 미발화(조기 반환) ──
+    def test_t7_gap_disarms_and_no_death_fire(self):
+        with tempfile.TemporaryDirectory() as t:
+            clk = Clock(1_000_000.0)
+            gate(t, FakeRunner(rep=self._active_rep()), clock=clk).run()   # baseline
+            clk.epoch += 16 * 60                                       # +16분 > 3주기 = GAP
+            r = FakeRunner(rep=self._idle_rep())
+            gate(t, r, clock=clk).run()
+            e = ledger_entries(t)[-1]
+            self.assertEqual(e["verdict"], "GAP")
+            self.assertEqual(r.enqueues, [])                           # GAP wake 금지·엣지 disarm
+            self.assertFalse(_counters(t)["idle_edge"]["worker"]["armed"])
+
+    # ── T15: 검증기 자체 검증(네거티브의 네거티브) — disarm 무력화 시 재발화 검출력 ──
+    def test_t15_disarm_regression_is_detectable(self):
+        with tempfile.TemporaryDirectory() as t:
+            gate(t, FakeRunner(rep=self._active_rep())).run()
+            gate(t, FakeRunner(rep=self._idle_rep())).run()           # 발화 → disarm
+            cpath = os.path.join(t, "counters.json")
+            c = json.load(open(cpath, encoding="utf-8"))
+            c["idle_edge"]["worker"] = {"armed": True, "last_fired": 0}   # 고의 파손: disarm 무력화 모사
+            json.dump(c, open(cpath, "w", encoding="utf-8"))
+            r = FakeRunner(rep=self._idle_rep())
+            gate(t, r).run()
+            self.assertEqual(len(r.enqueues), 1)                      # 재발화 = 회귀 검출 가능(정상은 0)
+
+    # ── T21: enqueue 실패(rc≠0) → armed 유지·재시도 / 성공 시 disarm ──
+    def test_t21_enqueue_failure_keeps_armed_retries(self):
+        with tempfile.TemporaryDirectory() as t:
+            gate(t, FakeRunner(rep=self._active_rep())).run()
+            r_fail = FakeRunner(rep=self._idle_rep(), enqueue_rc=1)
+            gate(t, r_fail).run()                                     # enqueue 실패
+            self.assertEqual(len(r_fail.enqueues), 1)                 # 시도는 함
+            self.assertNotIn("worker", _counters(t).get("idle_edge", {}))  # disarm 안 됨(default armed 유지)
+            r_ok = FakeRunner(rep=self._idle_rep())
+            gate(t, r_ok).run()                                       # 다음 주기 재시도
+            self.assertEqual(len(r_ok.enqueues), 1)                   # 재발화
+            self.assertFalse(_counters(t)["idle_edge"]["worker"]["armed"])  # 성공 → disarm
+
+    # ── T22: 진동 노드 → wake ≤1회/쿨다운창 ──
+    def test_t22_oscillating_node_wake_capped_per_cooldown(self):
+        with tempfile.TemporaryDirectory() as t:
+            clk = Clock(1_000_000.0)
+            gate(t, FakeRunner(rep=self._active_rep()), clock=clk, edge_cooldown=1000).run()
+            total = 0
+            for i in range(10):
+                clk.epoch += 100                                      # 100s 토글 · 쿨다운 1000s
+                r = FakeRunner(rep=(self._idle_rep() if i % 2 == 0 else self._active_rep()))
+                gate(t, r, clock=clk, edge_cooldown=1000).run()
+                total += len(r.enqueues)
+            self.assertGreaterEqual(total, 1)
+            self.assertLessEqual(total, 2)                            # 진동 5회에도 쿨다운창당 ≤1
+
+    # ── T23: counters 파손 복원 주기 → idle_edge 초기화 → 재-파도 0(Sim O-1) ──
+    def test_t23_counters_corruption_restore_no_edge_flood(self):
+        roles = ("a", "b", "c", "d")
+        idle_rep = report(live_nodes=[{"role": r, "agent_alive": True, "idle_secs": 600} for r in roles],
+                          idle_nodes=[{"role": r, "idle_secs": 600} for r in roles])
+        with tempfile.TemporaryDirectory() as t:
+            gate(t, FakeRunner(rep=idle_rep)).run()                   # baseline → 4노드 disarm
+            gate(t, FakeRunner(rep=idle_rep)).run()                   # QUIET
+            with open(os.path.join(t, "counters.json"), "w", encoding="utf-8") as f:
+                f.write("{corrupt json")                              # counters 파손
+            r = FakeRunner(rep=idle_rep)
+            gate(t, r).run()                                          # 복원 주기 → init_idle_edge
+            self.assertEqual(r.enqueues, [])                          # 재-파도 0(미적용 시 4발화)
 
 
 class ShadowChecker(unittest.TestCase):

@@ -324,6 +324,24 @@ def init_idle_edge(counters, report):
     counters["park_notified"] = False
 
 
+def rearm_idle_edge(counters, report):
+    """활동 재개(현재 idle_nodes에 없음)한 alive role의 엣지를 재무장(armed=True·last_fired 보존).
+
+    DESIGN §3.2: last_fired를 보존하므로 쿨다운(EDGE_COOLDOWN_SECS)이 진동 상한을 이룬다 — 재무장해도
+    쿨다운창 내 재발화는 억제되고(T22), 쿨다운 경과 후 재-idle 진입에만 다시 1회 발화한다(T3). 사망 role은
+    death/부활 경로가 별도로 소거하므로 여기서는 alive만 재무장한다.
+    """
+    idle_edge = counters.get("idle_edge")
+    if not idle_edge:
+        return
+    idle_roles = {(n.get("role") or "").lower() for n in (report.get("idle_nodes") or [])}
+    alive_roles = {(n.get("role") or "").lower() for n in (report.get("live_nodes") or [])
+                   if n.get("agent_alive")}
+    for role, st in idle_edge.items():
+        if role not in idle_roles and role in alive_roles and not st.get("armed", True):
+            st["armed"] = True                      # last_fired 보존(쿨다운=진동 상한)
+
+
 # ── EVT payload 매핑 표(계약 SOT: _round/EVENT_CONTRACT.md · javis_event.SCHEMA) ──
 #   idle    → agent.silent {agent, silent_minutes, level=critical}
 #   feed    → approval.needed {agent, task, summary}
@@ -332,42 +350,64 @@ def init_idle_edge(counters, report):
 #   collect → EVT 매핑 없음 → wake 전용
 #   DELTA   → task_progress {task, stage, [pct]}
 #   날짜변경 → briefing {counts:{running,inbox,approvals,alerts}}
-def extract_warnings(report):
-    """원문 report에서 WARN 트리거 목록 추출. 각 항목: trigger/reason/wake_body/(evt_type,evt_fields)/idem."""
+def extract_warnings(report, counters, now, edge_cooldown):
+    """원문 report에서 WARN 트리거 목록 추출(순수 — counters 읽기 전용). 각 항목:
+    trigger/reason/wake_body/(evt_type,evt_fields)/idem/(edge_role).
+
+    [DESIGN §3.2 v2.2] idle을 두 클래스로 분리한다:
+      - active(pending-todo idle): 레벨 WARN 유지(수신자 행동으로 해소되는 허용 클래스 — 현행 동등).
+      - 무배정(todo 파일 부재) idle: **엣지 1회 wake**(armed 비트 + 쿨다운 게이트). disarm은 배달 성공
+        확인 후 라우팅 측(_route_warn)에서만 하므로 이 함수는 counters를 변이하지 않는다(원자성·순수).
+      - done==total idle: 무발화(현행 억제 보존 — QUIET·park 도달성 유지).
+    """
     warns = []
     proc = ("read-screen 확인·재지시.")
     tail = " 기상절차: cys status --json 1콜 점검 병행."
 
-    # idle WARN은 pending-todo(진행 중 할 일이 남은) 노드 + todo 미상 노드에만 발화한다.
     # ★master 승인 2026-07-18(동작 현행 유지 — 리뷰어 노이즈 재유입 방지):
-    #   - C4 간접 커버 주장은 **pending-todo 노드의 승인 프롬프트 대기에 한정**한다. done 노드
-    #     (진행 완료·total==0 포함)는 억제되고, 무배정 노드(todo 없음)는 noisy-default로 발화하나
-    #     프롬프트↔idle 매핑이 보장되지 않는다 → **done/무배정 노드의 프롬프트는 미커버**(직접
-    #     감지기는 후속 과제). done 노드 idle 억제가 QUIET 도달성·quiet-park 신호를 살린다.
-    #   - ※리뷰어 상시 idle 노이즈는 현행 유지(완화 금지·master 지시), 임계 튜닝은 shadow(P1) 소관.
+    #   - active pending-todo idle은 레벨 WARN(승인 프롬프트 대기 간접 커버). 무배정 idle은 v5에서
+    #     엣지 1회로 전환(영원 반복 해소·standby 억제). done 노드 idle 억제가 QUIET 도달성을 살린다.
     #   - ⚠P2-info(취약 결합): nodes[].node(=node_label, role 소문자)와 idle_nodes[].role을
     #     문자열 라벨공간으로 조인한다 — role 명명 규칙이 바뀌면 이 조인이 조용히 깨진다.
+    #   - idle 사유별 task/idempotency-key를 노드 단위로 분리(gate-idle-<role>) — 큐 병합 최대화.
     pending = {n.get("node") for n in (report.get("nodes") or [])
                if n.get("total", 0) > 0 and n.get("done", 0) < n.get("total", 0)}
     todo_labels = {n.get("node") for n in (report.get("nodes") or [])}
-    idle = [n for n in (report.get("idle_nodes") or [])
-            if (n.get("role") or "").lower() in pending
-            or (n.get("role") or "").lower() not in todo_labels]
-    # ★master 승인 2026-07-18: idle 사유별로 task/idempotency-key를 노드 단위로 분리한다
-    #   (예: gate-idle-reviewer-codex). 지속되는 동일 노드 idle이 항상 같은 pending에 병합·억제되어
-    #   큐 병합이 최대화된다 — 다른 노드 idle 변동에 키가 흔들리지 않는다(집계 단일 키의 약점 제거).
-    for n in idle:
-        role = n.get("role", "unknown")
+    idle_edge = counters.get("idle_edge", {}) or {}
+    for n in (report.get("idle_nodes") or []):
+        role = (n.get("role") or "").lower()
+        if not role:
+            continue
         mins = (n.get("idle_secs") or 0) // 60
-        warns.append({
-            "trigger": "idle",
-            "task": "gate-idle-%s" % role,
-            "reason": "idle_5min:%s" % role,
-            "wake_body": "[gate] idle: %s idle 5분+ — %s%s" % (role, proc, tail),
-            "evt_type": "agent.silent",
-            "evt_fields": {"agent": role, "silent_minutes": int(mins), "level": "critical"},
-            "idem": "gate-idle-%s" % role,
-        })
+        if role in pending:
+            # active pending-todo idle → 레벨 WARN(현행 동등·억제 없음)
+            warns.append({
+                "trigger": "idle",
+                "task": "gate-idle-%s" % role,
+                "reason": "idle_5min:%s" % role,
+                "wake_body": "[gate] idle: %s idle 5분+ — %s%s" % (role, proc, tail),
+                "evt_type": "agent.silent",
+                "evt_fields": {"agent": role, "silent_minutes": int(mins), "level": "critical"},
+                "idem": "gate-idle-%s" % role,
+            })
+        elif role not in todo_labels:
+            # 무배정 idle → 엣지 1회(armed AND 쿨다운). disarm/last_fired은 배달 성공 후 라우팅 측에서.
+            st = idle_edge.get(role) or {"armed": True, "last_fired": 0}
+            cooldown_ok = now - st.get("last_fired", 0) >= edge_cooldown
+            if st.get("armed", True) and cooldown_ok:
+                warns.append({
+                    "trigger": "idle",
+                    "task": "gate-idle-%s" % role,
+                    "reason": "idle_edge:%s" % role,
+                    "wake_body": "[gate] idle-신규: %s 무배정 idle 진입(5분+) — 1회 통보"
+                                 "(standby 억제 개시). 점검 후 임무 배정 또는 standby 승인. "
+                                 "기상절차: cys status --json 1콜." % role,
+                    "evt_type": "agent.silent",
+                    "evt_fields": {"agent": role, "silent_minutes": int(mins), "level": "critical"},
+                    "idem": "gate-idle-%s" % role,
+                    "edge_role": role,          # 확정(disarm) 대상 표식
+                })
+        # done==total(role in todo_labels·not pending) → 무발화(현행 억제 보존)
     high = [n for n in (report.get("live_nodes") or [])
             if isinstance(n.get("context_pct"), int) and n["context_pct"] >= 60]
     if high:
@@ -668,7 +708,7 @@ class Gate:
                              "기상절차: cys status --json 1콜 점검 병행." % err,
                 "evt_type": None, "evt_fields": None, "idem": "gate-collect",
             }]
-            delivered = self._route_warn(warns, shadow, reasons)
+            delivered = self._route_warn(warns, shadow, reasons, counters, now_epoch)
             ledger_append(self.state_dir, {"ts": now_iso, "ts_epoch": now_epoch,
                                            "verdict": VERDICT_WARN, "reasons": [w["reason"] for w in warns],
                                            "delta_fields": [], "delivered": delivered,
@@ -724,7 +764,8 @@ class Gate:
             init_idle_edge(counters, report)
 
         # ── 분류 ──
-        warns = extract_warnings(report)
+        rearm_idle_edge(counters, report)                   # 활동 재개 role 엣지 재무장(§3.2)
+        warns = extract_warnings(report, counters, now_epoch, self.edge_cooldown)
         warns += build_stall_warnings(counters, report, self.cycle_minutes,
                                       self.stall_cycles, now_iso)
         delta_fields = diff_top_fields(old_snap, new_snap)
@@ -755,7 +796,7 @@ class Gate:
         # ── 라우팅 ──
         delivered = "none"
         if verdict == VERDICT_WARN:
-            delivered = self._route_warn(warns, shadow, reasons)
+            delivered = self._route_warn(warns, shadow, reasons, counters, now_epoch)
         elif verdict == VERDICT_DELTA:
             delivered = self._route_delta(old_snap, new_snap, shadow, reasons)
         # QUIET/NOCHG → 대장 기록만
@@ -774,6 +815,12 @@ class Gate:
         if not shadow and last is not None:
             self._maybe_briefing(last, now_epoch, report, warns, reasons)
 
+        # ── 잔류 pending 방어(§3.2): WARN 외 주기 말미에 master 큐 1회 drain. 엣지 enqueue 성공·drain
+        #   실패(zombie 등)로 큐에 남은 wake가 무WARN 주기에 방치되는 구멍을 봉쇄한다(빈 큐 drain은 무비용).
+        #   WARN 주기는 _route_warn이 이미 drain하므로 이중 방지 위해 제외.
+        if not shadow and verdict != VERDICT_WARN:
+            self.runner.drain("master")
+
         self._write_snapshot(new_snap)
         ledger_append(self.state_dir, {"ts": now_iso, "ts_epoch": now_epoch, "verdict": verdict,
                                        "reasons": reasons + [w["reason"] for w in warns],
@@ -784,17 +831,24 @@ class Gate:
         self._summary(verdict, delivered, reasons + [w["reason"] for w in warns])
         return report
 
-    def _route_warn(self, warns, shadow, reasons):
-        """WARN → enqueue master wake 직후 같은 실행에서 drain --deliver(치명 미완결 차단)+병행 EVT."""
+    def _route_warn(self, warns, shadow, reasons, counters, now):
+        """WARN → enqueue master wake 직후 같은 실행에서 drain --deliver(치명 미완결 차단)+병행 EVT.
+
+        [§3.2 확정 규칙] enqueue rc==0인 엣지 warn(edge_role 표식)만 disarm+last_fired 기록. enqueue
+        실패 시 armed 유지 → 다음 주기 자연 재시도(레벨 트리거의 자가치유 성질을 엣지에 보존·T21).
+        """
         if shadow:
             return "none"
         wake_any = False
+        idle_edge = counters.setdefault("idle_edge", {})
         for w in warns:
             # task_key는 노드/사유 단위(w["task"]) — 지속 조건이 같은 pending에 병합·억제되어
             # 큐 병합 최대화(master 승인 2026-07-18). 누락 시 트리거 단위로 폴백.
-            self.runner.enqueue("master", w.get("task", "gate-" + w["trigger"]),
-                                w["wake_body"], w["idem"])
+            rc = self.runner.enqueue("master", w.get("task", "gate-" + w["trigger"]),
+                                     w["wake_body"], w["idem"])
             wake_any = True
+            if rc == 0 and w.get("edge_role"):
+                idle_edge[w["edge_role"]] = {"armed": False, "last_fired": now}   # 배달 성공 확정 후 disarm
             if w.get("evt_type"):
                 erc, _, _ = self.runner.emit(w["evt_type"], w["evt_fields"])
                 if erc != 0:
