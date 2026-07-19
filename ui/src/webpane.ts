@@ -38,6 +38,19 @@ export function extractViewerPath(url: string): string | null {
   }
 }
 
+// 레이아웃 트리에서 web 노드의 뷰어 경로를 전부 수집(collectWebWids 관례 승계 — 순수 walk).
+// viewer.open dup 판정의 범위를 '현재 워크스페이스 트리'로 좁히는 데 쓴다: 전역 webPanes 스캔은
+// 다른 워크스페이스 pane 때문에 "이미 열려 있음"인데 현재 화면엔 없는 UX 결함을 만든다(시뮬 F1).
+export function collectWebPaths(node: any, out: (string | null)[] = []): (string | null)[] {
+  if (!node) return out;
+  if (node.type === "web") out.push(extractViewerPath(node.url));
+  else if (node.type === "split") {
+    collectWebPaths(node.a, out);
+    collectWebPaths(node.b, out);
+  }
+  return out;
+}
+
 // viewer.open 데몬 이벤트 판정 — DOM 무의존 순수 판정부(main.ts 핸들러가 소비, bun test 대상).
 // not-ready: 워크스페이스 미준비(pending) — 무음 드롭 금지, 호출측이 toast로 알린다.
 // stale: 데몬 재접속 replay가 과거 viewer.open을 되살리는 창 차단 — maxAgeSecs 초과 이벤트 무시.

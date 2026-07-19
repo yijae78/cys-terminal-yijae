@@ -24,6 +24,7 @@ import {
   viewerAppUrl,
   extractViewerPath,
   decideViewerOpen,
+  collectWebPaths,
   loadPersistedLayout,
   persistLayout,
   collectWebWids,
@@ -5230,7 +5231,9 @@ function onDaemonEvent(event: Record<string, unknown>) {
     const ws = current();
     const decision = decideViewerOpen({
       path: vpath,
-      existingPaths: Array.from(webPanes.values(), (v) => extractViewerPath(v.node.url)),
+      // dup 범위 = 현재 워크스페이스 트리(시뮬 F1) — 전역 webPanes 스캔은 타 ws pane 때문에
+      // "이미 열려 있음"인데 화면엔 없는 오판을 만든다. cap은 전역(자원 방벽 — 의도적 비대칭).
+      existingPaths: collectWebPaths(ws?.tree ?? null),
       paneCount: webPanes.size,
       maxPanes: 8,
       // stale 게이트: 데몬 재접속 replay가 과거 viewer.open을 되살려 스테일 pane이 뒤늦게 뜨는

@@ -12,6 +12,7 @@ import {
   viewerAppUrl,
   extractViewerPath,
   decideViewerOpen,
+  collectWebPaths,
   loadPersistedLayout,
   persistLayout,
   collectWebWids,
@@ -227,6 +228,15 @@ describe("viewer.open 이벤트 판정 — decideViewerOpen", () => {
   });
   it("pane 총량 상한 도달 시 cap — pane 홍수의 UI측 방벽", () => {
     expect(decideViewerOpen({ ...base, paneCount: 8 })).toBe("cap");
+  });
+  it("collectWebPaths — 트리에서 web 노드 뷰어 경로만 수집(dup 판정의 현재-ws 범위 재료)", () => {
+    const w1 = makeWebNode(1, viewerAppUrl(1, "t", "/a.md"));
+    const w2 = makeWebNode(2, viewerAppUrl(1, "t", "/b.md"));
+    const tree = { type: "split", dir: "row", a: { type: "pane", sid: 7 }, b: { type: "split", dir: "col", a: w1, b: w2 } };
+    expect(collectWebPaths(tree)).toEqual(["/a.md", "/b.md"]);
+    expect(collectWebPaths(null)).toEqual([]);
+    // 비URL(손상 저장본)은 null로 수집 — decideViewerOpen 판정은 null 혼입에 무사(기존 핀과 정합)
+    expect(collectWebPaths({ type: "web", wid: 3, url: "not a url" })).toEqual([null]);
   });
   it("판정 우선순위: not-ready > stale > dup > cap", () => {
     const all = {

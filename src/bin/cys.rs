@@ -1585,11 +1585,15 @@ fn run(command: Command) -> i32 {
 
         Command::View { path } => (|| -> Result<(), String> {
             // 실재 게이트: 없는 경로·디렉토리는 여기서 즉시 실패 — 오류가 pane 안으로 숨지 않게
-            // (reveal_path와 동형). canonicalize가 상대경로·심볼릭 링크를 절대 실경로로 해소한다.
-            // 허용 루트 판정은 사이드카(within_roots)에 위임 — allowlist 이중화=드리프트 위험.
-            let abs = std::fs::canonicalize(&path)
+            // (reveal_path의 metadata 게이트와 동형). canonicalize가 아닌 absolute를 쓴다:
+            // Windows canonicalize는 \\?\ verbatim 경로를 반환해 사이드카(python realpath) 대조와
+            // 미검증 결합면을 만든다. 심볼릭 링크 해소·허용 루트 판정은 사이드카(within_roots)가
+            // 단일 소유 — allowlist·해소 로직 이중화는 드리프트 위험.
+            let abs = std::path::absolute(&path)
+                .map_err(|e| format!("경로 해석 실패: {path} — {e}"))?;
+            let meta = std::fs::metadata(&abs)
                 .map_err(|e| format!("경로 열기 실패: {path} — {e}"))?;
-            if !abs.is_file() {
+            if !meta.is_file() {
                 return Err(format!("파일이 아님(디렉토리?): {}", abs.display()));
             }
             let reply = request("viewer.open", json!({"path": abs.to_string_lossy()}))?;
