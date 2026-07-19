@@ -953,6 +953,48 @@ class C71GateGuardBehavior(unittest.TestCase):
             os.environ.update(saved)
         self.assertEqual(res["status"], "PASS", res)           # F=SKIP·L=not-SKIP
 
+    def _run_c71_with_pack(self, pack_dir):
+        saved = dict(os.environ)
+        os.environ["CYS_PACK_DIR"] = pack_dir
+        os.environ.pop("CYS_SOCKET", None)
+        os.environ.pop("CYS_REPORT_GATE_DIR", None)
+        try:
+            pf = self.P.Preflight(fix=False, skips=set(), mode="report")
+            pf.c71_gate_guard_behavior()
+            return pf.results[-1]
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+    # ── FIX-1: dept 팩 컨텍스트 → L-케이스가 정합 소켓 토큰으로 not-SKIP → PASS(위양 FAIL 봉쇄) ──
+    @unittest.skipUnless(os.path.isdir(os.path.expanduser("~/.cys/pack")),
+                         "본사 팩(~/.cys/pack) 부재 — hq realpath 대조 불가")
+    def test_c71_passes_on_dept_pack_context(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as td:
+            deptpack = os.path.join(td, "pack-dept-dept-1")            # dept 팩 basename 모사
+            os.makedirs(os.path.join(deptpack, "bin"))
+            shutil.copyfile(os.path.join(BIN, "javis_report_gate.py"),  # 가드 포함 게이트 사본
+                            os.path.join(deptpack, "bin", "javis_report_gate.py"))
+            res = self._run_c71_with_pack(deptpack)
+            self.assertEqual(res["status"], "PASS", res)               # F=SKIP·L(dept 정합)=not-SKIP
+
+    # ── FIX-1: 가드 제거본 → 케이스 F가 SKIP 안 냄 → FAIL(회귀 검출 유지) ──
+    @unittest.skipUnless(os.path.isdir(os.path.expanduser("~/.cys/pack")),
+                         "본사 팩(~/.cys/pack) 부재 — hq realpath 대조 불가")
+    def test_c71_fails_when_guard_removed(self):
+        with tempfile.TemporaryDirectory() as td:
+            pk = os.path.join(td, "pack-noguard")
+            os.makedirs(os.path.join(pk, "bin"))
+            src = open(os.path.join(BIN, "javis_report_gate.py"), encoding="utf-8").read()
+            stripped = src.replace("foreign = foreign_daemon_verdict()", "foreign = None", 1)
+            self.assertIn("foreign = None", stripped)                  # 가드 무력화 확인
+            with open(os.path.join(pk, "bin", "javis_report_gate.py"), "w", encoding="utf-8") as f:
+                f.write(stripped)
+            res = self._run_c71_with_pack(pk)
+            self.assertEqual(res["status"], "FAIL", res)              # 회귀 검출
+            self.assertIn("가드 회귀", res["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

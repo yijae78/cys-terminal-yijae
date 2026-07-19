@@ -3944,11 +3944,20 @@ class Preflight:
             except (OSError, ValueError, IndexError) as e:
                 return None, "대장 회수 실패: %s" % e
 
+        # 케이스 L env는 가드 자신의 토큰 규칙에 맞춰 팩별로 정합하게 구성한다(FIX-1). dept 팩은 소켓
+        #   unset이면 가드가 정당하게 SKIP하므로(dept 팩은 cys-dept-<id> 토큰 요구) → 소켓 unset로
+        #   테스트하면 배포 후 7 dept 부트가 전부 위양 FAIL한다. gate_state_dir_for_pack과 동일한
+        #   basename 판별로 dept면 정합 소켓 토큰을, 본사·그 외면 소켓 unset을 준다.
+        base = os.path.basename(os.path.normpath(pack_dir()))
+        mdept = re.match(r"pack-dept-(.+)$", base)
         try:
             with tempfile.TemporaryDirectory() as tf, tempfile.TemporaryDirectory() as tl:
                 vf, ef = _run({"CYS_PACK_DIR": hq,           # 케이스 F: 본사 팩 + dept 소켓 토큰
                                "CYS_SOCKET": os.path.join(tf, "cys-dept-simfake", "cys.sock")}, tf)
-                vl, el = _run({"CYS_PACK_DIR": pack_dir()}, tl)   # 케이스 L: 팩 자기 컨텍스트 + 소켓 unset
+                l_over = {"CYS_PACK_DIR": pack_dir()}        # 케이스 L: 팩 자기 컨텍스트(정합)
+                if mdept:                                    # dept 팩 → 정합 소켓 토큰 부여(존재 불요)
+                    l_over["CYS_SOCKET"] = os.path.join(tl, "cys-dept-%s" % mdept.group(1), "cys.sock")
+                vl, el = _run(l_over, tl)
         except OSError as e:
             self.add(cid, WARN, "가드 행동 검사 환경 준비 실패(%s) — 비차단 강등" % e)
             return
