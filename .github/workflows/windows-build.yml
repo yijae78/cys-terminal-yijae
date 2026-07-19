@@ -403,3 +403,93 @@ jobs:
           # ★Actions pwsh 래퍼는 스크립트 말미에 exit $LASTEXITCODE 를 붙인다 — 위 방어적 uninstall(스모크 finally 가
           #   이미 제거해 rc=1)이 그 값을 오염시켜 '스모크 성공인데 스텝 exit 1'(run 28738140283 실증). 판정은 $code 로 끝 — 명시 exit 0.
           exit 0
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # T6 PYTHONUTF8 데몬 root 주입 스모크 (정밀진단 diagnose-utf8-fix (a) 검증).
+      # 목적: 데몬이 root env에서 PYTHONUTF8=1을 주입(main.rs scrub_claude_session_env)하므로, 데몬이
+      #   **스케줄 command로 spawn한 파이썬 자식**이 상속으로 한글 UTF-8 팩파일 open().read()를 무크래시로
+      #   수행함을 입증한다. ★이 스텝은 PYTHONUTF8을 호출 env에 넣지 않는다(build/T5 스텝과 달리 step-env
+      #   PYTHONUTF8 미설정) — 데몬 주입만으로 통과함을 증명하는 것이 검증의 핵심이다.
+      # 배선: CYS_PACK_DIR을 temp 팩으로 오버라이드해 schedule.json 경로를 결정론화하고, every_minutes:1
+      #   job(last_fired=0 → 첫 tick[TICK_SECS=30s] 즉시 발화)으로 데몬이 python3를 spawn → 결과 파일로 판정.
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: T6 PYTHONUTF8 데몬 root 주입 스모크 (스케줄 command 경유·호출 env 미설정)
+        shell: pwsh
+        timeout-minutes: 6
+        # ※의도적으로 env.PYTHONUTF8 미설정 — 데몬 자체 주입만으로 통과함을 입증하는 스텝이다.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # ① 호출 env에 PYTHONUTF8이 없어야 한다(있으면 데몬 자식이 상속으로 통과해 검증 무의미) → 제거·단언.
+          Remove-Item Env:PYTHONUTF8 -ErrorAction SilentlyContinue
+          if ($env:PYTHONUTF8) { throw "T6: 이 스텝은 PYTHONUTF8 미설정이어야 한다(데몬 주입 단독 입증)" }
+          # ② 설치물 발견(다른 스텝과 동일 관례) + 동봉 python3 절대경로(PATH 주입 비의존 결정론).
+          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
+          if (-not $inst) { throw "T6: 설치된 cysd.exe 미발견" }
+          $dir = $inst.Directory.FullName
+          $cys = Join-Path $dir 'cys.exe'
+          $cysd = $inst.FullName
+          $py = Join-Path $dir 'runtime\python\python3.exe'
+          if (-not (Test-Path $py)) { throw "T6: 동봉 python3.exe 미발견: $py" }
+          # ③ 격리 작업공간: temp 팩(CYS_PACK_DIR) + 한글 UTF-8(BOM 없음) 데이터 + 파이썬 프로브.
+          $work = Join-Path $env:RUNNER_TEMP ("utf8probe-" + [guid]::NewGuid().ToString('N'))
+          $packdir = Join-Path $work 'pack'
+          New-Item -ItemType Directory -Force -Path $packdir | Out-Null
+          $kfile  = Join-Path $work 'korean.txt'
+          $probe  = Join-Path $work 'probe.py'
+          $result = Join-Path $work 'result.txt'
+          # 한글 데이터 파일 — 6자('한글팩테스트'=UTF-8 18바이트)·BOM 없음(BOM 있으면 cp949 우연 통과로 판별력↓).
+          Set-Content -Path $kfile -Value '한글팩테스트' -Encoding utf8NoBOM -NoNewline
+          # 프로브(ASCII 전용 — YAML 블록스칼라 안전): 인코딩 미지정 open().read()는 PYTHONUTF8/utf8_mode에서만
+          #   UTF-8로 연다. utf8_mode==1 AND 디코드 결과 6자를 단언 — 주입 실패 시 cp1252/cp949로 18자/에러 →
+          #   비-0 exit. (한글 리터럴을 소스에 넣지 않아 pwsh here-string 열 봉인 문제를 회피한다.)
+          $pysrc = @(
+            'import sys, os'
+            'path, result = sys.argv[1], sys.argv[2]'
+            'try:'
+            '    f = open(path)                      # no-encoding -> default (UTF-8 iff PYTHONUTF8)'
+            '    data = f.read(); enc = f.encoding; f.close()'
+            '    ok = (sys.flags.utf8_mode == 1) and (len(data.strip()) == 6)'
+            '    with open(result, "w", encoding="utf-8") as r:'
+            '        r.write("%s utf8_mode=%d pythonutf8=%s enc=%s len=%d" % ('
+            '            "OK" if ok else "MISMATCH", sys.flags.utf8_mode,'
+            '            os.environ.get("PYTHONUTF8"), enc, len(data.strip())))'
+            '    sys.exit(0 if ok else 3)'
+            'except Exception as e:'
+            '    try:'
+            '        with open(result, "w", encoding="utf-8") as r:'
+            '            r.write("FAIL %r" % (e,))'
+            '    except Exception:'
+            '        pass'
+            '    sys.exit(1)'
+          ) -join "`n"
+          Set-Content -Path $probe -Value $pysrc -Encoding utf8NoBOM
+          # ④ 데몬 기동 — CYS_PACK_DIR=temp 팩, PYTHONUTF8 미상속(위 제거). 기존 데몬 정리 후 fresh 기동.
+          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep 1
+          $env:CYS_PACK_DIR = $packdir
+          Start-Process -FilePath $cysd -WindowStyle Hidden
+          Start-Sleep 8                                    # 부트 + 팩 install(schedule.json 시드) 대기
+          # ⑤ install이 시드한 schedule.json을 프로브 job 단독으로 덮어씀(설치 경합 회피 위해 부팅 후 기록).
+          $cmd = ('"{0}" "{1}" "{2}" "{3}"' -f $py, $probe, $kfile, $result)
+          $sched = @{ jobs = @(@{ id = 'utf8-probe-smoke'; every_minutes = 1; action = 'command'; command = $cmd; if_absent = 'skip' }) }
+          $sched | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $packdir 'schedule.json') -Encoding utf8NoBOM
+          Write-Host "T6 schedule.json 기록: $(Join-Path $packdir 'schedule.json')"
+          Write-Host "T6 command: $cmd"
+          # ⑥ 발화 대기(핫리로드 30s + tick 30s + 실행) — 결과 파일 폴링 최대 ~150s.
+          $deadline = (Get-Date).AddSeconds(150)
+          while (-not (Test-Path $result) -and (Get-Date) -lt $deadline) { Start-Sleep 3 }
+          # ⑦ 정리(판정 전 데몬 종료 — 결과는 이미 파일에 있음).
+          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          & $cys daemon uninstall 2>$null
+          # ⑧ 판정.
+          if (-not (Test-Path $result)) {
+            throw "T6: 결과 파일 미생성 — 데몬이 스케줄 command로 python을 발화하지 못함(schedule 배선/PATH/tick 점검). command=$cmd"
+          }
+          $out = (Get-Content -Path $result -Raw).Trim()
+          Write-Host "T6 result: $out"
+          if (-not $out.StartsWith('OK')) {
+            throw "T6: 데몬 주입 실패 — 스케줄 command로 spawn된 python이 UTF-8 모드가 아님(주입/상속 회귀). result=$out"
+          }
+          Write-Host "OK: T6 데몬 root PYTHONUTF8 주입 검증 통과 — 스케줄 command로 spawn된 python 자식이 호출 env PYTHONUTF8 없이도 utf8_mode=1로 한글 UTF-8 파일 무크래시 read."
+          Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+          exit 0
