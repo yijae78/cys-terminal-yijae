@@ -39,6 +39,9 @@ STALL_CYCLES_DEFAULT = 6       # 6주기=30분 무진행 → stall 승격(DESIGN
 QUIET_CYCLES_DEFAULT = 12      # 12주기=60분 QUIET → 세션 주차 후보(P2·CSO 집행)
 GAP_CYCLES = 3                 # 직전 대장과 간격 >3주기 = GAP(슬립·재부팅 복귀 위양성 강등)
 SCHEMA_VERSION = 1
+COUNTERS_SCHEMA_VERSION = 2    # counters.json 스키마 v2(추가 전용) — idle_edge·park_notified·death_pending
+#  (ledger·snapshot은 SCHEMA_VERSION=1 불변 — 데이터 계약: counters만 v2로 진화)
+EDGE_COOLDOWN_SECS = 7200      # 무배정 idle 엣지 wake 쿨다운(2h·24주기) — 진동 노드 wake 상한(모듈 상수·Gate 오버라이드 가능)
 LEDGER_MAX_BYTES = 5 * 1024 * 1024   # 대장 5MB 도달 시 ledger.jsonl.1로 1세대 로테이션
 
 # 정규화 블랙리스트 — 타임스탬프·수집시각·순서 비결정 항목만 제거한다. 화이트리스트 금지
@@ -308,6 +311,19 @@ def all_nodes_idle(report):
     return True
 
 
+def init_idle_edge(counters, report):
+    """idle_edge 초기화 규칙의 단일 진입점(DESIGN §3.2 v2.2·Sim R2 O-1).
+
+    현재 idle인 role을 모두 disarmed로 초기화 + park_notified=False. BASELINE(재설치)·GAP(재부팅
+    복귀)·counters 파손 복원 3경로가 공통 호출한다 — 업그레이드·복원 순간의 엣지 재발화 파도를 막는다
+    (미적용 시 복원 직후 전 idle 노드가 default armed로 재-파도, S2-8 O-1 실측). 파손을 재설치와
+    동급으로 취급하는 것이 근거. 이후 새로 idle로 '전이'하는 노드는 default armed라 정상 1회 발화한다.
+    """
+    idle_roles = [(n.get("role") or "").lower() for n in (report.get("idle_nodes") or [])]
+    counters["idle_edge"] = {r: {"armed": False, "last_fired": 0} for r in idle_roles if r}
+    counters["park_notified"] = False
+
+
 # ── EVT payload 매핑 표(계약 SOT: _round/EVENT_CONTRACT.md · javis_event.SCHEMA) ──
 #   idle    → agent.silent {agent, silent_minutes, level=critical}
 #   feed    → approval.needed {agent, task, summary}
@@ -519,12 +535,14 @@ class Runner:
 class Gate:
     def __init__(self, state_dir, runner, cycle_minutes=CYCLE_MINUTES_DEFAULT,
                  stall_cycles=STALL_CYCLES_DEFAULT, quiet_cycles=QUIET_CYCLES_DEFAULT,
+                 edge_cooldown=EDGE_COOLDOWN_SECS,
                  now_epoch_fn=time.time, now_iso_fn=_now_iso):
         self.state_dir = state_dir
         self.runner = runner
         self.cycle_minutes = cycle_minutes
         self.stall_cycles = stall_cycles
         self.quiet_cycles = quiet_cycles
+        self.edge_cooldown = edge_cooldown
         self.now_epoch_fn = now_epoch_fn
         self.now_iso_fn = now_iso_fn
         self.snap_path = os.path.join(state_dir, "last_snapshot.json")
@@ -547,7 +565,7 @@ class Gate:
         _write_json_atomic(self.snap_path, {"schema_version": SCHEMA_VERSION, "data": snap})
 
     def _write_counters(self, counters):
-        counters["schema_version"] = SCHEMA_VERSION     # S2-4: 상태 파일 스키마 버전(추가-전용 마이그레이션)
+        counters["schema_version"] = COUNTERS_SCHEMA_VERSION   # S2-4: counters 스키마 v2(추가-전용 마이그레이션)
         _write_json_atomic(self.counters_path, counters)
 
     def run(self, shadow=False):
@@ -668,6 +686,7 @@ class Gate:
             self._write_snapshot(new_snap)
             counters.setdefault("consecutive_nochg", 0)
             counters.setdefault("consecutive_quiet", 0)
+            init_idle_edge(counters, report)                # §3.2: 재설치 순간 엣지 재발화 파도 방지
             ledger_append(self.state_dir, {"ts": now_iso, "ts_epoch": now_epoch,
                                            "verdict": "BASELINE", "reasons": [], "delta_fields": [],
                                            "delivered": "none", "shadow": shadow})
@@ -686,6 +705,7 @@ class Gate:
                 counters["nodes"] = {}                          # 연속성 상실 → stall 카운터 리셋
                 counters["consecutive_nochg"] = 0
                 counters["consecutive_quiet"] = 0
+                init_idle_edge(counters, report)               # §3.2: 재부팅 복귀 순간 엣지 재발화 파도 방지
                 self._write_counters(counters)
                 ledger_append(self.state_dir, {"ts": now_iso, "ts_epoch": now_epoch,
                                                "verdict": "GAP", "reasons": ["interval>3cycles"],
@@ -696,6 +716,12 @@ class Gate:
 
         if not report.get("status_available"):
             reasons.append("status_unavailable")           # 관측용(daemon 일시 부재)·wake 안 함
+
+        # §3.2 초기화 단일화: idle_edge 부재(=counters 파손·필드 소실 복원 또는 v1→v2 업그레이드 첫 주기)를
+        #   재설치와 동급으로 취급해 현재 idle을 disarm 초기화한다 — 복원 직후 엣지 재발화 파도 봉쇄(O-1).
+        #   BASELINE·GAP은 조기 반환이라 이 경로에 안 오고, 정상 주기는 idle_edge가 상주하므로 무발동.
+        if "idle_edge" not in counters:
+            init_idle_edge(counters, report)
 
         # ── 분류 ──
         warns = extract_warnings(report)

@@ -300,10 +300,24 @@ class GateCore(unittest.TestCase):
             gate(t, r).run()
             counters = json.load(open(os.path.join(t, "counters.json"), encoding="utf-8"))
             snap = json.load(open(os.path.join(t, "last_snapshot.json"), encoding="utf-8"))
-            self.assertEqual(counters.get("schema_version"), 1)
-            self.assertEqual(snap.get("schema_version"), 1)
+            self.assertEqual(counters.get("schema_version"), 2)   # counters v2(idle_edge·park_notified)
+            self.assertEqual(snap.get("schema_version"), 1)       # snapshot·ledger는 v1 불변
             self.assertIn("data", snap)                       # 스냅샷 본문은 래퍼 안(diff 오탐 방지)
             self.assertEqual(ledger_entries(t)[-1]["schema_version"], 1)
+
+    # ── T12: counters v1 로드 → v2 자연 마이그레이션(추가 전용) ──
+    def test_counters_v1_migrates_to_v2(self):
+        with tempfile.TemporaryDirectory() as t:
+            rep = report(nodes=[{"node": "worker", "done": 1, "total": 3, "pct": 33}],
+                         live_nodes=[{"role": "worker", "agent_alive": True, "idle_secs": 10}])
+            # v1 counters(구 스키마 — idle_edge/park_notified 부재) + 스냅샷 선기록
+            gate(t, FakeRunner(rep=rep)).run()                # baseline → snapshot 생성
+            with open(os.path.join(t, "counters.json"), "w", encoding="utf-8") as f:
+                json.dump({"nodes": {}, "consecutive_nochg": 4, "schema_version": 1}, f)
+            gate(t, FakeRunner(rep=rep)).run()                # v1 로드 → v2 기록
+            counters = json.load(open(os.path.join(t, "counters.json"), encoding="utf-8"))
+            self.assertEqual(counters.get("schema_version"), 2)
+            self.assertIn("idle_edge", counters)              # 신규 필드 자연 마이그레이션
 
     def test_wrapped_snapshot_roundtrips_no_false_delta(self):
         # 래핑 스냅샷 로드→재정규화→diff가 schema_version 때문에 오탐 DELTA를 내지 않아야 한다.
