@@ -148,7 +148,7 @@ describe("④ URL 하드 가드", () => {
     expect(isAllowedWebPaneUrl("http://evil.com/app/")).toBe(false);
     expect(isAllowedWebPaneUrl("http://127.0.0.1/app/")).toBe(false); // 포트 없음
     expect(isAllowedWebPaneUrl("http://localhost/app/")).toBe(false); // 포트 없음
-    expect(isAllowedWebPaneUrl("http://127.0.0.1:80@evil.com/")).toBe(false); // userinfo 위장
+    expect(isAllowedWebPaneUrl("http://127.0.0.1:80@evil.example.com/")).toBe(false); // userinfo 위장
     expect(isAllowedWebPaneUrl("http://127.0.0.1:80.evil.com/")).toBe(false); // port 위장
     expect(isAllowedWebPaneUrl("http://127.0.0.1.evil.com:80/")).toBe(false); // host 위장
     expect(isAllowedWebPaneUrl("")).toBe(false);
