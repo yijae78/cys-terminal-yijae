@@ -95,6 +95,26 @@ if [ -s "$EVID/meta.json" ] && [ -s "$EVID/dom.html" ]; then
   if [ "$META_HASH" = "$CALC_HASH" ]; then echo "  [OK] dom_sha256 독립 재계산 일치"; else fail "dom_sha256 불일치 meta=$META_HASH calc=$CALC_HASH"; fi
 fi
 
+# --- F4: evidence_dir 재사용 세대혼합 방지 ---
+# 재사용 dir에 이전 세대(gen1) 잔재를 심고 2회차(gen2) 정상 실행 → gen1 잔재 0 확인.
+# 수정 전이면 gen1 meta.json(완결 마커)/dom.html이 gen2 screenshot과 섞여 세대혼합 번들이 완결로 오판됨.
+log "F4: evidence_dir 재사용 세대혼합 방지 ($EVID 재사용)"
+# gen1 잔재 심기: meta.json에 sentinel 주입 + dom.html을 다른 내용으로 오염
+printf '{"gen":"STALE_GEN1_SENTINEL","dom_sha256":"deadbeef"}' >"$EVID/meta.json"
+printf '<html>STALE GEN1 DOM</html>' >"$EVID/dom.html"
+# gen2 정상 실행 — 같은 dir 재사용
+python3 "$CLI" --headless open "$OK_URL" >/dev/null
+python3 "$CLI" --headless verify --expect-text "PAYMENT CONFIRMED" --evidence-dir "$EVID" >/dev/null
+RC_F4=$?
+[ "$RC_F4" -eq 0 ] || fail "F4 gen2 verify exit=$RC_F4 (기대 0)"
+# gen1 sentinel 잔존 0
+if grep -q "STALE_GEN1_SENTINEL" "$EVID/meta.json"; then fail "F4: gen1 meta sentinel 잔존(선삭제 실패)"; else echo "  [OK] gen1 meta sentinel 제거됨"; fi
+if grep -q "STALE GEN1 DOM" "$EVID/dom.html"; then fail "F4: gen1 dom 잔존(선삭제 실패)"; else echo "  [OK] gen1 dom 제거됨"; fi
+# gen2 meta.json은 유효 JSON이고 dom_sha256이 gen2 dom.html과 일치(세대 일관)
+F4_META="$(python3 -c "import json;print(json.load(open('$EVID/meta.json'))['dom_sha256'])" 2>/dev/null)"
+F4_CALC="$(python3 -c "import hashlib;print(hashlib.sha256(open('$EVID/dom.html','rb').read()).hexdigest())")"
+if [ -n "$F4_META" ] && [ "$F4_META" = "$F4_CALC" ]; then echo "  [OK] gen2 meta↔dom 세대 일관"; else fail "F4: gen2 meta/dom 세대 불일치 meta=$F4_META calc=$F4_CALC"; fi
+
 # --- 비신뢰 라벨 확인 (snapshot 헤더) ---
 log "snapshot 비신뢰 라벨 확인"
 if grep -q "UNTRUSTED WEB CONTENT" "$EVID/snapshot.txt"; then echo "  [OK] 비신뢰 헤더 존재"; else fail "snapshot에 비신뢰 라벨 없음"; fi

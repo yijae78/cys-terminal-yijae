@@ -105,6 +105,21 @@ describe("② v2→v3 마이그레이션", () => {
     expect(loadPersistedLayout(fakeStore({ [LAYOUT_KEY_V3]: "{bad" }).getItem)).toBeNull();
     expect(loadPersistedLayout(fakeStore().getItem)).toBeNull();
   });
+
+  it("손상 v3 + 정상 v2 → v2로 폴백 복원한다(F5)", () => {
+    const v2data = { workspaces: [{ id: 1, name: "before-upgrade", tree: null }], active: 0 };
+    const s = fakeStore({
+      [LAYOUT_KEY_V3]: "{corrupt json",
+      [LAYOUT_KEY_V2]: JSON.stringify(v2data),
+    });
+    // v3 손상이어도 전손실(null) 대신 v2 스냅샷으로 부팅한다
+    expect(loadPersistedLayout(s.getItem)).toEqual(v2data);
+  });
+
+  it("손상 v3 + 손상 v2 → null(최종 폴백)", () => {
+    const s = fakeStore({ [LAYOUT_KEY_V3]: "{bad", [LAYOUT_KEY_V2]: "{also bad" });
+    expect(loadPersistedLayout(s.getItem)).toBeNull();
+  });
 });
 
 describe("③ 다운그레이드 불변식 — 구 빌드는 v2를 읽는다", () => {

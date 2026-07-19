@@ -6,8 +6,8 @@
 // 클린룸: cmux 코드 무참조. 외부 의존 = playwright-core 단독.
 
 import { chromium, type BrowserContext, type Page, type Dialog } from "playwright-core";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { existsSync, mkdirSync, writeFileSync, rmSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import {
   BrowserState,
@@ -35,6 +35,12 @@ interface Ctx {
 // --- 상태 ---
 let persistentCtx: BrowserContext | null = null; // agent 프로필(무세션·기본)
 let humanCtx: BrowserContext | null = null; // human 프로필(인증·SOT) — CEO 결재 통과 시에만 생성
+// 진행중 launch Promise 캐시(프로필별) — 동시 첫 open 2건이 동일 userDataDir를 이중 launch 하지
+// 않도록 첫 호출의 Promise를 공유하고, 실패 시 캐시를 비워 다음 호출이 재시도한다(F3).
+let launchingCtx: { agent: Promise<BrowserContext> | null; human: Promise<BrowserContext> | null } = {
+  agent: null,
+  human: null,
+};
 const contexts = new Map<string, Ctx>();
 let lastActivity = Date.now();
 let lastEvidencePath: string | null = null; // 최근 evidence 번들 경로(관측 status·observe 반환용)
@@ -76,11 +82,22 @@ async function launchProfileCtx(profile: "agent" | "human"): Promise<BrowserCont
 
 async function ensureBrowser(profile: "agent" | "human" = "agent"): Promise<BrowserContext> {
   if (profile === "human") {
-    if (!humanCtx) humanCtx = await launchProfileCtx("human");
-    return humanCtx;
+    if (humanCtx) return humanCtx;
+    // 진행중 launch가 있으면 그 Promise를 공유(이중 launch 방지).
+    if (!launchingCtx.human) {
+      launchingCtx.human = launchProfileCtx("human")
+        .then((ctx) => (humanCtx = ctx))
+        .finally(() => { launchingCtx.human = null; }); // 성공·실패 모두 캐시 해제(실패 시 재시도 가능)
+    }
+    return launchingCtx.human;
   }
-  if (!persistentCtx) persistentCtx = await launchProfileCtx("agent");
-  return persistentCtx;
+  if (persistentCtx) return persistentCtx;
+  if (!launchingCtx.agent) {
+    launchingCtx.agent = launchProfileCtx("agent")
+      .then((ctx) => (persistentCtx = ctx))
+      .finally(() => { launchingCtx.agent = null; });
+  }
+  return launchingCtx.agent;
 }
 
 function getCtx(id: string): Ctx {
@@ -175,6 +192,11 @@ async function writeEvidence(
   snapshotText?: string
 ): Promise<string> {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  // evidence_dir 재사용 시 이전 세대 4파일을 선삭제한다(F4). 안 그러면 이번 회차가
+  // 중간 중단해도 이전 세대의 meta.json(완결 마커)이 남아 세대혼합 번들이 "완결"로 오판된다.
+  for (const f of ["screenshot.png", "snapshot.txt", "dom.html", "meta.json"]) {
+    rmSync(join(dir, f), { force: true });
+  }
   await page.screenshot({ path: join(dir, "screenshot.png"), fullPage: false });
   const snap = snapshotText ?? (await buildSnapshot(page)).text;
   writeFileSync(join(dir, "snapshot.txt"), snap, "utf8");
@@ -188,8 +210,11 @@ async function writeEvidence(
     verb,
     args,
   };
-  // meta.json 반드시 마지막에 — 반쪽 번들 차단(완결 마커)
-  writeFileSync(join(dir, "meta.json"), JSON.stringify(meta, null, 2), "utf8");
+  // meta.json 반드시 마지막에 — 반쪽 번들 차단(완결 마커). tmp 기록 후 rename 으로 원자화해
+  // 부분 기록된 meta.json 이 완결 마커로 보이지 않게 한다.
+  const metaTmp = join(dir, "meta.json.tmp");
+  writeFileSync(metaTmp, JSON.stringify(meta, null, 2), "utf8");
+  renameSync(metaTmp, join(dir, "meta.json"));
   lastEvidencePath = dir; // 관측(observe·status)이 마지막 증거 위치를 노출
   return dir;
 }
@@ -430,13 +455,22 @@ async function dispatch(verb: string, args: any): Promise<any> {
 // --- HTTP 서버 (127.0.0.1, port 0) ---
 const token = genToken();
 
+// 상수시간 토큰 비교(F6) — 길이 불일치는 즉시 false(timingSafeEqual은 길이 다르면 throw).
+// 둘 다 hex 토큰이라 latin1 바이트 인코딩으로 충분하고, 길이 정보 누출은 토큰 자릿수 고정이라 무해.
+function tokenEqual(given: string, expected: string): boolean {
+  const a = Buffer.from(given, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
 const server = Bun.serve({
   hostname: "127.0.0.1",
   port: 0,
   async fetch(req) {
     const url = new URL(req.url);
     const parts = url.pathname.split("/").filter(Boolean);
-    if (parts.length !== 2 || parts[0] !== token || parts[1] !== "rpc") {
+    if (parts.length !== 2 || !tokenEqual(parts[0], token) || parts[1] !== "rpc") {
       return new Response(JSON.stringify({ ok: false, error: { code: "FORBIDDEN", message: "bad token/path" } }), { status: 403 });
     }
     if (req.method !== "POST") {

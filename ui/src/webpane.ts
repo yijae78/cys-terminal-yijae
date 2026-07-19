@@ -52,16 +52,18 @@ export function collectWebWids(node: any, out: number[] = []): number[] {
 
 // 레이아웃 로드 — v3 우선, 없으면 v2 읽어 마이그레이션(구조 동일 passthrough). 손상 저장본은 null.
 // v2는 절대 쓰지/지우지 않는다(다운그레이드 안전).
+// ★손상 v3 폴백(F5): v3가 존재하나 JSON 손상이면 전손실 대신 v2 스냅샷으로 폴백한다
+// (업그레이드 직후 v2는 프리즈된 마지막 구-포맷 상태라 부팅 가능한 유효 후보다).
 export function loadPersistedLayout(getItem: (key: string) => string | null): any | null {
   const rawV3 = getItem(LAYOUT_KEY_V3);
   if (rawV3) {
     try {
       return JSON.parse(rawV3);
     } catch {
-      return null;
+      // v3 손상 → v2 폴백 시도(아래 공통 경로로 낙하). v2도 없거나 손상이면 최종 null.
     }
   }
-  const rawV2 = getItem(LAYOUT_KEY_V2); // v2→v3 마이그레이션(첫 v3 로드 전까지 구 저장본 승계)
+  const rawV2 = getItem(LAYOUT_KEY_V2); // v2→v3 마이그레이션(첫 v3 로드 전까지 구 저장본 승계) + v3 손상 폴백
   if (rawV2) {
     try {
       return JSON.parse(rawV2);

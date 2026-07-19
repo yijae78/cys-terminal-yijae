@@ -587,11 +587,26 @@ fn read_live_view_state(path: &std::path::Path) -> Option<Value> {
     Some(json!({"port": port, "token": token}))
 }
 
+/// ensure_view_bridge 임계구역 락 — 레이아웃 복원 시 web pane 2+개가 동시에 이 커맨드를
+/// invoke 하면 check-then-spawn 사이 갭에서 사이드카가 이중 spawn 되고, state.json 원자 기록의
+/// 패자가 고아로 영구 상주한다(view bridge는 유휴종료 없음). 이 프로세스 안의 동시 invoke를
+/// 직렬화해 첫 호출만 spawn하고 나머지는 락 획득 후 live state를 재확인해 즉시 반환하게 한다.
+/// ※한계: 프로세스 밖 동시성(앱 인스턴스 2개)은 이 락 범위 밖 — 별도 파일락이 필요하다(범위 외).
+static VIEW_BRIDGE_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+
 /// 뷰어 사이드카 확보(§8-1#13) — 살아있으면 {port, token} 즉시 반환, 아니면 detached spawn 후
 /// state.json(생존 pid) 을 최대 10초 대기해 반환. lazy 기동(부트체인 무접점)·읽기 전용 loopback.
 #[tauri::command]
 fn ensure_view_bridge() -> Result<Value, String> {
     let state_path = cys::home_dir().join(".cys/viewer/state.json");
+    // 락 밖 빠른 경로 — 이미 살아있으면 직렬화 없이 즉시 반환.
+    if let Some(v) = read_live_view_state(&state_path) {
+        return Ok(v);
+    }
+    // 임계구역 진입: spawn 은 프로세스 내 한 번에 하나만.
+    let lock = VIEW_BRIDGE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner()); // poison 무시(임계구역 상태 무보유)
+    // 락 획득 후 재확인(double-checked) — 대기 중 다른 invoke가 이미 기동했으면 spawn 생략.
     if let Some(v) = read_live_view_state(&state_path) {
         return Ok(v);
     }
