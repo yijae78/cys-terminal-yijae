@@ -532,6 +532,15 @@ class IdleEdge(unittest.TestCase):
             self.assertGreaterEqual(total, 1)
             self.assertLessEqual(total, 2)                            # 진동 5회에도 쿨다운창당 ≤1
 
+    # ── FIX-4: idle-신규 wake_body에 "⚠" 마커(설계 §4 정합) ──
+    def test_fix4_edge_wake_body_has_warning_marker(self):
+        with tempfile.TemporaryDirectory() as t:
+            gate(t, FakeRunner(rep=self._active_rep())).run()
+            r = FakeRunner(rep=self._idle_rep())
+            gate(t, r).run()
+            bodies = [reason for _to, _task, reason, _idem in r.enqueues]   # enqueue 3번째=wake_body
+            self.assertTrue(any("⚠" in b and "idle-신규" in b for b in bodies), bodies)
+
     # ── T23: counters 파손 복원 주기 → idle_edge 초기화 → 재-파도 0(Sim O-1) ──
     def test_t23_counters_corruption_restore_no_edge_flood(self):
         roles = ("a", "b", "c", "d")
@@ -697,6 +706,17 @@ class DeathEdge(unittest.TestCase):
             json.dump(c, open(cpath, "w", encoding="utf-8"))
             r = FakeRunner(rep=self.DEAD); gate(t, r).run()
             self.assertIn("gate-death-worker", self._master_tasks(r))  # 재발화 = 회귀 검출 가능
+
+    # ── FIX-3: death role 키 소문자 정규화(idle_edge·death_pending 키 공간 통일) ──
+    def test_fix3_death_role_keys_lowercased(self):
+        with tempfile.TemporaryDirectory() as t:
+            alive = report(live_nodes=[{"role": "Worker", "agent_alive": True, "idle_secs": 10}])
+            dead = report(live_nodes=[{"role": "Worker", "agent_alive": False}])
+            gate(t, FakeRunner(rep=alive)).run()                     # baseline
+            gate(t, FakeRunner(rep=dead)).run()                      # 시딩
+            dp = _counters(t)["death_pending"]
+            self.assertIn("worker", dp)                              # 소문자 키
+            self.assertNotIn("Worker", dp)                           # 대문자 이중 키 없음
 
     # ── T20: GAP 주기 중 사망 → 무발화(위양성 차단 트레이드오프 명문화) ──
     def test_t20_death_during_gap_no_fire_by_design(self):

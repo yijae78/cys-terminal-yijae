@@ -399,7 +399,7 @@ def extract_warnings(report, counters, now, edge_cooldown):
                     "trigger": "idle",
                     "task": "gate-idle-%s" % role,
                     "reason": "idle_edge:%s" % role,
-                    "wake_body": "[gate] idle-신규: %s 무배정 idle 진입(5분+) — 1회 통보"
+                    "wake_body": "[gate] ⚠ idle-신규: %s 무배정 idle 진입(5분+) — 1회 통보"
                                  "(standby 억제 개시). 점검 후 임무 배정 또는 standby 승인. "
                                  "기상절차: cys status --json 1콜." % role,
                     "evt_type": "agent.silent",
@@ -506,8 +506,11 @@ def build_death_warnings(old_snap, report, counters):
     """
     death_pending = counters.setdefault("death_pending", {})
     idle_edge = counters.setdefault("idle_edge", {})
-    prev = {n.get("role"): n for n in (old_snap.get("live_nodes") or []) if isinstance(n, dict)}
-    cur = {n.get("role"): n for n in (report.get("live_nodes") or []) if isinstance(n, dict)}
+    # role 키는 소문자로 정규화(FIX-3) — extract_warnings·idle_edge 키 공간과 통일(대소문자 혼재로
+    #   idle_edge에 "Worker"/"worker" 이중 키가 생기는 방어). death_pending 키도 동일 공간.
+    _rl = lambda n: (n.get("role") or "").lower()                      # noqa: E731
+    prev = {_rl(n): n for n in (old_snap.get("live_nodes") or []) if isinstance(n, dict)}
+    cur = {_rl(n): n for n in (report.get("live_nodes") or []) if isinstance(n, dict)}
 
     def dead_now(role):
         n = cur.get(role)
