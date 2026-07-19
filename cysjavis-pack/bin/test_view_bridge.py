@@ -86,6 +86,14 @@ class ViewBridgeTest(unittest.TestCase):
         except HTTPError as e:
             return e.code, e.read().decode()
 
+    def _headers(self, path, tok=None):
+        """(status, headers dict) — CSP 등 응답 헤더 실측용."""
+        try:
+            r = urlopen(self._url(path, tok), timeout=5)
+            return r.status, dict(r.headers)
+        except HTTPError as e:
+            return e.code, dict(e.headers)
+
     # --------------------------------------------------------------- 토큰
     def test_missing_token_404(self):
         code, _ = self._get("/api/list?path=" + self.root, tok="")
@@ -197,6 +205,26 @@ class ViewBridgeTest(unittest.TestCase):
         self.assertEqual(j["port"], 4321)
         self.assertEqual(j["token"], "tok-xyz")
         self.assertEqual(j["pid"], os.getpid())
+
+    # --------------------------------------------------------------- CSP
+    def test_csp_header_on_app(self):
+        # 정적앱 응답에 CSP 헤더가 실려 스크립트/외부연결 표면을 봉쇄하는지.
+        code, hdrs = self._headers("/app/")
+        self.assertEqual(code, 200)
+        csp = hdrs.get("Content-Security-Policy")
+        self.assertIsNotNone(csp, "CSP 헤더가 있어야 함")
+        self.assertIn("default-src 'none'", csp)
+        self.assertIn("script-src 'self'", csp)     # 인라인 스크립트 차단
+        self.assertIn("connect-src 'self'", csp)     # 외부 exfil 봉쇄
+        self.assertIn("base-uri 'none'", csp)
+
+    def test_csp_header_on_api(self):
+        # API(JSON) 응답에도 CSP 가 실리는지(모든 응답 강제).
+        code, hdrs = self._headers("/api/file?path=" +
+                                   os.path.join(self.root, "a.md"))
+        self.assertEqual(code, 200)
+        self.assertIn("connect-src 'self'",
+                      hdrs.get("Content-Security-Policy", ""))
 
     # --------------------------------------------------------------- 읽기전용
     def test_post_rejected(self):

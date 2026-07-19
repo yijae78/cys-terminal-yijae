@@ -43,11 +43,14 @@
   }
 
   // marked 출력 sanitize — 신뢰 경계 내부 파일이지만 script/iframe/on*/javascript:
-  // 제거로 방어선 유지(§XSS). DOMParser 로 파싱 후 위험 노드·속성 제거.
+  // 제거로 방어선 유지(§XSS). DOMParser(스크립팅 OFF)로 파싱 후 위험 노드·속성 제거.
+  // noscript/svg/math/template 은 스크립팅 OFF 파싱에선 무해해 보여도 라이브
+  // innerHTML 재삽입 시 재파싱돼 mXSS 로 되살아날 수 있어 함께 제거한다(심층방어).
   function sanitize(html) {
     var doc = new DOMParser().parseFromString(html, "text/html");
     var bad = doc.querySelectorAll(
-      "script,iframe,object,embed,link,meta,form,base,style");
+      "script,iframe,object,embed,link,meta,form,base,style," +
+      "noscript,svg,math,template");
     for (var i = 0; i < bad.length; i++) bad[i].remove();
     var all = doc.body.querySelectorAll("*");
     for (var j = 0; j < all.length; j++) {
@@ -56,9 +59,14 @@
       for (var a = 0; a < attrs.length; a++) {
         var name = attrs[a].name, val = attrs[a].value || "";
         if (/^on/i.test(name)) { el.removeAttribute(name); continue; }
-        if ((name === "href" || name === "src" || name === "xlink:href") &&
-            /^\s*(javascript|data|vbscript):/i.test(val)) {
-          el.removeAttribute(name);
+        if (name === "href" || name === "src" || name === "xlink:href") {
+          // 스킴 판정 전 제어문자(U+0000-U+0020: 탭·개행·CR·NUL 포함) 제거 정규화 —
+          // 브라우저는 URL 에서 이들을 무시하므로 `java<TAB>script:` 처럼 스킴 중간에
+          // 끼운 제어문자로 필터를 우회하는 벡터를 차단한다.
+          var scheme = val.replace(/[\u0000-\u0020]+/g, "");
+          if (/^(javascript|data|vbscript):/i.test(scheme)) {
+            el.removeAttribute(name);
+          }
         }
       }
     }

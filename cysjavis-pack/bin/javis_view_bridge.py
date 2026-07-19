@@ -42,6 +42,20 @@ REF_RE = re.compile(r"^[A-Za-z0-9_./~^@{}:\-]{1,200}$")
 # 콘솔 없는 부모가 띄울 때 새 콘솔 창 억제 (타 OS 무동작 · hud_bridge 관례).
 NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}
 
+# CSP — 악성 md 가 뷰어에서 스크립트 실행에 성공하더라도 심층방어로 피해 봉쇄:
+#   · script-src 'self'  : 인라인/외부 스크립트 차단(vendored·app.js 는 동일출처 허용)
+#   · connect-src 'self' : fetch/XHR/EventSource 를 loopback 사이드카로만 → 외부 exfil 봉쇄
+#   · default-src 'none' : 미명시 리소스 전면 차단(화이트리스트 방식)
+#   · style-src 'unsafe-inline' : hljs/mermaid 가 주입하는 인라인 <style> 허용(불가피)
+#   · img-src data: : marked 가 내보내는 data: 이미지 허용
+#   · base-uri/form-action 'none' : <base> 하이재킹·폼 전송 차단
+#   · frame-ancestors * : cys-terminal/Tauri 웹 pane 의 iframe 임베드 허용(loopback 한정)
+CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors *"
+)
+
 # 정적앱 확장자 → content-type (허용 목록 외 = octet-stream).
 CTYPES = {
     ".html": "text/html; charset=utf-8",
@@ -143,6 +157,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         # 읽기 전용 loopback 사이드카 — 교차출처 임베드/스크립트 표면 최소화.
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", CSP)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -288,6 +303,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", CSP)
         self.end_headers()
 
         def emit(obj):
