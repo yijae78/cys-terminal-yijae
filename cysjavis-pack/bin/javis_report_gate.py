@@ -479,6 +479,62 @@ def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso)
     return stalls
 
 
+def _death_warn(role):
+    return {
+        "trigger": "death",
+        "task": "gate-death-%s" % role,
+        "reason": "death:%s" % role,
+        "wake_body": "[gate] ⚠ death: %s 노드 사망 전이 감지 — 재기동·복구 판단 필요. "
+                     "기상절차: cys status --json 1콜." % role,
+        "evt_type": "agent.silent",
+        "evt_fields": {"agent": role, "silent_minutes": 0, "level": "critical"},
+        "idem": "gate-death-%s" % role,
+    }
+
+
+def build_death_warnings(old_snap, report, counters):
+    """alive→dead 전이를 시딩(전이)·확정(레벨) 2단계로 검출(DESIGN §3.3 v2.2·Sim R2 D-FIX-2/3).
+
+    스냅샷이 매 주기 전진하는 구조에서 '2연속 dead'를 성립시키려면 전이 단일 소스로는 불가하다(전이
+    검출은 차기 주기에 old_snap이 이미 dead라 영구 불성립 → death WARN 0회 회귀). 따라서:
+      - 시딩(전이): old_snap에서 alive였고 현재 dead → death_pending=1(무발화).
+      - 확정(레벨): death_pending에 오른 role은 old_snap이 아니라 **현재 report**에서 여전히 dead인지
+        재확인해 2회째에 WARN 1회 → "fired" sentinel(부활 전 재발화 차단).
+      - 부활 cleanup(독립): dead 기록 보유 role의 alive 재관측 시 death 발화와 무관하게 death_pending
+        소거 + idle_edge fresh armed(stale 쿨다운 미상속·D-FIX-3).
+    BASELINE·GAP 주기에서는 호출되지 않는다(조기 반환 — 재부팅 위양성 차단이 공짜로 확보됨).
+    """
+    death_pending = counters.setdefault("death_pending", {})
+    idle_edge = counters.setdefault("idle_edge", {})
+    prev = {n.get("role"): n for n in (old_snap.get("live_nodes") or []) if isinstance(n, dict)}
+    cur = {n.get("role"): n for n in (report.get("live_nodes") or []) if isinstance(n, dict)}
+
+    def dead_now(role):
+        n = cur.get(role)
+        return (n is None) or (n.get("agent_alive") is False)
+
+    prev_alive = {role for role, n in prev.items() if n.get("agent_alive") is True}
+    out = []
+    for role in set(death_pending) | prev_alive:
+        if not role:
+            continue
+        if role in death_pending:                       # 확정 단계(레벨 — old_snap 무관)
+            st = death_pending[role]
+            if not dead_now(role):                      # 부활 → D-FIX-3 독립 cleanup(발화와 무관)
+                del death_pending[role]
+                idle_edge[role] = {"armed": True, "last_fired": 0}   # fresh armed
+            elif st == "fired":
+                pass                                    # 발화 완료 — 부활까지 유지(재발화 금지)
+            elif isinstance(st, int) and st + 1 >= 2:
+                out.append(_death_warn(role))
+                death_pending[role] = "fired"
+            elif isinstance(st, int):
+                death_pending[role] = st + 1
+        elif role in prev_alive and dead_now(role):     # 시딩 단계(전이 — 무발화)
+            death_pending[role] = 1
+    return out
+
+
 # ─────────────────────────── 외부 명령 Runner(주입 가능) ───────────────────────────
 
 class Runner:
@@ -766,6 +822,7 @@ class Gate:
         # ── 분류 ──
         rearm_idle_edge(counters, report)                   # 활동 재개 role 엣지 재무장(§3.2)
         warns = extract_warnings(report, counters, now_epoch, self.edge_cooldown)
+        warns += build_death_warnings(old_snap, report, counters)   # 사망 엣지(§3.3)
         warns += build_stall_warnings(counters, report, self.cycle_minutes,
                                       self.stall_cycles, now_iso)
         delta_fields = diff_top_fields(old_snap, new_snap)

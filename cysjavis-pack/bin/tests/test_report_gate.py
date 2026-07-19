@@ -547,6 +547,93 @@ class IdleEdge(unittest.TestCase):
             self.assertEqual(r.enqueues, [])                          # 재-파도 0(미적용 시 4발화)
 
 
+class DeathEdge(unittest.TestCase):
+    """사망 엣지 WARN — 시딩/확정 분리·"fired" sentinel·부활 cleanup 독립(DESIGN §3.3 v2.2)."""
+
+    ALIVE = report(live_nodes=[{"role": "worker", "agent_alive": True, "idle_secs": 10}])
+    DEAD = report(live_nodes=[{"role": "worker", "agent_alive": False}])
+    GONE = report(live_nodes=[])
+
+    def _master_tasks(self, r):
+        return [task for _to, task, _r, _i in r.enqueues if _to == "master"]
+
+    # ── T8: alive→dead 전이 → death WARN 1회, 차기 주기 0회 ──
+    def test_t8_death_transition_fires_once(self):
+        with tempfile.TemporaryDirectory() as t:
+            gate(t, FakeRunner(rep=self.ALIVE)).run()                 # baseline alive
+            r1 = FakeRunner(rep=self.DEAD); gate(t, r1).run()         # 시딩(무발화)
+            self.assertEqual(self._master_tasks(r1), [])
+            r2 = FakeRunner(rep=self.DEAD); gate(t, r2).run()         # 확정 발화
+            e = ledger_entries(t)[-1]
+            self.assertEqual(e["verdict"], "WARN")
+            self.assertIn("gate-death-worker", self._master_tasks(r2))
+            self.assertTrue(any("death:worker" in x for x in e["reasons"]))
+            r3 = FakeRunner(rep=self.DEAD); gate(t, r3).run()         # "fired" → 재발화 0
+            self.assertEqual(self._master_tasks(r3), [])
+
+    # ── T9: surface 소멸(gone) → death WARN 1회 ──
+    def test_t9_surface_disappearance_fires_death(self):
+        with tempfile.TemporaryDirectory() as t:
+            gate(t, FakeRunner(rep=self.ALIVE)).run()
+            gate(t, FakeRunner(rep=self.GONE)).run()                  # 시딩
+            r = FakeRunner(rep=self.GONE); gate(t, r).run()           # 확정
+            e = ledger_entries(t)[-1]
+            self.assertEqual(e["verdict"], "WARN")
+            self.assertIn("gate-death-worker", self._master_tasks(r))
+
+    # ── T17: 사망 라이프사이클 — 시딩→확정 1회→"fired" 유지→부활 소거 ──
+    def test_t17_death_lifecycle_seed_confirm_fired_resurrect(self):
+        with tempfile.TemporaryDirectory() as t:
+            gate(t, FakeRunner(rep=self.ALIVE)).run()                 # baseline
+            gate(t, FakeRunner(rep=self.DEAD)).run()                  # 시딩
+            r_fire = FakeRunner(rep=self.DEAD); gate(t, r_fire).run() # 확정 1회
+            self.assertIn("gate-death-worker", self._master_tasks(r_fire))
+            self.assertEqual(_counters(t)["death_pending"]["worker"], "fired")
+            r_hold = FakeRunner(rep=self.DEAD); gate(t, r_hold).run() # "fired" 유지 → 0회
+            self.assertEqual(self._master_tasks(r_hold), [])
+            gate(t, FakeRunner(rep=self.ALIVE)).run()                 # 부활 → 상태 소거
+            self.assertNotIn("worker", _counters(t).get("death_pending", {}))
+
+    # ── T18: 사망→부활 cleanup(발화 독립)→fresh armed→idle 진입 시 엣지 1회 ──
+    def test_t18_resurrection_fresh_armed_then_edge(self):
+        with tempfile.TemporaryDirectory() as t:
+            gate(t, FakeRunner(rep=self.ALIVE)).run()                 # baseline
+            idle_rep = report(live_nodes=[{"role": "worker", "agent_alive": True, "idle_secs": 600}],
+                              idle_nodes=[{"role": "worker", "idle_secs": 600}])
+            gate(t, FakeRunner(rep=idle_rep)).run()                   # 엣지 1회 → disarm
+            gate(t, FakeRunner(rep=self.DEAD)).run()                  # 시딩
+            gate(t, FakeRunner(rep=self.DEAD)).run()                  # 확정 발화
+            gate(t, FakeRunner(rep=self.ALIVE)).run()                 # 부활 → fresh armed·death_pending 소거
+            self.assertTrue(_counters(t)["idle_edge"]["worker"]["armed"])
+            r = FakeRunner(rep=idle_rep); gate(t, r).run()            # 재-idle 진입 → 엣지 1회
+            self.assertIn("gate-idle-worker", [task for _to, task, _r, _i in r.enqueues])
+
+    # ── T19: 검증기 자체 검증 — "fired" sentinel 무력화 시 재발화 검출력 ──
+    def test_t19_death_refire_regression_is_detectable(self):
+        with tempfile.TemporaryDirectory() as t:
+            gate(t, FakeRunner(rep=self.ALIVE)).run()
+            gate(t, FakeRunner(rep=self.DEAD)).run()                  # 시딩
+            gate(t, FakeRunner(rep=self.DEAD)).run()                  # 확정 → "fired"
+            cpath = os.path.join(t, "counters.json")
+            c = json.load(open(cpath, encoding="utf-8"))
+            c["death_pending"]["worker"] = 1                          # 고의 파손: sentinel 되돌림
+            json.dump(c, open(cpath, "w", encoding="utf-8"))
+            r = FakeRunner(rep=self.DEAD); gate(t, r).run()
+            self.assertIn("gate-death-worker", self._master_tasks(r))  # 재발화 = 회귀 검출 가능
+
+    # ── T20: GAP 주기 중 사망 → 무발화(위양성 차단 트레이드오프 명문화) ──
+    def test_t20_death_during_gap_no_fire_by_design(self):
+        with tempfile.TemporaryDirectory() as t:
+            clk = Clock(1_000_000.0)
+            gate(t, FakeRunner(rep=self.ALIVE), clock=clk).run()      # baseline
+            clk.epoch += 16 * 60                                      # GAP
+            r = FakeRunner(rep=self.DEAD); gate(t, r, clock=clk).run()
+            e = ledger_entries(t)[-1]
+            self.assertEqual(e["verdict"], "GAP")
+            self.assertEqual(self._master_tasks(r), [])               # 사망 무발화(의도)
+            self.assertEqual(_counters(t).get("death_pending", {}), {})  # 시딩도 안 됨
+
+
 class ShadowChecker(unittest.TestCase):
     """javis_gate_check.py — 독립 키워드 규칙 검사기(producer≠evaluator)."""
     CHECK = os.path.join(BIN, "javis_gate_check.py")
