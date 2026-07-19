@@ -4103,6 +4103,58 @@ mod tests {
         assert_eq!(times.len(), 1, "창 밖 기록은 전부 제거된다");
     }
 
+    /// viewer.open dispatch 계약 핀(리뷰어1 F3 — '정직성' exit/에러 계약의 자동 커버리지).
+    /// 순수 판정부(viewer_rate_check)는 별도 테스트하고, 여기선 dispatch arm의 4계약을 박제한다:
+    /// ①빈 path=invalid_params ②reviewer 발신=acl_denied(caps fail-closed) ③정당 발신=published
+    /// +listeners 필드 존재 ④rate 창 초과=rate_limited. caps 게이트가 rate보다 선행이라 무권한
+    /// 발신자는 rate 창을 소비하지 못함(교차 DoS 차단)도 함께 확인된다.
+    #[test]
+    fn viewer_open_dispatch_contract() {
+        // 전역 rate 상태(VIEWER_OPEN_TIMES)는 프로세스 공유 — 이 테스트가 유일 소비자지만
+        // 순서 독립을 위해 진입 시 비운다(같은 모듈이라 private static 직접 접근 가능).
+        VIEWER_OPEN_TIMES
+            .get_or_init(|| std::sync::Mutex::new(Default::default()))
+            .lock()
+            .unwrap()
+            .clear();
+        let daemon = isolated_daemon();
+        // ① 빈 path → invalid_params
+        let r0 = dispatch(&daemon, Request { id: json!(1), method: "viewer.open".into(),
+            params: json!({"path": ""}) }, None);
+        let Reply::Single(resp0) = r0 else { panic!("single") };
+        assert_eq!(resp0["error"]["code"], json!("invalid_params"), "빈 path 거부: {resp0}");
+
+        // ② reviewer 발신 → acl_denied (WriteShell 부재·fail-closed)
+        let rev = make_surface(&daemon, Some("reviewer-codex"));
+        let rev_pid = 500_001;
+        bind_caller(&daemon, rev_pid, rev);
+        let rr = dispatch(&daemon, Request { id: json!(2), method: "viewer.open".into(),
+            params: json!({"path": "/tmp/x.md"}) }, Some(rev_pid));
+        let Reply::Single(respr) = rr else { panic!("single") };
+        assert_eq!(respr["error"]["code"], json!("acl_denied"), "reviewer 거부: {respr}");
+
+        // ③ 정당 발신(worker=full-trust) → published + listeners 필드
+        let wk = make_surface(&daemon, Some("worker"));
+        let wk_pid = 500_002;
+        bind_caller(&daemon, wk_pid, wk);
+        let rw = dispatch(&daemon, Request { id: json!(3), method: "viewer.open".into(),
+            params: json!({"path": "/tmp/x.md"}) }, Some(wk_pid));
+        let Reply::Single(respw) = rw else { panic!("single") };
+        assert_eq!(respw["ok"], json!(true), "정당 발신 성공: {respw}");
+        assert_eq!(respw["result"]["published"], json!(true));
+        assert!(respw["result"]["listeners"].is_number(), "listeners 필드: {respw}");
+
+        // ④ rate 창 초과 → rate_limited (③이 이미 1회 소비 · 창 8회이므로 7회 더 채운 뒤 초과)
+        for i in 0..7 {
+            let _ = dispatch(&daemon, Request { id: json!(100 + i), method: "viewer.open".into(),
+                params: json!({"path": "/tmp/x.md"}) }, Some(wk_pid));
+        }
+        let rlast = dispatch(&daemon, Request { id: json!(200), method: "viewer.open".into(),
+            params: json!({"path": "/tmp/x.md"}) }, Some(wk_pid));
+        let Reply::Single(resplast) = rlast else { panic!("single") };
+        assert_eq!(resplast["error"]["code"], json!("rate_limited"), "9회째 rate 거부: {resplast}");
+    }
+
     /// CC v2 WS-C: learn.checkpoint 코어 — rounds 병합·discovery 치환·ledger append·
     /// 파손 state.json 내성(fail-open)·learn.status 읽기 스키마와의 정합 핀.
     #[test]
