@@ -1472,12 +1472,14 @@ class Preflight:
                 #   (split-brain)시키므로 배선이 필수다. 멱등(2회차엔 이미 포함 → PASS).
                 cmd = j.get("command") or ""
                 expected_prefix = 'CYS_REPORT_GATE_DIR="%s" ' % gate_state_dir_for_pack(pack_dir())
-                # 존재 검사가 아니라 **값 정합** 검사(FIX-2): 프리픽스가 있어도 값이 팩 파생 기대값과
-                #   다르면(예: 본사값이 bake된 게이트 잡이 dept 팩에 든 install-before-seed 창) 교정한다 —
-                #   잘못된 값 프리픽스만 제거 후 기대값으로 재삽입(나머지 토큰 전부 보존)·백업·재파스·멱등.
-                if not cmd.startswith(expected_prefix):
-                    stripped = re.sub(r'^CYS_REPORT_GATE_DIR=(?:"[^"]*"|\S+)\s+', '', cmd)
-                    had_prefix = stripped != cmd
+                # 값 정합 검사(FIX-2) + 전역 스트립 강화(FIX-5): 선두 앵커(^)가 아니라 command 내 **모든**
+                #   CYS_REPORT_GATE_DIR=... 출현을 제거한 뒤 기대값 1개를 선두 재삽입한다. 비선두 오염·이중
+                #   env(셸 last-wins 오값)·선두정합+후미오염의 startswith false-PASS를 봉쇄한다. 다른 env
+                #   프리픽스(JAVIS_ROOT= 등)·기존 토큰은 보존. 정합 조건 = 선두 기대값 AND 출현 정확히 1회.
+                occ = len(re.findall(r'CYS_REPORT_GATE_DIR=', cmd))
+                if not (cmd.startswith(expected_prefix) and occ == 1):
+                    stripped = re.sub(r'CYS_REPORT_GATE_DIR=(?:"[^"]*"|\S+)\s*', '', cmd).lstrip()
+                    had_prefix = occ > 0
                     new_cmd = expected_prefix + stripped
                     if self.fix:
                         try:

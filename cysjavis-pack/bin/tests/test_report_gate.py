@@ -975,6 +975,46 @@ class C16ReportScheduleGate(unittest.TestCase):
             res2, _ = self._c16(deptpack, after["jobs"], fix=True)
             self.assertEqual(res2["status"], "PASS", res2)
 
+    # ── FIX-5: 비선두 오염 command → 전역 스트립·기대값 1개 선두 재삽입·타 env 보존·멱등 ──
+    def test_fix5_non_leading_pollution_globally_stripped(self):
+        with tempfile.TemporaryDirectory() as base:
+            deptpack = os.path.join(base, "pack-dept-dept-1")
+            os.makedirs(deptpack)
+            # CYS_REPORT_GATE_DIR가 선두가 아니고(JAVIS_ROOT 뒤) 본사값으로 오염된 command
+            polluted = ('JAVIS_ROOT="/x" CYS_REPORT_GATE_DIR="$HOME/.cys/state/report_gate" python3 '
+                        '"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py" run --shadow')
+            job = {"id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
+                   "command": polluted, "if_absent": "skip"}
+            res, after = self._c16(deptpack, [dict(job)], fix=True)
+            self.assertEqual(res["status"], "FIXED", res)
+            cmd = after["jobs"][0]["command"]
+            self.assertEqual(cmd.count("CYS_REPORT_GATE_DIR"), 1)                 # 정확히 1개
+            self.assertTrue(cmd.startswith('CYS_REPORT_GATE_DIR="$HOME/.cys/state/report_gate-dept-1"'), cmd)  # 선두·dept값
+            self.assertIn('JAVIS_ROOT="/x"', cmd)                                 # 타 env 프리픽스 보존
+            self.assertTrue(cmd.rstrip().endswith("run --shadow"))               # 후행 토큰 보존
+            res2, _ = self._c16(deptpack, after["jobs"], fix=True)               # 멱등
+            self.assertEqual(res2["status"], "PASS", res2)
+
+    # ── FIX-5: 선두 정합 + 후미 오염(이중 env) → startswith false-PASS 봉쇄 ──
+    def test_fix5_leading_correct_plus_trailing_pollution_not_false_pass(self):
+        with tempfile.TemporaryDirectory() as base:
+            deptpack = os.path.join(base, "pack-dept-dept-1")
+            os.makedirs(deptpack)
+            # 선두는 올바른 dept값이나 뒤에 본사값이 또 붙은 이중 env(셸 last-wins 오값 위험)
+            dbl = ('CYS_REPORT_GATE_DIR="$HOME/.cys/state/report_gate-dept-1" '
+                   'CYS_REPORT_GATE_DIR="$HOME/.cys/state/report_gate" python3 '
+                   '"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py" run')
+            job = {"id": "owner-progress-gate-5min", "every_minutes": 5, "action": "command",
+                   "command": dbl, "if_absent": "skip"}
+            # report 모드: 선두 정합이어도 occ==2 → 정합 아님 → FAIL(false-PASS 봉쇄)
+            res0, _ = self._c16(deptpack, [dict(job)])
+            self.assertEqual(res0["status"], "FAIL", res0)
+            res, after = self._c16(deptpack, [dict(job)], fix=True)
+            self.assertEqual(res["status"], "FIXED", res)
+            cmd = after["jobs"][0]["command"]
+            self.assertEqual(cmd.count("CYS_REPORT_GATE_DIR"), 1)                 # 이중 제거
+            self.assertTrue(cmd.startswith('CYS_REPORT_GATE_DIR="$HOME/.cys/state/report_gate-dept-1"'), cmd)
+
 
 class C71GateGuardBehavior(unittest.TestCase):
     """c71 게이트 가드 행동 회귀 — 가드 포함 게이트에 대해 PASS(DESIGN §3.7)."""
