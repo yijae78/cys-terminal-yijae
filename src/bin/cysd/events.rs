@@ -88,6 +88,12 @@ impl EventBus {
         self.tx.subscribe()
     }
 
+    /// 라이브 구독자 수(GUI 포워더 + cys events 합산 — GUI 단독 식별은 불가한 근사).
+    /// 0 = 구독자 전무 확정 → push형 이벤트(viewer.open 등)는 어디에도 표시되지 않는다.
+    pub fn listeners(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
     pub fn replay_after(&self, after_seq: u64) -> Vec<Value> {
         let inner = self.inner.lock().unwrap();
         inner

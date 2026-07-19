@@ -23,6 +23,7 @@ import {
   makeWebNode,
   viewerAppUrl,
   extractViewerPath,
+  decideViewerOpen,
   loadPersistedLayout,
   persistLayout,
   collectWebWids,
@@ -2286,8 +2287,11 @@ function closeWebPane(wid: number) {
   if (first != null) setFocus(first);
 }
 
-// 개발자 진입점 — 파일 경로를 뷰어 web pane으로 연다(포커스 pane 우측 분할). window.cysOpenViewer 노출.
-async function openViewerPane(path: string): Promise<void> {
+// 파일 경로를 뷰어 web pane으로 연다(포커스 pane 우측 분할). 진입 2경로:
+// ① 개발자 — window.cysOpenViewer(devtools 전용, focus=true 유지)
+// ② viewer.open 데몬 이벤트(cys view) — focus=false: 포커스 강탈 금지 원칙(approval.request의
+//    "자동 화면전환 없음"과 정합 — pane은 배경 생성, 알림은 toast로만).
+async function openViewerPane(path: string, focus = true): Promise<void> {
   const ws = current();
   if (!ws || ws.pending) return;
   const wid = webWidCounter++;
@@ -2296,7 +2300,7 @@ async function openViewerPane(path: string): Promise<void> {
   makeWebPane(node);
   ws.tree = ws.tree ? { type: "split", dir: "row", a: ws.tree, b: node } : node;
   render();
-  focusWebPane(wid);
+  if (focus) focusWebPane(wid);
 }
 (window as unknown as { cysOpenViewer: (p: string) => Promise<void> }).cysOpenViewer = openViewerPane;
 
@@ -5213,6 +5217,41 @@ function onDaemonEvent(event: Record<string, unknown>) {
   }
   if (name === "osc.notify") {
     toast("osc", `🔔 ${payload.title ?? "알림"}`, `surface:${sid} — ${String(payload.body ?? "").slice(0, 120)}`);
+    return;
+  }
+
+  if (name === "viewer.open") {
+    // cys view → 뷰어 web pane. 포커스 강탈 금지(approval.request의 "자동 화면전환 없음"과 정합):
+    // pane은 배경 생성(focus=false), 가시화는 toast로만. 발신자 caps 게이트·rate-limit은 데몬이
+    // 이미 통과시킨 이벤트다. 열리는 워크스페이스는 의도적으로 current()(사람이 보는 곳) —
+    // 발신 부서 ws로의 라우팅(approval류 socketForSlug)과 다른 선택임을 명시해 둔다: 뷰어의
+    // 목적이 "사람에게 산출물을 보여주기"라 사람의 현재 시야가 귀속처다.
+    const vpath = String(payload.path ?? "");
+    const ws = current();
+    const decision = decideViewerOpen({
+      path: vpath,
+      existingPaths: Array.from(webPanes.values(), (v) => extractViewerPath(v.node.url)),
+      paneCount: webPanes.size,
+      maxPanes: 8,
+      // stale 게이트: 데몬 재접속 replay가 과거 viewer.open을 되살려 스테일 pane이 뒤늦게 뜨는
+      // 창을 닫는다(이벤트 timestamp = 버스 발행 epoch).
+      eventEpoch: Number(event.timestamp ?? 0),
+      nowEpoch: Date.now() / 1000,
+      maxAgeSecs: 30,
+      wsReady: !!ws && !ws.pending,
+    });
+    if (decision === "open") {
+      openViewerPane(vpath, false);
+      toast("viewer", "📄 뷰어 열림", vpath);
+    } else if (decision === "not-ready") {
+      // 무음 드롭 금지 — cys view는 성공(exit 0)했는데 화면에 아무것도 없는 상태를 만들지 않는다.
+      toast("viewer", "뷰어 열기 보류", "워크스페이스 준비 중 — 잠시 후 다시 시도");
+    } else if (decision === "dup") {
+      toast("viewer", "이미 열려 있음", vpath);
+    } else if (decision === "cap") {
+      toast("viewer", "뷰어 pane 상한(8)", "기존 뷰어를 닫고 다시 시도");
+    }
+    // stale은 무음 무시가 의도 — 사용자가 지금 요청한 것이 아니라 과거 replay다.
     return;
   }
 

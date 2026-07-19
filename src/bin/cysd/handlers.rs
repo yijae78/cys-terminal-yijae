@@ -400,6 +400,40 @@ fn check_caps_gate(
     ))
 }
 
+/// viewer.open 발행 rate-limit 순수 판정부(테스트 대상) — 창(window) 내 상한 초과 거부.
+/// 슬라이딩 창: 창 밖으로 밀린 기록을 버리고, 상한 미만일 때만 기록 후 허용한다.
+/// 이벤트 폭탄(→ pane 홍수·사이드카 커넥션 폭발) 차단이 목적 — 정상 사용(단발 열람)은 무영향.
+fn viewer_rate_check(
+    times: &mut std::collections::VecDeque<std::time::Instant>,
+    now: std::time::Instant,
+    window: std::time::Duration,
+    max: usize,
+) -> bool {
+    while times.front().is_some_and(|t| now.duration_since(*t) > window) {
+        times.pop_front();
+    }
+    if times.len() >= max {
+        return false;
+    }
+    times.push_back(now);
+    true
+}
+
+/// viewer.open 전역 rate 상태 — 10초 창 8회. 데몬 프로세스 수명 동안 유지(재시작 시 초기화 무해).
+static VIEWER_OPEN_TIMES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+fn viewer_open_allowed(now: std::time::Instant) -> bool {
+    let m = VIEWER_OPEN_TIMES.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    viewer_rate_check(
+        &mut m.lock().unwrap(),
+        now,
+        std::time::Duration::from_secs(10),
+        8,
+    )
+}
+
 /// T3-13 타이핑 가드 창 (초). 0 = 비활성.
 fn typing_guard_secs() -> u64 {
     std::env::var("CYS_TYPING_GUARD_SECS")
@@ -2765,6 +2799,48 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "state": state})))
         }
 
+        // ─── 뷰어 web pane 열기 (cys view → GUI 배경 pane) ───
+        // 데몬 내부 버스 이벤트다 — 팩 도구 EVT 계약(javis_event.py·_round/EVENT_CONTRACT.md)과는
+        // 별개 층이므로 그 enum에 등재하지 않는다(층 혼동 방지).
+        // 경로 실재·파일 여부는 CLI(cys view)가 publish 전에 게이트하고, 허용 루트 판정은
+        // 사이드카(javis_view_bridge.py within_roots)에 위임한다(allowlist 이중화=드리프트 위험).
+        "viewer.open" => {
+            let Some(path) = param_str(&params, "path").filter(|p| !p.is_empty()) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing path"));
+            };
+            // 화면 변형 게이트: pane 생성은 오퍼레이터 화면을 바꾸는 행위 — mutation-class로
+            // 취급한다(WriteShell = full-trust 프록시. 전용 Cap 신설은 caps 직렬화 파장이 있어
+            // 보류). reviewer/planner·미해석 발신(외부 셸 등)은 fail-closed 거부되고
+            // check_caps_gate가 acl.denied 감사 이벤트를 남긴다.
+            if let Err(e) =
+                check_caps_gate(daemon, caller_pid, crate::caps::Cap::WriteShell, "viewer.open")
+            {
+                return Reply::Single(err_response(&id, "acl_denied", &e));
+            }
+            if !viewer_open_allowed(std::time::Instant::now()) {
+                return Reply::Single(err_response(
+                    &id,
+                    "rate_limited",
+                    "viewer.open rate limit (8/10s) — pane 홍수 차단",
+                ));
+            }
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            daemon.bus.publish(
+                "viewer.open",
+                "viewer",
+                caller_sid,
+                json!({"path": path,
+                       "caller_surface": caller_sid.map(surface_ref),
+                       "caller_pid": caller_pid}),
+            );
+            // listeners = 라이브 구독자 수(GUI 포워더+cys events 근사). 0이면 표시 불가 확정 —
+            // CLI가 exit≠0으로 정직하게 알린다(발행 성공≠표시 성공).
+            Reply::Single(ok_response(
+                &id,
+                json!({"published": true, "listeners": daemon.bus.listeners()}),
+            ))
+        }
+
         // ─── ⑪ pack-reinject 마커 단일 write path: 주입 성공 직후 컨트롤러가 호출 ───
         // status.set(자기보고) 확장이 아닌 전용 RPC다. 노드 자기보고로는 갱신 불가 —
         // pack-update/reinject 컨트롤러(cysd-매개 발신)가 surface_id·pack_version·directive_hash로
@@ -4004,6 +4080,28 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// viewer.open rate-limit 핀 — ①상한 내 허용 ②상한 도달 거부 ③창 경과 후 재허용.
+    /// 거부는 기록을 남기지 않는다(거부 폭주가 창을 연장해 영구 잠금되는 결함 방지).
+    #[test]
+    fn viewer_rate_check_sliding_window() {
+        use std::time::{Duration, Instant};
+        let mut times = std::collections::VecDeque::new();
+        let t0 = Instant::now();
+        let win = Duration::from_secs(10);
+        // ① 상한(3)까지 허용
+        assert!(viewer_rate_check(&mut times, t0, win, 3));
+        assert!(viewer_rate_check(&mut times, t0 + Duration::from_secs(1), win, 3));
+        assert!(viewer_rate_check(&mut times, t0 + Duration::from_secs(2), win, 3));
+        // ② 상한 도달 → 거부 (기록 미추가)
+        assert!(!viewer_rate_check(&mut times, t0 + Duration::from_secs(3), win, 3));
+        assert_eq!(times.len(), 3, "거부는 기록을 남기지 않는다");
+        // ③ 첫 기록(t0)이 창 밖으로 밀리면 재허용
+        assert!(viewer_rate_check(&mut times, t0 + Duration::from_secs(11), win, 3));
+        // ④ 전부 창 밖 → 비우고 재허용 (남는 기록은 방금 push한 1개뿐)
+        assert!(viewer_rate_check(&mut times, t0 + Duration::from_secs(60), win, 3));
+        assert_eq!(times.len(), 1, "창 밖 기록은 전부 제거된다");
+    }
 
     /// CC v2 WS-C: learn.checkpoint 코어 — rounds 병합·discovery 치환·ledger append·
     /// 파손 state.json 내성(fail-open)·learn.status 읽기 스키마와의 정합 핀.

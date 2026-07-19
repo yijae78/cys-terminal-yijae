@@ -98,6 +98,12 @@ enum Command {
         #[arg(long)]
         surface: Option<String>,
     },
+    /// 산출물을 GUI 뷰어 web pane으로 열기 (md/diff 렌더 · 허용 루트 한정 · cys pane 안에서만 —
+    /// full-trust 역할 필요, reviewer/외부 셸은 거부. GUI 미기동 시 exit 3)
+    View {
+        /// 렌더할 파일 경로 (절대/상대 — 실재하는 파일이어야 함)
+        path: String,
+    },
     /// T5 사용량 관측: 이 세션의 트랜스크립트 경로를 pane에 등록 (SessionStart hook 전용 plumbing)
     UsageRegister {
         /// 세션 트랜스크립트 절대경로 (.jsonl)
@@ -1576,6 +1582,26 @@ fn run(command: Command) -> i32 {
                 .map(|_| println!("OK"))
             })
         }
+
+        Command::View { path } => (|| -> Result<(), String> {
+            // 실재 게이트: 없는 경로·디렉토리는 여기서 즉시 실패 — 오류가 pane 안으로 숨지 않게
+            // (reveal_path와 동형). canonicalize가 상대경로·심볼릭 링크를 절대 실경로로 해소한다.
+            // 허용 루트 판정은 사이드카(within_roots)에 위임 — allowlist 이중화=드리프트 위험.
+            let abs = std::fs::canonicalize(&path)
+                .map_err(|e| format!("경로 열기 실패: {path} — {e}"))?;
+            if !abs.is_file() {
+                return Err(format!("파일이 아님(디렉토리?): {}", abs.display()));
+            }
+            let reply = request("viewer.open", json!({"path": abs.to_string_lossy()}))?;
+            let listeners = reply.get("listeners").and_then(|v| v.as_u64()).unwrap_or(0);
+            if listeners == 0 {
+                // 발행 성공 ≠ 표시 성공: 구독자 0 = GUI 포워더 부재 확정 → pane은 뜨지 않았다.
+                eprintln!("발행됐으나 구독자 0 — GUI(cys.app) 미기동으로 표시되지 않음");
+                std::process::exit(3);
+            }
+            println!("OK → viewer.open ({})", abs.display());
+            Ok(())
+        })(),
 
         Command::UsageRegister { transcript, surface } => {
             target_surface(&surface, &None).and_then(|sid| {

@@ -38,6 +38,29 @@ export function extractViewerPath(url: string): string | null {
   }
 }
 
+// viewer.open 데몬 이벤트 판정 — DOM 무의존 순수 판정부(main.ts 핸들러가 소비, bun test 대상).
+// not-ready: 워크스페이스 미준비(pending) — 무음 드롭 금지, 호출측이 toast로 알린다.
+// stale: 데몬 재접속 replay가 과거 viewer.open을 되살리는 창 차단 — maxAgeSecs 초과 이벤트 무시.
+// dup: 같은 경로 pane 존재 — 새로 만들지 않는다(중복 pane·이벤트 증폭 방지).
+// cap: 뷰어 pane 총량 상한 — pane 홍수의 UI측 방벽(데몬 rate-limit의 짝).
+export type ViewerOpenDecision = "open" | "dup" | "cap" | "stale" | "not-ready";
+export function decideViewerOpen(args: {
+  path: string;
+  existingPaths: (string | null)[];
+  paneCount: number;
+  maxPanes: number;
+  eventEpoch: number;
+  nowEpoch: number;
+  maxAgeSecs: number;
+  wsReady: boolean;
+}): ViewerOpenDecision {
+  if (!args.wsReady) return "not-ready";
+  if (args.nowEpoch - args.eventEpoch > args.maxAgeSecs) return "stale";
+  if (args.existingPaths.includes(args.path)) return "dup";
+  if (args.paneCount >= args.maxPanes) return "cap";
+  return "open";
+}
+
 // 레이아웃 트리에서 web 노드 wid를 전부 수집(순수 walk — DOM 무의존). teardown/복원 경로가
 // 이걸로 dispose 대상을 뽑는다. split은 양쪽 재귀, pane(터미널 sid)·null은 건너뛴다.
 export function collectWebWids(node: any, out: number[] = []): number[] {

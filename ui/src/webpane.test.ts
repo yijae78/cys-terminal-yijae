@@ -11,6 +11,7 @@ import {
   makeWebNode,
   viewerAppUrl,
   extractViewerPath,
+  decideViewerOpen,
   loadPersistedLayout,
   persistLayout,
   collectWebWids,
@@ -192,5 +193,52 @@ describe("보조 — URL 조립·경로 회수 왕복", () => {
   });
   it("extractViewerPath는 비URL에 null", () => {
     expect(extractViewerPath("not a url")).toBeNull();
+  });
+});
+
+describe("viewer.open 이벤트 판정 — decideViewerOpen", () => {
+  const base = {
+    path: "/r/_round/report.md",
+    existingPaths: [] as (string | null)[],
+    paneCount: 0,
+    maxPanes: 8,
+    eventEpoch: 1000,
+    nowEpoch: 1001,
+    maxAgeSecs: 30,
+    wsReady: true,
+  };
+  it("정상 이벤트는 open", () => {
+    expect(decideViewerOpen(base)).toBe("open");
+  });
+  it("워크스페이스 미준비(pending)는 not-ready — 무음 드롭 금지의 전제", () => {
+    expect(decideViewerOpen({ ...base, wsReady: false })).toBe("not-ready");
+  });
+  it("maxAgeSecs 초과 이벤트는 stale — 재접속 replay의 스테일 pane 부활 차단", () => {
+    expect(decideViewerOpen({ ...base, eventEpoch: 1000, nowEpoch: 1031 })).toBe("stale");
+    // 경계: 정확히 maxAgeSecs까지는 유효
+    expect(decideViewerOpen({ ...base, eventEpoch: 1000, nowEpoch: 1030 })).toBe("open");
+  });
+  it("같은 경로 pane이 이미 있으면 dup — 중복 pane 미생성", () => {
+    expect(
+      decideViewerOpen({ ...base, existingPaths: ["/other.md", "/r/_round/report.md"], paneCount: 2 }),
+    ).toBe("dup");
+    // extractViewerPath 실패분(null)이 섞여도 판정은 무사하다
+    expect(decideViewerOpen({ ...base, existingPaths: [null, "/other.md"], paneCount: 2 })).toBe("open");
+  });
+  it("pane 총량 상한 도달 시 cap — pane 홍수의 UI측 방벽", () => {
+    expect(decideViewerOpen({ ...base, paneCount: 8 })).toBe("cap");
+  });
+  it("판정 우선순위: not-ready > stale > dup > cap", () => {
+    const all = {
+      ...base,
+      wsReady: false,
+      nowEpoch: 9999,
+      existingPaths: [base.path],
+      paneCount: 8,
+    };
+    expect(decideViewerOpen(all)).toBe("not-ready");
+    expect(decideViewerOpen({ ...all, wsReady: true })).toBe("stale");
+    expect(decideViewerOpen({ ...all, wsReady: true, nowEpoch: 1001 })).toBe("dup");
+    expect(decideViewerOpen({ ...all, wsReady: true, nowEpoch: 1001, existingPaths: [] })).toBe("cap");
   });
 });
