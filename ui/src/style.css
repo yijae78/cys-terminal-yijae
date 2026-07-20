@@ -39,9 +39,10 @@ html, body {
   padding: 3px 10px; cursor: pointer; font-size: 12px;
 }
 #topbar button:hover { border-color: var(--accent); }
-/* 오너 지시(2026-07-20): 재시작 = 파괴적 동작이므로 붉은 경고색으로 명확히 구분(새로고침 ↻와 혼동 방지). */
-#btn-restart-daemon { color: #ff5252; border-color: rgba(239, 68, 68, .5); font-weight: 700; }
-#btn-restart-daemon:hover { color: #fff; border-color: #ff5252; background: rgba(239, 68, 68, .18); }
+/* 오너 지시(2026-07-20): 재시작 = 파괴적 동작이므로 붉은 경고색으로 명확히 구분(새로고침 ↻와 혼동 방지).
+   ★선택자 우선순위: '#topbar button'(1,0,1)를 이기려면 id 2개(#topbar #btn-restart-daemon = 2,0,0) 필요. */
+#topbar #btn-restart-daemon { color: #ff5252; border-color: rgba(239, 68, 68, .55); font-weight: 700; }
+#topbar #btn-restart-daemon:hover { color: #fff; border-color: #ff5252; background: rgba(239, 68, 68, .2); }
 .badge {
   display: inline-block; min-width: 16px; padding: 0 4px;
   border-radius: 8px; background: var(--error); color: #fff;
