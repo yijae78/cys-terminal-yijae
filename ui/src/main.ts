@@ -1954,6 +1954,21 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     // 브라우저 네이티브 paste 이벤트가 발화되고 아래 paste 리스너가 클립보드를 PTY로 보낸다.
     // (WebView2에서 xterm 기본 붙여넣기가 안 먹던 문제 — permission 불요의 clipboardData 경로.)
     if ((e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V")) return false;
+    // ★복사(오너 2026-07-20): 터미널 선택 텍스트를 클립보드로. xterm 기본은 선택→복사 자동 안 함.
+    //   Ctrl/Cmd+C = 선택이 있으면 복사(없으면 SIGINT 통과 — 실행 중단 보존) · Ctrl/Cmd+Shift+C = 복사 전용.
+    //   term.getSelection()은 한글(CJK)·영어 무관 정확한 유니코드 반환. copyToClipboard=execCommand 폴백(WebView2 권한 우회).
+    if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "C")) {
+      const selText = term.getSelection();
+      if (selText) {
+        if (e.type === "keydown") {
+          copyToClipboard(selText);
+          term.clearSelection();
+        }
+        return false; // 복사 = xterm에 안 넘김(SIGINT 미전송)
+      }
+      if (e.shiftKey) return false; // 무선택 Ctrl+Shift+C = no-op
+      return true; // 무선택 Ctrl+C = SIGINT 통과(기존 동작 보존)
+    }
     // ★Shift+Enter = 줄바꿈(오너 요청 2026-07-12): Option/Alt+Enter가 보내는 것과 동일한
     // 바이트(ESC+CR)를 PTY로 전송 — claude 등 CLI가 meta-Enter로 해석해 프롬프트에 개행 삽입.
     // mac·Windows 공통(플랫폼 분기 불요). keydown에서만 전송하고 keypress/keyup은 흡수해 이중 전송 방지.
@@ -4100,6 +4115,27 @@ function copyPath(s: string) {
   };
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(s).then(() => toast("feed", "경로 복사됨", s), fallback);
+  } else fallback();
+}
+
+// 터미널 선택 텍스트 복사(오너 2026-07-20) — copyPath와 동일한 WebView2 권한우회(execCommand 폴백).
+// 한글(CJK)·영어 무관 term.getSelection()의 유니코드 문자열을 그대로 클립보드로.
+function copyToClipboard(s: string) {
+  if (!s) return;
+  const preview = s.length > 60 ? s.slice(0, 57) + "…" : s;
+  const fallback = () => {
+    const ta = document.createElement("textarea");
+    ta.value = s;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    toast(ok ? "feed" : "watchdog", ok ? "복사됨" : "복사 실패", ok ? preview : "클립보드 접근 거부");
+  };
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(s).then(() => toast("feed", "복사됨", preview), fallback);
   } else fallback();
 }
 
