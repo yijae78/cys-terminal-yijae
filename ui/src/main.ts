@@ -2314,6 +2314,11 @@ async function manualRefresh() {
     if (ccOpen) refreshControlCenter();
     void checkVersionSkew();
     void renderAppVersion();
+    // 오너 지시(2026-07-20): 새로고침이 실행됐음을 명확히 알 수 있게 완료 표시.
+    // ↻ 버튼 회전(.spin)은 미묘해 인지 어려움 → 눈에 띄는 토스트를 병행한다.
+    toast("watchdog", "🔄 새로고침 완료", "노드 상태·pane 제목·버전을 다시 읽었습니다.");
+  } catch (e) {
+    toast("health", "새로고침 실패", String(e));
   } finally {
     manualRefreshing = false;
   }
