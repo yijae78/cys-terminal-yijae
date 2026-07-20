@@ -3475,12 +3475,19 @@ async function promptBinaryPatch() {
     return;
   }
   const v = updateAvailable.version;
+  // 오너 지시(2026-07-20): "설치 여부"뿐 아니라 "무엇이 업데이트되는지"도 보여준다 —
+  // check_update가 반환한 릴리스 변경 내용(notes=GitHub release body)을 모달 상세 블록에 표시.
+  const notes = updateAvailable.notes?.trim();
+  const changelog = notes
+    ? `📋 이번 업데이트 변경 내용 (v${v})\n\n${notes}`
+    : "📋 변경 내용 정보가 제공되지 않았습니다 (릴리스 노트 없음).";
   const ok = await confirmModal(
     `새 본체 버전 ${v} — 패치 설치`,
     `새 본체(앱) ${v}을 패치 방식으로 설치합니다: 저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 ` +
       `재시작합니다. 부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 ` +
       `있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)`,
     "설치",
+    changelog,
   );
   if (!ok) return;
   try {
@@ -4053,16 +4060,23 @@ async function openPalette() {
 
 // ★확인 버튼 라벨 매개변수화(오너 2026-07-15 실보고): 업데이트 창용 "설치" 하드코딩이 모든
 // 확인 창에 노출(완전 삭제 창의 확인 버튼이 "설치"로 표시). 호출부가 동작 동사를 지정한다.
-function confirmModal(title: string, body: string, yesLabel = "확인"): Promise<boolean> {
+function confirmModal(title: string, body: string, yesLabel = "확인", details?: string): Promise<boolean> {
   return new Promise((resolve) => {
     const ov = document.createElement("div");
     ov.className = "modal-overlay";
     ov.innerHTML =
       `<div class="modal"><h3></h3><p></p>` +
+      `<div class="modal-details" hidden></div>` +
       `<div class="modal-btns"><button class="modal-no">아니오</button>` +
       `<button class="modal-yes"></button></div></div>`;
     (ov.querySelector("h3") as HTMLElement).textContent = title;
     (ov.querySelector("p") as HTMLElement).textContent = body;
+    // 선택적 상세 블록(예: 업데이트 변경 내용/changelog) — 있으면 스크롤 가능한 박스로 표시.
+    const det = ov.querySelector(".modal-details") as HTMLElement;
+    if (details && details.trim()) {
+      det.textContent = details;
+      det.hidden = false;
+    }
     (ov.querySelector(".modal-yes") as HTMLElement).textContent = yesLabel;
     const done = (v: boolean) => {
       ov.remove();

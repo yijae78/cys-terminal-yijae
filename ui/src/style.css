@@ -518,6 +518,14 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 }
 .modal h3 { margin: 0 0 10px; font-size: 15px; }
 .modal p { margin: 0 0 18px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; color: var(--fg); }
+/* 업데이트 변경 내용 등 상세 블록 — 긴 changelog는 박스 내부에서 스크롤(모달 폭발 방지) */
+.modal-details {
+  margin: 0 0 18px; padding: 10px 12px; max-height: 240px; overflow-y: auto;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+  color: var(--fg); font-family: ui-monospace, "JetBrains Mono", Consolas, monospace;
+}
+.modal-details[hidden] { display: none; }
 .modal-btns { display: flex; gap: 10px; justify-content: flex-end; }
 .modal-btns button {
   padding: 7px 16px; border-radius: 6px; border: 1px solid var(--border);
