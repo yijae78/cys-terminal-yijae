@@ -14,7 +14,11 @@
 상태 저장: $JAVIS_ROOT/_round/tasks/<id>.json (쓰기는 temp+os.replace 원자적)
 락:        $JAVIS_ROOT/_round/tasks/<id>.lock/ (디렉터리 = mkdir 원자성) + owner.json
 
-exit codes: 0 ok · 2 usage · 3 not found · 4 blocked · 8 duplicate origin · 9 conflict(409)
+exit codes: 0 ok · 2 usage · 3 not found · 4 blocked · 5 no evidence(W0-3) · 8 duplicate origin · 9 conflict(409)
+
+T0a(2026-07-13 · attention-p0 승인): W0-3 evidence 게이트·W2-1 전이표·W1-2 handoff 리마인더를
+omc-w2 라인에서 이식 복원 — 문서화된 운영 계약(CLAUDE.md)과 라이브 코드의 분기 봉합.
+버전CAS·lease renew·서킷 등 W2 심층 기능 재통합은 T0b(후속 티켓) 범위.
 """
 # 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
 import os, sys
@@ -36,8 +40,10 @@ TASKS_DIR = os.path.join(ROOT, "_round", "tasks")
 STATUSES = ["backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"]
 OPEN_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"]
 TERMINAL_STATUSES = ["done", "cancelled"]
+TERMINAL_FROM = ("in_progress", "in_review")  # W2-1 전이표: 터미널 전이 허용 출발 상태(T0a 이식)
 
 EXIT_OK, EXIT_USAGE, EXIT_NOTFOUND, EXIT_BLOCKED, EXIT_DUP, EXIT_CONFLICT = 0, 2, 3, 4, 8, 9
+EXIT_NO_EVIDENCE = 5  # W0-3: done 전이에 증거 부재(T0a 이식 · 기존 exit 체계와 무충돌)
 
 
 def _now():
@@ -438,6 +444,21 @@ def cmd_set_status(a):
     # ★G6: done은 완료 하한선 통과 후에만 — 오종결이 의존자 unblock(:308)을 조기 발화하는
     #   경로를 닫는다. owner 없는(체크아웃 이력 없는) 태스크는 안착 대상이 없어 게이트 생략.
     #   ★WP-8(P-ORCH): 최대 settle sleep 은 wlock '밖'에서 — 락 장기점유·타임아웃을 피한다.
+    # W0-3 evidence 게이트(T0a 이식 — omc-w2 라인): done 전이는 --evidence 또는 --skip-reason 필수.
+    # 인자만 보는 즉시 검사라 settle 프로브(sleep 동반)보다 먼저 — cheap-first(성찰 D3).
+    # 기본 strict, CYS_TASK_EVIDENCE_GATE=warn|off 안전밸브.
+    ev_text = (getattr(a, "evidence", None) or "").strip()
+    skip_text = (getattr(a, "skip_reason", None) or "").strip()
+    if a.status == "done":
+        mode = os.environ.get("CYS_TASK_EVIDENCE_GATE", "strict")
+        has_evidence = len(ev_text) >= 8 or bool(skip_text)  # 품질 하한: evidence 최소 8자
+        if mode != "off" and not has_evidence:
+            if mode == "strict":
+                print('evidence required(5): done 전이는 --evidence 또는 --skip-reason 필수 '
+                      '(예: --evidence "pytest → 31/31 PASS" · evidence 최소 8자)', file=sys.stderr)
+                return EXIT_NO_EVIDENCE
+            print("evidence warn: done 전이에 검증 증거 없음 — --evidence 또는 --skip-reason 권장 "
+                  "(strict 승격 예정)", file=sys.stderr)
     settle_override_note = None
     if a.status == "done" and task.get("owner"):
         if getattr(a, "settled_override", None):
@@ -454,6 +475,20 @@ def cmd_set_status(a):
         if not task:
             print(f"not found: {a.id}", file=sys.stderr)
             return EXIT_NOTFOUND
+        # W2-1 전이표(T0a 이식): 터미널 전이는 in_progress|in_review에서만. 락 안 재독 상태 기준 —
+        # 어떤 변이보다 먼저 검사(거부 시 무변이 반환). CYS_TASK_TRANSITION_GATE=warn|off 안전밸브.
+        if a.status in TERMINAL_STATUSES and task.get("status") not in TERMINAL_FROM:
+            tmode = os.environ.get("CYS_TASK_TRANSITION_GATE", "strict")
+            if tmode == "strict":
+                print(f"transition denied(2): {task.get('status')}→{a.status} — "
+                      f"터미널 전이는 {'|'.join(TERMINAL_FROM)}에서만", file=sys.stderr)
+                return EXIT_USAGE
+            if tmode != "off":
+                print(f"transition warn: {task.get('status')}→{a.status} — "
+                      "터미널 전이는 in_progress|in_review에서 권장(전이표 W2-1)", file=sys.stderr)
+        if ev_text or skip_text:
+            task["evidence"] = {"type": "evidence" if ev_text else "skip",
+                                "text": ev_text or skip_text, "at": _now()}
         if settle_override_note is not None:
             task.setdefault("settle_overrides", []).append(
                 {"at": _now(), "reason": settle_override_note})
@@ -465,8 +500,15 @@ def cmd_set_status(a):
             task["owner"] = None
             _write_json_atomic(_task_path(a.id), task)
         result = {"id": a.id, "status": a.status}
+        if task.get("evidence"):
+            result["evidence"] = task["evidence"]
         if a.status == "done":
             result["unblocked"] = _find_unblocked_dependents(a.id)  # → javis_wakeup enqueue 대상
+            # W1-2 리마인더 + T2 전사통계 배선 — 비차단(exit 불변·연성 의존: 도구 부재 시 그냥 생략)
+            print("handoff: _round/handoffs/%s-done.md 5필드 기록 권장(HANDOFF_CONTRACT)" % a.id,
+                  file=sys.stderr)
+            print("evidence에 전사 통계 첨부 권장: javis_transcript_stats.py --latest --oneline "
+                  "(도구 부재 시 생략 — 비차단)", file=sys.stderr)
     print(json.dumps(result, ensure_ascii=False))
     return EXIT_OK
 
@@ -535,6 +577,10 @@ def main(argv=None):
     c.add_argument("--settled-override", dest="settled_override", default=None,
                    help="★G6: 완료 하한선 우회(사유 필수 기록) — owner 자신이 done을 선언하는 "
                         "등 안착 관측이 불가한 경우만")
+    c.add_argument("--evidence", default=None,
+                   help="W0-3: 검증 증거 '<검증명령 → 결과>' (최소 8자) — done 전이 필수")
+    c.add_argument("--skip-reason", dest="skip_reason", default=None,
+                   help="W0-3: 검증 불가 사유 — evidence 대체")
     c.set_defaults(fn=cmd_set_status)
 
     c = sub.add_parser("ready")

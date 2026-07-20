@@ -1047,6 +1047,32 @@ async fn run_sidecar_restore(socket: Option<std::path::PathBuf>) -> bool {
     .unwrap_or(false)
 }
 
+/// ★TCC 처방(오너 2026-07-15 — EPERM 실사고 구조 수리): 서명이 바뀌는 업그레이드마다 macOS가
+/// 폴더 접근 권한(TCC)을 리셋해 pane 자식(claude 등)이 작업 폴더 읽기에서 EPERM으로 죽는다.
+/// ①GUI(UI 프로세스)가 기동 시 데스크톱/문서를 read_dir — 미결정 상태면 macOS 권한 팝업이 떠
+///   선제 해결된다(UI 프로세스만 팝업 표시 가능 · CLI 자식은 팝업 없이 조용히 거부됨).
+/// ②이미 거부된 상태(팝업 재유도 불가)면 perm-warning 이벤트 → 프론트 sticky 토스트로 설정
+///   경로 안내. 매 기동 실행 — 저비용·멱등(허용 상태면 무음).
+#[cfg(target_os = "macos")]
+fn nudge_folder_permissions(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let home = cys::home_dir();
+        for folder in ["Desktop", "Documents"] {
+            let p = home.join(folder);
+            let denied = tokio::task::spawn_blocking(move || {
+                matches!(std::fs::read_dir(&p),
+                         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+            })
+            .await
+            .unwrap_or(false);
+            if denied {
+                let _ = app.emit("perm-warning", json!({"folder": folder}));
+            }
+        }
+    });
+}
+
 /// (T2) 업데이트 후 조직 전체 복원 — setup 완료를 막지 않도록 백그라운드 태스크로 순차 실행하며
 /// restore-progress를 emit한다(update-progress emit 스타일 동형). 본부=기본 소켓 사이드카 restore →
 /// list_depts() 순회: 부서 데몬이 살아있으면 사이드카 restore(부서 소켓), 죽었으면 기존 launch 경로
@@ -1057,6 +1083,18 @@ fn spawn_org_restore(app: AppHandle) {
         let _ = app.emit("restore-progress", json!({"phase": "start"}));
         // 본부(기본 소켓) — setup의 ensure_daemon으로 이미 가동 확정.
         let hq_ok = run_sidecar_restore(None).await;
+        // ★WP-3 리바이버 게이트: base 데몬 dept 묘비 — 삭제-의도 부서는 재기동에서 제외(+생존 시 reap).
+        // RPC 실패=빈 집합(보수적 fail-open: 묘비 부재=현행 거동 — 롤백 불변식 "부재=제약 없음").
+        let tombs: std::collections::HashSet<String> =
+            rpc_oneshot(&cys::socket_path(), "dept_tombstone.list", json!({}))
+                .await
+                .ok()
+                .and_then(|v| {
+                    v.get("dept_tombstones").and_then(|a| a.as_array()).map(|a| {
+                        a.iter().filter_map(|x| x.as_str().map(String::from)).collect()
+                    })
+                })
+                .unwrap_or_default();
         // 부서 순회 — 등록 부서(depts.json)만 대상(유령 부서 재-launch 차단).
         let mut ok = 0usize;
         let mut fail = 0usize;
@@ -1076,6 +1114,36 @@ fn spawn_org_restore(app: AppHandle) {
                     .await
                     .map(|r| r.is_ok())
                     .unwrap_or(false);
+                    // ★WP-3: 묘비 부서 — 재기동 금지. 생존이면 reap(정리 대기 프로세스 — 묘비가
+                    // 부활을 이미 차단하므로 좀비 아님. teardown 실패=WARN·차회 부팅 재평가로 수렴).
+                    if tombs.contains(name.as_str()) {
+                        let mut detail = "삭제-의도 묘비 — 재기동 제외".to_string();
+                        if alive {
+                            let _ = stop_dept_daemon_by_socket(
+                                sock.to_string_lossy().to_string(),
+                            )
+                            .await;
+                            // ★R4(D-IMPL-4): teardown 함수는 실패를 삼키므로(무조건 Ok) 재프로브로
+                            // 결과를 가시화 — 여전히 생존이면 WARN 라벨(차회 부팅 재시도가 수렴 경로).
+                            let still = tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                rpc_oneshot(&sock, "system.identify", json!({})),
+                            )
+                            .await
+                            .map(|r| r.is_ok())
+                            .unwrap_or(false);
+                            detail = if still {
+                                "삭제-의도 묘비 — teardown 미확정(WARN·차회 시작 시 재시도)".into()
+                            } else {
+                                "삭제-의도 묘비 — 잔존 데몬 정리 완료".into()
+                            };
+                        }
+                        let _ = app.emit(
+                            "restore-progress",
+                            json!({"phase": "skip", "dept": name, "detail": detail}),
+                        );
+                        continue;
+                    }
                     let dept_ok = if alive {
                         run_sidecar_restore(Some(sock.clone())).await
                     } else {
@@ -1753,6 +1821,121 @@ fn read_dept_catalog() -> Result<Value, String> {
     }
 }
 
+/// ★WP-3(BOOTSTRAP_HARDENING): 소켓 문자열에서 부서명 파생 — cys-dept-<name> 슬러그
+/// (unix `.../cys-dept-<n>/cys.sock` · pipe `\\.\pipe\cys-dept-<n>` 공통 · cys-dept D8 파생과 동일 규약).
+fn dept_name_from_socket(sock: &str) -> Option<String> {
+    let norm = sock.replace('\\', "/");
+    norm.split('/')
+        .find_map(|seg| seg.strip_prefix("cys-dept-").map(str::to_string))
+        .filter(|n| !n.is_empty())
+}
+
+/// ★WP-3 의도 선기록: 부서 삭제 클릭의 **제1행위** — base 데몬에 dept 묘비를 기록한다(견고
+/// writer=데몬 RPC·topology.json 영속). 이후의 teardown(bash→python 체인·reg_remove)이 무음
+/// 실패해도 리바이버(spawn_org_restore·프론트 복원)가 이 묘비를 게이트로 읽어 부활을 차단한다.
+#[tauri::command]
+async fn dept_tombstone_by_socket(socket: String) -> Result<Value, String> {
+    let name = dept_name_from_socket(&socket)
+        .ok_or_else(|| format!("부서명 파생 실패(비표준 소켓): {socket}"))?;
+    rpc_oneshot(&cys::socket_path(), "dept_tombstone.set", json!({"name": name})).await
+}
+
+/// ★WP-3 리바이버 게이트 소스: base 데몬의 dept 묘비 목록(프론트 복원이 유령 판정에 사용).
+#[tauri::command]
+async fn dept_tombstones() -> Result<Vec<String>, String> {
+    let v = rpc_oneshot(&cys::socket_path(), "dept_tombstone.list", json!({})).await?;
+    Ok(v.get("dept_tombstones")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default())
+}
+
+/// ★WP-1 결정 e(설계 v1.1): "마스터 시작" — cys launch-agent --role master 배선. worker/cso와
+/// 동일 메커니즘(앵커 준수: 시스템은 노드만 띄우고 지휘하지 않는다). CYS_SOCKET 제거로 항상
+/// base 데몬 대상(부서 오염 불가 — 소켓 격리와 동일 축). 생성된 surface는 GUI 자동입양이 수용.
+#[tauri::command]
+async fn start_master() -> Result<(), String> {
+    let cys = resolve_sidecar("cys");
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&cys);
+        inject_runtime_path(&mut cmd);
+        cmd.env_remove("CYS_SOCKET");
+        cmd.arg("launch-agent").arg("--role").arg("master").arg("--agent").arg("claude");
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// ★R8(WP-2·적대검증 W2): CEO 승격 대기(PENDING) 여부 — cys-dept가 기록한 상태 파일 존재 검사.
+/// 프론트가 시작 시 1회+팔레트 온디맨드로 읽는다(신규 타이머 금지 — WINAUDIT 타이머 증식 방지).
+#[tauri::command]
+fn ceo_pending() -> bool {
+    cys::home_dir().join(".cys/state/ceo-pending").exists()
+}
+
+/// ★R8: PENDING 해소 실행 — cys-dept promote-if-pending(대기형·자체 동의 게이트 feed --wait 경유).
+/// GUI는 role-less(CYS_ROLE 제거 명시)라 단일소유 가드를 통과한다. async라 UI 무블록,
+/// feed --wait의 timeout(deny/timeout=보류) 규약이 상한을 보장한다.
+#[tauri::command]
+async fn promote_pending_ceo() -> Result<String, String> {
+    let tool = dept_tool();
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("bash");
+        inject_runtime_path(&mut cmd);
+        cmd.env_remove("CYS_SOCKET");
+        cmd.env_remove("CYS_ROLE");
+        cmd.arg(&tool).arg("promote-if-pending");
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    let txt = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() {
+        Ok(txt.trim().to_string())
+    } else {
+        Err(txt.trim().to_string())
+    }
+}
+
+/// ★조직 모델(오너 2026-07-15): 부서 탭의 "▶부서장" — 해당 부서 데몬에 master(부서장) 노드 기동.
+/// start_master(base=CEO 자리)와 대칭·동일 메커니즘(launch-agent). CYS_SOCKET=부서 소켓으로
+/// 그 부서 데몬이 pane을 spawn하므로 부서 팩 디렉티브(MASTER_DIRECTIVE)가 자동 주입되고,
+/// claim도 그 부서 레지스트리 대상(데몬당 살아있는 마스터 1명 규칙은 부서별 독립 적용).
+#[tauri::command]
+async fn start_dept_master(socket: String) -> Result<(), String> {
+    let cys = resolve_sidecar("cys");
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&cys);
+        inject_runtime_path(&mut cmd);
+        cmd.env("CYS_SOCKET", &socket);
+        cmd.arg("launch-agent").arg("--role").arg("master").arg("--agent").arg("claude");
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// 부서 데몬 teardown(socket 기준) — ws 이름 변경(rename)으로 name→socket 매핑이 끊겨도 정확히 종료.
 /// cys-dept down-sock에 일임(레지스트리 역인덱스로 부서명 해석 후 teardown).
 #[tauri::command]
@@ -1867,10 +2050,37 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool) -> Result
     Ok(info)
 }
 
+/// 업데이트 체크·설치 공용 updater 핸들. CYS_UPDATE_MANIFEST_URL(테스트 전용 env)이 있으면 그
+/// 엔드포인트로 오버라이드한다 — 패치 채널 E2E 실기기 검증용(Finder 런칭엔 env가 없어 프로덕션
+/// 경로는 tauri.conf 기본 엔드포인트 그대로). ★서명 검증 불변: 설치는 baked pubkey로 .sig를
+/// 검증하므로 엔드포인트 교체가 위조 패키지 설치를 허용하지 않는다.
+fn build_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    if let Some(u) = cys::env_compat("CYS_UPDATE_MANIFEST_URL") {
+        let url: tauri::Url = u
+            .parse()
+            .map_err(|e| format!("CYS_UPDATE_MANIFEST_URL 파싱 실패: {e}"))?;
+        return app
+            .updater_builder()
+            .endpoints(vec![url])
+            .map_err(|e| e.to_string())?
+            .build()
+            .map_err(|e| e.to_string());
+    }
+    app.updater().map_err(|e| e.to_string())
+}
+
+/// 테스트 전용(패치 채널 E2E — 오너 2026-07-15): CYS_AUTOTEST_PATCH_INSTALL=1 env로 기동된
+/// 경우에만 true — UI가 기동 직후 패치 설치를 무클릭 자동 발화한다(Finder 런칭엔 env 부재 →
+/// 프로덕션 무영향).
+#[tauri::command]
+fn autotest_patch_install() -> bool {
+    cys::env_compat("CYS_AUTOTEST_PATCH_INSTALL").as_deref() == Some("1")
+}
+
 /// 업데이트 확인: 새 버전이 있으면 (version, notes)를 반환, 없으면 null.
 #[tauri::command]
 async fn check_update(app: AppHandle) -> Result<Option<Value>, String> {
-    let updater = app.updater().map_err(|e| e.to_string())?;
+    let updater = build_updater(&app)?;
     match updater.check().await.map_err(|e| e.to_string())? {
         Some(update) => Ok(Some(json!({
             "version": update.version,
@@ -1979,8 +2189,8 @@ async fn live_session_count() -> Result<u64, String> {
 
 /// 업데이트 다운로드·설치 후 데몬 핸드오프 + 재시작.
 /// force=false: 살아있는 세션이 있으면 설치 전에 거부(UI가 확인 후 force=true로 재호출).
-/// ★v0.12.51+ UI 미사용(후속 제거 예정) — 본체 업데이트는 홈페이지 다운로드로 전환됨(T5). 이 커맨드와
-///   update-progress emit은 미래 재활성화 여지를 위해 유지하나 UI에서 호출되지 않는다(promptBinaryHomepage 대체).
+/// ★재배선(오너 2026-07-15): 본체 패치(인앱) 설치 경로 재활성화 — UI promptBinaryPatch가 호출한다
+///   (구 T5 홈페이지 전용 정책의 실험적 개정 · 실기기 검증 대상). 아래 app.restart() 레이스 경고 참조.
 #[tauri::command]
 async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     // 1) 세션 가드 (오너 정책: 없으면 자동·있으면 확인)
@@ -1989,7 +2199,7 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
         return Err(format!("live_sessions:{sessions}"));
     }
     // 2) 업데이트 받아 설치 (.app 번들 교체 — 새 cysd/cys 동봉)
-    let updater = app.updater().map_err(|e| e.to_string())?;
+    let updater = build_updater(&app)?;
     let update = updater
         .check()
         .await
@@ -2244,6 +2454,12 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .manage(Attachments(Mutex::new(HashMap::new())))
         .invoke_handler(tauri::generate_handler![
+            dept_tombstone_by_socket,
+            dept_tombstones,
+            start_master,
+            start_dept_master,
+            ceo_pending,
+            promote_pending_ceo,
             daemon_status,
             list_surfaces,
             org_status,
@@ -2284,6 +2500,7 @@ fn main() {
             check_pack_update,
             live_session_count,
             install_update,
+            autotest_patch_install,
             rotate_daemon,
             install_pack_update,
             launch_dept_daemon,
@@ -2314,19 +2531,45 @@ fn main() {
                 let launchd_owns = maybe_autoregister_launchd().await;
                 #[cfg(not(target_os = "macos"))]
                 let launchd_owns = false;
-                let result = if launchd_owns {
-                    // launchd가 cysd를 소유·기동한다 — 수동 spawn 금지(중복 spawn·flock 경합 방지,
-                    // codex BLOCKER). launchctl load는 비동기라 socket-ready를 최대 5초 폴링.
+                // ★신선 머신 부트 수리(오너 2026-07-15 — "daemon: connecting…" 영구 고착 실사고):
+                // 종전에는 launchd 소유 시 5초 무응답이면 부트 시퀀스 전체를 영구 포기했다(재시도·
+                // 폴백 전무 — 온보딩·이벤트 파이프까지 미실행). 최신 macOS는 앱이 등록한 LaunchAgent를
+                // '백그라운드 항목' 사용자 승인까지 보류할 수 있고, 첫 실행 Gatekeeper 검증은 5초를
+                // 훌쩍 넘긴다. 수리: ①launchd 5초 무응답 → 형제 spawn 폴백(CLI cys와 대칭 — 중복
+                // spawn은 cysd 시동 잠금(healthy-holder 거부)이 단일 인스턴스 보장) ②그래도 실패면
+                // 15초 간격 백그라운드 재시도(최대 20회 ≈ 5분 — 승인 지연·느린 첫 기동 흡수)
+                // ③4회째부터 로그인 항목 안내 이벤트(daemon-retry-hint) — 생초보 가이드.
+                let mut result = if launchd_owns {
                     if wait_for_connect(50).await {
                         Ok(())
                     } else {
-                        Err("launchd-owned cysd did not become ready within 5s".to_string())
+                        eprintln!("[cys-app] launchd-owned cysd not ready in 5s — 형제 spawn 폴백");
+                        ensure_daemon().await
                     }
                 } else {
                     ensure_daemon().await
                 };
+                if result.is_err() {
+                    for attempt in 1..=20u32 {
+                        let _ = handle.emit(
+                            "daemon-error",
+                            format!("데몬 대기 중 — 재시도 {attempt}/20 (15초 간격)"),
+                        );
+                        if attempt == 4 {
+                            let _ = handle.emit("daemon-retry-hint", ());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                        if ensure_daemon().await.is_ok() {
+                            result = Ok(());
+                            break;
+                        }
+                    }
+                }
                 if let Err(e) = result {
-                    let _ = handle.emit("daemon-error", e);
+                    let _ = handle.emit(
+                        "daemon-error",
+                        format!("{e} — 데몬을 시작하지 못했습니다. 시스템 설정 → 일반 → 로그인 항목에서 cys 백그라운드 항목을 허용한 뒤 앱을 다시 여세요."),
+                    );
                     return;
                 }
                 let _ = handle.emit("daemon-ready", ());
@@ -2352,6 +2595,9 @@ fn main() {
                 }
                 // 업데이트 재시작 시: 새 팩(새 기능) 반영 + 노드 자동복귀(마커가 있을 때만).
                 maybe_apply_pending_update(&handle);
+                // ★TCC 처방(오너 2026-07-15): 폴더 권한 선제 트리거·거부 감지 안내.
+                #[cfg(target_os = "macos")]
+                nudge_folder_permissions(&handle);
             });
             Ok(())
         })

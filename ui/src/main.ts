@@ -6,6 +6,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
 import { shellQuote, shellQuoteJoin } from "./shellquote";
+import { updatePlan } from "./updateplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { orderPreservingEqualize, equalizeAdoptedTrees } from "./layout";
@@ -2550,7 +2551,7 @@ function buildTab(ws: Workspace): HTMLElement {
   const close = document.createElement("span");
   close.className = "ws-close";
   close.textContent = "×";
-  close.title = "워크스페이스 닫기 (surface 전부 종료)";
+  close.title = "완전 삭제 — 클릭하면 확인 창이 열립니다 (부서면 데몬 종료·부활 차단 포함)";
   titleRow.append(label, close);
   // WP-10: 부서 준비 중 탭엔 스피너 글리프를 라벨 앞에 붙이고 aria-busy 로 진행을 알린다(CSS가 회전·정지 담당).
   if (ws.pending) {
@@ -2647,21 +2648,31 @@ function buildTab(ws: Workspace): HTMLElement {
     ]);
   });
   close.addEventListener("click", async () => {
-    // WKWebView에서 confirm()은 무동작 — 2-click 확인 패턴 사용
-    if (close.dataset.arm !== "1") {
-      close.dataset.arm = "1";
-      close.innerHTML = TRASH_SVG;
-      close.classList.add("close-armed");
-      close.title = "한 번 더 누르면 삭제";
-      setTimeout(() => {
-        close.dataset.arm = "";
-        close.textContent = "×";
-        close.classList.remove("close-armed");
-        close.title = "워크스페이스 닫기 (surface 전부 종료)";
-      }, 2500);
-      return;
+    // ★완전 삭제 확인(오너 2026-07-15 — 발견 불가 UX 수리): 숨은 2-click 무장 패턴을 설명형
+    // 확인 다이얼로그로 교체(WKWebView confirm() 무동작 → 기존 confirmModal 재사용). 초보자가
+    // "무엇이 어떻게 삭제되는지" 읽고 결정한다. pane 개별 ×(저위험)는 종전 2-click 유지.
+    const wsName = ws.name || UNTITLED;
+    const ok = await confirmModal(
+      ws.socket ? `부서 "${wsName}" 완전 삭제` : `워크스페이스 "${wsName}" 완전 삭제`,
+      (ws.socket
+        ? "이 부서의 pane(에이전트 세션)이 전부 종료되고 부서 데몬도 종료됩니다. 삭제 의도가 기록되어 " +
+          "앱을 재시작해도 부활하지 않습니다."
+        : "이 워크스페이스의 pane(에이전트 세션)이 전부 종료되고 탭이 제거됩니다.") +
+        "\n\n완전히 삭제하시겠습니까?",
+      "삭제",
+    );
+    if (!ok) return;
+    // ★WP-3 의도 선기록(제1행위): teardown 이전에 base 데몬에 dept 묘비 기록 — 이후 체인이
+    // 무음 실패해도 재시작 부활을 차단한다. 실패=가시화(같은 탭 재삭제가 재시도 — 무음 삼킴 금지).
+    if (ws.socket) {
+      try {
+        await invoke("dept_tombstone_by_socket", { socket: ws.socket });
+      } catch (e) {
+        toast("watchdog", "부서 삭제 의도 기록 실패", `${e} — 삭제는 계속 진행되나 재시작 시 부활할 수 있습니다. 같은 탭을 다시 삭제하면 재시도됩니다.`);
+      }
     }
     for (const sid of collectSids(ws.tree)) {
+      // pane 개별 close 실패는 관용(묘비가 이미 부활 차단 — per-pane 토스트는 스팸).
       await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
       destroyPaneRuntime(sid, ws.socket);
     }
@@ -2671,7 +2682,12 @@ function buildTab(ws: Workspace): HTMLElement {
     // 부서 데몬 teardown은 '그 socket을 쓰는 마지막 탭'일 때만(중복 탭 잔존 시 다른 탭 보호)
     const stillUsed = ws.socket && workspaces.some((w) => w.socket === ws.socket);
     // socket 기준 teardown(order 8) — ws rename으로 name↔socket이 끊겨도 정확히 종료.
-    if (ws.socket && !stillUsed) await invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch(() => {});
+    // ★WP-3: 실패 가시화(.catch 삼킴 제거) — 묘비가 부활을 차단하므로 잔존 데몬은 '정리 대기'일 뿐이며
+    // 차회 부팅 reaper가 수렴하지만, 사용자에게는 알린다.
+    if (ws.socket && !stillUsed)
+      await invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch((e) =>
+        toast("watchdog", "부서 데몬 종료 실패", `${e} — 부활은 차단됨(삭제 의도 기록됨)·다음 앱 시작 시 자동 정리를 재시도합니다.`),
+      );
     if (workspaces.length === 0) {
       await addWorkspace(); // addWorkspace가 activeWs를 설정
     } else {
@@ -3398,67 +3414,81 @@ async function checkForUpdate(silent: boolean) {
   }
 
   const badge = document.getElementById("update-badge")!;
-  if (updateAvailable) {
-    // (T5) 본체(바이너리) 업데이트는 홈페이지 다운로드 전용 — 인앱 재시작 설치 폐지(오너 정책).
+  // 분기 판정은 순수 함수(updateplan.ts — 옵션 2·오너 승인 2026-07-14)로 일원화.
+  // 기존 4분기 배지·문구는 updateplan.test.ts가 문자열 단위로 핀(회귀 0) — 신설은
+  // pack-and-binary(본체+팩 동시·호환 시 팩 무중단을 가리지 않음·T5 불변) 하나뿐이다.
+  const plan = updatePlan({
+    binVersion: updateAvailable ? updateAvailable.version : null,
+    packVersion: packUpdateAvailable ? packUpdateAvailable.pack_version : null,
+    binaryTooOld: packUpdateAvailable ? packUpdateAvailable.binary_too_old : false,
+    binCheckFailed,
+    packCheckFailed,
+  });
+  if (plan.kind !== "unknown") {
+    // unknown = 체크 실패·보존 상태 없음 → 배지 유지('최신' 오단정 금지, 종전 fail-safe).
     badge.hidden = false;
-    badge.textContent = "!";
-    badge.classList.remove("ok");
-    badge.title = `새 본체 버전 ${updateAvailable.version} (홈페이지에서 다운로드)`;
-    if (!silent) promptBinaryHomepage();
-    else toast("feed", "🔄 새 본체 버전", `새 본체 ${updateAvailable.version} — 홈페이지(www.cysinsight.com)에서 다운로드`);
-  } else if (packUpdateAvailable && !packUpdateAvailable.binary_too_old) {
-    // 팩만 변경 + 바이너리 호환 → 무중단 가능(세션·데몬 생존).
-    badge.hidden = false;
-    badge.textContent = "↻";
-    badge.classList.remove("ok");
-    badge.title = `팩 ${packUpdateAvailable.pack_version} (무중단·세션 유지)`;
-    if (!silent) promptPackInstall();
-    else
-      toast("feed", "↻ 무중단 팩 업데이트", `팩 ${packUpdateAvailable.pack_version} — 상단 Update(재시작 없음)`);
-  } else if (packUpdateAvailable && packUpdateAvailable.binary_too_old) {
-    // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 본체 업데이트(홈페이지) 필요(T5 정책).
-    badge.hidden = false;
-    badge.textContent = "!";
-    badge.classList.remove("ok");
-    badge.title = `팩 ${packUpdateAvailable.pack_version}: 본체 업데이트 필요 (홈페이지에서 다운로드)`;
-    const msg = `새 팩 ${packUpdateAvailable.pack_version}은 더 새로운 본체를 요구합니다 — 홈페이지(www.cysinsight.com)에서 본체 업데이트 후 적용됩니다.`;
-    if (!silent) toast("health", "본체 업데이트 필요", msg);
-    else toast("feed", "⚠ 업데이트 있음", msg);
-  } else {
-    // ★fail-safe: 양쪽 체크가 모두 성공적으로 '없음'을 확인했을 때만 상태를 갱신한다. 장애(체크 실패)
-    // 시엔 마지막 검증 상태(배지)를 유지한다 — 일시 장애로 "최신" 오단정하지 않게.
-    if (!binCheckFailed && !packCheckFailed) {
-      // 오너 지시(2026-07-03): 최신 확인 시 숨김 대신 "0" 표시 — "확인이 끝났고 대기 업데이트
-      // 0건"을 명시(숨김은 '아직 확인 전'과 구별 불가였다). 중립 스타일(.ok)로 경고색 회피.
-      badge.hidden = false;
-      badge.textContent = "0";
-      badge.classList.add("ok");
-      badge.title = "최신 버전 — 대기 중인 업데이트 없음";
-    }
-    // 어느 한쪽이라도 체크 실패면 상태 불명 — '이미 최신' 단정 금지(바이너리·팩 둘 다 성공 확인 시에만).
-    if (!silent && !binCheckFailed && !packCheckFailed) toast("watchdog", "✅ 최신 버전", "최신 버전입니다. 추가 업데이트가 없습니다.");
+    badge.textContent = plan.badge;
+    if (plan.ok) badge.classList.add("ok");
+    else badge.classList.remove("ok");
+    badge.title = plan.title;
+  }
+  switch (plan.kind) {
+    case "pack-and-binary":
+      // ★옵션 2: 팩 무중단이 실행 가능한 액션 — 모달은 팩 하나만(silent 불변식: 모달 금지는
+      // silent 경로에만 해당·비silent도 모달 1개 상한), 본체는 토스트로 병행 안내(T5 경로 유지).
+      if (!silent) {
+        promptPackInstall();
+        toast("feed", "🔄 새 본체도 있음", `새 본체 ${updateAvailable!.version} — 상단 Update 버튼으로 패치 설치(재시작·자동 복원)`);
+      } else toast("feed", "↻ 무중단 팩 + 새 본체", plan.toastMsg);
+      break;
+    case "binary":
+      // 본체(바이너리) 패치 설치 — 오너 지시(2026-07-15) 재배선(구 T5 홈페이지 전용의 실험적 개정).
+      if (!silent) promptBinaryPatch();
+      else toast("feed", "🔄 새 본체 버전", plan.toastMsg);
+      break;
+    case "pack":
+      // 팩만 변경 + 바이너리 호환 → 무중단 가능(세션·데몬 생존).
+      if (!silent) promptPackInstall();
+      else toast("feed", "↻ 무중단 팩 업데이트", plan.toastMsg);
+      break;
+    case "binary-required":
+      // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 본체 업데이트(홈페이지) 필요(T5 정책).
+      if (!silent) toast("health", "본체 업데이트 필요", plan.toastMsg);
+      else toast("feed", "⚠ 업데이트 있음", plan.toastMsg);
+      break;
+    case "none":
+      // 오너 지시(2026-07-03): 최신 확인 시 숨김 대신 "0" 표시. 중립 스타일(.ok)로 경고색 회피.
+      if (!silent) toast("watchdog", "✅ 최신 버전", "최신 버전입니다. 추가 업데이트가 없습니다.");
+      break;
+    case "unknown":
+      break;
   }
 }
 
-/// (T5) 본체(바이너리) 업데이트 안내 — 인앱 install_update 폐지, 홈페이지 다운로드 전용(오너 정책).
-/// 새 본체 버전을 알리고 확인 시 다운로드 페이지를 시스템 브라우저로 연다(open_url = Rust HARD
-/// 화이트리스트 게이트). 데몬·세션은 건드리지 않는다(재시작 없음 — 팩 경로 promptPackInstall과 별개).
-async function promptBinaryHomepage() {
+/// 본체(바이너리) 패치 설치 — 오너 지시(2026-07-15)로 인앱 install_update 재배선(구 T5 홈페이지
+/// 전용 정책의 실험적 개정). install_update = drain 저장 신호 → 다운로드·서명검증 → .app 교체 →
+/// 데몬 핸드오프 → 앱 재시작(부서·노드는 피닉스·resume으로 자동 복원). 진행 표시는
+/// update-progress 리스너("upd-bin" sticky)가 전담한다.
+async function promptBinaryPatch() {
   if (!updateAvailable) {
     await checkForUpdate(false);
     return;
   }
   const v = updateAvailable.version;
   const ok = await confirmModal(
-    `새 본체 버전 ${v}`,
-    `새 본체(앱) 버전 ${v}이 있습니다. 본체 업데이트는 홈페이지에서 내려받아 설치합니다.\n\n` +
-      `확인을 누르면 다운로드 페이지(www.cysinsight.com)를 엽니다.`,
+    `새 본체 버전 ${v} — 패치 설치`,
+    `새 본체(앱) ${v}을 패치 방식으로 설치합니다: 저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 ` +
+      `재시작합니다. 부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 ` +
+      `있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)`,
+    "설치",
   );
   if (!ok) return;
   try {
-    await invoke("open_url", { url: "https://www.cysinsight.com" });
+    await invoke("install_update", { force: true });
+    // 성공 시 백엔드가 app.restart()까지 수행 — 후속 UI 처리 없음(진행은 update-progress 리스너).
   } catch (e) {
-    toast("health", "홈페이지 열기 실패", String(e));
+    dismissToast("upd-bin");
+    toast("health", "패치 설치 실패", String(e));
   }
 }
 
@@ -3571,6 +3601,7 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
     `데몬 교대 (새 버전 v${appVer})`,
     `작업 세션이 물려 있는 데몬 ${nodes}개를 새 버전으로 순차 교대(메인→부서)합니다. 저장(drain) 신호 후 ` +
       `교대하고 세션을 복원합니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 교대하시겠습니까?`,
+    "교대",
   );
   if (!ok) return;
   rotatingDaemon = true;
@@ -3591,6 +3622,61 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
   } catch (e) {
     dismissToast("rotate-daemon");
     toast("health", "데몬 교대 실패", String(e));
+  } finally {
+    rotatingDaemon = false;
+  }
+}
+
+// ── 상시 "↻ 재시작" 버튼(초보자용) — 수동 "데몬 kill + 앱 재실행" 루틴의 원클릭 대체 ──
+// 스큐 여부와 무관하게 메인→살아있는 부서 데몬을 force 순차 교대한다(drain 저장 → 종료 → 새 데몬 기동 →
+// 피닉스·resume 복원). manualRotateSkewed와 동일 백엔드(rotate_daemon/rotate_dept_daemon force=true) 재사용.
+// 앱 재시작 없음 — install_update의 app.restart()는 single-instance 레이스 경고 경로(휴면)라 배제,
+// GUI는 새 데몬에 자동 재연결된다. 죽은 부서 소켓은 skip(detectSkew 동형 — 부서 부활은 CSO·피닉스 소유).
+async function manualRestartAllDaemons() {
+  if (rotatingDaemon) {
+    toast("feed", "재시작 진행 중", "데몬 교대·재검이 진행 중입니다 — 잠시 후 다시 시도하세요.");
+    return;
+  }
+  const ok = await confirmModal(
+    "데몬 재시작",
+    "데몬(메인+부서)을 다시 시작합니다. 진행 중인 노드에 저장(drain) 신호를 보낸 뒤 데몬을 새로 켜고, " +
+      "부서·노드는 대화 기억까지 자동 복원됩니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 재시작하시겠습니까?",
+    "재시작",
+  );
+  if (!ok) return;
+  rotatingDaemon = true;
+  stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 후 데몬을 다시 시작하는 중… 부서·노드를 자동 복원합니다.");
+  try {
+    await invoke("rotate_daemon", { force: true });
+    // 부서 열거=list_depts(레지스트리 SOT) + daemon_status 생존 확인 — detectSkew 동형(죽은 등재 skip).
+    const reg = (await invoke("list_depts").catch(() => ({ depts: {} }))) as {
+      depts?: Record<string, { socket?: string }>;
+    };
+    let deptRestoreFailed = false;
+    const failedDepts: string[] = [];
+    for (const [name, meta] of Object.entries(reg.depts ?? {})) {
+      if (!meta.socket) continue;
+      try {
+        await invoke("daemon_status", { socket: meta.socket });
+      } catch {
+        continue; // 죽은/전이 중 부서 소켓 skip(무해)
+      }
+      try {
+        const info = (await invoke("rotate_dept_daemon", { name, force: true })) as { restore_ok?: boolean };
+        if (info?.restore_ok === false) deptRestoreFailed = true;
+      } catch {
+        failedDepts.push(name);
+      }
+    }
+    dismissToast("restart-daemon");
+    if (failedDepts.length)
+      toast("health", "⚠ 일부 부서 재시작 실패", `메인 데몬은 재시작됐으나 부서 교대가 실패했습니다: ${failedDepts.join(", ")} — 상태를 점검하세요.`);
+    else if (deptRestoreFailed)
+      toast("health", "⚠ 재시작 후 부서 복원 실패", "데몬은 재시작됐으나 일부 부서 노드 복원이 실패했습니다 — 상태를 점검하세요.");
+    else toast("watchdog", "✅ 데몬 재시작 완료", "데몬이 다시 시작됐습니다. 부서·노드 복원이 진행됩니다.");
+  } catch (e) {
+    dismissToast("restart-daemon");
+    toast("health", "데몬 재시작 실패", String(e));
   } finally {
     rotatingDaemon = false;
   }
@@ -3666,9 +3752,9 @@ async function promptPackInstall() {
 }
 
 /// Update 버튼 디스패처 — 가용 업데이트 종류에 따라 경로를 고른다.
-/// 본체(바이너리)=홈페이지 다운로드 안내(T5·재시작 없음) → 무중단 팩 → 미확인 시 수동 재확인.
+/// 본체(바이너리)=패치 설치(오너 2026-07-15 재배선·재시작+자동복원) → 무중단 팩 → 미확인 시 수동 재확인.
 async function onUpdateButton() {
-  if (updateAvailable) return promptBinaryHomepage();
+  if (updateAvailable) return promptBinaryPatch();
   if (packUpdateAvailable && !packUpdateAvailable.binary_too_old) return promptPackInstall();
   return checkForUpdate(false);
 }
@@ -3850,6 +3936,26 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
     });
   }
 
+  // ── (4-b) ★R8(WP-2): CEO 승격 대기 해소 — cys-dept PENDING(부트 게이트 보류)의 즉시 경로.
+  // 온디맨드 조회(팔레트 열 때만 — 신규 타이머 0). 대기형은 오너 동의 게이트(feed --wait) 경유.
+  if (await invoke("ceo_pending").catch(() => false)) {
+    items.push({
+      id: "act:ceo-promote",
+      title: "CEO 승격 진행 (대기 중)",
+      subtitle: "부서가 존재·base 부트 완료 — 동의 게이트(feed)를 거쳐 승격합니다",
+      keywords: "ceo promote 승격 pending 대기",
+      confirm: { title: "CEO 승격", body: "기본 데몬 master를 CEO로 승격합니다(동의 요청이 feed에 뜹니다 · .pre-ceo 백업으로 가역)." },
+      action: async () => {
+        try {
+          const r = (await invoke("promote_pending_ceo")) as string;
+          toast("feed", "CEO 승격 처리", r || "완료");
+        } catch (e) {
+          toast("health", "CEO 승격 실패", String(e));
+        }
+      },
+    });
+  }
+
   // ── (5) 빌트인 webview 액션(정적) ──
   items.push(
     { id: "act:new-tab", title: "새 탭", keywords: "new tab 탭", action: () => actionNew() },
@@ -3945,16 +4051,19 @@ async function openPalette() {
   input.focus();
 }
 
-function confirmModal(title: string, body: string): Promise<boolean> {
+// ★확인 버튼 라벨 매개변수화(오너 2026-07-15 실보고): 업데이트 창용 "설치" 하드코딩이 모든
+// 확인 창에 노출(완전 삭제 창의 확인 버튼이 "설치"로 표시). 호출부가 동작 동사를 지정한다.
+function confirmModal(title: string, body: string, yesLabel = "확인"): Promise<boolean> {
   return new Promise((resolve) => {
     const ov = document.createElement("div");
     ov.className = "modal-overlay";
     ov.innerHTML =
       `<div class="modal"><h3></h3><p></p>` +
       `<div class="modal-btns"><button class="modal-no">아니오</button>` +
-      `<button class="modal-yes">설치</button></div></div>`;
+      `<button class="modal-yes"></button></div></div>`;
     (ov.querySelector("h3") as HTMLElement).textContent = title;
     (ov.querySelector("p") as HTMLElement).textContent = body;
+    (ov.querySelector(".modal-yes") as HTMLElement).textContent = yesLabel;
     const done = (v: boolean) => {
       ov.remove();
       resolve(v);
@@ -4145,6 +4254,17 @@ async function start() {
     listen("daemon-error", (e) => {
       info.textContent = `daemon error: ${e.payload}`;
     });
+    // ★신선 머신 부트 수리 짝(오너 2026-07-15): 백엔드 재시도 4회째 발화 — 상단바 텍스트는
+    // 초보자가 놓치므로 sticky 토스트로 로그인 항목 승인 안내(데몬이 뜨면 daemon-ready가 진행).
+    listen("daemon-retry-hint", () => {
+      stickyToast(
+        "daemon-hint",
+        "health",
+        "데몬 시작 대기 중",
+        "백그라운드 서비스(cysd) 시작을 기다리고 있습니다. 계속 이 상태면: 시스템 설정 → 일반 → 로그인 항목에서 cys 관련 항목을 허용해 주세요. 허용 즉시 자동으로 연결됩니다.",
+      );
+    });
+    listen("daemon-ready", () => dismissToast("daemon-hint"));
     const probe = setInterval(async () => {
       try {
         await invoke("daemon_status");
@@ -4185,8 +4305,8 @@ async function start() {
   });
 
   // 바이너리 업데이트 진행률(install_update가 emit). chunk=이번 청크 바이트(누적 아님), total=전체(Option→null 가능).
-  // ★v0.12.51+ 휴면: 본체 업데이트가 홈페이지 다운로드로 전환돼(T5) install_update가 UI에서 호출되지 않으므로
-  //   이 리스너는 발화하지 않는다 — 백엔드 재활성화 여지를 위해 유지(backend install_update 주석과 짝).
+  // ★재활성(오너 2026-07-15): promptBinaryPatch가 install_update를 다시 호출한다 — 이 리스너가
+  //   "upd-bin" sticky 진행 토스트를 전담(backend install_update 주석과 짝).
   let updDownloaded = 0;
   await listen("update-progress", (e) => {
     const p = (e.payload ?? {}) as { phase?: string; chunk?: number; total?: number };
@@ -4248,6 +4368,18 @@ async function start() {
   });
 
   // (T4) 업데이트 후 조직 복원 진행(restore-progress·spawn_org_restore emit) — '직원 복귀 중' 가시화.
+  // ★TCC 처방(오너 2026-07-15): macOS 폴더 권한 거부 감지 → 안내(EPERM 실사고 — CLI 자식은
+  // 팝업 없이 조용히 거부되므로 GUI가 유일한 안내 주체다).
+  await listen("perm-warning", (e) => {
+    const p = (e.payload ?? {}) as { folder?: string };
+    const f = p.folder === "Documents" ? "문서" : "데스크탑";
+    stickyToast(
+      `perm-${p.folder ?? "folder"}`,
+      "health",
+      `⚠ macOS ${f} 폴더 접근 차단`,
+      `pane 안의 claude 등이 EPERM으로 꺼질 수 있습니다 — 시스템 설정 → 개인정보 보호 및 보안 → 파일 및 폴더(또는 전체 디스크 접근 권한)에서 cys를 허용한 뒤 앱을 재시작하세요.`,
+    );
+  });
   await listen("restore-progress", (e) => {
     const p = (e.payload ?? {}) as { phase?: string; hq_ok?: boolean; ok?: number; fail?: number; detail?: string };
     if (p.phase === "start") {
@@ -4275,6 +4407,21 @@ async function start() {
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)
   checkForUpdate(true);
   setInterval(() => checkForUpdate(true), 6 * 3600 * 1000);
+
+  // 테스트 전용(패치 채널 E2E — 오너 2026-07-15): CYS_AUTOTEST_PATCH_INSTALL=1 env 기동이면 기동
+  // 직후 패치 설치를 무클릭 자동 발화(Finder 런칭엔 env 부재 → 프로덕션 무영향). install_update가
+  // 자체적으로 업데이트를 재확인하므로 updateAvailable 상태에 의존하지 않는다.
+  (async () => {
+    try {
+      if ((await invoke("autotest_patch_install")) === true) {
+        stickyToast("upd-bin", "feed", "⬇ 패치 설치(자동 테스트)", "패치 업데이트 확인·설치 중…");
+        await invoke("install_update", { force: true });
+      }
+    } catch (e) {
+      dismissToast("upd-bin");
+      toast("health", "자동 테스트 패치 실패", String(e));
+    }
+  })();
 
   // Session restore (멀티마스터 F4): 저장본 먼저 로드(ws.socket 포함) → 부서 데몬 확보를 list 대조보다
   // 선행 → 소켓별 대조. 데몬 일시 미가동 ws는 보존(영구 삭제 방지, 검증 mustFix).
@@ -4320,10 +4467,30 @@ async function start() {
   } catch {
     registered = null;
   }
+  // ★WP-3 리바이버 게이트: base 데몬 dept 묘비 — 삭제-의도 부서 탭은 등재 여부와 무관하게 드롭
+  // (reg_remove 무음 실패로 등재가 잔존해도 부활 차단). 조회 실패=null(보수적 보존 — 현행 거동).
+  let deptTombs: Set<string> | null = null;
+  try {
+    deptTombs = new Set((await invoke("dept_tombstones")) as string[]);
+  } catch {
+    deptTombs = null;
+  }
 
   // 부서 데몬 확보를 list 대조보다 선행 — 미가동이면 cys-dept launch. 실패해도(등록된) ws는 보존.
   const ghosts = new Set<number>();
   for (const ws of workspaces.filter((w) => w.socket)) {
+    // ★WP-3+R10: 묘비 검사를 생존 검사보다 **선행** — spawn_org_restore는 업데이트 후에만
+    // 실행되므로(적대검증 보조 관찰), teardown 실패로 살아남은 묘비 데몬의 수렴 주체는 매 시작
+    // 도는 이 루프다. 묘비+생존이면 탭 드롭+정리 시도(묘비가 부활을 차단하므로 best-effort).
+    // 재생성 레이스 안전: 재생성 경로(allocate/create/launch)가 묘비를 선해소하므로 오드롭 없음.
+    {
+      const dn = deptNameFromSocket(ws.socket);
+      if (deptTombs && dn && deptTombs.has(dn)) {
+        ghosts.add(ws.id);
+        invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch(() => {});
+        continue;
+      }
+    }
     let alive = false;
     try {
       await invoke("daemon_status", { socket: ws.socket });
@@ -4570,6 +4737,7 @@ document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => 
 });
 document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
 document.getElementById("btn-refresh")!.addEventListener("click", () => void manualRefresh());
+document.getElementById("btn-restart-daemon")!.addEventListener("click", () => void manualRestartAllDaemons());
 document.getElementById("btn-theme")!.addEventListener("click", (e) =>
   openThemePopover(e.currentTarget as HTMLElement),
 );
@@ -4578,6 +4746,54 @@ document.getElementById("btn-theme")!.addEventListener("click", (e) =>
 // 새 ws를 master로 선언 시 공유 데몬 claim 충돌은 데몬 레벨 claim_denied(cysd handlers.rs·kill 없음)가
 // 비파괴 방어한다(생태계 죽지 않음·거부만). guard-master-claim(Fix2') 부트 자동발동 배선은 별건(헌법 토큰).
 document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
+
+// ★WP-1 결정 e(BOOTSTRAP_HARDENING v1.1): "마스터 시작" — cys launch-agent --role master 배선.
+// worker/cso 기동과 동일 메커니즘(앵커: 시스템은 노드만 띄우고 지휘하지 않는다). 초보를 "올바른
+// surface에서 마법 문구 입력"이라는 취약한 산문 계약에서 해방. 명령 자체가 base 데몬 고정
+// (CYS_SOCKET 제거 — start_master)이라 어느 탭에서 눌러도 부서 오염 불가. 생성 surface는 자동입양.
+// 중복 클릭은 데몬 claim_denied가 비파괴 방어(두 번째 master 거부 — 위 btn-ws-new 주석과 동일 축).
+// ★조직 모델(오너 2026-07-15): 본부=▶CEO(마스터 오브 마스터 자리) · 부서 탭=▶부서장(부서 데몬별
+// 독립 마스터). "데몬당 살아있는 마스터 1명" 규칙은 조직 단위별 적용 — 부서 10개면 마스터 10명.
+// claim_denied 원문은 초보에게 불친절 → 조직 모델 언어로 번역.
+function masterDeniedMsg(e: unknown, where: string): string {
+  const s = String(e);
+  if (/claim_denied|privileged role/i.test(s))
+    return `이미 ${where}에 마스터가 실행 중입니다 — 기존 마스터 탭(pane)을 사용하세요. (조직 단위당 마스터 1명 — 부서장은 각 부서 탭에서 세웁니다)`;
+  return s;
+}
+document.getElementById("btn-master-start")?.addEventListener("click", async () => {
+  try {
+    await invoke("start_master");
+    toast("feed", "▶ CEO 시작", "본부(base)에 마스터 오브 마스터 노드를 기동했습니다 — 잠시 후 pane이 자동으로 나타납니다. 부서가 있으면 승인 후 CEO 규약으로 승격됩니다.");
+  } catch (e) {
+    toast("health", "CEO 시작 실패", masterDeniedMsg(e, "본부(base)"));
+  }
+});
+document.getElementById("btn-dept-master")?.addEventListener("click", async () => {
+  const ws = workspaces[activeWs];
+  if (!ws?.socket) {
+    toast("health", "▶부서장은 부서 탭에서", "지금 보고 있는 탭이 본부입니다 — 부서 탭을 연 상태에서 누르세요(본부 마스터는 ▶CEO).");
+    return;
+  }
+  try {
+    await invoke("start_dept_master", { socket: ws.socket });
+    toast("feed", "▶ 부서장 시작", `${ws.name ?? "부서"}에 마스터(부서장) 노드를 기동했습니다 — 잠시 후 pane이 자동으로 나타납니다.`);
+  } catch (e) {
+    toast("health", "부서장 시작 실패", masterDeniedMsg(e, `이 부서(${ws.name ?? ws.socket})`));
+  }
+});
+
+// ★R8(WP-2): 시작 시 1회 CEO PENDING 고지 — cys-dept 알림이 가리키는 실존 컨트롤(팔레트
+// "CEO 승격 진행")로 안내. 폴링 없음(시작 1회+팔레트 온디맨드 — WINAUDIT 타이머 증식 방지).
+(async () => {
+  try {
+    if (await invoke("ceo_pending")) {
+      toast("feed", "CEO 승격 대기 중", "부서가 존재합니다 — base 부트 완료 후 명령 팔레트의 'CEO 승격 진행'으로 승인할 수 있습니다.");
+    }
+  } catch {
+    /* 데몬 미가동 등 — 침묵(다음 시작·팔레트에서 재확인) */
+  }
+})();
 
 // ---------- 사이드바 폭 드래그 + 글자 배율 (오너 요청 2026-07-12) ----------
 // 폭·배율은 CSS 변수(--wsbar-w/--wsbar-font)가 진실원, localStorage 영속. 클램프 산식=wsbar.ts.
