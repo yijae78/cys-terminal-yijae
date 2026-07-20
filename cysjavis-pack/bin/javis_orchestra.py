@@ -609,10 +609,13 @@ def resolve_manifest_phase(manifest, phase_id):
         return None, []
 
 
-def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None):
+def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None, probes=None):
     """위임 티켓 본문 생성. rules는 필수 — 호출자가 추출 성패를 알고 명시 주입한다
     (기본값 경유의 무경고 폴백 경로 제거 · self-test는 rules 주입으로 밀폐 검증).
-    tier_hint(R2 1단계): 권장 실행 등급 정보 1줄(강제 아님·None이면 라인 부재 → byte-identical)."""
+    tier_hint(R2 1단계): 권장 실행 등급 정보 1줄(강제 아님·None이면 라인 부재 → byte-identical).
+    probes(P3 · 설계 §4 컴포넌트 C): 이 태스크의 필수 probe 이름 리스트. 지정 시 '필수 probe' 블록
+    삽입, 빈/None이면 블록 부재 → 기존 티켓과 byte-identical(하위호환). E1 evidence-artifact 게이트와
+    는 별개·보완 채널(E1=산출물 파일 `--evidence-artifact`, P3=`--evidence` 텍스트 증거범주·probe 영수증)."""
     bullets = rules
     lines = []
     lines.append("[작업 위임 — 절대 강조 4규칙 포함 · work management 앵커]")
@@ -641,6 +644,33 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
                  "로 직접 push하라(--queued는 자동 Return 배달 — send-key 불필요·타이핑 가드 "
                  "안전). 즉시 끼어들어야 할 긴급 보고만 직접 send 후 `cys send-key --to master "
                  "Return`(가드 차단 시 --queued로 전환).")
+    # done 증거 게이트(P3 · 설계 §2.2·§4 컴포넌트 C) — E1 산출물 파일 게이트와 나란히 공존하는
+    # 별개·보완 채널: E1=검증 산출물 **파일**(--evidence-artifact), 여기=`--evidence` **텍스트**의
+    # 증거 범주(negative-case/실데이터)와 probe 영수증 대조. 문구 중복·모순 없이 둘 다 명시한다.
+    lines.append("done 증거 게이트(P3): `--evidence` 텍스트는 ①negative-case(고장 입력 검증) 또는 "
+                 "②실데이터(합성 픽스처 아님) 검증 결과를 담을 것. probe를 실행했으면 `probe:<name>` "
+                 "토큰을 `--evidence`에 명시하라(done 전이 시 probe 영수증 자동 대조). "
+                 "※아래 E1은 검증 산출물 **파일**(`--evidence-artifact`) 채널 — 둘은 별개·보완이다.")
+    # 필수 probe 블록은 probes 지정 시에만 삽입 — 미지정이면 라인 부재(하위호환·byte-identical).
+    # ★--task 동반 필수(R1 major-a): 영수증 대조는 (probe명∧exit0∧최근성∧target 일치)이고
+    #   relaxed probe(submit·ctx-compare·kill-preflight)의 target은 --task로만 바인딩된다 —
+    #   --task 없는 무-task 영수증은 done 대조에서 대상 불일치로 거부된다. task-prompt는 작업
+    #   서술만 알고 장부 task-id를 모르므로 `<task-id>` 플레이스홀더로 출력하고 워커가 치환한다.
+    if probes:
+        lines.append("필수 probe: 이 작업은 done 전 %s 각각 PASS 영수증 필수 "
+                     "(`python3 ${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_actprobe.py <name> "
+                     "--task <task-id> …` 실행 후 `--evidence`에 `probe:<name>` 토큰 포함). "
+                     "<task-id>는 네 장부 태스크 id로 치환하라 — task-prompt는 작업 서술만 알고 "
+                     "장부 id를 모른다. 미실행·FAIL 시 done 거부." % ", ".join(probes))
+        lines.append("  ⚠ relaxed probe(submit·ctx-compare·kill-preflight)는 `--task` 없이 "
+                     "실행하면 무-task 영수증이 되어 done 대조에서 대상 불일치로 거부된다 — "
+                     "반드시 --task를 동반하라.")
+    # E1 증거의 기계화(설계 §E1): 태스크 done 전이는 실제 검증 산출물 파일을 제출해야 통과(strict).
+    lines.append("완료 증거(E1 evidence-artifact 게이트 · strict): 태스크를 done 처리할 때 검증 산출물"
+                 " 파일(테스트 로그·빌드 출력 등, 권장 위치 `_round/evidence/<task-id>/`)을 만들고 "
+                 "`javis_task.py set-status <id> done --evidence-artifact <경로>`로 제출하라 — "
+                 "파일은 실존·비어있지않음·태스크 착수 이후 신선도를 기계 검사한다(검증 불가 시 "
+                 "--skip-reason, skip_audit.jsonl 감사 기록).")
     if prereq_block:
         lines.append("")
         lines.append(prereq_block)
@@ -700,7 +730,8 @@ def cmd_task_prompt(args):
     print(build_task_ticket(args.task, args.scope, success, args.to, rules=rules,
                             output_format=getattr(args, "output_format", None),
                             prereq_block=prereq, dont=getattr(args, "dont", None),
-                            tier_hint=getattr(args, "tier", None)))
+                            tier_hint=getattr(args, "tier", None),
+                            probes=_split_csv(getattr(args, "probes", None))))
     return 0
 
 
@@ -1465,8 +1496,21 @@ def cmd_self_test(args):
         for must in ("절대 강조 4규칙", "품질 절대우선", "할루시네이션 방지",
                      "hallucination-guard", "grill-me", "요약·압축 절대 금지", "게이트",
                      "성공 기준", "WORKER_TODO.md", "${CYS_PACK_DIR", "보고 채널",
-                     "--queued"):
+                     "--queued", "완료 증거(E1 evidence-artifact 게이트", "--evidence-artifact",
+                     "done 증거 게이트(P3)"):
             assert must in ticket, "task-prompt 티켓에 '%s' 누락" % must
+        # P3 필수 probe 블록: probes 미지정이면 부재(하위호환·E1 블록은 그대로), 지정 시 목록·actprobe 명령
+        assert "필수 probe" not in ticket, "probes 미지정인데 필수 probe 블록 존재(하위호환 위반)"
+        tp_probe = build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES,
+                                     probes=["submit", "artifact"])
+        assert "필수 probe" in tp_probe and "submit, artifact" in tp_probe \
+            and "javis_actprobe.py" in tp_probe, "probes 지정인데 필수 probe 블록 누락"
+        # ★--task 동반(R1 major-a) + relaxed 경고(무-task 영수증 거부 회귀 배선)
+        assert "--task <task-id>" in tp_probe, "probe 예시에 '--task <task-id>' 동반 누락(무-task 영수증 거부 회귀)"
+        assert "relaxed probe" in tp_probe, "relaxed probe --task 경고 누락"
+        # E1·P3 공존: probes 지정 시에도 E1 블록이 함께 존재(둘 다 명시)
+        assert "완료 증거(E1 evidence-artifact 게이트" in tp_probe and "done 증거 게이트(P3)" in tp_probe, \
+            "E1·P3 evidence 게이트 공존 실패"
         # 폴백 단독으로도 4규칙 마커 전부를 갖는다(디렉티브 부재 환경의 최후 방어선)
         fb = "\n".join(FALLBACK_RULES)
         for mark in RULE_MARKERS:
@@ -1789,6 +1833,10 @@ def main():
     tp.add_argument("--tier", default=None,
                     help="권장 실행 등급 정보 1줄 주입(trivial/standard/heavy — 강제 아님·R2 1단계·"
                          "javis_route suggested_node와 정합). 미지정 시 티켓 byte-동일")
+    tp.add_argument("--probes", default=None,
+                    help="이 태스크의 필수 probe 목록(쉼표 구분 — 예: 'submit,artifact'). 지정 시 "
+                         "티켓에 done 전 각 probe PASS 영수증 필수 블록 삽입(P3 · 설계 §2.2·§4 컴포넌트 C·"
+                         "javis_actprobe.py 대조). 미지정 시 블록 부재 → 티켓 byte-동일(하위호환)")
     tp.add_argument("--no-survival-gate", action="store_true",
                     help="생존 게이트 생략(D5 일회용 fresh 경로 — 워커 surface가 실행 시점에 생성될 때만). "
                          "평시 위임엔 쓰지 마라(상시 워커 생존 확인이 안전).")

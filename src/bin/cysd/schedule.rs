@@ -91,9 +91,10 @@ pub fn schedule_path() -> PathBuf {
 /// v2(A안·2026-07-11): text_command를 셸 메타문자 0의 단일 명령으로 정상화(Windows cmd /C 무실행 결함 근본수리).
 const BUILTIN_JOBS_VERSION: u64 = 2;
 
-/// built-in(phoenix 인프라) 잡 정의 — 팩 schedule.json 배달이 아니라 코드가 소유한다(schedule.json 이 user-owned
-/// 로 전환돼 팩 강제갱신이 사용자 잡을 보존하므로, built-in 잡 진화는 이 코드가 담당). 각 항목에 `_builtin`/
-/// `_builtin_version` 마커를 달아 ensure 가 id 로 upsert·버전 대조한다(Job 의 미지 필드는 serde 가 무시).
+/// built-in 잡 정의(phoenix 인프라 + learn 학습 루프) — 팩 schedule.json 배달이 아니라 코드가 소유한다
+/// (schedule.json 이 user-owned 로 전환돼 팩 강제갱신이 사용자 잡을 보존하므로, built-in 잡 진화는 이 코드가
+/// 담당). 각 항목에 `_builtin`/`_builtin_version` 마커를 달아 ensure 가 id 로 upsert·버전 대조한다(Job 의
+/// 미지 필드는 serde 가 무시). text_command 는 R-CLI-4 게이트가 이 코드 정의와의 정확 일치로 신뢰한다.
 fn builtin_jobs() -> Vec<serde_json::Value> {
     // ★A안(2026-07-11): text_command를 **셸 메타문자 0의 단일 명령**으로 정상화한다.
     //   구 정의(POSIX 문법: `printf …; python3 … 2>&1 | tail -N`)는 Windows에서 run_text_command가
@@ -129,13 +130,36 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "_builtin": "phoenix",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
+        // (learn gaps C12③) RSI 학습 루프 정기 잡 — G1 audit 구동자(일 1회)·G5 fleet digest(주 1회).
+        // CYS_ROUND_DIR 핀: 데몬 cwd 의존(_round) 대신 canonical ~/.cys/state/learn 고정
+        // (launchd cwd=/ 사고 이력·설계안 §3 G5) — 데몬 learn_state_dir 규약과 동일(env 설정 시 승계).
+        json!({
+            "id": "learn-ttl-audit",
+            "every_minutes": 1440,
+            "action": "push",
+            "to": "master",
+            "if_absent": "skip",
+            "text_command": "printf '[heartbeat] RSI 학습 TTL 감사(일 1회·G1) — 만기 tombstone·재검 wakeup·lapse 강등·refs 대조의 결정론 산출이다. hard-fail 항목은 능동 조치하라.\\n'; CYS_ROUND_DIR=\"${CYS_ROUND_DIR:-$HOME/.cys/state}\" JAVIS_ROOT=\"${JAVIS_ROOT:-$HOME/.cys/state}\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_learn.py\" audit --json",
+            "_builtin": "learn",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        }),
+        json!({
+            "id": "fleet-digest",
+            "every_minutes": 10080,
+            "action": "push",
+            "to": "master",
+            "if_absent": "skip",
+            "text_command": "printf '[heartbeat] 주간 fleet digest(G5) — 채택 학습물·사후 효과(ROI)·게이트 지출의 결정론 read-only 집계다. 수치 불변으로 보고하라. 추천 0건 지속=게이트 비용 재조정 검토 트리거.\\n'; CYS_ROUND_DIR=\"${CYS_ROUND_DIR:-$HOME/.cys/state}\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_fleet_report.py\" --days 7 2>&1 | tail -40",
+            "_builtin": "learn",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        }),
     ]
 }
 
 /// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
 ///   · 부재 → append(생성)
-///   · 존재 + built-in 마커(`_builtin=="phoenix"`) → 버전 상이 시 교체(갱신)·동버전 무접촉
-///   · 존재 + **마커 없음(사용자가 그 id 선점)** → ★codex W3: 교체 금지(사용자 잡 보존)·경고(conflicts 반환)
+///   · 존재 + built-in 마커(`_builtin`이 코드 정의와 일치: "phoenix"·"learn") → 버전 상이 시 교체(갱신)·동버전 무접촉
+///   · 존재 + **마커 없음/불일치(사용자가 그 id 선점)** → ★codex W3: 교체 금지(사용자 잡 보존)·경고(conflicts 반환)
 /// 반환 (changed, conflicts) — conflicts=사용자가 reserved id 를 쓴 잡 id 목록(호출측 loud 경고).
 fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) {
     let mut changed = false;
@@ -151,10 +175,12 @@ fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) 
             .position(|j| j.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
         {
             Some(pos) => {
-                // ★codex W3 major: built-in 마커(_builtin=="phoenix")가 있는 항목만 우리 소유 → 버전 갱신.
-                //   마커 없는 동명 항목은 사용자가 그 id 를 선점한 것 → 교체 금지+conflict 경고(user 잡 보존).
-                let is_ours =
-                    jobs[pos].get("_builtin").and_then(|v| v.as_str()) == Some("phoenix");
+                // ★codex W3 major: built-in 마커(_builtin)가 코드 정의(bj)의 마커와 일치하는 항목만
+                //   우리 소유 → 버전 갱신. 마커 없는/다른 동명 항목은 사용자가 그 id 를 선점한 것
+                //   → 교체 금지+conflict 경고(user 잡 보존). (마커군: "phoenix"=인프라·"learn"=학습 루프)
+                let want_marker = bj.get("_builtin").and_then(|v| v.as_str());
+                let is_ours = want_marker.is_some()
+                    && jobs[pos].get("_builtin").and_then(|v| v.as_str()) == want_marker;
                 if !is_ours {
                     conflicts.push(id);
                     continue;
@@ -837,15 +863,19 @@ mod tests {
             "id": "user-custom-job", "every_minutes": 30, "action": "push", "to": "master"
         })];
 
-        // 1차: built-in 2개 생성 → changed=true.
+        // 1차: built-in 4개(phoenix2 + learn2) 생성 → changed=true.
         let (c1, conf1) = apply_builtin_jobs(&mut jobs);
         assert!(c1, "1차 ensure 는 built-in 잡을 생성해야 한다");
         assert!(conf1.is_empty(), "conflict 없음(예약 id 미선점)");
         let ids: Vec<&str> = jobs.iter().filter_map(|j| j["id"].as_str()).collect();
         assert!(ids.contains(&"phoenix-snapshot-6h") && ids.contains(&"phoenix-drill-weekly"));
+        assert!(
+            ids.contains(&"learn-ttl-audit") && ids.contains(&"fleet-digest"),
+            "learn gaps C12③ 잡 2종 생성"
+        );
         assert!(ids.contains(&"user-custom-job"), "사용자 잡은 보존돼야 한다");
-        assert_eq!(jobs.len(), 3, "사용자1 + built-in2");
-        // 주기 정합(typed): snapshot=6h(360), drill=7일(10080).
+        assert_eq!(jobs.len(), 5, "사용자1 + built-in4");
+        // 주기 정합(typed): snapshot=6h(360), drill=7일(10080), audit=일(1440), digest=7일(10080).
         let period = |id: &str| {
             jobs.iter()
                 .find(|j| j["id"].as_str() == Some(id))
@@ -853,6 +883,8 @@ mod tests {
         };
         assert_eq!(period("phoenix-snapshot-6h"), Some(360), "snapshot 6h");
         assert_eq!(period("phoenix-drill-weekly"), Some(10080), "drill 7일");
+        assert_eq!(period("learn-ttl-audit"), Some(1440), "learn audit 일 1회");
+        assert_eq!(period("fleet-digest"), Some(10080), "fleet digest 주 1회");
 
         // 2차: 동버전 재실행 → 무접촉(changed=false·중복 0).
         let (c2, _) = apply_builtin_jobs(&mut jobs);
@@ -862,7 +894,7 @@ mod tests {
             .filter(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
             .count();
         assert_eq!(snap_count, 1, "재실행에도 중복 생성 0");
-        assert_eq!(jobs.len(), 3, "중복 없이 3개 유지");
+        assert_eq!(jobs.len(), 5, "중복 없이 5개 유지");
 
         // 3차: 구버전(마커=0) 항목이 있으면 갱신(교체) → changed=true, 여전히 중복 0.
         for j in jobs.iter_mut() {
@@ -922,6 +954,40 @@ mod tests {
         // drill 은 마커 없는 선점이 없으므로 정상 생성(changed=true).
         assert!(changed, "drill 신규 생성으로 changed");
         assert!(jobs.iter().any(|j| j["id"].as_str() == Some("phoenix-drill-weekly")));
+    }
+
+    /// (learn gaps C12③) pack seed(cysjavis-pack/schedule.json)의 마커 잡 ↔ builtin_jobs()
+    /// 코드 정의 동기 핀 — 드리프트하면 R-CLI-4 게이트가 seed 사본 text_command 를 거부해
+    /// 잡이 무음 실패한다(산문→코드 대칭 핀). learn 잡 2종 등재도 함께 박제.
+    #[test]
+    fn pack_seed_marked_jobs_match_builtin_defs() {
+        let seed: serde_json::Value =
+            serde_json::from_str(include_str!("../../../cysjavis-pack/schedule.json"))
+                .expect("seed schedule.json 파싱");
+        let builtins = builtin_jobs();
+        let mut checked = 0;
+        for j in seed["jobs"].as_array().expect("seed jobs 배열") {
+            if j.get("_builtin").is_none() {
+                continue; // 마커 없는 seed 잡(owner-report 등)은 코드 소유가 아니다
+            }
+            let id = j["id"].as_str().unwrap_or("?");
+            let b = builtins
+                .iter()
+                .find(|b| b.get("id") == j.get("id"))
+                .unwrap_or_else(|| panic!("seed 마커 잡 '{id}' 이 builtin_jobs() 에 없음"));
+            assert_eq!(j, b, "seed '{id}' ↔ builtin_jobs() 정의 드리프트");
+            checked += 1;
+        }
+        assert!(checked >= 2, "learn 잡 2종(learn-ttl-audit·fleet-digest)이 seed 에 등재돼야 한다");
+        // R-CLI-4: 코드 소유 text_command 는 게이트가 신뢰해야 발화된다.
+        for id in ["learn-ttl-audit", "fleet-digest"] {
+            let cmd = builtins
+                .iter()
+                .find(|b| b["id"].as_str() == Some(id))
+                .and_then(|b| b["text_command"].as_str())
+                .expect("text_command 존재");
+            assert!(is_trusted_builtin_text_command(cmd), "'{id}' text_command 게이트 신뢰");
+        }
     }
 
     #[test]

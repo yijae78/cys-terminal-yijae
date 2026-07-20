@@ -51,6 +51,14 @@ dept_sock(){
   esac
 }
 dept_pack(){ echo "$HOME/.cys/pack-dept-$1"; }
+# ★기능2: 부서 state 디렉토리(대화기억 transcripts.db 보관·실측 최대 324MB) = 소켓의 부모.
+# discover_depts(javis_phoenix.py:1082 glob `state_root/cys-dept-*`)와 동일 규약 — 이 경로가 사라지면
+# 재발견이 끊겨 부활이 영구 차단된다(rm 아닌 격리가 유일 복구 경로 · javis_backup default_roots 무포함).
+# Windows named pipe엔 형제 디렉토리 개념이 없어 unix 한정(named pipe면 dirname 무의미 → purge_state skip).
+dept_state(){ dirname "$(dept_sock "$1")"; }
+# ★기능2: 격리(휴지통) 루트 — 삭제는 전부 mv로 통일(백업 없는 rm 금지). discover_depts glob은
+# `cys-dept-*`만 매치하므로 `cys-trash/`는 무매치 = 재발견 절단(격리=부활 차단·복구 가능 양립).
+TRASH_ROOT="$HOME/.local/state/cys-trash"
 
 # ★W2a-4 의도삭제 → phoenix dept 묘비: 부서 전체 폐기(down/down-sock=의도적 teardown)를 phoenix
 # 보호집합(base dept_roster)에 명시적 폐역으로 기록해, 부활 보고가 폐기된 부서를 '부활 필요'로
@@ -81,6 +89,63 @@ dept_tombstone_remove(){
   ph="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_phoenix.py"
   [ -f "$ph" ] || return 0
   python3 "$ph" tombstone "$1" --dept --remove >/dev/null 2>&1 || true
+}
+
+# ★기능2 프리미티브: 부서 state 디렉토리(대화기억 transcripts.db) 격리(mv→trash). down 기본 체인 뒤
+# --purge-state에서만 호출. 삭제(rm) 아닌 격리라 왕복 복원 가능(mv 역방향). 반환 0=격리 완료 또는
+# 대상 없음(우아·no-op), 비0=부적격명·경로 불일치·사용 중·mv 실패·잔존(강행 금지). preflight stop-and-report 내장.
+dept_purge_state(){
+  local name="$1"
+  # ★F2(reviewer1): traversal 차단 — 부서명에 / 또는 .. 가 있으면 pwd -P가 네임스페이스 밖 실경로를
+  # 산출(문자열 동등 가드는 통과)→mv 대참사. 진입부에서 거부한다(빈 이름·경로구분자·상위참조 불허).
+  case "$name" in
+    */*|*..*|"") echo "[cys-dept] purge-state: 부적격 부서명('"'"'$name'"'"') — 경로 구분자·상위참조 불허" >&2; return 2 ;;
+  esac
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      echo "[cys-dept] purge-state: Windows named pipe 부서는 state 형제 디렉토리 없음 — skip($name)" >&2
+      return 0 ;;
+  esac
+  local sd; sd="$(dept_state "$name")"
+  local expect="$HOME/.local/state/cys-dept-$name"
+  if [ "$sd" != "$expect" ]; then
+    echo "[cys-dept] purge-state: state 경로 불일치(got=$sd expect=$expect) — 중단(오해석 방지)" >&2
+    return 3
+  fi
+  if [ ! -d "$sd" ]; then
+    echo "[cys-dept] purge-state: state 디렉토리 없음($sd) — 격리 대상 없음(no-op)"
+    return 0
+  fi
+  local rp; rp="$(cd "$sd" 2>/dev/null && pwd -P)" || rp="$sd"
+  # ★F2 belt: realpath 재대조 — 심링크·경합으로 rp가 cys-dept-<name> 밖이면 거부(mv 전 최종 방어).
+  if [ "$(basename "$rp")" != "cys-dept-$name" ]; then
+    echo "[cys-dept] purge-state: realpath 이탈($rp) — cys-dept-$name 아님, 중단" >&2
+    return 3
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof +D "$rp" >/dev/null 2>&1; then
+      echo "[cys-dept] purge-state: $rp 사용 중(열린 파일 존재) — 격리 중단(데몬 잔존 의심·강행 금지). down 재확인 후 재시도." >&2
+      return 4
+    fi
+  fi
+  local sz mt
+  sz="$(du -sh "$rp" 2>/dev/null | cut -f1)"
+  mt="$(stat -c '%y' "$rp" 2>/dev/null || stat -f '%Sm' "$rp" 2>/dev/null || echo '?')"
+  echo "[cys-dept] purge-state: 대상=$name 경로=$rp 크기=${sz:-?} 최종수정=${mt}"
+  local ts trash
+  ts="${CYS_TRASH_STAMP:-$(date +%s)}"
+  trash="$TRASH_ROOT/$name-$ts"
+  mkdir -p "$trash" || { echo "[cys-dept] purge-state: trash 생성 실패($trash)" >&2; return 5; }
+  if ! mv "$rp" "$trash/state" 2>/dev/null; then
+    echo "[cys-dept] purge-state: 격리 mv 실패($rp → $trash/state)" >&2
+    return 5
+  fi
+  if [ -d "$sd" ]; then
+    echo "[cys-dept] purge-state: 원위치 잔존($sd) — 격리 미완(FAIL)" >&2
+    return 6
+  fi
+  echo "[cys-dept] purge-state: $name state 격리 완료 → $trash/state (복구=mv 역방향·${CYS_TRASH_TTL_DAYS:-14}일 후 reap 소거)"
+  return 0
 }
 
 # RC-15(D7): 부서 로그·상태 디렉토리 — Windows named pipe 소켓(\\.\pipe\...)은 dirname/디렉토리 개념이
@@ -362,15 +427,16 @@ sys.exit(3)' 2>/dev/null) || true
   fi
 }
 # CEO 승격: 부서가 1개 이상이면 기본 데몬을 CEO로(디렉티브 교체, 가역 백업). 부서 0이면 표준 master 보존(하위호환).
-# ★첫 승격은 자동이 아니다(오너 2026-07-14): 최소 1개 마스터(부서)가 존재한 뒤 오너가 승인(feed)
-# 하거나 지명(promote-ceo)해야 한다. 마커(.pre-ceo)=기승인 상태라 조정(무결 유지)은 묻지 않는다.
+# ★자동 승격(오너 정책 2026-07-17): 부서(최소 1개 마스터) 생성 자체를 승격 동의로 간주해 자동 승격한다.
+#   (종전 2026-07-14 'feed 승인/지명 필요'는 폐기 — GUI 승인 버튼이 §3.2 자기승인 차단·토큰 불일치로 침묵
+#   실패해 승격이 걸리던 문제 해소). 지명(promote-ceo)은 여전히 오너 직접 경로다. 마커(.pre-ceo)=기승인 상태라 조정(무결 유지)은 묻지 않는다.
 # ★부트 게이트(BOOTSTRAP_HARDENING WP-2): base master가 한 번도 부트되지 않은 기계
 #   (.master-bootstrapped 부재 — writer=javis_bootstrap.py 성공 경로 유일)에서는 승격을 PENDING으로
 #   보류한다. 부트 전 승격은 "부트 시퀀스 0개인 CEO"를 낳는다(윈도우 초보 실사고 근본원인 R2).
 #   stale 정책(설계 §4.1): 이 게이트는 마커 '존재만' 본다(버전 무관 — 승격은 조직 사실).
 BOOT_MARKER="$HOME/.cys/.master-bootstrapped"
 CEO_PENDING="$HOME/.cys/state/ceo-pending"
-ceo_promote(){  # $1: "consented"면 동의 게이트 생략(오너 지명 promote-ceo 경로)
+ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자동 승격 알림 생략
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
   local ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
   [ -f "$ceo" ] || { echo "[cys-dept] CEO 템플릿 없음 — 승격 생략(cys init-pack 필요)"; return 0; }
@@ -385,22 +451,33 @@ ceo_promote(){  # $1: "consented"면 동의 게이트 생략(오너 지명 promo
     echo "[cys-dept] CEO 승격 보류(PENDING) — base master 미부트(.master-bootstrapped 부재)" >&2
     return 0
   fi
-  if [ ! -f "$md.pre-ceo" ] && [ "${1:-}" != "consented" ]; then
-    # deny/timeout/feed불가 = 승격 보류(표준 master 유지·다음 부서 이벤트에 재질의) — fail-safe는 '승격 안 함'.
-    # env -u CYS_SOCKET: 승격 대상은 기본 데몬이므로 승인 요청도 기본 데몬 feed로(ceo_reinject_master와 동형).
-    if env -u CYS_SOCKET "$CYS" feed push --wait --title "CEO 승격 승인 요청" \
-         --body "부서 생성 감지 — 기본 데몬 master를 CEO(master of master)로 승격합니까? (MASTER_DIRECTIVE→CEO 규약 교체·헌법은 .pre-ceo 보존·ceo_demote로 가역)"; then
-      echo "[cys-dept] CEO 승격 오너 승인됨"
-    else
-      echo "[cys-dept] CEO 승격 보류(오너 미승인/응답없음) — 표준 master 유지" >&2
-      return 0
-    fi
+  # ★자동 승격(오너 정책 2026-07-17): 종전 feed --wait 동의 게이트를 제거한다. 부서 생성 자체를 승격 동의로
+  #   간주해 자동 승격한다(GUI 승인 버튼이 §3.2 자기승인 차단·토큰 불일치로 침묵 실패해 승격이 걸리던 문제 해소).
+  #   위 ③ 부트 마커 PENDING 게이트는 불변(미부트 머신 승격 금지). consented(오너 지명)는 원래 자동 아님 — 알림 생략 판별용.
+  local _auto=0
+  if [ ! -f "$md.pre-ceo" ] && [ "${1:-}" != "consented" ]; then _auto=1; fi
+  # ★동시 승격 직렬화(오너 2026-07-15 적대검증 D-5): 두 promote가 겹치면 두 번째가 "pre-ceo 없음"을
+  # 읽은 뒤 첫 번째의 cp(ceo→md) 이후 실행돼 CEO 템플릿을 .pre-ceo로 복사→ceo_demote 원복 불능.
+  # flock으로 백업+교체를 원자화(flock 미설치 환경은 그대로 진행 — 인간 페이스 더블클릭은 저위험).
+  _swap(){ [ -f "$md.pre-ceo" ] || cp "$md" "$md.pre-ceo"; cp "$ceo" "$md"; }
+  if command -v flock >/dev/null 2>&1; then
+    ( flock 9; _swap ) 9>"$md.promote.lock"
+  else
+    _swap
   fi
-  [ -f "$md.pre-ceo" ] || cp "$md" "$md.pre-ceo"
-  cp "$ceo" "$md"
   rm -f "$CEO_PENDING" 2>/dev/null || true   # 승격 완료 = PENDING 해소
   echo "[cys-dept] 기본 데몬 CEO 승격(directives 교체·백업 .pre-ceo)"
   ceo_reinject_master "CEO 승격"
+  if [ "$_auto" -eq 1 ]; then
+    # ★자동 승격 직후 비대기 알림(오너 정책 2026-07-17). 승격 차단 금지(fail-open).
+    #   ★리뷰어1 F4: 종전 `|| true`는 push 실패(데몬 미기동 등)를 삼켜 오너가 정체성 변경을 통지받지 못했다 →
+    #   실패 시 stderr 1줄 가시화(exit code 무오염 — || 리스트 마지막이 echo라 set -e 안전).
+    #   가역 사실 근거: ceo_demote는 부서 0개(reg_count=0) 시 down/down-sock에서 자동 호출되어 .pre-ceo
+    #   백업을 복원한다(수동 강등 명령은 없음 — 환각 금지).
+    env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 완료(자동)" \
+      --body "부서 생성 감지 — 오너 정책(2026-07-17)에 따라 기본 데몬 master를 CEO로 자동 승격했습니다. 가역: 부서를 모두 정리해 0개가 되면 자동으로 표준 master로 강등(원복)됩니다(.pre-ceo 백업 복원)." >/dev/null 2>&1 \
+      || echo "[cys-dept] 승격 완료 알림 push 실패(데몬 미기동?) — 승격 자체는 완료됨" >&2
+  fi
 }
 ceo_demote(){
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
@@ -691,7 +768,19 @@ PY
     echo "$name"   # stdout 마지막 = 확정 name(Tauri 파싱)
     ;;
   down)
-    name="${2:?usage: cys-dept down <name>}"
+    # ★기능2 인자 파싱 하드닝: 플래그를 위치 무관 파싱하고 미지 플래그는 usage exit한다. 종전
+    # `name="${2:?}"; $3 무시`는 오순서(`down --purge-state dept-3`)에서 "--purge-state"를 부서명으로
+    # 흡수해 유령 부서를 down하는 무음 사고가 났다. 2인자 plain 호출(down <name>)은 거동 불변.
+    name=""; purge_state=0
+    shift  # "down" 제거
+    for _a in "$@"; do
+      case "$_a" in
+        --purge-state) purge_state=1 ;;
+        --*) echo "[cys-dept] down: 미지 플래그 '"'"'$_a'"'"' (usage: cys-dept down <name> [--purge-state])" >&2; exit 2 ;;
+        *) if [ -z "$name" ]; then name="$_a"; else echo "[cys-dept] down: 인자 과다 '"'"'$_a'"'"' (usage: cys-dept down <name> [--purge-state])" >&2; exit 2; fi ;;
+      esac
+    done
+    [ -n "$name" ] || { echo "usage: cys-dept down <name> [--purge-state]" >&2; exit 2; }
     sock="$(dept_sock "$name")"
     # ★NO_AUTOSTART(감사 2026-07-10): 죽은 부서 down 시 identify가 cysd를 되살려 그걸 kill하던 낭비 spawn 제거
     # — 실패 시 pid 빈값이면 아래가 kill을 건너뛰고 rm+reg_remove로 진행(종국 상태 동일).
@@ -707,6 +796,11 @@ PY
     dept_tombstone "$name"
     reg_remove "$name"
     [ "$(reg_count)" = "0" ] && ceo_demote || true
+    # ★기능2: --purge-state면 기본 teardown 체인 뒤 state 디렉토리(transcripts.db) 격리(mv→trash).
+    # 묘비는 영구 존치(위 dept_tombstone) — purge는 재발견 경로(state dir)를 끊어 부활을 봉인한다.
+    if [ "$purge_state" = 1 ]; then
+      dept_purge_state "$name" || { echo "[cys-dept] $name state 격리 실패(위 사유·teardown은 완료)" >&2; exit 3; }
+    fi
     echo "[cys-dept] $name 종료·정리 완료. 부서 수=$(reg_count)"
     ;;
   down-sock)
@@ -840,25 +934,48 @@ PY
     done <<EOF
 $snap
 EOF
-    echo "[cys-dept] reap 완료(dry=$dry): DEAD=$nd IDLE=$ni SKIP=$ns. 부서 수=$(reg_count)"
+    # ★기능2 trash 만료 소거: N일(기본 14·CYS_TRASH_TTL_DAYS) 경과 격리분을 영구 소거한다. 방치 시
+    # transcripts.db(부서당 최대 324MB)가 무한 누적되는데 resource_gate는 디스크 크기를 측정하지 않아
+    # 신호가 없다 — 이 sweep가 유일한 회수 경로. 소유·주기는 CSO_DIRECTIVE 참조. --dry면 판정만.
+    nt=0
+    if [ -d "$TRASH_ROOT" ]; then
+      ttl="${CYS_TRASH_TTL_DAYS:-14}"
+      while IFS= read -r _td; do
+        [ -n "$_td" ] || continue
+        if [ "$dry" = 1 ]; then echo "[cys-dept] reap(dry): TRASH-EXPIRE $_td (>${ttl}d)"
+        else rm -rf "$_td" && nt=$((nt+1)) && echo "[cys-dept] reap: TRASH-EXPIRE $_td (>${ttl}d)"; fi
+      done < <(find "$TRASH_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +"$ttl" 2>/dev/null)
+    fi
+    echo "[cys-dept] reap 완료(dry=$dry): DEAD=$nd IDLE=$ni SKIP=$ns TRASH-EXPIRE=$nt. 부서 수=$(reg_count)"
     ;;
   promote-ceo)
     # 오너 지명 경로(오너 2026-07-14): 오너/CSO가 기본 데몬 master를 CEO로 직접 지명 — 호출 자체가 동의.
     n=$(reg_count)
     [ "$n" -ge 1 ] || { echo "[cys-dept] 부서 0개 — CEO는 최소 1개 마스터(부서) 존재 후 단계다(승격 안 함)"; exit 4; }
     ceo_promote consented
+    # ★진짜 승격 검증(오너 2026-07-15 적대검증 D-2): consented(오너 지명)든 자동 승격이든 boot-marker
+    # PENDING 게이트(부트 미완)는 못 뚫어 ceo_promote가 미승격인데 return 0 할 수 있다. GUI가 그 exit 0을
+    # "✅ 승격 완료"로 오보하지 않게, 실제 승격 여부(md==CEO 템플릿 또는 .pre-ceo 백업 존재)를 post-verify해
+    # 미승격이면 exit 5로 truthful 실패를 반환한다(approve_ceo_promotion→Err→GUI 실패 표시).
+    _md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"; _ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
+    if cmp -s "$_md" "$_ceo" 2>/dev/null || [ -f "$_md.pre-ceo" ]; then
+      :   # 승격 확정(directive=CEO 또는 백업 존재)
+    else
+      echo "[cys-dept] CEO 승격 미완(보류) — base master 미부트(.master-bootstrapped 부재) 등. base 부트 완료 후 재시도." >&2
+      exit 5
+    fi
     ;;
   promote-if-pending)
     # BOOTSTRAP_HARDENING WP-2: 부트 게이트로 보류된 승격의 해소 경로.
     # 조건 = PENDING 존재 + .master-bootstrapped 존재 + 부서≥1. 미충족=no-op(exit 0·멱등).
-    # --request-only(부트 ⑦ 전용·비대기): 알림 재발행만 — 실제 승격·동의 대기는 하지 않는다
-    #   (부트와 승격 동의의 분리 — 설계 v1.1 결함⑤). 대기형: ceo_promote(자체 동의 게이트 --wait) 경유.
+    # --request-only(부트 ⑦ 전용·비대기): 알림 재발행만 — 실제 승격은 하지 않는다
+    #   (부트와 자동 승격의 분리 — 설계 v1.1 결함⑤). 대기형: ceo_promote(자동 승격, 오너 정책 2026-07-17) 경유.
     _pend_ok=0
     [ -f "$CEO_PENDING" ] && [ -f "$BOOT_MARKER" ] && [ "$(reg_count)" -ge 1 ] && _pend_ok=1
     if [ "${2:-}" = "--request-only" ]; then
       if [ "$_pend_ok" -eq 1 ]; then
         env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 대기" \
-          --body "부트 완료 — 부서가 존재하여 CEO 승격이 대기 중입니다. 명령 팔레트의 'CEO 승격 진행' 또는 다음 부서 이벤트에서 승인을 진행하세요." >/dev/null 2>&1 || true
+          --body "부트 완료 — 부서가 존재하여 CEO 승격이 대기 중입니다. 명령 팔레트의 'CEO 승격 진행' 또는 다음 부서 이벤트에서 자동 승격됩니다(오너 정책 2026-07-17)." >/dev/null 2>&1 || true
         echo "[cys-dept] CEO 승격 대기 알림 발행(request-only)"
       else
         echo "[cys-dept] promote-if-pending(request-only): 조건 미충족 — no-op (pending=$([ -f "$CEO_PENDING" ] && echo y || echo n) 마커=$([ -f "$BOOT_MARKER" ] && echo y || echo n) 부서=$(reg_count))"
@@ -866,7 +983,7 @@ EOF
       exit 0
     fi
     if [ "$_pend_ok" -eq 1 ]; then
-      ceo_promote   # 동의 게이트(feed --wait) 경유 — 성공 시 PENDING 해소는 ceo_promote 내부
+      ceo_promote   # 자동 승격(오너 정책 2026-07-17) 경유 — 성공 시 PENDING 해소는 ceo_promote 내부
     else
       echo "[cys-dept] promote-if-pending: 조건 미충족 — no-op"
     fi

@@ -161,6 +161,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(world())
         if path == "/history":
             return self._json({"events": []})
+        if path == "/skills":   # D6 카페 팝업스토어 — 브리지 /skills 계약 합성(404 회피)
+            return self._json({"skills": [
+                {"name": "appbuild", "description": "웹/앱 자율 빌드 오케스트레이터",
+                 "accounts": ["acct-a", "acct-b", "acct-c", "acct-d"]},
+                {"name": "deep-research", "description": "다출처 팩트체크 리서치 하네스",
+                 "accounts": ["claude"]},
+                {"name": "diagnose", "description": "난해 버그 진단 루프", "accounts": ["pack", "claude"]}]})
         if path == "/peek":
             q = parse_qs(urlparse(self.path).query)   # parse_qs 가 percent-decoding 수행 → 정식 키 복원
             PEEK_KEYS.append(q.get("key", [""])[0])
@@ -314,6 +321,7 @@ def main() -> int:
             title = page.evaluate("window.__officeDebug.panelTitle()")
             check("본부" in title and "@surface" not in title and "main" not in title,
                   f"④ 패널 dept_label 표기('본부 · role', raw 키 비노출) (title={title!r})")
+            # office-cc v13 배치·착석·강아지·상점 불변식은 전용 게이트(office_cc_gate.py)로 분리.
 
             check(len(page_errors) == 0, f"콘솔 pageerror 0건 (got {page_errors})")
             check(len(console_errors) == 0, f"콘솔 error 0건 (got {console_errors[:3]})")

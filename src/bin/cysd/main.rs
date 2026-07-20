@@ -6,9 +6,11 @@
 // GUI 앱과 동일하게 릴리스에서 windows subsystem 으로 빌드해 콘솔을 원천 제거한다(디버그는 콘솔 유지).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accounts;
 mod alerts;
 mod analytics;
 mod approval;
+mod approval_risk;
 mod caps;
 mod channels;
 mod classifier;
@@ -21,6 +23,7 @@ mod hwmon;
 mod recall;
 mod schedule;
 mod severity;
+mod skillrun;
 mod state;
 mod undo;
 mod usage;
@@ -57,11 +60,86 @@ fn scrub_claude_session_env() {
             eprintln!("[cysd] scrubbed leaky claude session env: {k}");
         }
     }
+    // ★데몬 root env에 PYTHONUTF8=1 주입(정밀진단 diagnose-utf8-fix (a) 확정).
+    // ⓐ근거: Windows embeddable python은 기본 코드페이지(cp1252/cp949)로 파일을 열어 한글 UTF-8
+    //   팩파일 open().read()가 UnicodeDecodeError로 크래시한다. 데몬 root에서 1회 설정하면 데몬이
+    //   spawn하는 **전 파이썬 자식**(fire_command 스케줄 잡·office-bridge·phoenix·auto-restore 등)이
+    //   상속으로 자동 커버된다 — spawn 지점 개별 주입 금지(누락 시 6곳 산발). state.rs:1705의 pane
+    //   builder.env("PYTHONUTF8","1") 주입과 정합(pane 밖 데몬 자식까지 root가 커버). unix는 이미
+    //   UTF-8이라 no-op(무영향).
+    // ⓑ2024 edition 마이그레이션 시: std::env::set_var는 2024부터 unsafe fn이므로 `unsafe { … }`
+    //   래핑이 필요하다(현 edition은 safe — 위 scrub 루프의 remove_var와 동일 계약).
+    std::env::set_var("PYTHONUTF8", "1");
 }
 
 #[tokio::main]
 async fn main() {
     scrub_claude_session_env();
+
+    // ★W1(조기 단일 인스턴스 게이트): 소켓 경로 확정 직후·pack 설치보다 먼저 단일 인스턴스 게이트를
+    // 통과시킨다. 목적 — 락/싱글턴 경쟁의 **패자**가 상태를 오염시키는 부트 부수효과 전에 죽게 하는 것.
+    // (게이트 뒤 부수효과: Daemon::new 의 operator.token 디스크 덮어쓰기·feed.jsonl compaction, 워치독·
+    //  스케줄러·오피스 브리지 spawn, pack install, daemon.started 발행 등.) ★리뷰어1 F2: 패자의 잔여
+    // 부수효과는 상태디렉터리 mkdir/chmod 0o700(멱등·무해)뿐 — operator.token·feed.jsonl 등 상태 파일과
+    // 프로세스 spawn 은 무접촉이다. 과거엔 락 획득을 accept_loop 진입까지 미뤄 패자가 부수효과 전량을
+    // 실행한 뒤에야 죽었다 → launchd KeepAlive 재기동 폭주 시 패자가 매번 operator.token 을 덮어써 라이브
+    // 데몬 메모리 토큰과 불일치 → GUI 승인 Feed 우회가 무력화되어 Allow 전멸.
+    let socket_path = cys::socket_path();
+
+    // unix: flock 기반 startup 락 — 경합 시 hung 홀더는 데드맨이 회수·인수, 건강한 홀더/구 락파일은
+    // fail-closed exit. 락 파일 핸들은 이 main 스코프에서 데몬 수명 동안 보유한다(핸들 drop = flock 해제 =
+    // 게이트 소멸이므로 절대 조기 drop 금지 — accept_loop 는 반환하지 않아 main 종료까지 살아있다).
+    #[cfg(unix)]
+    let _lock_file = {
+        use std::os::unix::fs::PermissionsExt;
+        // 상태 디렉터리 선생성: 락 파일이 이 디렉터리에 놓이므로 락 획득 전에 반드시 존재해야 한다
+        // (소유자 전용 0o700 — transcripts.db·feed.jsonl·소켓을 같은 UID로 봉인).
+        if let Some(dir) = socket_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        // ★W3: 경합 시 단순 exit(1)이 아니라, 홀더가 hung(무응답 + heartbeat stale)이면 데드맨이
+        // 회수·인수한다. 건강한 홀더/구 락파일(pid 미상)은 fail-closed로 exit(무손실·오살상 차단).
+        let lock_path = socket_path.with_extension("lock");
+        let state_dir = socket_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let lock = acquire_startup_lock(&lock_path, &socket_path, &state_dir);
+        // ★W3 heartbeat: 승자만 주기적으로 mtime을 갱신한다 → 런타임이 wedge되면 interval 태스크가
+        // 진행하지 못해 자연히 stale이 되고, 다음 경합자의 데드맨이 dead로 판정할 수 있다.
+        // 기동 창(락 획득~첫 주기 touch)은 claim_lock의 동기 초기 touch가 방어한다.
+        {
+            let hb = deadman::heartbeat_path(&state_dir);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(deadman::HEARTBEAT_INTERVAL);
+                loop {
+                    tick.tick().await;
+                    deadman::touch_heartbeat(&hb);
+                }
+            });
+        }
+        lock
+    };
+
+    // windows: named pipe first-instance 선점 = 데몬 싱글턴 가드. 조기에 first 인스턴스를 만들어
+    // accept_loop 로 넘겨 재사용한다(probe-후-close-재open 레이스 없이 그대로 리스너 풀에 편입).
+    // 선점 실패(이미 홀더 존재)는 기존 즉사 의미 유지 — eprintln 후 exit 1.
+    #[cfg(windows)]
+    let first_pipe = {
+        let pipe_name = socket_path.to_string_lossy().into_owned();
+        match create_pipe_instance(&pipe_name, true) {
+            Ok(s) => s,
+            Err(e) => {
+                // ★리뷰어1 F3: 구 panic!(exit 101) → exit(1) 통일 — 즉사 의미는 동일하되 종료코드를
+                // unix 패자(acquire_startup_lock 의 exit(1))와 일치화한다.
+                eprintln!("error: another cysd already owns the pipe {pipe_name}: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // windows .prev sweep 은 위 싱글턴 게이트 **뒤**에서 수행 — 승자만 잔해를 정리한다(패자는 이미 즉사).
     // ★무중단 rename-swap 잔해 청소(nsis-hooks.nsh의 짝): 업데이트가 잠긴 파일을 죽이는 대신
     // <이름>.prev*(cysd/cys 고정 체인 + unlock-sweep의 <이름>.prev<rand> — msys-2.0.dll 등 세션이
     // 로드한 runtime 이미지)로 밀어두므로, 새 cysd 기동 시 설치 트리를 재귀 순회하며 이름에
@@ -97,10 +175,15 @@ async fn main() {
     // crash recovery(§7-⑤): 직전 pack-update가 apply 도중 죽어 남긴 orphan 저널을 install(false)
     // **이전에** 자가치유한다(미커밋=rollback / 커밋완료=정리). 순서가 중요 — install(false)가
     // 부분반영 트리 위에서 돌면 안 되므로 반드시 선행한다.
-    match cys::pack::recover_pack_journal() {
-        Ok(true) => eprintln!("[cysd] pack-update orphan journal recovered (self-heal)"),
-        Ok(false) => {}
-        Err(e) => eprintln!("[cysd] pack journal recovery skipped: {e}"),
+    // ★리뷰어1 F1: 조기 락 전진(W1)으로 "락 보유~소켓 bind" 창이 이 pack recover/install 동기 블로킹을
+    // 통째로 포함하게 됐다 — 단일 워커(1코어)에서 이 블로킹이 tokio 워커를 45초(HEARTBEAT_STALE_THRESHOLD)+
+    // 굶기면 heartbeat interval 태스크가 못 돌아 stale → 경합자 데드맨이 정당한 승자를 Dead 오판·SIGKILL 할
+    // 수 있다. spawn_blocking 으로 별도 블로킹 풀에 태워 main 태스크가 yield 해도 interval 이 계속 돌게 한다.
+    match tokio::task::spawn_blocking(cys::pack::recover_pack_journal).await {
+        Ok(Ok(true)) => eprintln!("[cysd] pack-update orphan journal recovered (self-heal)"),
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => eprintln!("[cysd] pack journal recovery skipped: {e}"),
+        Err(e) => eprintln!("[cysd] pack journal recovery task failed: {e}"),
     }
     // 온보딩②: 팩이 이 바이너리 버전으로 미커밋일 때만 자동 설치 — 신규 머신·바이너리 업그레이드·
     // 팩 소실(.pack-version/매니페스트 부재 = 게이트 개방)이 실행 조건. launch-agent·디렉티브·acl이
@@ -110,16 +193,23 @@ async fn main() {
     // 손상+마커 무결 상태의 치유는 cys init-pack/pack-update/doctor --fix 명시 경로가 담당한다
     // (매 부트 전량 치유는 seed-once 원복 사고(7-12)의 원인 기전 — 의도적 축소).
     if !cys::pack::pack_current_for(env!("CARGO_PKG_VERSION")) {
-        match cys::pack::install(false) {
-            Ok((written, _)) if written > 0 => eprintln!(
+        // ★리뷰어1 F1: install(false)도 동기 블로킹(최대 320파일 read+해시+write)이라 위 heartbeat 굶김
+        // 위험이 동일 — spawn_blocking 으로 분리한다. (pack_current_for 게이트는 stat 2회라 동기 유지.)
+        // W0-d: cysd 부팅 자동설치는 라이브 팩 쓰기 프로덕션 진입점 — 인가 부여.
+        match tokio::task::spawn_blocking(|| {
+            cys::pack::install(false, Some(cys::pack::PackWriteAuth::production()))
+        })
+        .await
+        {
+            Ok(Ok((written, _))) if written > 0 => eprintln!(
                 "[cysd] CYSJavis Pack: {written} file(s) installed at {}",
                 cys::pack::pack_dir().display()
             ),
-            Ok(_) => {}
-            Err(e) => eprintln!("[cysd] pack auto-install skipped: {e}"),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("[cysd] pack auto-install skipped: {e}"),
+            Err(e) => eprintln!("[cysd] pack auto-install task failed: {e}"),
         }
     }
-    let socket_path = cys::socket_path();
     let daemon = Daemon::new(socket_path.clone());
 
     governance::spawn_watchdog(Arc::clone(&daemon));
@@ -129,6 +219,13 @@ async fn main() {
     schedule::spawn_scheduler(Arc::clone(&daemon));
     usage::spawn_usage_collector(Arc::clone(&daemon));
     usage::spawn_agy_collector(Arc::clone(&daemon));
+    // CC v2 WS-A: 계정 발견(프로필 스캔)+스냅샷 예열 — 관측 전에도 전 계정이 CC에 보인다.
+    // 전부 fail-open(파일 부재·파싱 실패=빈 뷰) — 부트체인 비치명.
+    accounts::seed_known(&daemon);
+    accounts::spawn_custom_adapters(Arc::clone(&daemon));
+    // CC v2 WS-B: 스킬 run 생애주기 — 이전 데몬의 열린 run 정리 후 전이 워처 기동.
+    skillrun::reconcile_boot(&daemon);
+    skillrun::spawn_watcher(Arc::clone(&daemon));
     // CC "🏢 오피스" 탭의 상시 가용성 — 메타버스 오피스 브리지(127.0.0.1:8642) 자동기동.
     spawn_office_bridge(crate::state::state_dir(&socket_path));
     // C0: 채널 부팅 재조정(고아 선-kill→새 토큰 재스폰) — 이벤트버스·state 준비 후(§2.1-2).
@@ -187,7 +284,11 @@ async fn main() {
         "cysd (CYSJavis terminal daemon) listening on {}",
         socket_path.display()
     );
+    #[cfg(unix)]
     accept_loop(daemon, &socket_path).await;
+    // windows: main()에서 조기 선점한 first 파이프 인스턴스를 넘겨 리스너 풀에 재사용시킨다.
+    #[cfg(windows)]
+    accept_loop(daemon, &socket_path, first_pipe).await;
 }
 
 /// 종료 직전 회수: 원장의 scoped 그룹을 전부 죽이고, stopping 이벤트 발행 후
@@ -207,36 +308,9 @@ fn shutdown_cleanup(daemon: &Arc<Daemon>, reason: &str) {
 #[cfg(unix)]
 async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    if let Some(dir) = socket_path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-        // 상태 디렉터리는 소유자 전용 — transcripts.db·feed.jsonl·소켓을 같은 UID로 봉인
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
-    // 동시 기동 TOCTOU 차단: 점검-삭제-바인드를 flock으로 직렬화 — 늦게 뜬 데몬이
-    // 살아있는 데몬의 소켓 파일을 unlink해 도달 불가 좀비로 만드는 경로를 막는다.
-    // 락 파일은 데몬 수명 동안 보유한다.
-    // ★W3: 경합 시 단순 exit(1)이 아니라, 홀더가 hung(무응답 + heartbeat stale)이면 데드맨이
-    // 회수·인수한다. 건강한 홀더/구 락파일(pid 미상)은 fail-closed로 exit(무손실·오살상 차단).
-    let lock_path = socket_path.with_extension("lock");
-    let state_dir = socket_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let _lock_file = acquire_startup_lock(&lock_path, socket_path, &state_dir);
-
-    // ★W3 heartbeat: 승자만 주기적으로 mtime을 갱신한다 → 런타임이 wedge되면 interval 태스크가
-    // 진행하지 못해 자연히 stale이 되고, 다음 경합자의 데드맨이 dead로 판정할 수 있다.
-    // 기동 창(락 획득~첫 주기 touch)은 claim_lock의 동기 초기 touch가 방어한다.
-    {
-        let hb = deadman::heartbeat_path(&state_dir);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(deadman::HEARTBEAT_INTERVAL);
-            loop {
-                tick.tick().await;
-                deadman::touch_heartbeat(&hb);
-            }
-        });
-    }
+    // ★W1: startup 락 획득·heartbeat spawn·상태 디렉터리 선생성은 부트 부수효과보다 먼저 실행돼야
+    // 하므로 main()으로 전진했다(경쟁 패자가 부수효과 실행 전 즉사). 락 파일 핸들은 main 스코프에서
+    // 데몬 수명 동안 보유된다. 여기(accept_loop)에는 소켓 바인드·수신 준비만 남긴다.
     // Refuse to start if a live daemon already owns the socket (중복 기동 방지 — 거버넌스 철학).
     if socket_path.exists() {
         if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
@@ -1221,11 +1295,15 @@ async fn pipe_listener(
 }
 
 #[cfg(windows)]
-async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
+async fn accept_loop(
+    daemon: Arc<Daemon>,
+    socket_path: &std::path::Path,
+    first: tokio::net::windows::named_pipe::NamedPipeServer,
+) {
     let pipe_name = socket_path.to_string_lossy().into_owned();
-    // 첫 인스턴스: first_pipe_instance(true) = 데몬 싱글턴 가드(이름 선점 시 즉사) — 기존 의미 유지.
-    let first = create_pipe_instance(&pipe_name, true)
-        .unwrap_or_else(|e| panic!("create pipe {pipe_name} failed: {e}"));
+    // ★W1-c: 첫 인스턴스(= 데몬 싱글턴 가드)는 main()에서 부트 부수효과보다 먼저 조기 선점해 넘겨받는다.
+    // 여기서 다시 만들지 않고 그대로 리스너 풀에 편입한다(probe-후-close-재open 레이스 제거·경쟁 패자는
+    // main()의 선점 실패 지점에서 이미 즉사).
     // ★P0-7 최종 층위(D1/W5): 파이프 listening 직후 공통 부트 — unix accept_loop 와 **동일 함수**(prune +
     //   콜드부트 auto-restore). 과거 이 호출이 Windows 에만 빠져 auto-restore 가 발동조차 안 하고 phoenix-restore.log
     //   가 빈 파일이던 결함(CI 실경로 스모크 ⑧)을 봉인. state_dir 은 함수 내부 canonical 매핑(Windows 슬러그).
@@ -1699,6 +1777,14 @@ mod env_scrub_tests {
             "무관 env까지 지우면 안 된다"
         );
         std::env::remove_var("CYS_SCRUB_TEST_KEEP");
+    }
+
+    /// 데몬 root env 정규화가 PYTHONUTF8=1을 주입하는지 박제(Windows cp1252/cp949 크래시 방지 —
+    /// spawn 전 파이썬 자식 상속 커버). set_var는 "1"로만 설정되므로 병렬 테스트 간 경합 무해.
+    #[test]
+    fn sets_pythonutf8_for_spawned_python_children() {
+        super::scrub_claude_session_env();
+        assert_eq!(std::env::var("PYTHONUTF8").as_deref(), Ok("1"));
     }
 }
 

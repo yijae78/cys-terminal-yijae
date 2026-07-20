@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::broadcast;
@@ -151,6 +151,13 @@ pub struct Surface {
     pub queue_paused_until: Mutex<Option<Instant>>,
     /// T4-17 에코 제외: 마지막 원격 주입 시각 (주입 직후 에코 라인은 룰 매칭 제외)
     pub last_injected: Mutex<Option<Instant>>,
+    /// ★좌석 점유 캐시(SEAT-1): watchdog 틱이 커널 사실(자손 프로세스 유무)로 갱신하는 단일 SOT.
+    /// 0=Unknown(미판정·프로브 실패) 1=Occupied(자손 존재=쓰이는 중) 2=Empty(셸 단독=빈 좌석).
+    /// **왜 캐시인가**: 판정 재료(전 프로세스 표)는 watchdog이 이미 매 틱 refresh 한다 — RPC 경로가
+    /// 각자 재조회하면 같은 비용을 중복 지불한다. 쓰기 = `governance::refresh_seat_cache` 단독(단일
+    /// writer), 읽기 = surface.list·status·deliver_queued. 승계 게이트만은 캐시를 믿지 않고 그 시점
+    /// 프로브를 새로 뜬다(드문 경로·판정이 role 재바인딩을 좌우하므로 stale 금지).
+    pub seat_cache: AtomicU8,
     /// T5 사용량 관측 스냅샷 (usage.rs 수집기가 갱신 — 자기보고 agent_status와 별개 층위)
     pub observed_usage: Mutex<Option<crate::usage::ObservedUsage>>,
     /// T5 세션 트랜스크립트 등록 (`usage.register` — SessionStart hook의 결정론 매핑)
@@ -294,6 +301,14 @@ pub struct FeedItem {
     /// 인메모리 Vec이라 마이그레이션 불요. serde default 하위호환.
     #[serde(default)]
     pub publisher_surface: Option<u64>,
+    /// W3.1 서버측 위험 파생 태그("auto"|"high"|"human"). cysd가 title·body에서 파생한다
+    /// (발행자 tier/kind 자기신고 무관). None=구 영속 라인·파생 전. serde default 하위호환.
+    #[serde(default)]
+    pub risk_class: Option<String>,
+    /// W3.2 이 항목이 CEO 자동결재 경로로 배달됐는가(flag ON + risk=auto). UI가 CC 전환 유예
+    /// 연장(90초) 판단에 쓴다. serde default 하위호환(구 라인·비대상=false).
+    #[serde(default)]
+    pub auto_route: bool,
 }
 
 pub struct Config {
@@ -306,6 +321,9 @@ pub struct Config {
     pub idle_seconds: u64,
     /// (E-a) 동시 살아있는 worker-* 한도. 0=무제한(하위호환 escape hatch).
     pub max_active_workers: usize,
+    /// W3 CEO 자동결재 라우팅 게이트. 기본 OFF(미설정) — 현행 동작 100% 보존(C-4 부트스트랩
+    /// 안전). ON일 때만 risk=auto 항목을 CEO 좌석으로 즉시 배달한다. `CYS_APPROVE_AUTO_ROUTE=1`.
+    pub approve_auto_route: bool,
 }
 
 impl Config {
@@ -323,6 +341,10 @@ impl Config {
                 .unwrap_or(false),
             idle_seconds: env_f64("CYS_IDLE_SECONDS", 300.0) as u64,
             max_active_workers: env_f64("CYS_MAX_ACTIVE_WORKERS", 8.0) as usize,
+            // 미설정=OFF(fail-safe). "1"만 ON — 그 외 값·부재는 현행 동작 보존.
+            approve_auto_route: cys::env_compat("CYS_APPROVE_AUTO_ROUTE")
+                .map(|v| v == "1")
+                .unwrap_or(false),
         }
     }
 }
@@ -788,6 +810,14 @@ pub struct Daemon {
     pub master_claimed_at: Mutex<Option<f64>>,
     pub feed_items: Mutex<Vec<FeedItem>>,
     pub feed_waiters: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
+    /// ★GUI 오퍼레이터 승인(오너 2026-07-15): 기동 시 재발급되는 오퍼레이터 토큰 —
+    /// state_dir의 `operator.token`(unix 0600) 파일과 동일 값. feed.reply가 이 값과 일치하는
+    /// `operator_token` 파라미터를 받으면 §3.2 자기승인 가드를 면제한다(GUI Allow가 pgid 각인·
+    /// surface 미귀속 fail-closed에 오탐 차단되던 결함 수리). 첨부 주체는 GUI Tauri 백엔드
+    /// 유일 — 공용 cys CLI 무첨부는 워커의 **우발적** 면제만 차단한다(의도적 동일사용자
+    /// 프로세스는 토큰 파일을 읽어 raw RPC로 우회 가능 — M11 수준·사고 방지용, 암호학적 방어
+    /// 아님). 발급·기록 실패 시 None(면제 경로 비활성=기존 동작) — 부트체인 비치명.
+    pub operator_token: Option<String>,
     /// feed.jsonl append 직렬화 락 — write_all이 짧은 write로 쪼개져도 한 줄 전체가
     /// 한 임계영역에서 쓰이게 보장한다. O_APPEND의 원자성은 단일 write() 콜 단위라,
     /// 대용량 body가 분할 write되면 다른 동시 appender의 라인이 끼어들어 JSONL이
@@ -812,6 +842,12 @@ pub struct Daemon {
     /// (W4) 전 surface reader 스레드의 vt100 파서 패닉 격리 누적 횟수(데몬 health 신호).
     /// surface별 카운터(Surface::parser_panics)의 데몬 전체 합산 — status(org.status)에 노출한다.
     pub parser_panics_total: AtomicU64,
+    /// CC v2 WS-A: 계정 단위 rate limit 집계 상태(뷰·신원 캐시·영속 스로틀) — accounts.rs 전담.
+    pub accounts: Mutex<crate::accounts::AccountsState>,
+    /// CC v2 WS-C: learn.status assets(기억·스킬·directives fs 스캔) 60s 캐시 — (계산 시각, 값).
+    pub learn_assets_cache: Mutex<Option<(f64, serde_json::Value)>>,
+    /// CC v2 WS-C: canonical 학습 상태(~/.cys/state/learn) 쓰기 직렬화 — 데몬 단일 writer 불변식.
+    pub learn_write: Mutex<()>,
     /// ★T6: auto-restore가 스폰한 phoenix restore 프로세스의 (pid, start_time) 등록부.
     /// authoritative(타이핑 가드 면제) 게이트의 restore-root allowlist — 이 목록에 있는 pid의
     /// **살아있는 자손만, 복원이 도는 동안만** 면제받는다(RestoreRootGuard가 수명 관리). 콜드부트
@@ -819,6 +855,14 @@ pub struct Daemon {
     /// 실패하던 dept-4 결함을 좁게 연다 — surface.create 임의-cmd 자식·HUD bridge는 이 목록에
     /// 오르지 않으므로 면제 대상이 아니다. (pid, start_time)로 pid 재사용을 fail-closed 구분한다.
     pub restore_roots: Mutex<Vec<(u32, u64)>>,
+    /// W3.6 형해화 back-pressure: 발행자(surface)별 승인 (요청 수, 거부 수) 누적. 키=발행
+    /// surface id(미상 발행자=0). org.status에 노출 + 임계 초과 시 이벤트·경고 플래그. 인메모리
+    /// 세션 카운터(재시작 시 리셋 — 저볼륨·근사 신호라 영속 불요).
+    pub approval_stats: Mutex<HashMap<u64, (u64, u64)>>,
+    /// W3.2 CEO 자동배달 멱등: 의미 키(kind+title+publisher_surface+body sha256) → 마지막
+    /// 배달 epoch. 재발행이 매번 새 request_id를 받아도(id 기준 억제 실패) 같은 의미 요청의
+    /// CEO 이중 주입을 억제한다. 인메모리(세션 한정 — 저볼륨).
+    pub auto_route_seen: Mutex<HashMap<String, f64>>,
 }
 
 /// ★T6 RAII: auto-restore가 스폰한 phoenix restore 프로세스를 restore_roots에 등록하고, Drop에서
@@ -1107,6 +1151,33 @@ pub(crate) fn unique_sock_name() -> String {
     )
 }
 
+/// ★GUI 오퍼레이터 승인(오너 2026-07-15): 오퍼레이터 토큰 파일 기록 — unix는 0600(소유자 전용)을
+/// 생성·기존 파일 양쪽에 강제한다(mode()는 생성 시에만 적용되므로 set_permissions로 재강제 —
+/// 이전 실행이 넓은 권한으로 남긴 파일도 조인다). Windows는 %LOCALAPPDATA%(사용자 프로필 경계)
+/// 하위라 별도 ACL 없이 기록 — named pipe owner-only DACL과 동일한 단일-사용자 신뢰경계(M11 수준).
+/// 이 토큰은 "데몬 state 디렉토리를 읽을 수 있는 오퍼레이터(사람) 세션" 증명이지 암호학적 방어가
+/// 아니다 — 동일 사용자 프로세스는 누구나 읽을 수 있다(정직한 한계 = DESIGN-ko.md §3.2).
+fn write_operator_token(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(token.as_bytes())?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(token.as_bytes())
+    }
+}
+
 /// 데몬과 같은 디렉터리에 놓인 형제 `cys` CLI 경로.
 /// Windows에서는 실행파일명이 `cys.exe`이므로 플랫폼별 확장자를 붙인다
 /// Windows: 데몬(cysd)이 스폰하는 콘솔 자식(CLI·셸·taskkill 등)이 콘솔 창을 띄우지 않게
@@ -1242,6 +1313,22 @@ impl Daemon {
                     v["reason"].as_str().unwrap_or("").to_string(),
                 )
             });
+        // ★GUI 오퍼레이터 승인(오너 2026-07-15): 오퍼레이터 토큰 발급 — 소켓 listen 전(new 내부)에
+        // 기동마다 재발급·덮어쓰기해 파일=메모리 정합을 데몬 재시작(churn)에도 유지한다. GUI(Tauri)가
+        // 이 파일을 매 호출 신선 재독해 feed.reply에 첨부. 실패는 비치명(로그만) — 부트체인 차단 금지.
+        let operator_token = match crate::channels::random_token_hex() {
+            Ok(tok) => match write_operator_token(&dir.join("operator.token"), &tok) {
+                Ok(()) => Some(tok),
+                Err(e) => {
+                    eprintln!("cysd: operator.token 기록 실패(GUI 오퍼레이터 승인 면제 비활성): {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("cysd: 오퍼레이터 토큰 발급 실패(GUI 오퍼레이터 승인 면제 비활성): {e}");
+                None
+            }
+        };
         // T7 E1-3: 영속 분석 DB는 socket_path가 struct로 move되기 전에 연다.
         let analytics_conn = crate::analytics::open(&socket_path);
         // C0: 채널 계층 DB(channels.db)도 move 전에 연다. 무결 필수 — open 실패 시 None(모듈 비활성).
@@ -1282,6 +1369,7 @@ impl Daemon {
             master_claimed_at: Mutex::new(None),
             feed_items: Mutex::new(restored),
             feed_waiters: Mutex::new(HashMap::new()),
+            operator_token,
             feed_persist_lock: Mutex::new(()),
             // 큐 WAL 복원: queue-state.json을 mid로 dedup해 replay (미배달 큐 재기동 생존·P7)
             restored_queue: Mutex::new(load_queue_state(&dir)),
@@ -1293,7 +1381,12 @@ impl Daemon {
             analytics: Mutex::new(analytics_conn),
             channels: Mutex::new(channels_conn),
             parser_panics_total: AtomicU64::new(0),
+            accounts: Mutex::new(Default::default()),
+            learn_assets_cache: Mutex::new(None),
+            learn_write: Mutex::new(()),
             restore_roots: Mutex::new(Vec::new()),
+            approval_stats: Mutex::new(HashMap::new()),
+            auto_route_seen: Mutex::new(HashMap::new()),
         });
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.
         crate::analytics::seed_consumption(&daemon);
@@ -1328,6 +1421,9 @@ impl Daemon {
             publisher_pid: None, // 데몬 발행 — 외부 caller 없음(자기승인 판정 비적용).
             publisher_pgid: None,
             publisher_surface: None,
+            // 데몬 자동 알림은 자동결재 대상이 아니다(notification 축약 경로) — 무파생·무라우팅.
+            risk_class: None,
+            auto_route: false,
         };
         self.feed_items.lock().unwrap().push(item.clone());
         self.persist_feed_item(&item);
@@ -1337,7 +1433,7 @@ impl Daemon {
             surface_id,
             json!({"request_id": request_id, "kind": kind, "title": title,
                    // 데몬 자동 알림은 항상 무태그(=D·미러 제외) — tier 필드 계약 균일성(§2.4-3).
-                   "body": body, "wait": false, "tier": "d"}),
+                   "body": body, "wait": false, "tier": "d", "auto_route": false}),
         );
     }
 
@@ -1386,7 +1482,22 @@ impl Daemon {
     /// 반환, pending이 아니거나 없으면 None(멱등 — 중복 해소는 None). ★락 순서: feed_items →
     /// feed_waiters(feed.push와 동일). channels 락을 잡은 채 호출돼도 안전하다(feed_items→channels
     /// 역순 경로 없음 — mirror는 feed_items 해제 후 호출).
+    /// 얇은 래퍼(하위호환 — reason·caller 미상 경로: stale-clear·채널 미러). 감사에는
+    /// decision만 남고 reason/caller는 null이 된다.
     pub fn resolve_feed_item(&self, request_id: &str, decision: &str) -> Option<FeedItem> {
+        self.resolve_feed_item_audited(request_id, decision, None, None)
+    }
+
+    /// 단일 해소 경로(M7) + W3.5 감사(producer≠auditor). 모든 결재는 이 코어를 지나며 cysd가
+    /// approval_audit.jsonl에 자동 append한다(CEO 자기기록 아님). reason·caller는 feed.reply
+    /// 경로에서만 Some.
+    pub fn resolve_feed_item_audited(
+        &self,
+        request_id: &str,
+        decision: &str,
+        reason: Option<&str>,
+        caller_pid: Option<u32>,
+    ) -> Option<FeedItem> {
         let snapshot = {
             let mut items = self.feed_items.lock().unwrap();
             let item = items.iter_mut().find(|i| i.request_id == request_id)?;
@@ -1399,6 +1510,11 @@ impl Daemon {
             item.clone()
         };
         self.persist_feed_item(&snapshot);
+        // W3.5 감사 append는 자동결재 기능의 일부 — flag ON일 때만 기록한다(C-4: OFF=현행
+        // 100% 동일, audit 파일도 미생성). OFF면 해소만 하고 감사는 건너뛴다.
+        if self.config.approve_auto_route {
+            self.append_approval_audit(&snapshot, decision, reason, caller_pid);
+        }
         if let Some(tx) = self.feed_waiters.lock().unwrap().remove(request_id) {
             let _ = tx.send(decision.to_string());
         }
@@ -1432,6 +1548,43 @@ impl Daemon {
             let _ = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes());
             // §9.1-1: append 후 fsync — 재부팅에도 미배달 승인요청(feed)이 디스크에 확정된다.
             // (파일별 내구성 불균일 해소: topology는 이미 fsync, feed.jsonl은 누락돼 있었다.)
+            let _ = f.sync_all();
+        }
+    }
+
+    /// W3.5 승인 감사 append(producer≠auditor): 해소된 항목 스냅샷 + decision·reason·caller를
+    /// approval_audit.jsonl에 한 줄 기록한다. CEO가 자기 결재를 기록하는 게 아니라 cysd가 단일
+    /// 해소 경로에서 자동 기록한다. ⚠v1 로테이션 부재 명시 수용(승인=사람 페이스 저볼륨) —
+    /// size/age 캡은 후속 티켓(§5 리스크 대장). feed_persist_lock 재사용으로 append 직렬화.
+    fn append_approval_audit(
+        &self,
+        item: &FeedItem,
+        decision: &str,
+        reason: Option<&str>,
+        caller_pid: Option<u32>,
+    ) {
+        let record = json!({
+            "ts": now_epoch(),
+            "req_id": item.request_id,
+            "kind": item.kind,
+            "risk": item.risk_class,
+            "publisher": item.publisher_surface,
+            "caller": caller_pid,
+            "decision": decision,
+            "reason": reason,
+        });
+        let Ok(line) = serde_json::to_string(&record) else {
+            return;
+        };
+        let dir = state_dir(&self.socket_path);
+        let _guard = self.feed_persist_lock.lock().unwrap();
+        // v1 의도적 무제한 append(승인은 사람 페이스 저볼륨) — size/age 캡은 별건 티켓(#7).
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("approval_audit.jsonl"))
+        {
+            let _ = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes());
             let _ = f.sync_all();
         }
     }
@@ -1705,6 +1858,10 @@ impl Daemon {
             queue_starving_since: Mutex::new(None),
             queue_confirm_pending: Mutex::new(None),
             agent_status: Mutex::new(None),
+            // ★SEAT-1: 신생 좌석은 Unknown(0)에서 출발한다 — 첫 watchdog 틱이 커널 사실로 확정한다.
+            // Unknown의 소비 규약은 "현행 동작 유지"다(§소비처: 큐=배달·승계=거부) — 판정 미도달이
+            // 새로운 실패를 만들지 않는다.
+            seat_cache: AtomicU8::new(0),
             agent_meta: Mutex::new(None),
             agent_seen: AtomicBool::new(false),
             agent_exit_notified: AtomicBool::new(false),
@@ -3491,6 +3648,8 @@ mod tests {
             publisher_pid: None,
             publisher_pgid: None,
             publisher_surface: None,
+            risk_class: None,
+            auto_route: false,
         }
     }
 

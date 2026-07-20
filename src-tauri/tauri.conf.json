@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "cys",
-  "version": "0.12.64",
+  "version": "0.12.98",
   "identifier": "com.cysjavis.terminal",
   "build": {
     "frontendDist": "../ui/dist",
-    "beforeBuildCommand": "sh ../scripts/bundle-prep.sh"
+    "beforeBuildCommand": { "script": "sh ../scripts/bundle-prep.sh", "cwd": "." }
   },
   "app": {
     "withGlobalTauri": true,

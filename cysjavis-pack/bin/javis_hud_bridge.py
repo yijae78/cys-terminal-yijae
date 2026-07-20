@@ -16,6 +16,7 @@ WorldState(§4)로 정규화해 127.0.0.1 전용 HTTP(+SSE)로 내보낸다.
 # 번들 embeddable python(._pth 잠금)은 스크립트 dir을 sys.path에 자동 추가하지 않는다(C60 실측).
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import glob
 import json
 import os
 import re
@@ -113,13 +114,18 @@ def pick_ctx(node):
 
 
 # ------------------------------------------------------------ 코얼레싱 (§6.3)
-NOISE_NAMES = {"watchdog.duplicate_procs", "watchdog.proc_count"}
+# watchdog.* 는 route_event 가 startswith 로 선차단·dog_fx 가 kill/alert 변환 — NOISE_NAMES 는
+# 그 외 소음용(현재 비어 있음). "watchdog.proc_count" 는 실이벤트명이 proc_count_high 라 도달불가
+# 死엔트리였으므로 제거(reviewer1 minor).
+NOISE_NAMES = set()
 ALERT_COALESCE = {  # (이벤트명 → 동일 surface 재발화 억제 윈도 s)
     "health.alert": 30.0,
     "master.deadman": 60.0,
     "pane.idle": 120.0,
     "schedule.fired": 10.0,
     "schedule.error": 30.0,
+    "watchdog.dog.kill": 10.0,    # D4 강아지 fx kill ≤1건/10s (kind별 분리 — kill 이 alert 에 안 밀림)
+    "watchdog.dog.alert": 10.0,   # D4 강아지 fx alert ≤1건/10s
 }
 FX_BUDGET_PER_SEC = 20
 
@@ -439,8 +445,10 @@ class World:
                             for s in d.get("surfaces", [])}
                 new_keys = {node_key(s) for d in new_deps
                             for s in d.get("surfaces", [])}
-                old_shape = [d.get("_slug") for d in self.departments]
-                new_shape = [d.get("_slug") for d in new_deps]
+                # D5: (slug, label) 튜플 비교 — display_name 개명만 바뀌어도 structural=True
+                # → 전체 재빌드 유발(층 라벨 재시작 없이 반영). 개명은 드문 이벤트, 재빌드 비용 수용.
+                old_shape = [(d.get("_slug"), d.get("_dept_label")) for d in self.departments]
+                new_shape = [(d.get("_slug"), d.get("_dept_label")) for d in new_deps]
                 structural = (old_keys != new_keys) or (old_shape != new_shape)
                 # 출력량 변화율 (line_count 델타)
                 now = time.time()
@@ -683,6 +691,36 @@ TOOL_HOOKS = {"agent.hook.PreToolUse": "pre", "agent.hook.PostToolUse": "post",
               "agent.hook.PermissionRequest": "perm"}
 
 
+def dog_fx(name, ev, coal, now):
+    """watchdog kill/alert 이벤트 → 강아지 fx 프레임 (D4). 그 외 watchdog.* 는 차단(틱 피드 유지).
+
+    · watchdog.duplicate_procs → {t:'dog', kind:'kill', pid:<pids 첫번째 or None>, count:N}
+    · watchdog.proc_count_high → {t:'dog', kind:'alert', sid:<surface id>, count:N}
+    코얼레싱: kind별 독립 10s 창(watchdog.dog.kill / watchdog.dog.alert) — 초과분 폐기.
+    kill(실 프로세스 강제종료 사건)은 alert 창에 밀리지 않는다(각 kind 자기 창만 소비).
+    백로그(BACKLOG_FX_SECS 초과 과거 이벤트)는 억제. t:'dog' 라 구 프론트는 무시(additive·v2 유지).
+    """
+    p = ev.get("payload") or {}
+    if name == "watchdog.duplicate_procs":
+        pids = p.get("pids") if isinstance(p.get("pids"), list) else []
+        frame = {"t": "dog", "kind": "kill", "pid": pids[0] if pids else None,
+                 "count": p.get("count")}
+    elif name == "watchdog.proc_count_high":
+        frame = {"t": "dog", "kind": "alert", "sid": ev.get("surface_id"),
+                 "count": p.get("count")}
+    else:
+        return []   # tick_panic·load_high·duplicates_killed 등 그 외 watchdog.* 차단
+    ts = ev.get("timestamp") or now
+    if (now - ts) > BACKLOG_FX_SECS:
+        return []   # 과거 이벤트: 연출 억제 (콜드스타트 폭주 방지) — 백로그 판정은 epoch(now vs ts)
+    # coal.allow 는 now 를 넘기지 않는다: Coalescer 버킷·창은 monotonic 시계축이라 epoch now 를
+    # 주입하면 (epoch-monotonic ≈ +1.78e9) 매 dog 이벤트가 전역 fx 예산을 풀리필해 flood 보호가
+    # 무력화된다(reviewer1 실측). 나머지 9개 호출과 동일하게 monotonic 기본에 정렬한다.
+    if not coal.allow("watchdog.dog." + frame["kind"], "dog"):
+        return []   # kind별 코얼레싱 창 내 초과분 폐기
+    return [frame]
+
+
 def route_event(ev, world, coal, slug="main", now=None):
     """데몬 이벤트 1건 → 방출 프레임 목록 (+월드 반영). 순수 로직 (테스트 대상).
 
@@ -694,9 +732,11 @@ def route_event(ev, world, coal, slug="main", now=None):
     fx 프레임은 억제한다 — "켜는 순간"의 과거 연출 폭주 방지, 상태는 손실 0.
     """
     name = ev.get("name") or ""
-    if name in NOISE_NAMES or name.startswith("watchdog."):
-        return [], False
     now = time.time() if now is None else now
+    if name.startswith("watchdog."):
+        return dog_fx(name, ev, coal, now), False   # kill/alert 만 강아지 fx, 그 외 차단
+    if name in NOISE_NAMES:
+        return [], False
     ts = ev.get("timestamp") or now
     backlog = (now - ts) > BACKLOG_FX_SECS
     sid = ev.get("surface_id")
@@ -1141,6 +1181,113 @@ def read_history(after_ts, limit=6000):
     return out[-limit:]
 
 
+# -------------------------------------------------- 스킬 카탈로그 (D6 · GET /skills)
+def skill_sources(home=None):
+    """스킬 스캔 소스 [(디렉토리, 계정 라벨)] 동적 탐색.
+
+    <ROOT>/skills(pack) + ~/.claude/skills(claude) + glob ~/.claude-*/skills
+    (라벨 = 디렉토리명 'claude-' 뒤 접미사). 계정 프로필을 하드코딩하지 않아 임의 계정을
+    자동 지원하며(기능 확장), 소스에 개인 핸들 리터럴이 남지 않는다(라벨은 런타임 파생).
+    """
+    home = home or os.path.expanduser("~")
+    srcs = [(os.path.join(ROOT, "skills"), "pack"),
+            (os.path.join(home, ".claude", "skills"), "claude")]
+    prefix = ".claude-"
+    for d in sorted(glob.glob(os.path.join(home, prefix + "*", "skills"))):
+        suffix = os.path.basename(os.path.dirname(d))[len(prefix):]   # .claude-<라벨>
+        srcs.append((d, suffix or "claude"))
+    return srcs
+
+
+SKILLS_CACHE_SECS = 60.0
+SKILL_DESC_MAX = 200
+_skills_cache = {"ts": 0.0, "data": None}
+_skills_lock = threading.Lock()
+_SKILL_FM_RE = re.compile(r"^\s*(name|description)\s*:\s*(.*)$")
+
+
+def parse_skill_md(path, dirname):
+    """SKILL.md → (name, description). frontmatter name/description 우선, 없으면 디렉토리명·첫 문단.
+
+    description 은 SKILL_DESC_MAX(200) 자 절단. 파일 부재·오류 시 (dirname, "").
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return dirname, ""
+    name = desc = None
+    body = text
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            body = text[end + 4:]
+            for line in text[3:end].splitlines():
+                m = _SKILL_FM_RE.match(line)
+                if not m:
+                    continue
+                k, v = m.group(1), m.group(2).strip()
+                if len(v) >= 2 and v[0] in "\"'" and v[-1] == v[0]:
+                    v = v[1:-1]
+                if k == "name" and v:
+                    name = v
+                elif k == "description" and v:
+                    desc = v
+    if not name:
+        name = dirname
+    if not desc:
+        for line in body.splitlines():   # 첫 문단(비어있지·헤딩·구분선 아닌 첫 줄)
+            s = line.strip()
+            if s and not s.startswith("#") and not s.startswith("---"):
+                desc = s
+                break
+        desc = desc or ""
+    return name, desc[:SKILL_DESC_MAX]
+
+
+def scan_skills(now=None, sources=None):
+    """4개 소스의 SKILL.md 스캔 → 병합 스킬 목록 {"skills":[{name,description,accounts}]}.
+
+    동일 name 은 accounts 병합(마스터·워커 계정 스킬 편차 표기). 60s 캐시(시각 비교) —
+    sources 명시(테스트) 시 캐시 우회. 각 소스는 하위 디렉토리의 SKILL.md 만 채택('_'·'.' 접두 skip).
+    """
+    now = time.time() if now is None else now
+    use_cache = sources is None
+    srcs = skill_sources() if sources is None else sources
+    if use_cache:
+        with _skills_lock:
+            if _skills_cache["data"] is not None \
+               and (now - _skills_cache["ts"]) < SKILLS_CACHE_SECS:
+                return _skills_cache["data"]
+    merged = {}   # name → {"name","description","accounts":[...]}
+    for base, account in srcs:
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for dirname in entries:
+            if dirname.startswith("_") or dirname.startswith("."):
+                continue
+            sk = os.path.join(base, dirname, "SKILL.md")
+            if not os.path.isfile(sk):
+                continue
+            nm, desc = parse_skill_md(sk, dirname)
+            ent = merged.get(nm)
+            if ent is None:
+                merged[nm] = {"name": nm, "description": desc, "accounts": [account]}
+            else:
+                if account not in ent["accounts"]:
+                    ent["accounts"].append(account)
+                if not ent["description"] and desc:   # 앞 소스가 빈 설명이면 뒤 소스로 보강
+                    ent["description"] = desc
+    data = {"skills": sorted(merged.values(), key=lambda e: e["name"])}
+    if use_cache:
+        with _skills_lock:
+            _skills_cache["ts"] = now
+            _skills_cache["data"] = data
+    return data
+
+
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
 
@@ -1244,7 +1391,7 @@ class SubscriptionSupervisor:
                     frames, want_poke = route_event(ev, self.world, self.coal, slug)
                     for fr in frames:
                         self.hub.publish(fr)
-                        if fr.get("t") == "fx":
+                        if fr.get("t") in ("fx", "dog"):   # D4 강아지 fx 도 /history 리플레이 포함
                             archive_fx(ev.get("timestamp"), fr)
                     if want_poke:
                         self.poke.set()
@@ -1466,6 +1613,9 @@ class Handler(BaseHTTPRequestHandler):
                 after = 0.0
             body = json.dumps({"events": read_history(after)}, ensure_ascii=False).encode()
             return self._send(200, "application/json; charset=utf-8", body)
+        if path == "/skills":   # D6: 카페 팝업스토어 진열용 스킬 카탈로그 (127.0.0.1·60s 캐시)
+            body = json.dumps(scan_skills(), ensure_ascii=False).encode()
+            return self._send(200, "application/json; charset=utf-8", body)
         if path == "/peek":
             tok = self.headers.get("X-HUD-Token")
             if not self.token or not tok or not secrets.compare_digest(str(tok), str(self.token)):
@@ -1487,6 +1637,16 @@ class Handler(BaseHTTPRequestHandler):
                     body = f.read()
                 if ctype.startswith("text/html"):   # 조작 토큰 주입 (동일 페이지 한정)
                     body = body.replace(b"__HUD_TOKEN__", (self.token or "").encode())
+                    # W1-c 조용한 실패 배너 부트 가드 주입 — __HUD_TOKEN__ 치환과 별개
+                    # 앵커(</head> 직전, 실측 존재). office3d.html 본문 무접촉 원칙 준수.
+                    body = body.replace(
+                        b"</head>",
+                        b'<script src="/office-boot.js"></script>\n</head>', 1)
+                    if b"/office-boot.js" not in body:  # 주입 self-check (침묵 실패 방지)
+                        sys.stderr.write(
+                            "[hud_bridge] WARN: office-boot.js 주입 실패 — "
+                            "%s 에 </head> 앵커 부재\n" % fp)
+                        sys.stderr.flush()
                 return self._send(200, ctype, body, cache)
             except OSError:
                 return self._send(404, "text/plain", b"missing asset")
@@ -1596,6 +1756,11 @@ def main():
         "/vendor/three.module.js":
             (os.path.join(WEB_DIR, "vendor", "three.module.js"),
              "text/javascript; charset=utf-8", True),
+        # W1-c 부트 가드 — 침묵 실패 복구 안내. cache=False(no-store): 보안·복구
+        # 자산이 WKWebView 휴리스틱 캐시로 구버전 잔존하면 안 됨(HTML과 동일 근거).
+        "/office-boot.js":
+            (os.path.join(WEB_DIR, "office-boot.js"),
+             "text/javascript; charset=utf-8", False),
     }
     load_heat(world)                       # 히트 링 복원 (재시작 생존)
     world.cost_cache = {"ts": time.time(), "value": read_cost_today(TRANSCRIPTS_DB)}

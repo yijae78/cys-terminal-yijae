@@ -5,16 +5,32 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
-import { shellQuote, shellQuoteJoin } from "./shellquote";
+import { shellQuote } from "./shellquote";
+import { baseName, insertionText, isStreaming, splitPath } from "./ftdrop";
+import { transferTrees } from "./transfer";
 import { updatePlan } from "./updateplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { orderPreservingEqualize, equalizeAdoptedTrees } from "./layout";
+import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
 import { deptPlaceholderLabel, ccNodeLabel } from "./deptlabel";
+import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purgeconfirm";
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
 import { ccNodeLabel } from "./deptlabel";
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
+import {
+  type WebNode,
+  isAllowedWebPaneUrl,
+  makeWebNode,
+  viewerAppUrl,
+  extractViewerPath,
+  decideViewerOpen,
+  collectWebPaths,
+  loadPersistedLayout,
+  persistLayout,
+  collectWebWids,
+} from "./webpane";
 
 declare global {
   interface Window {
@@ -37,7 +53,9 @@ const listen = (name: string, handler: (e: { payload: unknown }) => void) =>
 
 type Node =
   | { type: "split"; dir: "row" | "col"; ratio?: number; a: Node; b: Node }
-  | { type: "pane"; sid: number };
+  | { type: "pane"; sid: number }
+  // web pane — 뷰어 사이드카 iframe(§2D). sid 없음(PTY/데몬 무접점) → 순회 유틸은 wid로 별도 취급.
+  | WebNode;
 
 interface Workspace {
   id: number;
@@ -63,12 +81,25 @@ interface GroupMeta {
   anchorSocket?: string; // 부서 그룹이면 부서 데몬 socket
 }
 
-const LAYOUT_KEY = "cys-layout-v2";
+// 레이아웃 저장/로드는 webpane.ts로 이관(v3 저장 · v2 마이그레이션 읽기 · 다운그레이드 안전).
+// LAYOUT_KEY_V2/V3 상수·loadPersistedLayout/persistLayout 참조.
 
 // pane 식별 복합키 — 서로 다른 데몬이 같은 surface_id를 독립 발급하므로 (socket, sid)로 구분한다.
 const paneKey = (sid: number, socket?: string): string => `${socket ?? ""}#${sid}`;
 
-interface PaneRuntime {
+// pane 런타임의 종류 무관 이음새 — 일반 순회 루프(테마·포커스·리사이즈·정리)가 xterm 구체
+// 타입(rt.term) 대신 이 메서드만 경유하게 해, 다음 커밋에서 비터미널 pane을 안전히 편입한다.
+// 터미널 특화 경로(IME·send-text·PTY 배선·스크롤백·폰트·refresh)는 PaneRuntime 필드로 그대로 접근한다.
+interface PaneView {
+  el: HTMLElement;
+  resize(): void;
+  applyTheme(bg: string, fg: string): void;
+  setFocused(focused: boolean): void;
+  dispose(): void;
+}
+
+// PaneRuntime = PaneView의 터미널 구현(TerminalPaneView). 아래 필드는 터미널 전용 경로가 직접 쓴다.
+interface PaneRuntime extends PaneView {
   sid: number;
   socket?: string;
   el: HTMLElement;
@@ -82,6 +113,10 @@ interface PaneRuntime {
   observer: ResizeObserver;
   // 바닥 고정 재적용 — 리사이즈(fitPane) 뒤 뷰포트가 바닥에서 밀려나면 복귀시킨다.
   snapToBottom: () => void;
+  // 마지막 PTY 출력 시각(ms) — 경로 주입의 스트리밍 가드(ftdrop.isStreaming)가 읽는다.
+  lastOutputAt: () => number;
+  // IME 조합 pending 여부 — 조합 중 주입의 순서 역전(자모 뒤섞임) 차단.
+  imeBusy: () => boolean;
 }
 
 // ---------- T5 사용량 관측 배지 (pane 헤더) ----------
@@ -154,6 +189,15 @@ let ccSessionsWindow = "7d";
 let ccSessionsStarOnly = false;
 let ccSessionsRedact = false;
 let ccSessionSelected: string | null = null;
+// 계정 Rate Limit(전 조직 병합 뷰) — usage_accounts_all 최신 스냅샷. Live KPI/게이지가 이 데이터를 폴백보다 우선.
+let ccAccounts: any[] = [];
+// 계정 라벨(이메일) 가림 토글 — 스크린샷 공유용. 결정론 해시 6자로 치환.
+let ccAcctRedact = localStorage.getItem("cys-cc-acct-redact") === "1";
+// 스킬 보드 카탈로그 캐시 + 검색어 — 검색은 재fetch 없이 renderBoardDomains 재렌더(깜빡임 방지).
+let ccBoardCatalog: any = { domains: [], actions: [] };
+let ccBoardSearch = "";
+// 보드 버튼 호출수 뱃지(B2) — control_skills 7d by_skill 캐시(스킬명→호출수).
+let ccBoardCalls: Record<string, number> = {};
 
 // HUD-5: 밀도 모드 — 비기술자 Glance(오늘 큰 글씨) ↔ 엔지니어 Ops(6탭). body class 1개가 진실원.
 type CcDensity = "ops" | "glance";
@@ -203,6 +247,77 @@ function ccAggRate(fleet: any[]): Record<string, { used: number; reset: number |
     }
   }
   return agg;
+}
+
+// 시:분(epoch 초) — 계정 소진 예상·최근 실행 시작시각의 간단 표기.
+function ccHHMM(epoch: number): string {
+  if (!Number.isFinite(epoch) || epoch <= 0) return "";
+  const d = new Date(epoch * 1000);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+// 자산 mtime(epoch 초) → YYYY.MM.DD — 자산 칩 툴팁.
+function ccAssetDate(mtime: any): string {
+  const n = Number(mtime);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const d = new Date(n * 1000);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}.${p(d.getMonth() + 1)}.${p(d.getDate())}`;
+}
+// 결정론 해시 6자(djb2) — 계정 라벨 가림(스크린샷용). 같은 라벨은 항상 같은 해시.
+function ccHash6(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return h.toString(16).padStart(8, "0").slice(0, 6);
+}
+const ccAcctLabel = (label: string): string => (ccAcctRedact ? `#${ccHash6(label)}` : label);
+// 지정 rate 라벨(5h/7d)에서 사용률 최고 계정 — Live KPI/게이지의 "최고 사용 계정 기준" 값.
+function ccAcctMax(label: string): { used: number; reset: number | null; acct: string } | null {
+  let best: { used: number; reset: number | null; acct: string } | null = null;
+  for (const a of ccAccounts) {
+    for (const r of a.rate ?? []) {
+      if (r.label !== label) continue;
+      const used = Number(r.used_pct);
+      if (!Number.isFinite(used)) continue;
+      if (!best || used > best.used)
+        best = { used, reset: r.resets_at ?? null, acct: String(a.label ?? a.account_id ?? "?") };
+    }
+  }
+  return best;
+}
+
+// 계정 Rate Limit 섹션 — 전 조직 병합 계정을 provider·라벨·plan·5h/7d 게이지·리셋·관측 뱃지로 렌더.
+function renderAccounts() {
+  const host = document.getElementById("cc-accounts");
+  if (!host) return;
+  if (!ccAccounts.length) {
+    host.innerHTML = `<div class="cc-empty">관측된 계정 없음</div>`;
+    return;
+  }
+  host.innerHTML = ccAccounts
+    .map((a) => {
+      const prov = ccEsc(String(a.provider ?? "?"));
+      const label = ccEsc(ccAcctLabel(String(a.label ?? a.account_id ?? "?")));
+      const plan = a.plan ? `<span class="cc-acct-plan">${ccEsc(String(a.plan))}</span>` : "";
+      // 게이지 — rate limit 임계(70/90)로 sevClass. cc-tbar 재사용.
+      const gauges = ["5h", "7d"]
+        .map((lab) => {
+          const r = (a.rate ?? []).find((x: any) => x.label === lab);
+          const used = r ? Math.round(Number(r.used_pct)) : 0;
+          const reset = r && r.resets_at != null ? ccReset(lab, r.resets_at) : "";
+          const fill = r ? `<span class="cc-tbar-fill ${sevClass(used, 70, 90)}" style="width:${Math.min(100, used)}%"></span>` : "";
+          return `<div class="cc-tbar"><span class="cc-tbar-lab">${lab}</span><span class="cc-tbar-track">${fill}</span><span class="cc-tbar-pct">${r ? used + "%" : "—"}</span><span class="cc-tbar-reset">${reset}</span></div>`;
+        })
+        .join("");
+      const badges: string[] = [];
+      if (a.updated_at == null) badges.push(`<span class="cc-acct-badge">관측 없음</span>`);
+      if (a.adapter === false) badges.push(`<span class="cc-acct-badge">관측 어댑터 없음</span>`);
+      const stale = Number(a.stale_secs);
+      if (Number.isFinite(stale) && stale > 120) badges.push(`<span class="cc-acct-badge">${Math.round(stale / 60)}분 전 관측</span>`);
+      if (a.exhaust_at != null) badges.push(`<span class="cc-acct-badge warn">이 속도면 ${ccHHMM(Number(a.exhaust_at))} 소진</span>`);
+      return `<div class="cc-acct-row"><span class="cc-acct-prov">[${prov}]</span><span class="cc-acct-label">${label}</span>${plan}<div class="cc-acct-gauges">${gauges}</div><span class="cc-acct-badges">${badges.join("")}</span></div>`;
+    })
+    .join("");
 }
 
 // HUD-5: 밀도 전환 — 순수 CSS(body class)가 진실원. JS는 class 토글 + 영속 + 버튼 라벨만.
@@ -261,6 +376,14 @@ function tickCc() {
 
 async function refreshControlCenter() {
   if (!ccOpen) return;
+  // 계정 Rate Limit(전 조직 병합) — Live KPI/게이지가 이 데이터를 쓰므로 대시보드 렌더 전에 최신화.
+  if (ccTab === "live") {
+    try {
+      ccAccounts = ((await invoke("usage_accounts_all")) as any)?.accounts ?? [];
+    } catch {
+      /* 데몬 일시 부재 — 직전 스냅샷 유지, 다음 틱 재시도 */
+    }
+  }
   try {
     renderControlCenter(await invoke("control_dashboard"));
     ccFailStreak = 0;
@@ -283,6 +406,8 @@ async function refreshControlCenter() {
   // Tasks 안전망 reconcile: 이벤트 누락·부서 신규 기동을 5초 폴링으로 보정(평시는 이벤트 드리븐).
   if (ccTab === "tasks") refreshTasks();
   if (ccTab === "feed") refreshFeed();
+  // 보드는 카탈로그 전체 재렌더 없이 최근 실행 카드만 5초 갱신(깜빡임 방지).
+  if (ccTab === "board") refreshBoardRuns();
 }
 
 // B-11: 연속 실패 표면화 — 3틱(15초) 연속 실패면 footer를 경고로 전환(조용한 stale 오인 차단)
@@ -399,53 +524,17 @@ async function openOfficeView() {
 
 // D5: 스킬 버튼 보드 — 카탈로그 큐레이션 렌더 + 일회용 워커 실행 + 산출물 회수(터미널 입력 0회).
 async function refreshBoard() {
-  const cat = (await invoke("read_board_catalog").catch(() => ({ domains: [], actions: [] }))) as any;
-  const host = document.getElementById("cc-board-domains")!;
-  host.innerHTML = "";
-  for (const d of cat.domains ?? []) {
-    const sec = document.createElement("div");
-    sec.className = "cc-board-domain";
-    sec.innerHTML = `<div class="cc-board-domain-h">${ccEsc(d.label ?? d.id ?? "")}</div>`;
-    const wrap = document.createElement("div");
-    wrap.className = "cc-board-btns";
-    for (const s of d.skills ?? []) {
-      if ((s.acl ?? 1) > 1) continue; // 비기술자: acl≤1만 (민감/위험 스킬은 카탈로그 미포함=암묵 차단)
-      const b = document.createElement("button");
-      b.className = "cc-board-btn";
-      b.textContent = s.label ?? s.name;
-      b.title = `${s.scope ?? ""}${s.gate === "hitl" ? " · 미리보기 확인 필요" : ""}`;
-      b.onclick = () => runSkillButton(s);
-      wrap.appendChild(b);
-    }
-    sec.appendChild(wrap);
-    host.appendChild(sec);
+  ccBoardCatalog = (await invoke("read_board_catalog").catch(() => ({ domains: [], actions: [] }))) as any;
+  // 호출수 뱃지 데이터(7d) — 실패는 뱃지 생략(보드 본기능 무영향).
+  try {
+    const sk = (await invoke("control_skills", { window: "7d" })) as any;
+    ccBoardCalls = {};
+    for (const x of sk?.summary?.by_skill ?? []) if (x?.name) ccBoardCalls[String(x.name)] = Number(x.calls) || 0;
+  } catch {
+    /* graceful */
   }
-  // SB-4: actions(write-a-skill 등) 1급 노출 — 도메인과 동일 실행 경로(신규 인프라 0)
-  const actions = cat.actions ?? [];
-  if (actions.length) {
-    const sec = document.createElement("div");
-    sec.className = "cc-board-domain";
-    sec.innerHTML = `<div class="cc-board-domain-h">도구</div>`;
-    const wrap = document.createElement("div");
-    wrap.className = "cc-board-btns";
-    for (const a of actions) {
-      if ((a.acl ?? 1) > 1) continue;
-      const b = document.createElement("button");
-      b.className = "cc-board-btn";
-      b.textContent = a.label ?? a.name;
-      b.onclick = () =>
-        runSkillButton({
-          name: a.name,
-          label: a.label ?? a.name,
-          scope: "새 스킬 만들기 (write-a-skill — 일상 워크플로우를 스킬로 codify)",
-          success: "SKILL.md 4칸 본문 생성·트리거 명확",
-          gate: "hitl",
-        });
-      wrap.appendChild(b);
-    }
-    sec.appendChild(wrap);
-    host.appendChild(sec);
-  }
+  renderBoardDomains();
+  refreshBoardRuns();
   // 회수 패널 — list_dir 재사용(결정론 위치 skill_out_dir)
   const outHost = document.getElementById("cc-board-out")!;
   let dirs: any[] = [];
@@ -466,7 +555,120 @@ async function refreshBoard() {
           })
           .join("");
   outHost.querySelectorAll<HTMLElement>(".cc-board-out-item").forEach((b) =>
-    b.addEventListener("click", () => invoke("open_path", { path: b.dataset.path }).catch(() => {})),
+    b.addEventListener("click", () => { if (b.dataset.path) void openPathChecked(b.dataset.path); }),
+  );
+}
+
+// 오너 즐겨찾기 pin — localStorage "cys-board-pins"(name 배열). 설계(board-pins.json) 대비 의도적 로컬 축소.
+function boardPins(): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem("cys-board-pins") || "[]");
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+function toggleBoardPin(name: string) {
+  const pins = boardPins();
+  const i = pins.indexOf(name);
+  if (i >= 0) pins.splice(i, 1);
+  else pins.push(name);
+  localStorage.setItem("cys-board-pins", JSON.stringify(pins));
+  renderBoardDomains();
+}
+// actions(write-a-skill 등)를 스킬 객체로 정규화 — 도메인 스킬과 동일 실행 경로.
+function boardActionSkill(a: any): any {
+  return {
+    name: a.name,
+    label: a.label ?? a.name,
+    scope: "새 스킬 만들기 (write-a-skill — 일상 워크플로우를 스킬로 codify)",
+    success: "SKILL.md 4칸 본문 생성·트리거 명확",
+    gate: "hitl",
+  };
+}
+// 보드 버튼 1개 — 클릭=실행, 우클릭=즐겨찾기 토글, pin이면 ★ 표시.
+function makeBoardBtn(s: any): HTMLButtonElement {
+  const b = document.createElement("button");
+  b.className = "cc-board-btn";
+  const pinned = boardPins().includes(s.name);
+  if (pinned) b.classList.add("pinned");
+  const calls = ccBoardCalls[String(s.name)] ?? 0;
+  const callChip = calls > 0 ? `<span class="cc-board-calls" title="최근 7일 호출수">${Math.floor(calls)}</span>` : "";
+  b.innerHTML = `${pinned ? `<span class="cc-board-pin">★</span>` : ""}${ccEsc(String(s.label ?? s.name ?? ""))}${callChip}`;
+  b.title = `${s.scope ?? ""}${s.gate === "hitl" ? " · 미리보기 확인 필요" : ""} · 우클릭=즐겨찾기`;
+  b.onclick = () => runSkillButton(s);
+  b.oncontextmenu = (e) => {
+    e.preventDefault();
+    toggleBoardPin(String(s.name));
+  };
+  return b;
+}
+// 카탈로그 도메인·actions 렌더 — 검색어(name/label/scope 부분일치) 필터 + 즐겨찾기 상단 그룹.
+// 검색은 재fetch 없이 이 함수만 재호출(깜빡임 방지).
+function renderBoardDomains() {
+  const cat = ccBoardCatalog;
+  const q = ccBoardSearch.trim().toLowerCase();
+  const match = (s: any) => !q || [s.name, s.label, s.scope].some((x) => String(x ?? "").toLowerCase().includes(q));
+  const host = document.getElementById("cc-board-domains");
+  if (!host) return;
+  host.innerHTML = "";
+  // 카탈로그 전체 스킬(acl≤1) 색인 — 즐겨찾기 복제용. actions는 정규화.
+  const all = new Map<string, any>();
+  for (const d of cat.domains ?? []) for (const s of d.skills ?? []) if ((s.acl ?? 1) <= 1) all.set(s.name, s);
+  for (const a of cat.actions ?? []) if ((a.acl ?? 1) <= 1) all.set(a.name, boardActionSkill(a));
+
+  const appendGroup = (title: string, skills: any[]) => {
+    if (!skills.length) return;
+    const sec = document.createElement("div");
+    sec.className = "cc-board-domain";
+    sec.innerHTML = `<div class="cc-board-domain-h">${ccEsc(title)}</div>`;
+    const wrap = document.createElement("div");
+    wrap.className = "cc-board-btns";
+    for (const s of skills) wrap.appendChild(makeBoardBtn(s));
+    sec.appendChild(wrap);
+    host.appendChild(sec);
+  };
+
+  // ★ 즐겨찾기(오너 pin) — 카탈로그 스킬 복제, 상단 그룹.
+  const pinned = boardPins().map((n) => all.get(n)).filter((s) => s && match(s));
+  appendGroup("★ 즐겨찾기", pinned);
+  // 비기술자: acl≤1만 (민감/위험 스킬은 카탈로그 미포함=암묵 차단)
+  for (const d of cat.domains ?? [])
+    appendGroup(d.label ?? d.id ?? "", (d.skills ?? []).filter((s: any) => (s.acl ?? 1) <= 1 && match(s)));
+  // SB-4: actions(write-a-skill 등) 1급 노출 — 도메인과 동일 실행 경로(신규 인프라 0)
+  appendGroup("도구", (cat.actions ?? []).filter((a: any) => (a.acl ?? 1) <= 1 && match(a)).map(boardActionSkill));
+}
+
+// 최근 실행 카드 — skill_runs 폴링 렌더. 상태칩·시작시각·산출물 열기(open_path).
+async function refreshBoardRuns() {
+  const host = document.getElementById("cc-board-runs");
+  if (!host) return;
+  let runs: any[] = [];
+  try {
+    runs = ((await invoke("skill_runs", { limit: 20 })) as any)?.runs ?? [];
+  } catch {
+    /* 데몬 일시 부재 — 다음 틱 재시도 */
+  }
+  host.innerHTML = runs.length
+    ? runs
+        .map((r) => {
+          const status = String(r.status ?? "");
+          const chip =
+            status === "done"
+              ? `<span class="cc-run-status done">✅ 완료</span>`
+              : status === "failed"
+                ? `<span class="cc-run-status failed">❌ 실패${r.exit_note ? ` (${ccEsc(String(r.exit_note))})` : ""}</span>`
+                : `<span class="cc-run-status launched">⏳ 진행중</span>`;
+          const when = r.started_at ? ccHHMM(Number(r.started_at)) : "";
+          const art = r.artifact_dir
+            ? `<button class="cc-run-art" data-path="${ccEsc(String(r.artifact_dir))}">📂 산출물</button>`
+            : "";
+          return `<div class="cc-run-card"><span class="cc-run-label">${ccEsc(String(r.label ?? r.name ?? "?"))}</span><span class="cc-run-when">${ccEsc(when)}</span>${chip}${art}</div>`;
+        })
+        .join("")
+    : `<div class="cc-empty">최근 실행 없음</div>`;
+  host.querySelectorAll<HTMLElement>(".cc-run-art").forEach((b) =>
+    b.addEventListener("click", () => { if (b.dataset.path) void openPathChecked(b.dataset.path); }),
   );
 }
 
@@ -616,26 +818,48 @@ async function runSkillButton(s: any) {
   boardBusy = true;
   setTimeout(() => (boardBusy = false), 2000); // 연타 디바운스(surface 누적 방지)
   try {
+    // 착수 전 자원 게이트 — hard(2)=차단, soft(1)=비차단 경고 toast 후 진행(이 조직 머신은
+    // nodes 축이 상시 soft라 모달이면 매 실행이 막힌다 — 실측 2026-07-16). 조회 실패=통과(관측 부재).
+    let gate: any = { exit_code: 0 };
+    try {
+      gate = await invoke("resource_gate_check");
+    } catch {
+      /* 게이트 조회 실패 — 통과 취급 */
+    }
+    if (Number(gate?.exit_code) === 2) {
+      toast("watchdog", "자원 한계", "watchdog 차단 — 자원(서버·부하)을 정리한 뒤 다시 실행하세요");
+      return;
+    }
+    if (Number(gate?.exit_code) === 1) {
+      toast("watchdog", "자원 경고", "시스템 부하가 높은 상태에서 실행합니다(soft)");
+    }
     let userInput = "";
     if (s.gate === "hitl") {
-      // D6 제품 모드: 본문 원고/주제 입력 모달(HITL 보존·신뢰선 라벨·게이트 건너뛰기 금지)
-      const got = await inputModal(
-        s.label ?? s.name,
-        s.scope ?? "내용을 입력하세요",
-        "여기에 본문 원고나 주제를 붙여넣으세요…",
-      );
-      if (got === null) return; // 취소
-      userInput = got;
+      // D6 제품 모드: HITL 입력(신뢰선 라벨·게이트 건너뛰기 금지). fields 있으면 다중 필드, 없으면 단일 원고.
+      if (Array.isArray(s.fields) && s.fields.length) {
+        const got = await fieldsModal(s.label ?? s.name, s.scope ?? "내용을 입력하세요", s.fields);
+        if (got === null) return; // 취소
+        userInput = got;
+      } else {
+        const got = await inputModal(
+          s.label ?? s.name,
+          s.scope ?? "내용을 입력하세요",
+          "여기에 본문 원고나 주제를 붙여넣으세요…",
+        );
+        if (got === null) return; // 취소
+        userInput = got;
+      }
     }
-    // ★무계약 차단: task-prompt 티켓을 먼저 생성(javis_orchestra 경유). UI는 ticket 텍스트만 받는다.
+    // ★무계약 차단: task-prompt 티켓을 먼저 생성(javis_orchestra 경유). 반환은 {ticket, run_id} 객체.
     const scope = userInput ? `${s.scope ?? ""} · 입력 원고: ${userInput}` : s.scope ?? "";
-    const ticket = (await invoke("make_ticket", {
+    const t = (await invoke("make_ticket", {
       task: s.label ?? s.name,
       scope,
       success: s.success ?? "",
       to: "worker",
-    })) as string;
-    await invoke("run_skill", { name: s.name, ticket, agent: "claude", closeAfter: null });
+      slug: s.name,
+    })) as any;
+    await invoke("run_skill", { name: s.name, ticket: t.ticket, agent: "claude", closeAfter: null, runId: t.run_id });
     // 일회용 워커 pane은 CC 오버레이(z-index 1500) **아래** 작업공간에 뜬다 — CC를 닫아야
     // 보인다(오너 실증 2026-07-03: "CC를 종료해야 나타난다"). 실행 성공 시 자동으로 닫는다.
     setCcOpen(false);
@@ -682,16 +906,58 @@ async function refreshLearn() {
         .map((k) => {
           const r = rounds[k];
           const v = String(r?.verdict ?? "-");
-          return `<div class="cc-learn-row"><span class="cc-learn-round">${ccEsc(k)}</span><span class="cc-learn-verdict" style="color:${vColor[v] ?? "inherit"}">${ccEsc(v)}</span><span class="cc-learn-meta">저장 ${r?.stored?.length ?? 0} · harness ${r?.harness?.length ?? 0}</span></div>`;
+          // C2 v2: items(state/expires) 칩 — 구 라운드(items 부재)는 칩 0개로 관용(기존 렌더 불변).
+          // 값 전부 ccEsc 경유(오염 state.json XSS 방어 — 상단 gemini REVISE와 동일 원칙).
+          const its: any[] = Array.isArray(r?.items) ? r.items : [];
+          const itemChips = its
+            .map((it: any) => {
+              const st = String(it?.state ?? "-");
+              const ex = it?.expires ? ` ~${String(it.expires)}` : "";
+              return `<span class="cc-chip cc-learn-item" title="type: ${ccEsc(String(it?.type ?? "?"))} · expires: ${ccEsc(String(it?.expires ?? "미기록"))}">${ccEsc(String(it?.name ?? "?"))} · ${ccEsc(st + ex)}</span>`;
+            })
+            .join("");
+          return `<div class="cc-learn-row"><span class="cc-learn-round">${ccEsc(k)}</span><span class="cc-learn-verdict" style="color:${vColor[v] ?? "inherit"}">${ccEsc(v)}</span><span class="cc-learn-meta">저장 ${r?.stored?.length ?? 0} · harness ${r?.harness?.length ?? 0}</span>${itemChips}</div>`;
         })
         .join("")
     : `<div class="cc-empty">학습 라운드 기록 없음 — RSI 라운드(javis_rsi.py checkpoint)가 기록을 남기면 여기 표시됩니다</div>`;
 
   const ribbons: string[] = [];
-  for (const k of keys) for (const h of rounds[k]?.harness ?? []) ribbons.push(`${k}: ${h.retention ?? "?"}`);
+  for (const k of keys)
+    for (const h of rounds[k]?.harness ?? []) {
+      // eval:{before,after} 있으면 개선 델타(%p)를 리본에 부기 — 없으면 기존 그대로.
+      let delta = "";
+      if (h.eval) {
+        const bef = Number(h.eval.before), aft = Number(h.eval.after);
+        if (Number.isFinite(bef) && Number.isFinite(aft)) {
+          const dv = Math.round(aft - bef);
+          delta = ` (${dv >= 0 ? "+" : ""}${dv}%p)`;
+        }
+      }
+      ribbons.push(`${k}: ${h.retention ?? "?"}${delta}`);
+    }
   document.getElementById("cc-learn-retention")!.innerHTML = ribbons.length
     ? ribbons.map((t) => `<span class="cc-learn-ribbon ${t.includes("keep") ? "keep" : "rollback"}" title="retention: keep=개선 채택 유지 / rollback=회귀로 되돌림">${ccEsc(t)}</span>`).join("")
     : `<div class="cc-empty">채택/롤백 기록 없음</div>`;
+
+  // 📚 자산 성장 — 기억·스킬 개수(+7d 증가)·directives 개정, 각 행에 recent 이름 칩(클릭=open_path).
+  const assets = state?.assets ?? {};
+  const mem = assets.memory ?? {}, sk = assets.skills ?? {}, dir = assets.directives ?? {};
+  const assetChip = (r: any) =>
+    `<span class="cc-chip cc-asset-chip" data-path="${ccEsc(String(r.path ?? ""))}" title="${ccEsc(ccAssetDate(r.mtime))}">${ccEsc(String(r.name ?? "?"))}</span>`;
+  const assetRows: string[] = [
+    `<div class="cc-asset-row"><span class="cc-asset-lab">기억</span><span class="cc-asset-v"><span class="cc-asset-n">${discNum(mem.total)}개</span><span class="cc-dim">+${discNum(mem.added_7d)}/7d</span>${(mem.recent ?? []).map(assetChip).join("")}</span></div>`,
+    `<div class="cc-asset-row"><span class="cc-asset-lab">스킬</span><span class="cc-asset-v"><span class="cc-asset-n">${discNum(sk.total)}개</span><span class="cc-dim">+${discNum(sk.added_7d)}/7d</span>${(sk.recent ?? []).map(assetChip).join("")}</span></div>`,
+    `<div class="cc-asset-row"><span class="cc-asset-lab">directives</span><span class="cc-asset-v"><span class="cc-dim">최근 7d 개정 ${discNum(dir.changed_7d)}건</span>${(dir.recent ?? []).map(assetChip).join("")}</span></div>`,
+  ];
+  const assetsHost = document.getElementById("cc-learn-assets");
+  if (assetsHost) {
+    assetsHost.innerHTML = assetRows.join("");
+    assetsHost.querySelectorAll<HTMLElement>(".cc-asset-chip").forEach((c) =>
+      c.addEventListener("click", () => {
+        if (c.dataset.path) void openPathChecked(c.dataset.path);
+      }),
+    );
+  }
 
   document.getElementById("cc-learn-discovery")!.innerHTML = (
     [
@@ -1008,7 +1274,7 @@ function jumpEvidence(ev: string) {
   } else if (/^[0-9a-f]{7,40}$/i.test(ev)) {
     toast("feed", "🔗 커밋 근거", ev); // SHA — 표시(점프 대상 없음)
   } else {
-    invoke("open_path", { path: ev }).catch(() => toast("watchdog", "근거 파일 없음", ev));
+    void openPathChecked(ev); // 실패 사유(비존재·실행형)별 정확한 안내는 헬퍼가 담당
   }
 }
 
@@ -1117,13 +1383,21 @@ function renderControlCenter(d: any) {
 
 function renderLiveBody(d: any, fleet: any[]) {
   const agg = ccAggRate(fleet);
+  renderAccounts();
+  // KPI 5h/7d = 계정 병합 데이터의 "최고 사용 계정" max. 서브텍스트=그 계정 라벨. 계정 부재 시 ccAggRate 폴백.
   document.getElementById("cc-kpi")!.innerHTML = ["5h", "7d"]
     .map((lab) => {
+      const m = ccAcctMax(lab);
       const w = agg[lab];
-      const used = w ? Math.round(w.used) : 0;
+      const used = m ? Math.round(m.used) : w ? Math.round(w.used) : 0;
       const name = lab === "5h" ? "세션 (5h)" : "주간 (7d)";
-      const tip = lab === "5h" ? "최근 5시간 rate limit 사용률 (전 노드 최대값)" : "최근 7일 rate limit 사용률 (전 노드 최대값)";
-      return `<div class="cc-card ${sevClass(used, 60, 80)}" title="${tip}"><div class="cc-card-val">${used}%</div><div class="cc-card-reset">${w ? ccReset(lab, w.reset) : ""}</div><div class="cc-card-name">${name}</div></div>`;
+      const sub = m ? ccAcctLabel(m.acct) : w ? ccReset(lab, w.reset) : "";
+      const tip = m
+        ? "최고 사용 계정 기준"
+        : lab === "5h"
+          ? "최근 5시간 rate limit 사용률 (전 노드 최대값)"
+          : "최근 7일 rate limit 사용률 (전 노드 최대값)";
+      return `<div class="cc-card ${sevClass(used, 60, 80)}" title="${ccEsc(tip)}"><div class="cc-card-val">${used}%</div><div class="cc-card-reset">${ccEsc(sub)}</div><div class="cc-card-name">${name}</div></div>`;
     })
     .join("");
 
@@ -1139,10 +1413,12 @@ function renderLiveBody(d: any, fleet: any[]) {
 
   document.getElementById("cc-token-bars")!.innerHTML = ["5h", "7d"]
     .map((lab) => {
+      const m = ccAcctMax(lab);
       const w = agg[lab];
-      const used = w ? Math.round(w.used) : 0;
+      const used = m ? Math.round(m.used) : w ? Math.round(w.used) : 0;
+      const reset = m ? m.reset : w ? w.reset : null;
       const name = lab === "5h" ? "세션" : "주간";
-      return `<div class="cc-tbar"><span class="cc-tbar-lab">${name}</span><span class="cc-tbar-track"><span class="cc-tbar-fill ${sevClass(used, 60, 80)}" style="width:${Math.min(100, used)}%"></span></span><span class="cc-tbar-pct">${used}%</span><span class="cc-tbar-reset">${w ? ccReset(lab, w.reset) : ""}</span></div>`;
+      return `<div class="cc-tbar"><span class="cc-tbar-lab">${name}</span><span class="cc-tbar-track"><span class="cc-tbar-fill ${sevClass(used, 60, 80)}" style="width:${Math.min(100, used)}%"></span></span><span class="cc-tbar-pct">${used}%</span><span class="cc-tbar-reset">${reset != null ? ccReset(lab, reset) : ""}</span></div>`;
     })
     .join("");
 
@@ -1290,6 +1566,10 @@ let groups: GroupMeta[] = []; // 06: 그룹 메타 배열(진실원=localStorage
 let groupCounter = 1; // 06: 그룹 id 발급(ws의 wsCounter와 분리)
 let focusedSid: number | null = null;
 const panes = new Map<string, PaneRuntime>(); // 키 = paneKey(sid, socket)
+// web pane(뷰어 iframe) 런타임 — 터미널 panes와 분리(최소 침습). 키 = wid(단조증가 고유 id).
+// PaneView 이음새를 공유하므로 테마·포커스·리사이즈·정리 순회는 두 맵을 함께 돈다.
+const webPanes = new Map<number, WebPaneView>();
+let webWidCounter = 1;
 // 부서 데몬 socket_slug(F3 백엔드 단일진실) → socket 경로. launch_dept_daemon 반환·daemon-event로 채운다.
 const socketForSlug = new Map<string, string>();
 // 사이드바 노드 신호 캐시(B3) — org.status 응답을 워크스페이스 행 집계용으로 보관.
@@ -1311,7 +1591,8 @@ function applyBgColor(color: string | null): void {
   const fg = readableForeground(bg);
   document.documentElement.style.setProperty("--bg", bg);
   document.documentElement.style.setProperty("--canvas-text", fg);
-  for (const rt of panes.values()) rt.term.options.theme = { background: bg, foreground: fg };
+  for (const rt of panes.values()) rt.applyTheme(bg, fg);
+  for (const wp of webPanes.values()) wp.applyTheme(bg, fg); // web pane도 동일 테마 전파(§14)
   if (color === null) localStorage.removeItem("cys-bg-color");
   else localStorage.setItem("cys-bg-color", color);
 }
@@ -1370,30 +1651,53 @@ function saveLayout() {
   groups = normG; // 06: 멤버0 그룹을 모듈 상태에서도 즉시 해체(유령 누적 방지 · 적대검증 교정)
   const activeId = workspaces[activeWs]?.id;
   const a = Math.max(0, norm.findIndex((w) => w.id === activeId));
-  localStorage.setItem(
-    LAYOUT_KEY,
-    JSON.stringify({ workspaces: norm, groups: normG, active: a, counter: wsCounter, groupCounter }),
-  );
+  // v3에만 저장 — v2는 다운그레이드용으로 프리즈(webpane.persistLayout이 키를 봉인).
+  persistLayout((k, v) => localStorage.setItem(k, v), {
+    workspaces: norm,
+    groups: normG,
+    active: a,
+    counter: wsCounter,
+    groupCounter,
+    webWidCounter,
+  });
 }
 
 function collectSids(node: Node | null, out: number[] = []): number[] {
   if (!node) return out;
   if (node.type === "pane") out.push(node.sid);
-  else {
+  else if (node.type === "split") {
     collectSids(node.a, out);
     collectSids(node.b, out);
   }
+  // web 노드는 sid가 없는 리프 — 터미널/데몬 순회에서 스킵(입양·리사이즈 로직 오염 방지).
   return out;
+}
+
+// web pane 고유 id 수집 — 정리(고아 dispose)·close 경로가 쓴다. collectSids의 web 짝.
+// 순수 walk는 webpane.collectWebWids(단위 테스트 대상)에 위임 — teardown/복원이 같은 로직을 공유한다.
+function collectWids(node: Node | null, out: number[] = []): number[] {
+  return collectWebWids(node, out);
 }
 
 function replaceNode(node: Node, target: number, make: (old: Node) => Node | null): Node | null {
   if (node.type === "pane") {
     return node.sid === target ? make(node) : node;
   }
+  if (node.type === "web") return node; // web 리프: sid 대상과 무관 — 그대로 보존
   const a = replaceNode(node.a, target, make);
   const b = replaceNode(node.b, target, make);
   if (a && b) return { ...node, a, b };
   return a ?? b; // one side removed → collapse to sibling
+}
+
+// web 노드를 wid로 트리에서 제거(닫기 경로) — replaceNode의 sid 대응. collapse 규칙 동일.
+function removeWebNode(node: Node, wid: number): Node | null {
+  if (node.type === "web") return node.wid === wid ? null : node;
+  if (node.type === "pane") return node;
+  const a = removeWebNode(node.a, wid);
+  const b = removeWebNode(node.b, wid);
+  if (a && b) return { ...node, a, b };
+  return a ?? b;
 }
 
 // ---------- pane lifecycle ----------
@@ -1809,7 +2113,9 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     output_event: string;
     exited_event: string;
   };
+  const outStamp = { t: 0 }; // 마지막 출력 시각 — rt.lastOutputAt(스트리밍 가드)의 원천
   const un1 = await listen(ev.output_event, (e) => {
+    outStamp.t = Date.now();
     term.write(b64ToBytes(e.payload as string), snapToBottom);
   });
   const un2 = await listen(ev.exited_event, () => {
@@ -1835,7 +2141,21 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   });
   observer.observe(termHost);
 
-  const rt: PaneRuntime = { sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom };
+  const rt: PaneRuntime = {
+    sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom,
+    lastOutputAt: () => outStamp.t,
+    imeBusy: () => imeState.pending !== "",
+    // ── PaneView 이음새(일반 순회 루프 진입점) — 아래 구현은 기존 직접 조작과 동작 동일 ──
+    resize: () => fitPane(rt),
+    applyTheme: (bg, fg) => { rt.term.options.theme = { background: bg, foreground: fg }; },
+    setFocused: (focused) => { rt.el.classList.toggle("focused", focused); if (focused) rt.term.focus(); },
+    dispose: () => {
+      rt.observer.disconnect();
+      rt.unlisten.forEach((u) => u());
+      rt.term.dispose();
+      rt.el.remove();
+    },
+  };
   panes.set(paneKey(sid, socket), rt);
   return rt;
 }
@@ -1851,12 +2171,156 @@ function fitPane(rt: PaneRuntime) {
 function destroyPaneRuntime(sid: number, socket?: string) {
   const rt = panes.get(paneKey(sid, socket));
   if (!rt) return;
-  rt.observer.disconnect();
-  rt.unlisten.forEach((u) => u());
-  rt.term.dispose();
-  rt.el.remove();
+  rt.dispose();
   panes.delete(paneKey(sid, socket));
 }
+
+// ---------- web pane (뷰어 사이드카 iframe) ----------
+// 터미널 pane과 동일 PaneView 이음새를 구현하되 xterm 대신 iframe을 얹는다. 타이틀 스트립은
+// cross-origin/loopback iframe 키보드 데드존(§8-1#12) 대응 포커스 캐처 + 제목·URL 표시 + 닫기.
+// 마운트 시 사이드카 미기동/로드 실패면 "계기 대기 중" 플레이스홀더 + 5s 재시도(§8-1#13).
+interface WebPaneView extends PaneView {
+  wid: number;
+  node: WebNode;
+}
+
+const VIEW_BRIDGE_RETRY_MS = 5000;
+
+function makeWebPane(node: WebNode): WebPaneView {
+  const el = document.createElement("div");
+  el.className = "pane web-pane";
+  el.dataset.wid = String(node.wid);
+
+  const header = document.createElement("div");
+  header.className = "pane-title";
+  header.tabIndex = 0; // 포커스 캐처 — iframe 밖 키 핸드오프 지점
+  const titleEl = document.createElement("span");
+  titleEl.className = "pane-title-text";
+  titleEl.textContent = node.title ?? "뷰어";
+  const urlEl = document.createElement("span");
+  urlEl.className = "pane-usage web-url";
+  const closeBtn = document.createElement("span");
+  closeBtn.className = "pane-close";
+  closeBtn.textContent = "×";
+  closeBtn.title = "web pane 닫기";
+  header.append(titleEl, urlEl, closeBtn);
+
+  const body = document.createElement("div");
+  body.className = "web-body";
+  const frame = document.createElement("iframe");
+  frame.className = "web-frame";
+  // 로컬 뷰어 앱 스크립트·동일출처 fetch(/api)만 허용, top-navigation·popup·폼은 차단(하드 가드 보완).
+  frame.setAttribute("sandbox", "allow-scripts allow-same-origin");
+  const placeholder = document.createElement("div");
+  placeholder.className = "web-placeholder";
+  body.append(placeholder, frame);
+  el.append(header, body);
+
+  let retryTimer: number | undefined;
+  let disposed = false;
+  let themeCache: { bg: string; fg: string } | null = null;
+
+  const showPlaceholder = (msg: string) => {
+    placeholder.textContent = msg;
+    placeholder.style.display = "";
+    frame.style.visibility = "hidden";
+  };
+  const postTheme = () => {
+    if (!themeCache) return;
+    frame.contentWindow?.postMessage(
+      { type: "cys-theme", vars: { "--bg": themeCache.bg, "--fg": themeCache.fg } },
+      "*",
+    );
+  };
+  frame.addEventListener("load", () => {
+    placeholder.style.display = "none";
+    frame.style.visibility = "";
+    postTheme(); // 뷰어 색 = 터미널 테마(§14)
+  });
+
+  const scheduleRetry = () => {
+    clearTimeout(retryTimer);
+    retryTimer = window.setTimeout(() => { if (!disposed) ensureAndLoad(); }, VIEW_BRIDGE_RETRY_MS);
+  };
+  // 사이드카 확보 → 최신 {port,token}으로 URL 재조립 → iframe 로드. 실패=플레이스홀더+재시도.
+  const ensureAndLoad = async () => {
+    if (disposed) return;
+    const path = extractViewerPath(node.url);
+    if (path === null) return showPlaceholder("잘못된 뷰어 경로 — 열 수 없음");
+    let bridge: { port: number; token: string };
+    try {
+      bridge = (await invoke("ensure_view_bridge")) as { port: number; token: string };
+    } catch {
+      showPlaceholder("계기 대기 중 — 재시도…");
+      return scheduleRetry();
+    }
+    if (disposed) return;
+    const url = viewerAppUrl(bridge.port, bridge.token, path);
+    if (!isAllowedWebPaneUrl(url)) return showPlaceholder("차단된 URL — 로드 거부"); // 하드 가드
+    node.url = url; // 저장 시 최신 URL 유지(토큰 회전 반영)
+    urlEl.textContent = `127.0.0.1:${bridge.port}`;
+    urlEl.title = url;
+    showPlaceholder("로딩 중…");
+    frame.src = url;
+  };
+
+  closeBtn.addEventListener("click", () => closeWebPane(node.wid));
+  header.addEventListener("mousedown", () => focusWebPane(node.wid));
+  showPlaceholder("계기 대기 중…");
+  ensureAndLoad();
+
+  const view: WebPaneView = {
+    wid: node.wid,
+    node,
+    el,
+    resize: () => { /* iframe은 CSS flex로 자동 리사이즈 — no-op */ },
+    applyTheme: (bg, fg) => { themeCache = { bg, fg }; postTheme(); },
+    setFocused: (focused) => { el.classList.toggle("focused", focused); },
+    dispose: () => { disposed = true; clearTimeout(retryTimer); el.remove(); },
+  };
+  webPanes.set(node.wid, view);
+  return view;
+}
+
+function destroyWebPane(wid: number) {
+  const v = webPanes.get(wid);
+  if (!v) return;
+  v.dispose();
+  webPanes.delete(wid);
+}
+
+// web pane 포커스 — 터미널·다른 web 포커스 해제 후 자신만 focused(단일 포커스 불변식).
+function focusWebPane(wid: number) {
+  focusedSid = null;
+  for (const rt of panes.values()) rt.setFocused(false);
+  for (const [id, v] of webPanes) v.setFocused(id === wid);
+}
+
+function closeWebPane(wid: number) {
+  const ws = current();
+  destroyWebPane(wid);
+  if (ws?.tree) ws.tree = removeWebNode(ws.tree, wid);
+  render();
+  const first = collectSids(ws?.tree ?? null)[0];
+  if (first != null) setFocus(first);
+}
+
+// 파일 경로를 뷰어 web pane으로 연다(포커스 pane 우측 분할). 진입 2경로:
+// ① 개발자 — window.cysOpenViewer(devtools 전용, focus=true 유지)
+// ② viewer.open 데몬 이벤트(cys view) — focus=false: 포커스 강탈 금지 원칙(approval.request의
+//    "자동 화면전환 없음"과 정합 — pane은 배경 생성, 알림은 toast로만).
+async function openViewerPane(path: string, focus = true): Promise<void> {
+  const ws = current();
+  if (!ws || ws.pending) return;
+  const wid = webWidCounter++;
+  // 초기 URL엔 경로만 담는다(port 0·token pending) — makeWebPane의 ensureAndLoad가 실제로 재조립.
+  const node = makeWebNode(wid, viewerAppUrl(0, "pending", path), baseName(path) || "뷰어");
+  makeWebPane(node);
+  ws.tree = ws.tree ? { type: "split", dir: "row", a: ws.tree, b: node } : node;
+  render();
+  if (focus) focusWebPane(wid);
+}
+(window as unknown as { cysOpenViewer: (p: string) => Promise<void> }).cysOpenViewer = openViewerPane;
 
 // ---------- pane drag 이동 (탭을 끌어 자유 배치) ----------
 
@@ -1868,7 +2332,12 @@ function startPaneDrag(e0: MouseEvent, sid: number) {
   let ghost: HTMLElement | null = null;
   let hint: HTMLElement | null = null;
   let target: { sid: number; side: DropSide } | null = null;
+  let tabTarget: HTMLElement | null = null; // F6: 사이드바 ws 탭 위 드롭 = 전출
 
+  const clearTabTarget = () => {
+    tabTarget?.classList.remove("transfer-target");
+    tabTarget = null;
+  };
   const move = (e: MouseEvent) => {
     if (!dragging) {
       // 클릭(포커스)과 구분 — 6px 이상 움직여야 드래그 시작
@@ -1885,9 +2354,22 @@ function startPaneDrag(e0: MouseEvent, sid: number) {
     }
     ghost!.style.left = `${e.clientX + 10}px`;
     ghost!.style.top = `${e.clientY + 10}px`;
-    const over = (document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null)?.closest(
-      ".pane",
-    ) as HTMLElement | null;
+    // F6: 사이드바 탭 히트테스트 — 탭 위면 전출 대상 표시(pane 분할 힌트와 배타)
+    const hitEl = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+    const tab = hitEl?.closest(".ws-tab") as HTMLElement | null;
+    if (tab !== tabTarget) {
+      clearTabTarget();
+      if (tab?.dataset.wsId) {
+        tabTarget = tab;
+        tab.classList.add("transfer-target");
+      }
+    }
+    if (tabTarget) {
+      target = null;
+      if (hint) hint.hidden = true;
+      return;
+    }
+    const over = hitEl?.closest(".pane") as HTMLElement | null;
     target = null;
     if (over?.dataset.sid && Number(over.dataset.sid) !== sid) {
       const r = over.getBoundingClientRect();
@@ -1913,10 +2395,184 @@ function startPaneDrag(e0: MouseEvent, sid: number) {
     ghost?.remove();
     hint?.remove();
     document.body.classList.remove("pane-dragging");
-    if (dragging && target) movePane(sid, target.sid, target.side);
+    const destWsId = tabTarget?.dataset.wsId;
+    clearTabTarget();
+    if (dragging && destWsId != null) void transferPaneToWs(sid, Number(destWsId));
+    else if (dragging && target) movePane(sid, target.sid, target.side);
   };
   window.addEventListener("mousemove", move, true);
   window.addEventListener("mouseup", up, true);
+}
+
+// F6: pane 전출 — 동일 socket ws 간은 원자 트리 이동(transfer.ts 순수 로직),
+// 크로스 부서(다른 socket)는 맥락보존 재인스턴스화(transferCrossDept).
+async function transferPaneToWs(sid: number, destWsId: number) {
+  const srcWs = current();
+  const destWs = workspaces.find((w) => w.id === destWsId);
+  if (!destWs || destWs === srcWs) return;
+  if (destWs.pending) {
+    toast("watchdog", "전출 불가", "대상 부서 데몬이 아직 준비 중입니다");
+    return;
+  }
+  if ((destWs.socket ?? undefined) !== (srcWs.socket ?? undefined)) {
+    return transferCrossDept(sid, srcWs, destWs);
+  }
+  // 가드: 전출 시점 pane 생존(reap 경합) — 죽은 sid를 대상 트리에 넣지 않는다
+  if (!panes.has(paneKey(sid, srcWs.socket))) {
+    toast("watchdog", "전출 불가", "pane이 이미 종료되었습니다");
+    return;
+  }
+  const moved = transferTrees(srcWs.tree, destWs.tree, sid);
+  if (!moved) {
+    toast("watchdog", "전출 불가", "레이아웃에서 pane을 찾지 못했습니다");
+    return;
+  }
+  // 원자 반영: 두 트리 동시 교체 → 단일 render(saveLayout 포함) — JS 단일 스레드의 동기 블록이라
+  // 같은 sid가 두 트리에 걸친 중간 상태가 렌더·영속에 노출되지 않는다.
+  srcWs.tree = moved.src;
+  destWs.tree = moved.dest;
+  if (focusedSid === sid) focusedSid = collectSids(srcWs.tree)[0] ?? null;
+  render();
+  if (focusedSid != null) setFocus(focusedSid);
+  toast("feed", "pane 전출 완료", `→ ${destWs.name || UNTITLED}`);
+}
+
+// F6-2: 크로스 부서 전출 — 라이브 프로세스는 데몬 간 이주가 물리적으로 불가하므로,
+// 핸드오프 문서로 맥락을 승계(HANDOFF_CONTRACT 5필드)한 뒤 대상 부서에서 재기동한다.
+// 어느 단계든 실패 시 원본 무접촉(전출 실패=현상 유지). 원본 정리는 재기동 성공 후에만.
+async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspace) {
+  const srcSock = srcWs.socket;
+  if (!panes.has(paneKey(sid, srcSock))) {
+    toast("watchdog", "전출 불가", "pane이 이미 종료되었습니다");
+    return;
+  }
+  const r = (await invoke("list_surfaces", { socket: srcSock }).catch(() => null)) as {
+    surfaces: { surface_id: number; live_cwd: string | null; role?: string | null; agent?: string | null }[];
+  } | null;
+  const me = r?.surfaces.find((s) => s.surface_id === sid);
+  // fail-closed: RPC 실패·미발견이면 분류 불가 — 살아있는 에이전트를 '셸'로 오분류해
+  // 핸드오프 없이 닫는 파괴 분기로의 fail-open 금지(적대검증 최강 공격 봉인).
+  if (!me) {
+    toast("watchdog", "전출 불가", "pane 상태를 확인할 수 없습니다(RPC 실패) — 원본은 그대로입니다");
+    return;
+  }
+  const isAgent = !!(me.role || me.agent);
+  const cwd = me.live_cwd ?? null;
+  // 부서 노드는 cwd가 "/"(루트)로 뜨는 경우가 실측됨 — 루트류(/·드라이브 루트)·미확보 cwd는
+  // 프로젝트 상대 경로(_round/handoffs)가 성립하지 않으므로 ~/.cys/transfers 로 폴백한다.
+  const rootish = !cwd || cwd === "/" || /^[A-Za-z]:[\\/]?$/.test(cwd);
+  // 역할 승계: 원 역할 그대로 재기동(무음 worker 강등 금지). 데몬 유래 값이지만 명령 조합에
+  // 들어가므로 형식 가드([a-z0-9-]) — 벗어나면 worker 폴백. 리뷰어는 전용 CLI 처방(RESTART와 동일).
+  const srcRole = me.role && /^[a-z0-9-]{1,32}$/.test(me.role) ? me.role : "worker";
+  const LAUNCH_BY_ROLE: Record<string, string> = {
+    "reviewer-gemini": "agy --dangerously-skip-permissions",
+    "reviewer-codex": "codex --dangerously-bypass-approvals-and-sandbox",
+  };
+  const launchCmd = LAUNCH_BY_ROLE[srcRole] ?? `cys launch-agent --role ${srcRole} --agent claude`;
+  const ok = await confirmModal(
+    "부서 간 전출",
+    isAgent
+      ? `부서 간 전출은 핸드오프 문서로 맥락을 승계한 재기동입니다(${srcRole} 역할로 재기동). ` +
+          "진행 중이던 응답(라이브 추론 상태)은 이어지지 않습니다. 진행하시겠습니까?"
+      : "이 pane은 에이전트 미등록(셸)입니다 — 같은 경로의 새 셸을 대상 부서에 만들고 이 pane을 닫습니다. 진행하시겠습니까?",
+    "전출",
+  );
+  if (!ok) return;
+  try {
+    let handoffPath: string | null = null;
+    if (isAgent) {
+      // ① 핸드오프 지시 주입 — clear_first(데몬 T3-13 권위 전달: Ctrl-U 정리→paste→지연 CR
+      //    원자 제출). raw "\r" 동봉은 Claude CLI가 붙여넣기로 삼켜 미제출(e2e 실측 결함).
+      const base = rootish
+        ? `${(await invoke("home_dir_path")) as string}/.cys/transfers`
+        : `${cwd}/_round/handoffs`;
+      handoffPath = `${base}/transfer-${sid}-${Date.now()}.md`;
+      const inst =
+        `지금까지의 작업 상태를 HANDOFF_CONTRACT 5필드로 ${handoffPath} 에 기록하라` +
+        `(디렉토리가 없으면 mkdir -p로 생성). 각 필드는 정확히 "## Decided" "## Rejected" "## Risks" ` +
+        `"## Files" "## Remaining" 마크다운 헤더로 쓰고, 해당 없음은 "없음"으로 명기하라. ` +
+        `5필드가 모두 기록된 파일이 전출 준비 완료 신호다.`;
+      await invoke("send_input", { socket: srcSock, surfaceId: sid, data: inst, clearFirst: true });
+      // ② 5필드 내용 검증 대기(3초 간격·최대 120초) — 화면 파싱이 아니라 파일 내용 확인(결정론).
+      stickyToast("transfer", "feed", "전출 준비 중", "핸드오프 기록 대기(최대 120초)…");
+      // 파일 실존≠내용 유효 — 5필드(HANDOFF_CONTRACT)가 전부 갖춰질 때까지 대기한다.
+      // 부분 기록(아직 쓰는 중)도 다음 틱에 재확인되므로 조기 통과가 없다.
+      const FIELDS = ["## Decided", "## Rejected", "## Risks", "## Files", "## Remaining"];
+      const deadline = Date.now() + 120_000;
+      let ready = false;
+      while (Date.now() < deadline) {
+        await new Promise((res) => setTimeout(res, 3000));
+        const head = (await invoke("read_text_head", { path: handoffPath }).catch(() => null)) as
+          | string
+          | null;
+        if (head && FIELDS.every((f) => head.includes(f))) {
+          ready = true;
+          break;
+        }
+      }
+      if (!ready) {
+        toast(
+          "watchdog",
+          "전출 중단",
+          "핸드오프가 기록되지 않았거나 5필드가 미완성입니다(120초) — 원본은 그대로입니다",
+        );
+        return;
+      }
+    }
+    // ③ 대상 부서에 새 surface 생성 + 트리 편입(같은 경로에서 시작 — 루트류 cwd는 승계하지
+    //    않고 데몬 기본값(home)으로: 루트 cwd pane 재생산 차단)
+    const newSid = await newSurface(rootish ? null : cwd, destWs.socket);
+    destWs.tree = destWs.tree
+      ? { type: "split", dir: "row", a: destWs.tree, b: { type: "pane", sid: newSid } }
+      : { type: "pane", sid: newSid };
+    // ③ 이후 실패는 보상 트랜잭션 — 새 pane 회수+트리 복원으로 "원본 보존"을 거짓말이 아니게 한다.
+    try {
+      if (isAgent) {
+        // ④ 에이전트 재기동(노드 재기동 처방과 동일 명령)
+        await invoke("send_input", {
+          socket: destWs.socket,
+          surfaceId: newSid,
+          data: `${launchCmd}\r`,
+        });
+        // agent-ready 폴링(최대 60초): agent_meta 등록을 확인한 뒤 복원 지시를 보낸다 —
+        // queued(조용 시점 배달)만으로는 부팅 중 quiet 순간에 떨어져 유실될 수 있다(이중 안전).
+        stickyToast("transfer", "feed", "전출 진행 중", "새 워커 기동 대기…");
+        const readyBy = Date.now() + 60_000;
+        while (Date.now() < readyBy) {
+          await new Promise((res) => setTimeout(res, 3000));
+          const rr = (await invoke("list_surfaces", { socket: destWs.socket }).catch(() => null)) as {
+            surfaces: { surface_id: number; role?: string | null; agent?: string | null }[];
+          } | null;
+          const ns = rr?.surfaces.find((s) => s.surface_id === newSid);
+          if (ns?.agent || ns?.role) break; // 등록 확인 — 미확인이어도 queued가 2차 안전망
+        }
+        await invoke("send_input", {
+          socket: destWs.socket,
+          surfaceId: newSid,
+          data: `너는 전출된 워커다. ${handoffPath} 를 읽고 작업을 이어가라.`,
+          queued: true,
+        });
+      }
+      // ⑤ 재기동 성공 후에만 원본 정리
+      await invoke("close_surface", { socket: srcSock, surfaceId: sid });
+    } catch (e) {
+      await invoke("close_surface", { socket: destWs.socket, surfaceId: newSid }).catch(() => {});
+      destroyPaneRuntime(newSid, destWs.socket);
+      if (destWs.tree) destWs.tree = replaceNode(destWs.tree, newSid, () => null);
+      render();
+      toast("watchdog", "전출 실패", `${e} — 원본 pane은 보존되고 새 pane은 회수했습니다`);
+      return;
+    }
+    destroyPaneRuntime(sid, srcSock);
+    if (srcWs.tree) srcWs.tree = replaceNode(srcWs.tree, sid, () => null);
+    if (focusedSid === sid) focusedSid = collectSids(current()?.tree ?? null)[0] ?? null;
+    render();
+    toast("feed", "부서 전출 완료", `→ ${destWs.name || UNTITLED} (surface:${newSid})`);
+  } catch (e) {
+    toast("watchdog", "전출 실패", `${e} — 원본 pane은 보존됩니다`);
+  } finally {
+    dismissToast("transfer");
+  }
 }
 
 /// sid pane을 트리에서 떼어 target pane의 side 쪽에 분할 삽입한다.
@@ -1946,33 +2602,21 @@ function movePane(sid: number, targetSid: number, side: DropSide) {
 function setFocus(sid: number) {
   focusedSid = sid;
   const key = paneKey(sid, current()?.socket);
-  for (const [id, rt] of panes) rt.el.classList.toggle("focused", id === key);
-  panes.get(key)?.term.focus();
+  for (const [id, rt] of panes) rt.setFocused(id === key);
+  for (const wp of webPanes.values()) wp.setFocused(false); // 단일 포커스 — web pane 강조 해제
   updateFtRoot(); // 파일 트리가 열려 있으면 선택한 surface의 폴더로 전환
 }
 
-// 드롭 물리좌표(디바이스 픽셀)를 CSS px로 환산해 그 지점을 포함하는 pane 런타임을 찾는다.
-// 매칭 실패 시 포커스된 pane → 현재 ws 첫 pane 폴백. pane이 전무하면 undefined(호출측이 조용히 무시).
-function paneAtPhysicalPoint(pos?: { x: number; y: number }): PaneRuntime | undefined {
-  if (panes.size === 0) return undefined;
-  if (pos) {
-    const dpr = window.devicePixelRatio || 1;
-    const hit = document.elementFromPoint(pos.x / dpr, pos.y / dpr) as HTMLElement | null;
-    const paneEl = hit?.closest(".pane") as HTMLElement | null;
-    if (paneEl) {
-      for (const rt of panes.values()) if (rt.el === paneEl) return rt;
-    }
-  }
-  const sock = current()?.socket;
-  if (focusedSid != null) {
-    const rt = panes.get(paneKey(focusedSid, sock));
-    if (rt) return rt;
-  }
-  const firstSid = collectSids(current()?.tree ?? null)[0];
-  if (firstSid != null) {
-    const rt = panes.get(paneKey(firstSid, sock));
-    if (rt) return rt;
-  }
+// 드롭 물리좌표(디바이스 픽셀)를 CSS px로 환산해 그 지점을 '직격'하는 pane만 찾는다.
+// 폴백 없음 — 빗나간 드롭이 포커스 pane에 조용히 주입되던 오배달 footgun 제거.
+// 호출측이 undefined를 무동작+토스트로 처리한다(무음 실패 금지).
+function paneAtPointStrict(pos?: { x: number; y: number }): PaneRuntime | undefined {
+  if (!pos) return undefined;
+  const dpr = window.devicePixelRatio || 1;
+  const hit = document.elementFromPoint(pos.x / dpr, pos.y / dpr) as HTMLElement | null;
+  const paneEl = hit?.closest(".pane") as HTMLElement | null;
+  if (!paneEl) return undefined;
+  for (const rt of panes.values()) if (rt.el === paneEl) return rt;
   return undefined;
 }
 
@@ -1989,7 +2633,7 @@ function render() {
   requestAnimationFrame(() => {
     for (const sid of collectSids(current()?.tree ?? null)) {
       const rt = panes.get(paneKey(sid, current()?.socket));
-      if (rt) fitPane(rt);
+      if (rt) rt.resize();
     }
   });
   saveLayout();
@@ -2029,6 +2673,11 @@ function renderNode(node: Node): HTMLElement {
     placeholder.className = "pane";
     placeholder.textContent = `surface:${node.sid} (없음)`;
     return placeholder;
+  }
+  if (node.type === "web") {
+    // 런타임이 이미 있으면 그 el 재사용, 없으면(복원 직후) 생성한다.
+    const v = webPanes.get(node.wid) ?? makeWebPane(node);
+    return v.el;
   }
   const div = document.createElement("div");
   div.className = `split ${node.dir}`;
@@ -2071,7 +2720,7 @@ function attachDividerDrag(
       saveLayout();
       for (const sid of collectSids(node)) {
         const rt = panes.get(paneKey(sid, current()?.socket));
-        if (rt) fitPane(rt);
+        if (rt) rt.resize();
       }
     };
     window.addEventListener("mousemove", move);
@@ -2650,6 +3299,8 @@ function buildTab(ws: Workspace): HTMLElement {
     showCtxMenu(e.clientX, e.clientY, [
       { label: "이름 변경", action: startRename },
       ...wsGroupCtxItems(ws), // 06: 그룹 만들기/넣기/빼기
+      // ★기능2: 부서 탭에만 — 대화기억까지 격리하고 부활을 영구 차단하는 완전 삭제(기존 2-click close 무접촉).
+      ...(ws.socket ? [{ label: "완전 삭제(부활 차단)", action: () => purgeDept(ws) }] : []),
     ]);
   });
   close.addEventListener("click", async () => {
@@ -2681,6 +3332,8 @@ function buildTab(ws: Workspace): HTMLElement {
       await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
       destroyPaneRuntime(sid, ws.socket);
     }
+    // web pane도 정리 — ws 통째 삭제 시 iframe·webPanes 엔트리가 고아로 남지 않게 dispose.
+    for (const wid of collectWids(ws.tree)) destroyWebPane(wid);
     const i = workspaces.indexOf(ws); // 캡처된 idx는 stale일 수 있음 — 실시간 위치로 식별
     if (i < 0) { render(); return; } // 이미 제거된 ws 재클릭 — no-op
     workspaces.splice(i, 1);
@@ -2891,6 +3544,8 @@ async function confirmDeleteGroup(g: GroupMeta) {
       await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
       destroyPaneRuntime(sid, ws.socket);
     }
+    // web pane 정리(ws close 핸들러와 동일 정합) — 그룹 삭제로 사라지는 ws의 iframe·엔트리 dispose.
+    for (const wid of collectWids(ws.tree)) destroyWebPane(wid);
     const i = workspaces.indexOf(ws);
     if (i < 0) continue;
     workspaces.splice(i, 1);
@@ -2911,7 +3566,11 @@ async function confirmDeleteGroup(g: GroupMeta) {
 const UNTITLED = "non title";
 
 // 커스텀 컨텍스트 메뉴 (WKWebView 기본 메뉴 대체) — 싱글톤, 바깥 클릭·Esc로 닫힘.
-function showCtxMenu(x: number, y: number, items: { label: string; action: () => void }[]) {
+function showCtxMenu(
+  x: number,
+  y: number,
+  items: { label: string; action: () => void; disabled?: boolean }[],
+) {
   document.getElementById("ctx-menu")?.remove();
   const menu = document.createElement("div");
   menu.id = "ctx-menu";
@@ -2929,13 +3588,15 @@ function showCtxMenu(x: number, y: number, items: { label: string; action: () =>
   };
   for (const it of items) {
     const row = document.createElement("div");
-    row.className = "ctx-item";
+    // disabled = 표시 전용 행(경로 표시 등) — 클릭 무반응(CSS pointer-events 차단과 짝)
+    row.className = "ctx-item" + (it.disabled ? " disabled" : "");
     row.textContent = it.label;
-    row.addEventListener("mousedown", (e) => {
-      e.preventDefault();
-      closeMenu();
-      it.action();
-    });
+    if (!it.disabled)
+      row.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        closeMenu();
+        it.action();
+      });
     menu.appendChild(row);
   }
   menu.style.left = `${x}px`;
@@ -3225,6 +3886,9 @@ interface FeedItem {
   surface_id: number | null;
   status: string;
   decision: string | null;
+  // W3: cysd가 title·body에서 파생한 위험 클래스("auto"|"high"|"human") + 자동결재 라우팅 여부.
+  risk_class?: string | null;
+  auto_route?: boolean;
 }
 
 // 승인 Feed는 Control Center의 '승인 Feed' 탭으로 편입됨(독립 패널 폐기).
@@ -3234,22 +3898,50 @@ function openFeed() {
   setCcTab("feed");
 }
 
-// 승인 자동 화면전환 유예: master가 이 시간 안에 자동 승인(reply)하면 전환하지 않는다.
+// 승인 자동 화면전환 유예: master/CEO가 이 시간 안에 자동 승인(reply)하면 전환하지 않는다.
 // 유예 후에도 pending인 항목 = 사람 수동 승인 필요 → 그때만 승인 Feed 탭으로 전환.
-const FEED_SWITCH_GRACE_MS = 30_000;
-function scheduleFeedSwitchIfStillPending(requestId: string) {
+const FEED_SWITCH_GRACE_MS = 30_000; // 비대상(현행) 유예
+// W3.4: auto_route 항목은 CEO 심의형 turn이 90초 초과가 흔하므로 기본 유예를 90초로 둔다.
+const FEED_SWITCH_GRACE_AUTO_MS = 90_000;
+// approval.stalled(5분) 경로가 사람 소환을 담당하므로 그 전까지만 동적 연장한다(그 뒤엔 escalation).
+const FEED_SWITCH_MAX_MS = 300_000;
+
+// W3.4: CEO 좌석이 살아서 생성 중(working·저idle)이면 결재 심의가 진행 중으로 본다 —
+// nodeSig(refreshSidebarStatus가 org_status에서 채움)를 재갱신한 뒤 판정한다.
+async function ceoIsActivelyGenerating(): Promise<boolean> {
+  await refreshSidebarStatus().catch(() => {});
+  for (const sig of nodeSig.values()) {
+    if (sig.role === "ceo") {
+      const alive = sig.agent_alive !== false; // null(미상)은 살아있다고 본다
+      const working = sig.state === "working" || sig.idle_secs < 30;
+      return alive && working;
+    }
+  }
+  return false; // ceo 좌석 신호 부재 = 비활성 → 즉시 전환(사람 소환)
+}
+
+// autoRoute=true면 90초 기본 + CEO 활성 시 wait timeout 내 동적 연장, 아니면 30초 고정.
+function scheduleFeedSwitchIfStillPending(requestId: string, autoRoute = false, elapsedMs = 0) {
   if (!requestId) return;
+  const grace = autoRoute ? FEED_SWITCH_GRACE_AUTO_MS : FEED_SWITCH_GRACE_MS;
   setTimeout(async () => {
     const r = (await invoke("feed_list", { status: null }).catch(() => null)) as { items: FeedItem[] } | null;
     const item = r?.items.find((i) => i.request_id === requestId);
-    if (item?.status === "pending") openFeed();
-  }, FEED_SWITCH_GRACE_MS);
+    if (item?.status !== "pending") return; // 이미 결재됨 — 전환 없음
+    // auto_route: CEO가 살아서 생성 중이고 상한 이내면 유예 연장(전환 보류).
+    if (autoRoute && elapsedMs + grace < FEED_SWITCH_MAX_MS && (await ceoIsActivelyGenerating())) {
+      scheduleFeedSwitchIfStillPending(requestId, true, elapsedMs + grace);
+      return;
+    }
+    openFeed(); // 유예 후에도 pending + CEO 비활성/상한 → 사람 개입
+  }, grace);
 }
 
 // ---------- file tree (오른쪽 섹션 — 선택한 surface의 폴더 탐색) ----------
 
 let ftOpen = false;
 let ftRoot: string | null = null;
+let ftPinned = false; // F5: 수동 재루팅(더블클릭/메뉴) 시 true — live_cwd 자동 추종 일시 해제
 const ftExpanded = new Set<string>(); // 펼쳐진 하위 폴더 경로
 
 function setFtOpen(open: boolean) {
@@ -3258,9 +3950,10 @@ function setFtOpen(open: boolean) {
   if (open) updateFtRoot(); // pane 폭 변화는 ResizeObserver가 자동 보정
 }
 
-// 포커스된 surface의 현재 경로를 트리 루트로 — 포커스 이동·cd 모두 추적
+// 포커스된 surface의 현재 경로를 트리 루트로 — 포커스 이동·cd 모두 추적.
+// 수동 핀(ftPinned) 중엔 정지 — 다음 틱의 live_cwd 추종이 수동 이동을 되돌리는 경합 차단(F5).
 async function updateFtRoot() {
-  if (!ftOpen || focusedSid == null) return;
+  if (!ftOpen || focusedSid == null || ftPinned) return;
   try {
     const r = (await invoke("list_surfaces", { socket: current()?.socket })) as {
       surfaces: { surface_id: number; live_cwd: string | null }[];
@@ -3276,6 +3969,14 @@ async function updateFtRoot() {
   }
 }
 
+// F5: 수동 재루팅 — 핀을 세워 자동 추종을 멈춘다(헤더 📌 클릭 = 추종 복귀).
+function setFtRoot(dir: string, pinned: boolean) {
+  ftRoot = dir;
+  ftPinned = pinned;
+  ftExpanded.clear();
+  renderFileTree();
+}
+
 async function renderFileTree() {
   const body = document.getElementById("ft-body")!;
   const label = document.getElementById("ft-root-label")!;
@@ -3284,10 +3985,38 @@ async function renderFileTree() {
     label.textContent = "파일";
     return;
   }
-  label.textContent = ftRoot.split("/").pop() || ftRoot;
-  label.title = ftRoot;
+  label.textContent = (ftPinned ? "📌 " : "") + (baseName(ftRoot) || ftRoot);
+  label.title = ftPinned ? `${ftRoot}\n📌 고정됨 — 클릭하면 pane 경로 자동 추종으로 복귀` : ftRoot;
+  label.onclick = ftPinned
+    ? () => {
+        ftPinned = false;
+        void updateFtRoot();
+        renderFileTree();
+      }
+    : null;
+  // F4: 루트 전체 경로 상시 표시(헤더 서브라인) — "어디에 있는지"를 우클릭 없이도 보이게
+  let pathLine = document.getElementById("ft-path");
+  if (!pathLine) {
+    pathLine = document.createElement("div");
+    pathLine.id = "ft-path";
+    document.getElementById("ft-head")!.after(pathLine);
+  }
+  pathLine.textContent = ftRoot;
+  pathLine.title = ftRoot;
   const frag = await buildDirNodes(ftRoot, 0);
   body.innerHTML = "";
+  // F5: 상위 폴더 행 — 더블클릭으로 한 단계 위로(단일 클릭 무동작 = 오클릭 방지).
+  // parent===ftRoot(루트 "/"·"C:\")면 생략 — 자기 자신으로의 루프 방지.
+  const parent = splitPath(ftRoot).parent;
+  if (parent && parent !== ftRoot) {
+    const up = document.createElement("div");
+    up.className = "ft-row dir";
+    up.style.paddingLeft = "8px";
+    up.textContent = "▴ ..";
+    up.title = `${parent} — 더블클릭으로 이동`;
+    up.addEventListener("dblclick", () => setFtRoot(parent, true));
+    body.appendChild(up);
+  }
   body.appendChild(frag);
 }
 
@@ -3308,18 +4037,224 @@ async function buildDirNodes(dir: string, depth: number): Promise<DocumentFragme
     row.textContent = ent.is_dir ? `${ftExpanded.has(full) ? "▾" : "▸"} ${ent.name}` : ent.name;
     row.title = full;
     row.addEventListener("click", () => {
+      // 드래그로 소비된 mousedown의 후행 click 억제 — 펼침/열기 오발 방지(F2)
+      if (ftDragConsumed) {
+        ftDragConsumed = false;
+        return;
+      }
       if (ent.is_dir) {
         if (ftExpanded.has(full)) ftExpanded.delete(full);
         else ftExpanded.add(full);
         renderFileTree();
       } else {
-        invoke("open_path", { path: full }).catch(() => {}); // 시스템 기본 앱으로 열기
+        void openPathChecked(full); // F1: 실패 가시화 + 실행형 확인
       }
+    });
+    if (ent.is_dir) row.addEventListener("dblclick", () => setFtRoot(full, true)); // F5(D2b)
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      ftContextMenu(e, full, ent.is_dir); // F3
+    });
+    row.addEventListener("mousedown", (e) => {
+      if (e.button === 0) startFtDrag(e, full); // F2: pane으로 드래그해 경로 주입
     });
     frag.appendChild(row);
     if (ent.is_dir && ftExpanded.has(full)) frag.appendChild(await buildDirNodes(full, depth + 1));
   }
   return frag;
+}
+
+// F1: 파일 열기 — 실패 무음 금지(feed_reply dead-button 수리와 동일 처방).
+// 실행형 파일은 백엔드가 executable_confirm으로 거절 → 확인 후 force 재호출(fail-closed).
+async function openPathChecked(full: string) {
+  try {
+    await invoke("open_path", { path: full });
+  } catch (e) {
+    if (String(e).includes("executable_confirm")) {
+      const ok = await confirmModal(
+        "실행 파일 열기",
+        `${full}\n\n실행 권한이 있는 파일입니다 — 기본 앱으로 여는 대신 실행될 수 있습니다. 계속하시겠습니까?`,
+        "열기",
+      );
+      if (!ok) return;
+      await invoke("open_path", { path: full, force: true }).catch((e2) =>
+        toast("watchdog", "파일 열기 실패", String(e2)),
+      );
+    } else {
+      toast("watchdog", "파일 열기 실패", String(e));
+    }
+  }
+}
+
+// 클립보드 복사 — WKWebView에서 navigator.clipboard가 거부될 수 있어 execCommand 폴백.
+function copyPath(s: string) {
+  const fallback = () => {
+    const ta = document.createElement("textarea");
+    ta.value = s;
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    if (ok) toast("feed", "경로 복사됨", s);
+    else toast("watchdog", "경로 복사 실패", "클립보드 접근이 거부되었습니다");
+  };
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(s).then(() => toast("feed", "경로 복사됨", s), fallback);
+  } else fallback();
+}
+
+// F3: 파일 트리 컨텍스트 메뉴 — 확장 가능 항목 배열(도메인 액션 추가 = 원소 추가).
+// 삽입 대상 pane을 라벨에 명시해 오배달 인지를 차단한다(현재 ws의 pane 나열).
+function ftContextMenu(e: MouseEvent, full: string, isDir: boolean) {
+  const sock = current()?.socket;
+  const items: { label: string; action: () => void; disabled?: boolean }[] = [
+    { label: full, action: () => {}, disabled: true }, // F4: 경로 표시(아래 복사와 짝)
+    { label: "경로 복사", action: () => copyPath(full) },
+  ];
+  if (!isDir) items.push({ label: "열기", action: () => void openPathChecked(full) });
+  items.push({
+    label: "Finder에서 보기",
+    action: () =>
+      void invoke("reveal_path", { path: full }).catch((err) =>
+        toast("watchdog", "Finder 표시 실패", String(err)),
+      ),
+  });
+  for (const sid of collectSids(current()?.tree ?? null).slice(0, 6)) {
+    const rt = panes.get(paneKey(sid, sock));
+    if (!rt) continue;
+    const name = rt.titleEl.textContent || `surface ${sid}`;
+    items.push({ label: `➤ ${name} 에 경로 삽입`, action: () => void injectPathsToPane(rt, [full]) });
+  }
+  if (isDir) {
+    items.push({ label: "패널 루트를 여기로", action: () => setFtRoot(full, true) });
+    items.push({
+      label: "cd 텍스트 삽입(전송 없음)",
+      action: () => {
+        const rt = focusedSid != null ? panes.get(paneKey(focusedSid, sock)) : undefined;
+        if (!rt) return toast("watchdog", "삽입 대상 없음", "포커스된 pane이 없습니다");
+        void injectRawToPane(rt, `cd ${shellQuote(full, /Windows/i.test(navigator.userAgent))}`);
+      },
+    });
+  }
+  showCtxMenu(e.clientX, e.clientY, items);
+}
+
+// F2: 경로 주입 파이프라인 — ①실존 재검증(스테일 트리 차단) ②스트리밍 가드 ③IME 가드
+// ④형식 결정(에이전트=@멘션/미등록=셸 인용) ⑤주입+피드백. 자동 Return 없음 — 전송은 사람 몫.
+async function injectPathsToPane(rt: PaneRuntime, paths: string[]) {
+  for (const p of paths) {
+    // Windows OS 드롭 경로는 "\" 구분 — splitPath가 양쪽 구분자를 인식(POSIX-only 파싱 회귀 방지)
+    const { parent, name } = splitPath(p);
+    const entries = (await invoke("list_dir", { path: parent }).catch(() => null)) as
+      | { name: string }[]
+      | null;
+    if (!entries || !entries.some((en) => en.name === name)) {
+      toast("watchdog", "경로가 더 이상 없음", `${p} — 트리를 새로고침합니다`);
+      void renderFileTree();
+      return;
+    }
+  }
+  if (isStreaming(rt.lastOutputAt(), Date.now())) {
+    const ok = await confirmModal(
+      "에이전트 응답 중",
+      "대상 pane이 출력 중입니다. 지금 삽입하면 프롬프트가 섞일 수 있습니다. 그래도 삽입하시겠습니까?",
+      "삽입",
+    );
+    if (!ok) return;
+  }
+  if (rt.imeBusy()) {
+    toast("watchdog", "한글 조합 중", "조합을 끝낸 뒤 다시 시도해 주세요");
+    return;
+  }
+  const r = (await invoke("list_surfaces", { socket: rt.socket }).catch(() => null)) as {
+    surfaces: { surface_id: number; live_cwd: string | null; role?: string | null; agent?: string | null }[];
+  } | null;
+  const me = r?.surfaces.find((s) => s.surface_id === rt.sid);
+  const agent = !!(me?.role || me?.agent);
+  const isWin = /Windows/i.test(navigator.userAgent);
+  await injectRawToPane(rt, insertionText(paths, { agent, isWin, cwd: me?.live_cwd ?? null }));
+}
+
+// 주입 공통부 — 성공 피드백(헤더 플래시+토스트)·실패 토스트(무음 삼킴 금지). 자동 Return 없음.
+async function injectRawToPane(rt: PaneRuntime, data: string) {
+  try {
+    await invoke("send_input", { socket: rt.socket, surfaceId: rt.sid, data });
+    rt.el.classList.add("inject-flash");
+    setTimeout(() => rt.el.classList.remove("inject-flash"), 700);
+    toast("feed", "경로 삽입됨", `${rt.titleEl.textContent || rt.sid} — Enter를 눌러야 전송됩니다`);
+  } catch (e) {
+    toast("watchdog", "삽입 실패", String(e));
+  }
+}
+
+let ftDragConsumed = false; // 드래그로 소비된 mousedown의 후행 click 억제 플래그
+
+// F2: 트리 행 드래그 — pane 위 드롭 시 경로 주입. startPaneDrag와 동일한 mouse 기반(6px 임계).
+// 드롭이 pane을 직격하지 못하면 무동작+토스트 — 포커스 pane 폴백 오배달(footgun) 금지.
+function startFtDrag(e0: MouseEvent, full: string) {
+  const start = { x: e0.clientX, y: e0.clientY };
+  let dragging = false;
+  let ghost: HTMLElement | null = null;
+  let over: PaneRuntime | null = null;
+  const clearOver = () => {
+    over?.el.classList.remove("drop-target");
+    over = null;
+  };
+  const move = (e: MouseEvent) => {
+    if (!dragging) {
+      if (Math.abs(e.clientX - start.x) + Math.abs(e.clientY - start.y) < 6) return;
+      dragging = true;
+      ftDragConsumed = true;
+      ghost = document.createElement("div");
+      ghost.id = "drag-ghost";
+      ghost.textContent = baseName(full) || full;
+      document.body.append(ghost);
+    }
+    ghost!.style.left = `${e.clientX + 10}px`;
+    ghost!.style.top = `${e.clientY + 10}px`;
+    const el = (document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null)?.closest(
+      ".pane",
+    ) as HTMLElement | null;
+    let rt: PaneRuntime | null = null;
+    if (el) for (const cand of panes.values()) if (cand.el === el) rt = cand;
+    if (rt !== over) {
+      clearOver();
+      over = rt;
+      over?.el.classList.add("drop-target");
+    }
+  };
+  const up = () => {
+    window.removeEventListener("mousemove", move, true);
+    window.removeEventListener("mouseup", up, true);
+    ghost?.remove();
+    const target = over;
+    clearOver();
+    if (!dragging) return;
+    // click은 mouseup과 같은 엘리먼트에서만 발화 — pane 위에서 끝난 드래그는 행 click이 없어
+    // 플래그가 잔류하면 다음 정상 클릭 1회를 오발 억제한다 → 태스크 큐에서 무조건 청소.
+    setTimeout(() => {
+      ftDragConsumed = false;
+    }, 0);
+    if (!target) {
+      toast("watchdog", "드롭 취소", "pane 위에 놓아야 삽입됩니다");
+      return;
+    }
+    void injectPathsToPane(target, [full]);
+  };
+  window.addEventListener("mousemove", move, true);
+  window.addEventListener("mouseup", up, true);
+}
+
+// ★GUI 오퍼레이터 승인(오너 2026-07-15): feed_reply 실패 사유를 사용자 문구로 분류 — 기존
+// `.catch(() => {})` 은폐가 "버튼이 죽은 것처럼" 보이게 해 진단을 지연시킨 결함의 수리.
+// 백엔드가 "코드: 메시지" 형식으로 코드를 보존해 주므로 코드 문자열로 분류한다.
+function feedReplyErrorText(e: unknown): string {
+  const s = String(e);
+  if (s.includes("self_approval_denied"))
+    return "자기승인 차단(§3.2) — 발행자와 같은 프로세스의 승인은 거부됩니다. 데몬이 구버전이면 업데이트 후 다시 시도하세요.";
+  if (s.includes("not_found")) return "항목을 찾을 수 없습니다(만료·삭제되었을 수 있음).";
+  if (s.includes("already resolved")) return "이미 처리된 항목입니다.";
+  return `전송 오류: ${s}`;
 }
 
 async function refreshFeed() {
@@ -3354,15 +4289,53 @@ async function refreshFeed() {
     if (item.status === "pending") {
       const actions = document.createElement("div");
       actions.className = "fi-actions";
+      const btns: HTMLButtonElement[] = [];
       for (const [label, decision, cls] of [["Allow", "allow", "allow"], ["Deny", "deny", "deny"]] as const) {
         const btn = document.createElement("button");
         btn.className = cls;
         btn.textContent = label;
         btn.addEventListener("click", async () => {
-          await invoke("feed_reply", { requestId: item.request_id, decision }).catch(() => {});
-          refreshFeed();
-          refreshSidebarStatus(); // 결정 직후 집계 배지 즉시 갱신
+          // ★GUI 오퍼레이터 승인(오너 2026-07-15 · 리뷰어1 R1 반영): in-flight 동안 두 버튼 비활성
+          // (이중클릭·상반 결정 경합 차단), finally에서 전 경로(성공 포함) 재활성 후 재렌더로 일원화
+          // — 기존 .catch(() => {}) 은폐 제거 + 실패 시 사유 토스트.
+          btns.forEach((b) => (b.disabled = true));
+          try {
+            // ★CEO 승격 Allow 결함 수리(오너 2026-07-15 + 적대검증 D-2/3/4): 이 요청을 만든 cys-dept
+            // 대기자는 데몬 재시작 등으로 죽어 pending 고아가 되며, feed_reply만으론 승격이 집행되지
+            // 않았다(먹통). ①머신 kind(ceo-promote-request)로만 라우팅 — 제목 정규식은 정보성 알림
+            // ("보류/대기")에도 매칭돼 오탐(D-3). ②승격을 feed_reply보다 **먼저** 집행 — 실패 시 항목을
+            // pending으로 남겨 재시도 가능(D-4). ③promote-ceo가 미승격 PENDING이면 exit 5→Err→실패
+            // 표시(가짜 "완료" 토스트 차단·D-2).
+            const isCeoPromote = item.kind === "ceo-promote-request";
+            if (isCeoPromote && decision === "allow") {
+              try {
+                const r = (await invoke("approve_ceo_promotion")) as string;
+                try {
+                  await invoke("feed_reply", { requestId: item.request_id, decision });
+                  toast("watchdog", "✅ CEO 승격 완료", r || "기본 데몬 master를 CEO로 승격했습니다.");
+                } catch (e) {
+                  // 승격은 성공, feed 항목 해소만 실패(pending 잔존) — 두 사실을 모두 표시.
+                  toast("health", "CEO 승격 완료 · feed 해소 실패",
+                    `승격: ${r || "완료"} / feed: ${feedReplyErrorText(e)}`);
+                }
+              } catch (e) {
+                // 승격 실패 — feed_reply 하지 않음(항목 pending 유지·재시도 가능). 실패 사유 표시.
+                toast("health", "CEO 승격 실패", String(e));
+              }
+            } else {
+              try {
+                await invoke("feed_reply", { requestId: item.request_id, decision });
+              } catch (e) {
+                toast("health", decision === "allow" ? "승인 실패" : "거부 실패", feedReplyErrorText(e));
+              }
+            }
+          } finally {
+            btns.forEach((b) => (b.disabled = false));
+            refreshFeed();
+            refreshSidebarStatus(); // 결정 직후 집계 배지 즉시 갱신
+          }
         });
+        btns.push(btn);
         actions.appendChild(btn);
       }
       el.appendChild(actions);
@@ -3510,6 +4483,9 @@ async function promptBinaryPatch() {
 // ★거버넌스: 부서 교대는 '재기동'일 뿐 CSO 단일소유 생성/폐기 권한을 건드리지 않는다
 // (rotate_dept_daemon=cys-dept rotate=데몬 프로세스만 재기동·레지스트리·묘비·CEO 불변).
 let rotatingDaemon = false;
+// ★[F3] 부서 완전 폐역(purge) 진행 플래그 — purge와 데몬 교대(restart)는 같은 부서 데몬을 동시에 건드리면
+// 경합한다. purge는 rotatingDaemon을, restart는 purgingDept를 서로 존중해 상호 배제한다.
+let purgingDept = false;
 let verSkewBadge: HTMLElement | null = null;
 let skewNoticeShown = false; // C: 세션당 1회 능동 안내 플래그(스큐 해소 시 리셋)
 
@@ -3519,17 +4495,18 @@ interface SkewedDept {
 }
 
 // rotate_daemon/rotate_dept_daemon 래퍼 — force=false면 백엔드가 세션>0 시 "live_sessions:N"로 거부(=보류).
-async function rotateMainDaemon(force: boolean): Promise<"ok" | "held" | "err"> {
+// skipDrain: verified 재시작 경로만 true(사전 drain --verify로 저장 확인됨) — 기본 false는 plain drain(회귀 0).
+async function rotateMainDaemon(force: boolean, skipDrain = false): Promise<"ok" | "held" | "err"> {
   try {
-    await invoke("rotate_daemon", { force });
+    await invoke("rotate_daemon", { force, skipDrain });
     return "ok";
   } catch (e) {
     return String(e).includes("live_sessions:") ? "held" : "err";
   }
 }
-async function rotateDeptDaemon(name: string, force: boolean): Promise<"ok" | "held" | "err"> {
+async function rotateDeptDaemon(name: string, force: boolean, skipDrain = false): Promise<"ok" | "held" | "err"> {
   try {
-    await invoke("rotate_dept_daemon", { name, force });
+    await invoke("rotate_dept_daemon", { name, force, skipDrain });
     return "ok";
   } catch (e) {
     return String(e).includes("live_sessions:") ? "held" : "err";
@@ -3619,11 +4596,11 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
   rotatingDaemon = true;
   stickyToast("rotate-daemon", "feed", "↻ 데몬 교대", `새 버전 v${appVer}로 교대 중… 저장 후 세션을 복원합니다.`);
   try {
-    if (heldMain) await invoke("rotate_daemon", { force: true });
+    if (heldMain) await invoke("rotate_daemon", { force: true, skipDrain: false });
     // 경미2: rotate_dept_daemon이 반환하는 restore_ok=false(교대 후 부서 노드 복원 실패)를 삼키지 않고 승격.
     let deptRestoreFailed = false;
     for (const d of heldDepts) {
-      const info = (await invoke("rotate_dept_daemon", { name: d.name, force: true })) as { restore_ok?: boolean };
+      const info = (await invoke("rotate_dept_daemon", { name: d.name, force: true, skipDrain: false })) as { restore_ok?: boolean };
       if (info?.restore_ok === false) deptRestoreFailed = true;
     }
     dismissToast("rotate-daemon");
@@ -3639,53 +4616,144 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
   }
 }
 
-// ── 상시 "↻ 재시작" 버튼(초보자용) — 수동 "데몬 kill + 앱 재실행" 루틴의 원클릭 대체 ──
-// 스큐 여부와 무관하게 메인→살아있는 부서 데몬을 force 순차 교대한다(drain 저장 → 종료 → 새 데몬 기동 →
-// 피닉스·resume 복원). manualRotateSkewed와 동일 백엔드(rotate_daemon/rotate_dept_daemon force=true) 재사용.
-// 앱 재시작 없음 — install_update의 app.restart()는 single-instance 레이스 경고 경로(휴면)라 배제,
-// GUI는 새 데몬에 자동 재연결된다. 죽은 부서 소켓은 skip(detectSkew 동형 — 부서 부활은 CSO·피닉스 소유).
+// ── drain --verify 결과 타입(cys 코어 결정론 JSON) ──
+type DrainVerifyNode = {
+  role: string;
+  department?: string;
+  surface: string;
+  outcome: string; // saved | timeout | delivery_failed | unverifiable | skipped_restoring
+  detail: string;
+  pending_undelivered?: number;
+};
+type DrainVerifyReport = {
+  all_saved: boolean;
+  total: number;
+  summary: { saved: number; timeout: number; delivery_failed: number; unverifiable: number; skipped_restoring: number };
+  nodes: DrainVerifyNode[];
+  pending_loss_warning?: { role: string; surface: string; pending_undelivered: number }[];
+};
+
+// ★[F2] 검증은 nonce '마커 기입'만 확인한다 — 노드가 마커 앞에서 SESSION_STATE 내용을 실제로 최신화했는지는
+// 보증하지 못한다(형식적 순응 한계·내용 최신성은 노드 책임). 라벨을 "마커 확인"으로 완화해 과대주장 금지.
+const OUTCOME_LABEL: Record<string, string> = {
+  saved: "체크포인트 마커 확인",
+  timeout: "마커 미확인(시간초과)",
+  delivery_failed: "지시 전달 실패(입력 미제출)",
+  unverifiable: "검증 불가(구버전 데몬)",
+  skipped_restoring: "복원 중 — 건너뜀",
+};
+
+// 부분 실패 노드를 사람이 읽을 리포트로. 마커 확인된 노드는 생략, 미확인만 나열한다.
+function drainVerifyReportText(r: DrainVerifyReport): string {
+  const bad = r.nodes.filter((n) => n.outcome !== "saved");
+  const lines = bad.map(
+    (n) => `• ${n.department ? n.department + " / " : ""}${n.role} (${n.surface}): ${OUTCOME_LABEL[n.outcome] ?? n.outcome}`,
+  );
+  return (
+    `${r.total}개 노드 중 ${r.summary.saved}개만 체크포인트 마커가 확인됐습니다.\n\n` +
+    `${lines.join("\n")}\n\n` +
+    "대화 원문은 재시작 후 트랜스크립트로 복원됩니다. 이 확인은 마커 기입만 보증하며, 위 노드를 포함해 각 노드의 증류 체크포인트(SESSION_STATE·TODO) 내용 최신성은 노드 책임입니다.\n\n" +
+    "그래도 지금 재시작하시겠습니까?"
+  );
+}
+
+// 데몬 재시작 코어 — 메인 + 살아있는 부서를 force 순차 교대한다(종료 → 새 데몬 기동 → 피닉스·resume 복원).
+// skipDrain=true면 rotate가 이중 drain을 생략(verified 경로: 사전 drain --verify로 저장 확인됨),
+// false면 rotate가 plain drain(기존 거동·폴백). 앱 재시작 없음 — GUI는 새 데몬에 자동 재연결.
+// 죽은 부서 소켓은 skip(detectSkew 동형 — 부서 부활은 CSO·피닉스 소유).
+async function restartAllDaemons(skipDrain: boolean): Promise<{ failedDepts: string[]; deptRestoreFailed: boolean }> {
+  await invoke("rotate_daemon", { force: true, skipDrain });
+  // 부서 열거=list_depts(레지스트리 SOT) + daemon_status 생존 확인 — detectSkew 동형(죽은 등재 skip).
+  const reg = (await invoke("list_depts").catch(() => ({ depts: {} }))) as {
+    depts?: Record<string, { socket?: string }>;
+  };
+  let deptRestoreFailed = false;
+  const failedDepts: string[] = [];
+  for (const [name, meta] of Object.entries(reg.depts ?? {})) {
+    if (!meta.socket) continue;
+    try {
+      await invoke("daemon_status", { socket: meta.socket });
+    } catch {
+      continue; // 죽은/전이 중 부서 소켓 skip(무해)
+    }
+    try {
+      const info = (await invoke("rotate_dept_daemon", { name, force: true, skipDrain })) as { restore_ok?: boolean };
+      if (info?.restore_ok === false) deptRestoreFailed = true;
+    } catch {
+      failedDepts.push(name);
+    }
+  }
+  return { failedDepts, deptRestoreFailed };
+}
+
+function restartResultToast(failedDepts: string[], deptRestoreFailed: boolean) {
+  if (failedDepts.length)
+    toast("health", "⚠ 일부 부서 재시작 실패", `메인 데몬은 재시작됐으나 부서 교대가 실패했습니다: ${failedDepts.join(", ")} — 상태를 점검하세요.`);
+  else if (deptRestoreFailed)
+    toast("health", "⚠ 재시작 후 부서 복원 실패", "데몬은 재시작됐으나 일부 부서 노드 복원이 실패했습니다 — 상태를 점검하세요.");
+  else toast("watchdog", "✅ 데몬 재시작 완료", "데몬이 다시 시작됐습니다. 부서·노드 복원이 진행됩니다.");
+}
+
+// ── 상시 "↻ 재시작" 버튼(초보자용) — "저장 검증 후 자동 재시작" 흐름 ──
+// 1) 확인 모달[저장 후 재시작/취소] → 2) drain --verify(feature-detect)로 노드별 체크포인트 저장 검증
+// → 3) green(all_saved)이면 자동 진행(skipDrain=true), 부분 실패면 노드별 리포트+[그래도 재시작/취소].
+// cys 코어가 --verify를 미지원하면(구버전) plain drain 폴백(skipDrain=false)+경고. '무손실' 표현 금지 —
+// 대화 원문은 트랜스크립트 복원, 이 기능은 증류 체크포인트(SESSION_STATE·TODO) 최신성만 보증한다.
 async function manualRestartAllDaemons() {
-  if (rotatingDaemon) {
-    toast("feed", "재시작 진행 중", "데몬 교대·재검이 진행 중입니다 — 잠시 후 다시 시도하세요.");
+  if (rotatingDaemon || purgingDept) {
+    // ★[F3] 부서 완전 폐역(purge) 진행 중이면 같은 부서 데몬 경합을 피해 재시작을 보류·안내.
+    toast("feed", "작업 진행 중", "데몬 교대 또는 부서 완전 삭제가 진행 중입니다 — 잠시 후 다시 시도하세요.");
     return;
   }
   const ok = await confirmModal(
     "데몬 재시작",
-    "데몬(메인+부서)을 다시 시작합니다. 진행 중인 노드에 저장(drain) 신호를 보낸 뒤 데몬을 새로 켜고, " +
-      "부서·노드는 대화 기억까지 자동 복원됩니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 재시작하시겠습니까?",
-    "재시작",
+    "재시작 전에 각 노드의 체크포인트(SESSION_STATE·TODO) 저장을 먼저 검증합니다. 검증이 끝나면 데몬(메인+부서)을 " +
+      "다시 켜고 부서·노드의 대화 기억을 트랜스크립트로 복원합니다.\n\n지금 저장을 검증하고 재시작하시겠습니까?",
+    "저장 후 재시작",
   );
   if (!ok) return;
   rotatingDaemon = true;
-  stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 후 데몬을 다시 시작하는 중… 부서·노드를 자동 복원합니다.");
   try {
-    await invoke("rotate_daemon", { force: true });
-    // 부서 열거=list_depts(레지스트리 SOT) + daemon_status 생존 확인 — detectSkew 동형(죽은 등재 skip).
-    const reg = (await invoke("list_depts").catch(() => ({ depts: {} }))) as {
-      depts?: Record<string, { socket?: string }>;
-    };
-    let deptRestoreFailed = false;
-    const failedDepts: string[] = [];
-    for (const [name, meta] of Object.entries(reg.depts ?? {})) {
-      if (!meta.socket) continue;
-      try {
-        await invoke("daemon_status", { socket: meta.socket });
-      } catch {
-        continue; // 죽은/전이 중 부서 소켓 skip(무해)
-      }
-      try {
-        const info = (await invoke("rotate_dept_daemon", { name, force: true })) as { restore_ok?: boolean };
-        if (info?.restore_ok === false) deptRestoreFailed = true;
-      } catch {
-        failedDepts.push(name);
+    // 1) 저장 검증(drain --verify) — feature-detect. 미지원/실패 시 plain drain 폴백.
+    stickyToast("restart-daemon", "feed", "↻ 저장 검증", "재시작 전 노드 체크포인트(SESSION_STATE)를 검증하는 중…");
+    let verify: DrainVerifyReport | null = null;
+    // [F5] 폴백 사유 분기: "unsupported"(구버전 미지원) vs "verify_failed"(크래시/하드캡). 둘 다 plain
+    // drain 폴백(skipDrain=false)이나 UI 문구는 정직하게 다르게 표기한다("무손실" 표현 없음).
+    let fallback: ReturnType<typeof classifyDrainVerifyFallback> = null;
+    try {
+      verify = (await invoke("drain_verify", { timeout: 20 })) as DrainVerifyReport;
+    } catch (e) {
+      fallback = classifyDrainVerifyFallback(String(e));
+      if (!fallback) throw e; // 알 수 없는 에러는 상위 catch로
+    }
+    if (fallback) {
+      dismissToast("restart-daemon");
+      const t = drainVerifyFallbackToast(fallback);
+      toast("health", t.title, t.body);
+      stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 후 데몬을 다시 시작하는 중… 부서·노드를 자동 복원합니다.");
+      const { failedDepts, deptRestoreFailed } = await restartAllDaemons(false);
+      dismissToast("restart-daemon");
+      restartResultToast(failedDepts, deptRestoreFailed);
+      return;
+    }
+    // 2) 부분 실패면 노드별 리포트 + [그래도 재시작/취소]. green(all_saved)이면 자동 진행.
+    if (verify && !verify.all_saved) {
+      dismissToast("restart-daemon");
+      const proceed = await confirmModal("일부 노드 저장 미확인", drainVerifyReportText(verify), "그래도 재시작");
+      if (!proceed) {
+        rotatingDaemon = false;
+        return;
       }
     }
+    // 3) verified 재시작 — 사전 검증했으므로 rotate는 이중 drain 생략(skipDrain=true).
+    stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 검증 완료 — 데몬을 다시 시작하고 노드를 복원하는 중…");
+    const { failedDepts, deptRestoreFailed } = await restartAllDaemons(true);
     dismissToast("restart-daemon");
-    if (failedDepts.length)
-      toast("health", "⚠ 일부 부서 재시작 실패", `메인 데몬은 재시작됐으나 부서 교대가 실패했습니다: ${failedDepts.join(", ")} — 상태를 점검하세요.`);
-    else if (deptRestoreFailed)
-      toast("health", "⚠ 재시작 후 부서 복원 실패", "데몬은 재시작됐으나 일부 부서 노드 복원이 실패했습니다 — 상태를 점검하세요.");
-    else toast("watchdog", "✅ 데몬 재시작 완료", "데몬이 다시 시작됐습니다. 부서·노드 복원이 진행됩니다.");
+    // 재시작 창 큐 보존[A3-F3]: 인메모리 미배달 push는 재시작에 유실된다 — 정직하게 고지(무음 유실 금지).
+    const pendingLost = (verify?.pending_loss_warning ?? []).reduce((a, p) => a + (p.pending_undelivered || 0), 0);
+    if (pendingLost > 0)
+      toast("health", "미배달 push 유실", `재시작으로 미배달 큐 ${pendingLost}건이 유실됩니다(대화 원문은 트랜스크립트로 복원).`);
+    restartResultToast(failedDepts, deptRestoreFailed);
   } catch (e) {
     dismissToast("restart-daemon");
     toast("health", "데몬 재시작 실패", String(e));
@@ -3696,7 +4764,7 @@ async function manualRestartAllDaemons() {
 
 // 시작 시 1회 + 5분 주기(B) — 스큐 재검·배지 멱등 갱신·무손실 자동 교대·1회 능동 안내(C).
 async function checkVersionSkew() {
-  if (rotatingDaemon) return; // 교대 진행 중 중복 발동 방지(주기 타이머·수동 클릭)
+  if (rotatingDaemon || purgingDept) return; // 교대·purge 진행 중 중복 발동 방지(주기 타이머·수동 클릭) [F3]
   let appVer = "";
   try {
     appVer = (await invoke("app_version")) as string;
@@ -4126,6 +5194,193 @@ function inputModal(title: string, label: string, placeholder: string): Promise<
   });
 }
 
+// 다중 필드 HITL 모달 — 카탈로그 entry.fields([{key,label,placeholder,multiline}])를 각 입력으로 렌더.
+// 결과는 "key: value" 줄들로 합쳐 기존 userInput 자리에 사용(빈 필드 생략). 취소·전부 빈값=null.
+function fieldsModal(title: string, label: string, fields: any[]): Promise<string | null> {
+  return new Promise((resolve) => {
+    const ov = document.createElement("div");
+    ov.className = "modal-overlay";
+    const rows = fields
+      .map((f, i) => {
+        const ph = ccEsc(String(f.placeholder ?? ""));
+        const lb = ccEsc(String(f.label ?? f.key ?? ""));
+        const inp = f.multiline
+          ? `<textarea class="modal-input cc-field" data-i="${i}" rows="4" placeholder="${ph}"></textarea>`
+          : `<input class="modal-input cc-field" data-i="${i}" type="text" placeholder="${ph}" style="min-height:auto" />`;
+        return `<p class="modal-label">${lb}</p>${inp}`;
+      })
+      .join("");
+    ov.innerHTML =
+      `<div class="modal"><h3></h3><p class="modal-label modal-head"></p>${rows}` +
+      `<div class="modal-trust">⚠ 산출물은 "AI 보조 생성 · 오너 검수 전"입니다. 외부 공유 전 검수를 받으세요.</div>` +
+      `<div class="modal-btns"><button class="modal-no">취소</button>` +
+      `<button class="modal-yes">진행</button></div></div>`;
+    (ov.querySelector("h3") as HTMLElement).textContent = title;
+    (ov.querySelector(".modal-head") as HTMLElement).textContent = label;
+    const done = (v: string | null) => {
+      ov.remove();
+      resolve(v);
+    };
+    ov.querySelector(".modal-yes")!.addEventListener("click", () => {
+      const parts: string[] = [];
+      ov.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(".cc-field").forEach((el) => {
+        const f = fields[Number(el.dataset.i)];
+        const val = el.value.trim();
+        if (val) parts.push(`${f.key ?? f.label ?? "field"}: ${val}`);
+      });
+      done(parts.length ? parts.join("\n") : null);
+    });
+    ov.querySelector(".modal-no")!.addEventListener("click", () => done(null));
+    ov.addEventListener("click", (e) => {
+      if (e.target === ov) done(null);
+    });
+    document.body.appendChild(ov);
+    setTimeout(() => (ov.querySelector(".cc-field") as HTMLElement | null)?.focus(), 50);
+  });
+}
+
+// ★기능2: 부서 완전 폐역 확인 — 부서명 타이핑 일치 시에만 "완전 삭제" 활성. 크기·최종 mtime·CEO 강등·
+// 격리 복구를 정직 고지한다(비가역처럼 보이나 실제는 격리 후 약 14일 소거 — 오도 금지). teardown-only 인
+// 기존 탭 삭제(2-click 대체 close)와 별개 경로. resolve(true)=진행.
+function purgeConfirmModal(
+  name: string,
+  info: { sizeHuman: string; mtime: string; isLast: boolean; exists: boolean },
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const ov = document.createElement("div");
+    ov.className = "modal-overlay";
+    const notice = [
+      info.exists
+        ? `대화기억(state) 크기 ${info.sizeHuman} · 최종 수정 ${info.mtime}`
+        : "대화기억(state) 디렉토리 없음(격리 대상 없음)",
+      // ★D2a(purge-safety 2026-07-16): 작업 폴더(cwd)는 격리하지 않는다 — 전 부서 cwd=$HOME(공유)
+      // 현실에서 "작업물 격리" 고지는 홈 격리 약속이 되는 오도였다. GUI는 --purge-workdir 미요청.
+      "삭제되는 것: 부서 데몬 종료 + 대화기억·pack 격리 + 재시작 부활 영구 차단(묘비 존치). 작업 폴더(cwd)는 보존됩니다.",
+      info.isLast ? "⚠ 이 부서가 마지막입니다 — 삭제 시 CEO가 표준 master로 강등됩니다." : "",
+      "복구: 즉시 삭제가 아니라 ~/.local/state/cys-trash/ 로 격리 보관되어 되돌릴 수 있고, 약 14일 후 자동 소거됩니다.",
+      `계속하려면 아래에 부서명 "${name}" 을 정확히 입력하세요.`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    ov.innerHTML =
+      `<div class="modal"><h3></h3><p class="modal-label" style="white-space:pre-wrap"></p>` +
+      `<input class="modal-input" type="text" />` +
+      `<div class="modal-hint" aria-live="polite"></div>` +
+      `<div class="modal-btns"><button class="modal-no">취소</button>` +
+      `<button class="modal-yes" disabled>완전 삭제</button></div></div>`;
+    (ov.querySelector("h3") as HTMLElement).textContent = `부서 "${name}" 완전 삭제(부활 차단)`;
+    (ov.querySelector(".modal-label") as HTMLElement).textContent = notice;
+    const inp = ov.querySelector(".modal-input") as HTMLInputElement;
+    const yes = ov.querySelector(".modal-yes") as HTMLButtonElement;
+    const hint = ov.querySelector(".modal-hint") as HTMLElement;
+    // ★D3b(purge-safety 2026-07-16): macOS 자동 대문자화가 소문자 입력을 재교정해 정확 재입력조차
+    // 불일치가 되던 실사고 차단 — 확인 입력엔 자동 교정 3종을 끈다(계약=PURGE_INPUT_GUARDS).
+    for (const [k, v] of PURGE_INPUT_GUARDS) inp.setAttribute(k, v);
+    inp.placeholder = name;
+    inp.addEventListener("input", () => {
+      // ★D3c: 불일치는 침묵이 아니라 사유를 말한다(비활성 버튼 무반응 오인 방지).
+      yes.disabled = !purgeNameMatches(inp.value, name);
+      hint.textContent = purgeMismatchHint(inp.value, name);
+    });
+    const done = (v: boolean) => {
+      ov.remove();
+      resolve(v);
+    };
+    yes.addEventListener("click", () => {
+      if (!yes.disabled) done(true);
+    });
+    ov.querySelector(".modal-no")!.addEventListener("click", () => done(false));
+    ov.addEventListener("click", (e) => {
+      if (e.target === ov) done(false);
+    });
+    document.body.appendChild(ov);
+    setTimeout(() => inp.focus(), 50);
+  });
+}
+
+// ★기능2: 부서 완전 폐역 실행 — 프리뷰(크기·mtime·마지막여부) 조회 → 타이핑 확인 → purge → 탭 제거.
+// 기존 close(2-click 대체) 경로와 별개: 이건 대화기억까지 격리하고 부활을 영구 차단한다(javis_org destroy).
+async function purgeDept(ws: Workspace) {
+  if (!ws.socket) return;
+  // ★[F3] 데몬 교대(restart)나 다른 purge가 진행 중이면 같은 부서 데몬 경합을 피해 거부·안내.
+  if (rotatingDaemon || purgingDept) {
+    toast("feed", "작업 진행 중", "데몬 재시작 또는 다른 완전 삭제가 진행 중입니다 — 잠시 후 다시 시도하세요.");
+    return;
+  }
+  let info: {
+    name?: string;
+    size_bytes?: number;
+    mtime_secs?: number;
+    is_last?: boolean;
+    exists?: boolean;
+  } = {};
+  try {
+    info = (await invoke("dept_purge_preview_by_socket", { socket: ws.socket })) as typeof info;
+  } catch (e) {
+    toast("watchdog", "삭제 프리뷰 실패", `${e} — 삭제를 중단합니다. 다시 시도해 주세요.`);
+    return;
+  }
+  const nm = info.name || ws.name || UNTITLED;
+  const bytes = Number(info.size_bytes || 0);
+  const sizeHuman =
+    bytes >= 1e9
+      ? (bytes / 1e9).toFixed(1) + " GB"
+      : bytes >= 1e6
+        ? (bytes / 1e6).toFixed(1) + " MB"
+        : bytes >= 1e3
+          ? (bytes / 1e3).toFixed(1) + " KB"
+          : bytes + " B";
+  const mtime = info.mtime_secs ? new Date(info.mtime_secs * 1000).toLocaleString() : "?";
+  const ok = await purgeConfirmModal(nm, {
+    sizeHuman,
+    mtime,
+    isLast: !!info.is_last,
+    exists: !!info.exists,
+  });
+  if (!ok) return;
+  // ★[F3-R TOCTOU] 진입 가드는 모달 '전'이라, 부서명 타이핑 모달이 열려 있던 수초간 checkVersionSkew
+  // 타이머/수동 restart가 rotatingDaemon을 잡았을 수 있다. 모달 확인 직후·집행 직전에 재확인한다.
+  if (rotatingDaemon) {
+    toast("feed", "작업 진행 중", "데몬 재시작이 진행 중입니다 — 잠시 후 다시 시도하세요.");
+    return;
+  }
+  // ★[F3] 데몬 폐역 구간 동안 restart를 배제(manualRestartAllDaemons·checkVersionSkew가 purgingDept 존중).
+  purgingDept = true;
+  try {
+    // ★D2b(purge-safety 2026-07-16): 실패는 8초 자동소멸 toast가 아니라 sticky — 실사고에서 사용자가
+    // 실패 사실 자체를 인지하지 못했다("눌러도 무반응"). 재시도 진입 시 이전 실패는 갱신/해소된다.
+    const failId = `purge-fail-${ws.socket}`;
+    try {
+      await invoke("purge_dept_daemon_by_socket", { socket: ws.socket });
+    } catch (e) {
+      stickyToast(failId, "watchdog", "부서 완전 삭제 실패", `${nm}: ${e} — 삭제되지 않았습니다.`);
+      return;
+    }
+    dismissToast(failId);
+    toast("watchdog", "부서 완전 삭제 완료", `${nm} — 대화기억은 격리 보관(복구 가능)·재시작 부활 차단.`);
+    // 프론트 pane·탭 정리(데몬은 이미 down — close_surface 실패는 관용).
+    for (const sid of collectSids(ws.tree)) {
+      await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
+      destroyPaneRuntime(sid, ws.socket);
+    }
+    const i = workspaces.indexOf(ws);
+    if (i < 0) {
+      render();
+      return;
+    }
+    workspaces.splice(i, 1);
+    if (workspaces.length === 0) {
+      await addWorkspace();
+    } else {
+      if (i < activeWs) activeWs -= 1;
+      activeWs = Math.min(activeWs, workspaces.length - 1);
+    }
+    render();
+  } finally {
+    purgingDept = false;
+  }
+}
+
 // ---------- toasts (daemon push events) ----------
 
 function toast(category: string, name: string, detail: string) {
@@ -4238,6 +5493,43 @@ function onDaemonEvent(event: Record<string, unknown>) {
     return;
   }
 
+  if (name === "viewer.open") {
+    // cys view → 뷰어 web pane. 포커스 강탈 금지(approval.request의 "자동 화면전환 없음"과 정합):
+    // pane은 배경 생성(focus=false), 가시화는 toast로만. 발신자 caps 게이트·rate-limit은 데몬이
+    // 이미 통과시킨 이벤트다. 열리는 워크스페이스는 의도적으로 current()(사람이 보는 곳) —
+    // 발신 부서 ws로의 라우팅(approval류 socketForSlug)과 다른 선택임을 명시해 둔다: 뷰어의
+    // 목적이 "사람에게 산출물을 보여주기"라 사람의 현재 시야가 귀속처다.
+    const vpath = String(payload.path ?? "");
+    const ws = current();
+    const decision = decideViewerOpen({
+      path: vpath,
+      // dup 범위 = 현재 워크스페이스 트리(시뮬 F1) — 전역 webPanes 스캔은 타 ws pane 때문에
+      // "이미 열려 있음"인데 화면엔 없는 오판을 만든다. cap은 전역(자원 방벽 — 의도적 비대칭).
+      existingPaths: collectWebPaths(ws?.tree ?? null),
+      paneCount: webPanes.size,
+      maxPanes: 8,
+      // stale 게이트: 데몬 재접속 replay가 과거 viewer.open을 되살려 스테일 pane이 뒤늦게 뜨는
+      // 창을 닫는다(이벤트 timestamp = 버스 발행 epoch).
+      eventEpoch: Number(event.timestamp ?? 0),
+      nowEpoch: Date.now() / 1000,
+      maxAgeSecs: 30,
+      wsReady: !!ws && !ws.pending,
+    });
+    if (decision === "open") {
+      openViewerPane(vpath, false);
+      toast("viewer", "📄 뷰어 열림", vpath);
+    } else if (decision === "not-ready") {
+      // 무음 드롭 금지 — cys view는 성공(exit 0)했는데 화면에 아무것도 없는 상태를 만들지 않는다.
+      toast("viewer", "뷰어 열기 보류", "워크스페이스 준비 중 — 잠시 후 다시 시도");
+    } else if (decision === "dup") {
+      toast("viewer", "이미 열려 있음", vpath);
+    } else if (decision === "cap") {
+      toast("viewer", "뷰어 pane 상한(8)", "기존 뷰어를 닫고 다시 시도");
+    }
+    // stale은 무음 무시가 의도 — 사용자가 지금 요청한 것이 아니라 과거 replay다.
+    return;
+  }
+
   if (category === "health") {
     toast("health", `⚠ ${name}`, `surface:${sid} rule=${payload.rule} — ${String(payload.line ?? "").slice(0, 120)}`);
   } else if (category === "watchdog") {
@@ -4249,9 +5541,12 @@ function onDaemonEvent(event: Record<string, unknown>) {
   } else if (category === "feed") {
     if (name === "feed.item.created") {
       toast("feed", "📥 승인 요청", String(payload.title ?? ""));
-      // 즉시 전환하지 않는다 — master 자동 승인 유예 후에도 pending인 항목만
+      // 즉시 전환하지 않는다 — master/CEO 자동 승인 유예 후에도 pending인 항목만
       // 사람 개입 필요로 보고 전환한다(자동 승인분은 무전환).
-      if (payload.wait === true) scheduleFeedSwitchIfStillPending(String(payload.request_id ?? ""));
+      // W3.4: auto_route 항목은 90초 기본 + CEO 활성 동적 연장, 비대상 wait 항목은 30초.
+      const autoRoute = payload.auto_route === true;
+      if (payload.wait === true || autoRoute)
+        scheduleFeedSwitchIfStillPending(String(payload.request_id ?? ""), autoRoute);
     }
     refreshFeed();
     refreshSidebarStatus(); // 피드 이벤트 시 집계 배지 갱신(멀티부서 정합)
@@ -4268,6 +5563,18 @@ function onDaemonEvent(event: Record<string, unknown>) {
 
 async function start() {
   const info = document.getElementById("daemon-info")!;
+  // ★T2 안전모드 pull(emit-before-listen 레이스 회피): 백엔드가 비정규 실행 위치(translocation/DMG 등)
+  // 면 데몬이 뜨지 않아 아래 daemon-ready await 가 영원히 안 풀린다. 그 await **전에** 백엔드를 직접
+  // 조회해(데몬 무관 순수 커맨드) 안내를 확정 표시한다. translocation-blocked 이벤트는 벨트앤서스펜더
+  // 로 유지되며, 같은 토스트 id("safe-mode")라 중복 발화해도 dedupe 된다.
+  try {
+    const guidance = await invoke("boot_verdict");
+    if (typeof guidance === "string" && guidance) {
+      stickyToast("safe-mode", "health", "안전모드 — 설치 위치를 옮겨 주세요", guidance);
+    }
+  } catch {
+    /* 비-macOS·조회 실패는 정상 부트로 흘려보냄(안전모드는 macOS 전용 게이트) */
+  }
   await new Promise<void>((resolve) => {
     listen("daemon-ready", () => resolve());
     listen("daemon-error", (e) => {
@@ -4307,20 +5614,22 @@ async function start() {
 
   await listen("daemon-event", (e) => onDaemonEvent(e.payload as Record<string, unknown>));
 
-  // ── 파일 드래그&드롭 → 드롭한 pane의 PTY에 셸 인용 경로 타이핑(iTerm2 동작) ──
+  // ── 파일 드래그&드롭 → 드롭한 pane의 PTY에 경로 주입(iTerm2 동작) ──
   // dragDropEnabled 기본 활성이라 Tauri가 OS 드롭을 가로채 tauri://drag-drop로 준다(HTML5 drop 미발화).
   // payload.position=물리 픽셀. 전역 listen은 target=Any라 창 라벨로 emit된 이 이벤트를 수신한다
   // (검증: tauri 2.11 event/listener.rs match_any_or_filter — listener.target==Any면 emit 타겟 무관 매칭).
+  // F2: 트리 드래그와 동일 파이프라인(injectPathsToPane) — 재검증·스트리밍 가드·@멘션 형식 공유.
+  // 직격 실패 시 무동작+토스트(포커스 pane 폴백 오배달 금지).
   await listen("tauri://drag-drop", (e) => {
     const p = (e.payload ?? {}) as { paths?: string[]; position?: { x: number; y: number } };
     const paths = p.paths ?? [];
     if (!paths.length) return;
-    const rt = paneAtPhysicalPoint(p.position);
-    if (!rt) return; // pane이 하나도 없으면 무시(에러 금지)
-    const isWin = /Windows/i.test(navigator.userAgent);
-    // 여러 파일이면 각각 셸 인용 후 공백 연결, 끝에 공백 1개(개행 없음 — 실행은 사용자 몫).
-    const data = shellQuoteJoin(paths, isWin) + " ";
-    invoke("send_input", { socket: rt.socket, surfaceId: rt.sid, data }).catch(() => {});
+    const rt = paneAtPointStrict(p.position);
+    if (!rt) {
+      if (panes.size > 0) toast("watchdog", "드롭 취소", "pane 위에 놓아야 삽입됩니다");
+      return;
+    }
+    void injectPathsToPane(rt, paths);
   });
 
   // 바이너리 업데이트 진행률(install_update가 emit). chunk=이번 청크 바이트(누적 아님), total=전체(Option→null 가능).
@@ -4423,6 +5732,24 @@ async function start() {
     toast("health", "업데이트 경고", msg);
   });
 
+  // ★팀 기동 경고(적대검증 D-8): 마스터는 떴으나 cys boot가 팀(CSO·워커·리뷰어)을 못 세운 경우
+  // (claude 미설치 등) 침묵하지 않고 안내 — 종전엔 실패를 삼켜 "팀 0개"를 사용자가 몰랐다.
+  await listen("boot-warning", (e) => {
+    const msg = typeof e.payload === "string" ? e.payload : "팀 기동에 실패했습니다.";
+    stickyToast("boot-warn", "health", "팀 기동 경고", msg);
+  });
+
+  // ★T2 안전모드(translocation/비정규 경로): 앱이 임시/비정규 위치에서 실행돼 데몬·launchd·팩 등록을
+  // 전부 skip 한 경우(백엔드 조기 반환) 침묵하지 않고 설치 복구 절차를 sticky 로 안내한다. 이 경로에선
+  // daemon-ready 가 오지 않아 상단바가 대기 상태로 남으므로, sticky 안내가 유일한 사용자 신호다.
+  await listen("translocation-blocked", (e) => {
+    const msg =
+      typeof e.payload === "string"
+        ? e.payload
+        : "cys.app을 응용 프로그램(Applications) 폴더로 옮긴 뒤 다시 열어 주세요.";
+    stickyToast("safe-mode", "health", "안전모드 — 설치 위치를 옮겨 주세요", msg);
+  });
+
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)
   checkForUpdate(true);
   setInterval(() => checkForUpdate(true), 6 * 3600 * 1000);
@@ -4445,13 +5772,15 @@ async function start() {
   // Session restore (멀티마스터 F4): 저장본 먼저 로드(ws.socket 포함) → 부서 데몬 확보를 list 대조보다
   // 선행 → 소켓별 대조. 데몬 일시 미가동 ws는 보존(영구 삭제 방지, 검증 mustFix).
   try {
-    const saved = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? "null");
+    // v3 우선 로드, 없으면 v2 마이그레이션(webpane.loadPersistedLayout — 구조 동일 passthrough).
+    const saved = loadPersistedLayout((k) => localStorage.getItem(k));
     if (saved && Array.isArray(saved.workspaces)) {
       workspaces = saved.workspaces;
       groups = Array.isArray(saved.groups) ? saved.groups : []; // 06: 하위호환 — 옛 저장본엔 groups 없음
       activeWs = saved.active ?? 0;
       wsCounter = saved.counter ?? 1;
       groupCounter = saved.groupCounter ?? 1; // 06
+      webWidCounter = saved.webWidCounter ?? 1; // web pane 고유 id 카운터(v2 저장본엔 없음)
     }
   } catch {
     workspaces = [];
@@ -4462,6 +5791,9 @@ async function start() {
   workspaces = normalizeWorkspaces(workspaces);
   // 카운터 보정: 신규 id/이름이 항상 기존 최댓값 초과하도록(중복·손상 저장본에도 강건)
   wsCounter = Math.max(wsCounter, 0, ...workspaces.map((w) => w.id)) + 1;
+  // web pane wid 카운터도 복원 트리의 최대 wid 초과로 보정(중복 발급 차단).
+  const restoredWids = workspaces.flatMap((w) => collectWids(w.tree));
+  webWidCounter = Math.max(webWidCounter, 0, ...restoredWids) + 1;
   // 06: 고아 그룹 청소 + groupCounter를 기존 최대 id+1로 보정(중복·손상 저장본에도 강건).
   groups = normalizeGroups(workspaces, groups);
   groupCounter = Math.max(groupCounter, 0, ...groups.map((g) => g.id)) + 1;
@@ -4789,6 +6121,20 @@ document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => 
   ccSessionSelected = null;
   refreshSessions();
 });
+// 계정 라벨 가림 토글 — 상태 영속 + refreshControlCenter로 KPI·계정 섹션 재렌더(라벨→해시).
+const acctRedactBtn = document.getElementById("btn-cc-acct-redact")!;
+acctRedactBtn.classList.toggle("active", ccAcctRedact); // 복원 상태 반영
+acctRedactBtn.addEventListener("click", (e) => {
+  ccAcctRedact = !ccAcctRedact;
+  localStorage.setItem("cys-cc-acct-redact", ccAcctRedact ? "1" : "0");
+  (e.currentTarget as HTMLElement).classList.toggle("active", ccAcctRedact);
+  refreshControlCenter();
+});
+// 스킬 보드 검색 — 카탈로그 버튼 필터(재fetch 없이 renderBoardDomains 재렌더).
+document.getElementById("cc-board-search")!.addEventListener("input", (e) => {
+  ccBoardSearch = (e.currentTarget as HTMLInputElement).value;
+  renderBoardDomains();
+});
 document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
 document.getElementById("btn-refresh")!.addEventListener("click", () => void manualRefresh());
 document.getElementById("btn-restart-daemon")!.addEventListener("click", () => void manualRestartAllDaemons());
@@ -4863,7 +6209,7 @@ applyWsbarVars(); // 마운트 시 저장값 복원
 
 function refitAllPanes() {
   for (const rt of panes.values()) {
-    fitPane(rt); // 숨김/미배치 pane은 fitPane 내부 가드가 거른다
+    rt.resize(); // 숨김/미배치 pane은 fitPane 내부 가드가 거른다
     rt.term.refresh(0, rt.term.rows - 1); // PTY rows/cols 불변이어도 화면 재렌더 보장
   }
 }

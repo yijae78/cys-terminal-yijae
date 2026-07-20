@@ -239,6 +239,14 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
 .pane .pane-usage .warn { color: #d29922; }
 .pane .pane-usage .crit { color: #f85149; font-weight: 600; }
 .pane .pane-usage.stale { opacity: .45; }
+/* web pane(뷰어 iframe) — 타이틀 스트립 + iframe 본체 + 로드 대기/실패 플레이스홀더 */
+.pane .web-url { color: #6e7681; max-width: 40ch; overflow: hidden; text-overflow: ellipsis; }
+.pane .web-body { position: relative; flex: 1; min-height: 0; }
+.pane .web-frame { width: 100%; height: 100%; border: none; background: var(--bg); }
+.pane .web-placeholder {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: #8b949e; font-size: 12px; background: var(--bg);
+}
 
 /* ───────── T6 Control Center (전용 풀 패널 — 외장 Streamlit 대시보드의 네이티브 이식) ───────── */
 #cc-panel {
@@ -532,6 +540,11 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
   background: var(--bg); color: var(--canvas-text); cursor: pointer; font-size: 13px;
 }
 .modal-btns .modal-yes { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+/* ★D3a(purge-safety 2026-07-16): 비활성이 활성과 픽셀 동일해 "눌러도 무반응"으로 오인되던 실사고 —
+   #btn-ws-dept:disabled(위 113행)와 동일 관용구로 모달 버튼 전체에 비활성 시각화. */
+.modal-btns button:disabled { opacity: .5; cursor: default; }
+/* 완전삭제 확인 입력의 불일치 실시간 힌트(modal-trust 계열 경고색·빈 상태 높이 예약) */
+.modal-hint { font-size: 11px; color: #f59e0b; margin: 6px 0 0; min-height: 14px; }
 
 /* 07 Command Palette (⌘K) — modal-overlay + ctx-menu 패턴 합성 */
 .palette-overlay {
@@ -826,3 +839,53 @@ body.cc-office #cc-view-office { flex: 1; min-height: 0; }
 #app-version { color: #6e7681; font-size: 10px; font-family: ui-monospace, "Cascadia Code", monospace; }
 #btn-refresh.spin { animation: wsn-rotate .6s linear; }
 @keyframes wsn-rotate { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+/* ───────── CC v2: 계정 Rate Limit · 최근 실행 · 자산 (기존 cc-* 톤 따름) ───────── */
+.cc-acct-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,.06); font-size: 12px; }
+.cc-acct-row:last-child { border-bottom: none; }
+.cc-acct-prov { font-size: 11px; color: #64748b; font-weight: 700; flex: none; }
+.cc-acct-label { color: #e2e8f0; font-weight: 600; flex: none; }
+.cc-acct-plan { font-size: 11px; padding: 1px 7px; border-radius: 8px; background: rgba(0,212,255,.14); color: #00d4ff; flex: none; }
+.cc-acct-gauges { flex: 1 1 240px; min-width: 200px; }
+.cc-acct-gauges .cc-tbar { margin-bottom: 4px; }
+.cc-acct-gauges .cc-tbar:last-child { margin-bottom: 0; }
+.cc-acct-badges { display: flex; flex-wrap: wrap; gap: 4px; flex: none; }
+.cc-acct-badge { font-size: 10px; padding: 1px 7px; border-radius: 8px; background: rgba(100,116,139,.18); color: #94a3b8; }
+.cc-acct-badge.warn { background: rgba(245,158,11,.16); color: #f59e0b; }
+#btn-cc-acct-redact { background: none; border: none; cursor: pointer; font-size: 12px; opacity: .5; padding: 0 4px; }
+#btn-cc-acct-redact.active { opacity: 1; }
+
+.cc-run-card { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,.06); font-size: 12px; }
+.cc-run-card:last-child { border-bottom: none; }
+.cc-run-label { color: #e2e8f0; font-weight: 600; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cc-run-when { color: #64748b; font-variant-numeric: tabular-nums; flex: none; }
+.cc-run-status { font-size: 11px; font-weight: 700; padding: 1px 8px; border-radius: 8px; flex: none; }
+.cc-run-status.done { background: rgba(34,197,94,.14); color: #22c55e; }
+.cc-run-status.failed { background: rgba(239,68,68,.14); color: #ef4444; }
+.cc-run-status.launched { background: rgba(100,116,139,.18); color: #94a3b8; }
+.cc-run-art { flex: none; font-size: 11px; color: #e2e8f0; background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.10); border-radius: 6px; padding: 2px 8px; cursor: pointer; }
+.cc-run-art:hover { background: rgba(255,255,255,.10); }
+
+#cc-board-search { width: 100%; box-sizing: border-box; margin-bottom: 10px; padding: 7px 10px; font-size: 13px;
+  color: var(--canvas-text); background: var(--bg); border: 1px solid var(--border); border-radius: 8px; outline: none; }
+#cc-board-search:focus { border-color: var(--accent); }
+.cc-board-pin { color: #f5c518; margin-right: 4px; }
+.cc-board-btn.pinned { border-color: rgba(245,197,24,.45); }
+.cc-board-calls { margin-left: 6px; font-size: 10px; padding: 0 6px; border-radius: 8px;
+  background: rgba(0,212,255,.14); color: #00d4ff; font-variant-numeric: tabular-nums; }
+
+.cc-asset-n { color: #e2e8f0; font-weight: 700; font-variant-numeric: tabular-nums; }
+.cc-asset-chip { cursor: pointer; }
+.cc-asset-chip:hover { background: rgba(0,212,255,.16); color: #00d4ff; }
+
+/* ── 파일 기능 강화(F1~F5)·pane 전출(F6) ── */
+/* F4: 트리 루트 전체 경로 상시 표시(헤더 서브라인) */
+#ft-path { padding: 3px 8px; font-size: 10px; color: #8b949e; word-break: break-all;
+  border-bottom: 1px solid #21262d; }
+/* F3/F4: 메뉴의 표시 전용 행(경로) — 클릭 무반응 */
+#ctx-menu .ctx-item.disabled { opacity: .65; pointer-events: none; white-space: normal;
+  word-break: break-all; max-width: 360px; font-size: 11px; }
+/* F2: 드롭 대상 pane 하이라이트 + 삽입 성공 플래시 */
+.pane.drop-target { outline: 2px solid var(--accent); outline-offset: -2px; }
+.pane.inject-flash .pane-title { background: rgba(47,129,247,.35); transition: background .6s; }
+/* F6: 전출 대상 ws 탭 하이라이트 */
+.ws-tab.transfer-target { outline: 2px dashed var(--accent); outline-offset: -2px; }

@@ -1,0 +1,42 @@
+# Style Guide — 디자인 토큰 (`context/style-guide.md`)
+
+> PROPOSAL v3 §4-I 시각 검증 루프의 참조 파일 2/2. NLC의 visual.md(8-2)·FDS tokens(4-1)와 접합한다.
+> 이 문서는 토큰의 구체 값 SOT다. 컴포넌트/화면은 값을 하드코딩하지 말고 이 토큰을 참조한다.
+> 토큰 변경 시 `ruler apply`(FDS governance: token_change_requires_ruler_apply).
+
+<!-- [채움 지시] 프로젝트 디자인 토큰의 실제 값을 채운다. 아래는 골격 예시. -->
+
+## Color Tokens (채움)
+```yaml
+color:
+  bg:        { default: "[FILL]", subtle: "[FILL]" }
+  fg:        { default: "[FILL]", muted: "[FILL]" }
+  primary:   { default: "[FILL]", hover: "[FILL]", active: "[FILL]" }
+  danger:    { default: "[FILL]" }
+  border:    { default: "[FILL]" }
+  theme:     [light, dark, system]
+```
+
+## Typography Tokens (채움)
+```yaml
+typography:
+  font_family: { sans: "[FILL]", mono: "[FILL]" }
+  scale:       { h1: "[FILL]", h2: "[FILL]", h3: "[FILL]", body: "[FILL]", caption: "[FILL]" }
+  weight:      { regular: 400, medium: 500, bold: 700 }
+  line_height: { tight: "[FILL]", normal: "[FILL]" }
+```
+
+## Spacing / Radius / Shadow (채움)
+```yaml
+spacing: { xs: "[FILL]", sm: "[FILL]", md: "[FILL]", lg: "[FILL]", xl: "[FILL]" }   # 4pt/8pt 그리드 권장
+radius:  { sm: "[FILL]", md: "[FILL]", lg: "[FILL]", full: "9999px" }
+shadow:  { sm: "[FILL]", md: "[FILL]", lg: "[FILL]" }
+```
+
+## Breakpoints (mobile_first)
+```yaml
+breakpoints: { sm: "[FILL]", md: "[FILL]", lg: "[FILL]", xl: "[FILL]" }   # 컴포넌트당 최소 2개
+```
+
+## Component State Style Naming
+`Component__Variant--State` (예: `Button__Primary--Hover`). 상태별 스타일은 visual.md(8-2)에서 이 토큰을 참조해 매핑한다.

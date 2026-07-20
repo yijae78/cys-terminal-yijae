@@ -35,3 +35,9 @@ description: 완성 영상의 시각 품질을 프레임 단위 비전 검수로
 `{gate: "visual", verdict: GO|NO_GO, issues: [{timecode, type, evidence}]}` — 일관성 결함의
 `type`은 `consistency_character | consistency_space | consistency_identity_mix`(기존 값 무변경). 상위
 `[[video-verify]]`로 반환. NO_GO면 문제 프레임 근거를 첨부해 회송한다.
+
+**증거 규약 (영상/음성 매체)**: issue 항목의 `{timecode, type, evidence}`는 영상/음성 증거 3종을
+실어야 한다 — `timecode`=① 타임코드 구간(`MM:SS-MM:SS`), `evidence`=② 프레임 캡처 경로 + ③ 결함
+서술. verdict evidence 로 승격 시 위치 ref 규약 `경로.mp4#t=MM:SS-MM:SS`. 이 포맷은 형제 관문
+(`[[video-verify-audio-sync]]` 등 `{timecode,type,evidence}` 공유)에도 동일 적용. 상세 =
+`${CYS_PACK_DIR:-$HOME/.cys/pack}/round/EVIDENCE_CONVENTION.md`(§1 영상/음성).

@@ -98,6 +98,12 @@ enum Command {
         #[arg(long)]
         surface: Option<String>,
     },
+    /// 산출물을 GUI 뷰어 web pane으로 열기 (md/diff 렌더 · 허용 루트 한정 · cys pane 안에서만 —
+    /// full-trust 역할 필요, reviewer/외부 셸은 거부. GUI 미기동 시 exit 3)
+    View {
+        /// 렌더할 파일 경로 (절대/상대 — 실재하는 파일이어야 함)
+        path: String,
+    },
     /// T5 사용량 관측: 이 세션의 트랜스크립트 경로를 pane에 등록 (SessionStart hook 전용 plumbing)
     UsageRegister {
         /// 세션 트랜스크립트 절대경로 (.jsonl)
@@ -119,6 +125,14 @@ enum Command {
         #[arg(long)]
         surface: Option<String>,
     },
+    /// CC v2: 계정 단위 rate limit 뷰(로컬 데몬) — 자원 게이트·스크립트 소비용
+    UsageAccounts {
+        #[arg(long)]
+        json: bool,
+    },
+    /// CC v2: RSI 학습 체크포인트 push — stdin JSON({round, verdict, stored, harness, discovery})을
+    /// learn.checkpoint RPC로 전달 (javis_learn.py 전용 plumbing · 데몬 부재 시 exit 1)
+    LearnCheckpoint,
     /// T1-2 통합 관제 보드: 전 노드 상태를 1콜로 (read-screen 폴링 대체)
     Status {
         #[arg(long)]
@@ -137,7 +151,15 @@ enum Command {
     /// kill-switch 해제 — 동결된 큐·스케줄 재개
     Resume,
     /// 업데이트 재시작 전 살아있는 노드에 저장 신호 + 유예 (best-effort drain)
-    Drain,
+    Drain {
+        /// 저장 검증 모드: 노드별 체크포인트(SESSION_STATE) nonce 마커 기입을 결정론 확인 후
+        /// 결과 JSON+exit code 반환 (기존 무인자 plain drain은 거동 불변 — best-effort 저장 신호만).
+        #[arg(long)]
+        verify: bool,
+        /// verify 모드 노드별 검증 대기(초) — 전역 하드캡=timeout+마진. plain drain은 무영향.
+        #[arg(long, default_value_t = 20)]
+        timeout: u64,
+    },
     /// preflight 게이트: exit 0 = running, 4 = paused (자율주행 매 action 전 확인용)
     GateCheck,
     /// 미배달 큐 검사·철회 (kill-switch의 짝)
@@ -383,6 +405,28 @@ enum Command {
         /// (healed system 파일 전용) 보존본(.user)을 ~/.cys/local 오버레이로 이동(스킬 shadowing)
         #[arg(long)]
         to_local: bool,
+        /// 내 수정(.user/현재본)과 vendor 본의 diff 를 제안 patch 파일로 생성(개선 환류 — 자동 전송 없음)
+        #[arg(long)]
+        propose: bool,
+        /// 확인 프롬프트 없이 적용 (헌법 파일 병합·교체는 --yes 여도 확인 필수)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 팩 상대경로의 소유권 등급(system|user|seed-once) 판정 — pack-guard hook·스크립트용 결정론 조회
+    #[command(name = "pack-ownership")]
+    PackOwnership {
+        /// 팩 상대경로(예: bin/javis_learn.py, soul.md)
+        rel: String,
+        /// 등급 문자열만 출력(스크립트 소비용)
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// 직전 설치 보존본(<pack>.prev)에서 파일 단위 복원 — 업데이트 직후 "잃었다" 순간의 원커맨드 되돌리기
+    #[command(name = "pack-rollback")]
+    PackRollback {
+        /// 복원할 팩 상대경로. 생략 시 .prev 와 현재 팩의 차이 목록 표시
+        #[arg(long)]
+        file: Option<String>,
         /// 확인 프롬프트 없이 적용
         #[arg(long)]
         yes: bool,
@@ -445,6 +489,9 @@ enum Command {
         /// 진단 결과를 JSON으로 출력.
         #[arg(long)]
         json: bool,
+        /// 커스터마이즈 실태 리포트 생성(로컬 파일 — 자발 제출용·자동 전송 없음)
+        #[arg(long)]
+        custom_report: bool,
     },
     /// Search the persistent transcript memory of ALL agents' terminal activity (FTS)
     Recall {
@@ -487,6 +534,12 @@ enum Command {
         role: String,
         #[arg(long)]
         surface: Option<String>,
+        /// ★SEAT: 보유자가 '빈 좌석'(agent 없는 셸·자손 프로세스 0·최근 입력 없음)이면 승계한다.
+        /// 데몬이 그 좌석의 공허를 결정론으로 재판정하므로 요청일 뿐 강제가 아니다 — agent 가 붙은
+        /// 정당한 보유자는 종전대로 거부된다. 부트 체인(javis_bootstrap ③)이 빈 셸에 막혀
+        /// '유령 master' 데드엔드에 빠지던 경로를 푼다.
+        #[arg(long = "takeover-empty-seat")]
+        takeover_empty_seat: bool,
     },
     /// Mark a surface quiescing(=채널 inbox 주입 보류) or release it (§2.2 S5) — cycle-agent가 clear 전후 호출
     Quiesce {
@@ -718,12 +771,16 @@ enum ChannelAction {
 
 #[derive(Subcommand)]
 enum SkillAction {
-    /// Create a new skill from experience (SKILL.md, 4-칸 본문 템플릿)
+    /// Create a new skill from experience (SKILL.md, 4-칸 본문 템플릿).
+    /// 기본 생성 위치 = ~/.cys/local/skills (업데이트·치유가 절대 건드리지 않는 사용자 영역)
     New {
         /// kebab-case skill name
         name: String,
         #[arg(long)]
         description: String,
+        /// 팩 디렉터리(vendor 영역)에 생성 — 개발 기계에서 upstream 승격 예정인 스킬 전용
+        #[arg(long)]
+        pack: bool,
     },
     /// List skill covers (name + description)
     List,
@@ -742,6 +799,9 @@ enum SkillAction {
         /// fresh surface TTL(초). 미지정=schedule.rs 기본 TTL
         #[arg(long)]
         close_after: Option<u64>,
+        /// CC v2: 보드 run 생애주기 추적 id(make_ticket이 발급·산출물 dir과 동일). 미지정=추적 없음
+        #[arg(long)]
+        run_id: Option<String>,
     },
 }
 
@@ -859,6 +919,9 @@ enum FeedAction {
     Reply {
         request_id: String,
         decision: String,
+        /// 결재 사유(W3.3 감사 기록용). 한글·공백은 셸에서 단일 인용으로 감싼다.
+        #[arg(long)]
+        reason: Option<String>,
     },
 }
 
@@ -1520,6 +1583,30 @@ fn run(command: Command) -> i32 {
             })
         }
 
+        Command::View { path } => (|| -> Result<(), String> {
+            // 실재 게이트: 없는 경로·디렉토리는 여기서 즉시 실패 — 오류가 pane 안으로 숨지 않게
+            // (reveal_path의 metadata 게이트와 동형). canonicalize가 아닌 absolute를 쓴다:
+            // Windows canonicalize는 \\?\ verbatim 경로를 반환해 사이드카(python realpath) 대조와
+            // 미검증 결합면을 만든다. 심볼릭 링크 해소·허용 루트 판정은 사이드카(within_roots)가
+            // 단일 소유 — allowlist·해소 로직 이중화는 드리프트 위험.
+            let abs = std::path::absolute(&path)
+                .map_err(|e| format!("경로 해석 실패: {path} — {e}"))?;
+            let meta = std::fs::metadata(&abs)
+                .map_err(|e| format!("경로 열기 실패: {path} — {e}"))?;
+            if !meta.is_file() {
+                return Err(format!("파일이 아님(디렉토리?): {}", abs.display()));
+            }
+            let reply = request("viewer.open", json!({"path": abs.to_string_lossy()}))?;
+            let listeners = reply.get("listeners").and_then(|v| v.as_u64()).unwrap_or(0);
+            if listeners == 0 {
+                // 발행 성공 ≠ 표시 성공: 구독자 0 = GUI 포워더 부재 확정 → pane은 뜨지 않았다.
+                eprintln!("발행됐으나 구독자 0 — GUI(cys.app) 미기동으로 표시되지 않음");
+                std::process::exit(3);
+            }
+            println!("OK → viewer.open ({})", abs.display());
+            Ok(())
+        })(),
+
         Command::UsageRegister { transcript, surface } => {
             target_surface(&surface, &None).and_then(|sid| {
                 request(
@@ -1536,6 +1623,51 @@ fn run(command: Command) -> i32 {
 
         Command::UsageEventStdin { surface } => return run_usage_event_stdin(&surface),
 
+        Command::UsageAccounts { json: as_json } => request("usage.accounts", json!({}))
+            .map(|r| {
+                if as_json {
+                    println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+                } else {
+                    for a in r["accounts"].as_array().into_iter().flatten() {
+                        let label = a["label"].as_str().unwrap_or("?");
+                        let provider = a["provider"].as_str().unwrap_or("?");
+                        let rate: Vec<String> = a["rate"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|w| {
+                                format!(
+                                    "{} {:.0}%",
+                                    w["label"].as_str().unwrap_or("?"),
+                                    w["used_pct"].as_f64().unwrap_or(0.0)
+                                )
+                            })
+                            .collect();
+                        let obs = if a["updated_at"].is_null() {
+                            "관측 없음".to_string()
+                        } else {
+                            rate.join(" · ")
+                        };
+                        println!("{provider:<12} {label:<32} {obs}");
+                    }
+                }
+            }),
+
+        Command::LearnCheckpoint => {
+            let mut buf = String::new();
+            if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+                eprintln!("error: stdin JSON 필요 ({{round, verdict, …}})");
+                return 1;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&buf) else {
+                eprintln!("error: stdin JSON 파싱 실패");
+                return 1;
+            };
+            request("learn.checkpoint", v).map(|r| {
+                println!("OK round={}", r["round"].as_str().unwrap_or("?"));
+            })
+        }
+
         Command::Status { json: as_json } => return run_status(as_json),
         Command::Fleet { json: as_json } => return run_fleet(as_json),
 
@@ -1545,7 +1677,11 @@ fn run(command: Command) -> i32 {
         Command::Resume => request("system.resume", json!({}))
             .map(|_| println!("RESUMED — 동결된 큐·스케줄 재개")),
 
-        Command::Drain => {
+        Command::Drain { verify, timeout } if verify => {
+            return run_drain_verify(timeout);
+        }
+
+        Command::Drain { .. } => {
             // 업데이트 재시작 전 살아있는 역할 노드에 저장 신호를 보내고 짧게 유예한다(best-effort).
             // 노드(LLM) 협조 의존이라 무손실 보장은 아니며, 주 복원 경로는 재시작 후 resume이다.
             // ★hard watchdog: 데몬 무응답으로 RPC(read_line)가 hang해도 12s 내 무조건 종료해,
@@ -1816,15 +1952,42 @@ fn run(command: Command) -> i32 {
             return run_pack_update(from, manifest_url, dry_run);
         }
         Command::PackPlan { force } => return run_pack_plan(force),
-        Command::PackMerge { file, take_new, keep_mine, ai, to_local, yes } => {
-            return run_pack_merge(file, take_new, keep_mine, ai, to_local, yes);
+        Command::PackMerge { file, take_new, keep_mine, ai, to_local, propose, yes } => {
+            return run_pack_merge(file, take_new, keep_mine, ai, to_local, propose, yes);
+        }
+        Command::PackOwnership { rel, quiet } => {
+            // 결정론 조회 전용(쓰기 0) — 분류 SOT 는 pack::ownership() 한 곳(pack-guard hook 이 소비).
+            // ★effective 등급: 치유·prune 은 임베드/매니페스트 파일에만 작용하므로, 임베드에 없는
+            // 자작 신규 파일은 등급과 무관하게 불가침 — "custom" 으로 구분해 hook 오탐을 차단한다.
+            let embedded = cys::pack::PACK_ALL.iter().any(|(r, _)| *r == rel.as_str());
+            let name = if embedded { cys::pack::ownership_name(&rel) } else { "custom" };
+            if quiet {
+                println!("{name}");
+            } else {
+                let meaning = match name {
+                    "custom" => "비출하 자작 파일 — 업데이트·치유·정리 전부 불가침(생존 보증 대상)",
+                    "user" => "사용자 소유 — 업데이트가 절대 덮지 않음(vendor 전진은 .new 병치)",
+                    "seed-once" => "런타임 상태 — 부재 시에만 시드, 존재하면 불가침",
+                    _ => "vendor 소유 — 수정본은 다음 설치 스윕에 치유(수정 전 .user 보존). 자작은 새 파일로",
+                };
+                println!("{rel}: {name} — {meaning}");
+            }
+            return 0;
+        }
+        Command::PackRollback { file, yes } => {
+            return run_pack_rollback(file, yes);
         }
 
         Command::PackManifest { key_id, signed_at, expires_at, min_binary_version, pack_version } => {
             return run_pack_manifest(key_id, signed_at, expires_at, &min_binary_version, pack_version);
         }
 
-        Command::Doctor { fix, json } => return run_doctor(fix, json),
+        Command::Doctor { fix, json, custom_report } => {
+            if custom_report {
+                return run_doctor_custom_report();
+            }
+            return run_doctor(fix, json);
+        }
 
         Command::License { action } => {
             let now = chrono::Utc::now().timestamp();
@@ -1865,8 +2028,9 @@ fn run(command: Command) -> i32 {
             })
         }),
 
-        Command::ClaimRole { role, surface } => target_surface(&surface, &None).and_then(|sid| {
-            request("system.claim_role", json!({"role": role, "surface_id": sid}))
+        Command::ClaimRole { role, surface, takeover_empty_seat } => target_surface(&surface, &None).and_then(|sid| {
+            request("system.claim_role", json!({"role": role, "surface_id": sid,
+                                                "takeover_empty_seat": takeover_empty_seat}))
                 .map(|r| println!("registered: {} → surface:{}", r["role"].as_str().unwrap_or("?"), sid))
         }),
 
@@ -2082,12 +2246,16 @@ fn run_feed(action: FeedAction) -> i32 {
             }
             0
         }),
-        FeedAction::Reply { request_id, decision } => {
-            request("feed.reply", json!({"request_id": request_id, "decision": decision}))
-                .map(|_| {
-                    println!("OK");
-                    0
-                })
+        FeedAction::Reply { request_id, decision, reason } => {
+            // reason은 Some일 때만 실어 보낸다(None=키 부재 → 데몬에서 null 처리).
+            request(
+                "feed.reply",
+                json!({"request_id": request_id, "decision": decision, "reason": reason}),
+            )
+            .map(|_| {
+                println!("OK");
+                0
+            })
         }
     };
     match result {
@@ -2505,15 +2673,46 @@ fn run_cost_baseline(action: CostBaselineAction) -> i32 {
 fn run_skill(action: SkillAction) -> i32 {
     let skills_dir = cys::pack::pack_dir().join("skills");
     let result: Result<(), String> = match action {
-        SkillAction::New { name, description } => (|| {
+        SkillAction::New { name, description, pack } => (|| {
             if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
                 return Err("name must be kebab-case ascii (a-z0-9-)".into());
             }
-            let dir = skills_dir.join(&name);
+            // ★W-G1(커스텀 생존 설계 2026-07-17): 자작 스킬의 기본 거처 = local 오버레이(업데이트
+            // 불가침 — §12.7 문서와 CLI 의 비대칭 해소). --pack 은 upstream 승격 예정 전용이며,
+            // vendor 임베드와 동명이면 다음 스윕에 치유(교체)되므로 생성 자체를 거부한다.
+            let vendor_rel = format!("skills/{name}/SKILL.md");
+            let vendor_exists = cys::pack::PACK_ALL.iter().any(|(r, _)| *r == vendor_rel);
+            let root = if pack {
+                if vendor_exists {
+                    return Err(format!(
+                        "vendor 스킬 '{name}' 이 이미 출하됨 — 팩 안 동명 생성은 다음 스윕에 치유(소실)됩니다. \
+                         오버레이 생성(기본값·shadowing) 또는 다른 이름을 쓰세요."
+                    ));
+                }
+                skills_dir.clone()
+            } else {
+                cys::pack::local_dir().join("skills")
+            };
+            let dir = root.join(&name);
             let path = dir.join("SKILL.md");
             if path.exists() {
                 return Err(format!("skill '{name}' already exists: {}", path.display()));
             }
+            // 반대편 루트 중복도 고지(생성은 허용 — shadowing 은 정당한 사용).
+            if !pack && vendor_exists {
+                println!("[주의] 동명 vendor 스킬 존재 — 이 오버레이 스킬이 shadowing 으로 이깁니다(의도 확인).");
+            }
+            // ★W-D2 기준점: vendor 동명을 가리는 순간의 임베드 해시를 기록 — 이후 pack-plan 이
+            // vendor 전진을 결정론 판정한다. 기록이 없으면 매 실행 "판정 불가" 잡음이 되어
+            // 경고 피로(무시 학습)를 부른다 — 승격(--to-local)과 손수 생성 양 경로 모두에 심는다.
+            let vendor_base: Option<String> = if !pack {
+                cys::pack::PACK_ALL
+                    .iter()
+                    .find(|(r, _)| *r == vendor_rel)
+                    .map(|(_, c)| cys::pack::content_hash_pub(c))
+            } else {
+                None
+            };
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let body = format!(
                 "---\nname: {name}\ndescription: {description}\n---\n\n\
@@ -2524,7 +2723,13 @@ fn run_skill(action: SkillAction) -> i32 {
                  ## 확인하는 방법 (검증 — 겪을 때마다 한 줄씩 누적하라)\n- \n"
             );
             std::fs::write(&path, body).map_err(|e| e.to_string())?;
+            if let Some(h) = vendor_base {
+                let _ = cys::pack::write_atomic(&dir.join(".vendor-base"), h.as_bytes());
+            }
             println!("created {}", path.display());
+            if !pack {
+                println!("(업데이트 불가침 영역 — 어떤 패치·재설치에도 보존됩니다)");
+            }
             println!("(4칸을 채우고, master 승인이 필요하면 feed push로 보고하라)");
             Ok(())
         })(),
@@ -2576,12 +2781,21 @@ fn run_skill(action: SkillAction) -> i32 {
             println!("{content}");
             Ok(())
         })(),
-        SkillAction::Run { name, ticket, agent, close_after } => (|| {
+        SkillAction::Run { name, ticket, agent, close_after, run_id } => (|| {
             if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
                 return Err("name must be kebab-case ascii (a-z0-9-)".into());
             }
             if ticket.trim().is_empty() {
                 return Err("ticket 비어 있음 — 무계약 실행 금지(task-prompt 경유 필수)".into());
+            }
+            // CC v2 WS-B: run 생애주기 등록(best-effort — 실패해도 실행은 막지 않는다).
+            // ttl은 아래 close_after 기본(600)과 동일 값 — 데몬이 deadline 산출에 쓴다.
+            if let Some(rid) = run_id.as_ref() {
+                let _ = request(
+                    "skill.run_started",
+                    json!({"run_id": rid, "name": name,
+                           "ttl_secs": close_after.unwrap_or(600)}),
+                );
             }
             // 일회용 격리 실행 = schedule add --fresh 잡(즉발 원샷 + fresh + worker 디렉티브 주입 + 자동 close).
             // invisible `claude -p` 맹목복제 금지(PROMPT_RUNNER_ABSENT) — 보이는 surface + 원장 강제종료.
@@ -2927,7 +3141,8 @@ fn run_init_pack(force: bool, no_install_hook: bool, claude_settings: Option<Str
     let dir = cys::pack::pack_dir();
     // §3.1 팩 atomic swap: 파일별 in-place write(중단 시 반쯤 쓰인 팩) 대신 staging 전개→검증→
     // 원자 rename 교체(pack_dir.prev 1세대 보존). 중단은 기존 팩을 건드리지 않는다.
-    let (written, kept) = match cys::pack::install_staged(force) {
+    // W0-d: cys init-pack CLI 핸들러는 라이브 팩 쓰기 프로덕션 진입점 — 인가 부여.
+    let (written, kept) = match cys::pack::install_staged(force, Some(cys::pack::PackWriteAuth::production())) {
         Ok(wk) => wk,
         Err(e) => {
             eprintln!("error: {e}");
@@ -3731,7 +3946,55 @@ fn expand_tilde(p: &str) -> std::path::PathBuf {
 
 /// 절대지침 앵커4-1: 프로젝트 시작 시 CSO·worker·agy·codex 4개 노드를 의무 기동한다
 /// (LLM orchestrating 상주 편성). grok은 설치돼 있으면 추가 리뷰어로 띄운다(미설치 skip).
+/// 소켓별 boot 락 가드 — Acquired는 fd를 쥔 채 Drop에서 flock 자동 해제. 파일 열기 실패나
+/// windows는 Acquired(None)로 락 없이 진행(직렬화만 포기·중복은 데몬 특권 가드가 대부분 흡수).
+enum BootLock {
+    Acquired(#[allow(dead_code)] Option<std::fs::File>),
+    Busy,
+}
+
+/// 현재 소켓(CYS_SOCKET 상속)의 boot 락 파일을 비차단 flock 획득 시도.
+fn acquire_boot_lock() -> BootLock {
+    let lock_path = cys::socket_path()
+        .parent()
+        .map(|d| d.join("cys-boot.lock"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/cys-boot.lock"));
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let f = match std::fs::OpenOptions::new().create(true).write(true).open(&lock_path) {
+        Ok(f) => f,
+        Err(_) => return BootLock::Acquired(None), // 락 못 열면 직렬화 없이 진행(보수적 허용)
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            BootLock::Acquired(Some(f))
+        } else {
+            BootLock::Busy
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        BootLock::Acquired(Some(f))
+    }
+}
+
 fn run_boot(cwd: Option<String>) -> i32 {
+    // ★이중 boot 직렬화(오너 2026-07-15 적대검증 D-7 + 아키텍트 성찰): 마스터 팀 스폰 트리거가
+    // 겹칠 수 있다(고전 경로=UserPromptSubmit 훅이 javis_bootstrap.py ④ boot 발화 · 버튼 경로=GUI
+    // spawn_orchestra_boot · 마스터 LLM이 스스로 boot). 두 boot가 겹치면 각자 "역할 미가동" 스냅샷을
+    // 보고 리뷰어(데몬 특권 가드 없음)를 중복 스폰할 수 있다. 소켓별 boot 락을 비차단 획득 —
+    // 이미 다른 boot가 진행 중이면 즉시 성공 반환(그 boot가 팀을 세운다·이 호출은 멱등 no-op).
+    // (claim-role의 boot 부작용은 아키텍트 성찰로 제거 — 레지스트리 op가 프로세스 스폰하는 결합 차단.)
+    let _boot_lock = match acquire_boot_lock() {
+        BootLock::Acquired(g) => g,
+        BootLock::Busy => {
+            println!("cys boot — 다른 boot 진행 중(락 보유) — 중복 스폰 방지로 skip (그 boot가 팀을 세움)");
+            return 0;
+        }
+    };
     // (역할, 에이전트) 표준 편성 — 4차 의무 4종 + 선택 grok. 순서: CSO 먼저(감독).
     const PLAN: &[(&str, &str)] = &[
         ("cso", "claude"),
@@ -3827,19 +4090,41 @@ fn run_boot(cwd: Option<String>) -> i32 {
 /// agents.json에서 어댑터 스펙 로드
 fn load_agent_spec(agent: &str) -> Result<Value, String> {
     let agents_path = cys::pack::pack_dir().join("agents.json");
-    let agents: Value = std::fs::read_to_string(&agents_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .ok_or_else(|| {
-            format!(
-                "agents.json not found at {} — run `cys init-pack` first",
-                agents_path.display()
-            )
-        })?;
-    agents
-        .get(agent)
-        .cloned()
-        .ok_or_else(|| format!("unknown agent '{agent}' (agents.json에 정의 필요)"))
+    // agents.json 은 user 소유(★W-B) — 손상돼도 치유가 자동 복구하지 않으므로 부재/파싱 실패를
+    // 구분해 복구 경로를 정확히 안내한다(부재→init-pack 시드 / 손상→take-new 또는 삭제 후 재시드).
+    let raw = std::fs::read_to_string(&agents_path).map_err(|_| {
+        format!(
+            "agents.json not found at {} — run `cys init-pack` first",
+            agents_path.display()
+        )
+    })?;
+    let agents: Value = serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "agents.json 파싱 실패({e}) — 사용자 수정 중 손상된 듯. 복구: 파일을 백업·삭제 후 \
+             `cys init-pack`(vendor 본 재시드) → 백업에서 커스텀 어댑터만 되살리기",
+        )
+    })?;
+    if let Some(spec) = agents.get(agent) {
+        return Ok(spec.clone());
+    }
+    // ★W-B 보완(성찰 2 적대검증 산물): user 승격의 대가 = 동결 — 사용자가 agents.json 을 수정해
+    // 두면 vendor 가 **새 어댑터**를 출하해도 .new 병치만 되고 디스크 본엔 영영 안 들어와
+    // "신규 CLI 지원했는데 안 됨"이 된다(schedule.json 은 데몬의 ensure_builtin_jobs 가 같은
+    // 문제를 코드로 메우지만 agents.json 엔 그 보완이 없었다). 디스크에 없는 키만 **임베드
+    // 어댑터로 폴백**해 '사용자 수정 보존'과 'vendor 신기능 즉시 사용'의 합집합을 만든다.
+    // (덮어쓰기 0 — 디스크 정의가 있으면 항상 디스크가 이긴다.)
+    let embedded_agents: Option<Value> = cys::pack::PACK_ALL
+        .iter()
+        .find(|(r, _)| *r == "agents.json")
+        .and_then(|(_, c)| serde_json::from_str(c).ok());
+    if let Some(spec) = embedded_agents.as_ref().and_then(|v| v.get(agent)) {
+        eprintln!(
+            "[agents] '{agent}' 은 내 agents.json 에 없어 **내장 정의로 폴백**했다 \
+             (vendor 신규 어댑터 — 내 수정본은 그대로 보존됨). 편입하려면: cys pack-merge --file agents.json"
+        );
+        return Ok(spec.clone());
+    }
+    Err(format!("unknown agent '{agent}' (agents.json에 정의 필요)"))
 }
 
 /// 역할 디렉티브 + soul.md + 장기메모리 색인 + 스킬 색인 조립 (launch/reinject/cycle 공용)
@@ -4471,6 +4756,11 @@ fn run_launch_agent_opts(
             "surface.create",
             json!({"cwd": cwd, "title": workflow_title(role, agent, &cwd), "role": role,
                    "rows": 40, "cols": 140, "idempotency_key": idem, "env": env_obj,
+                   // ★SEAT: launch-agent 는 '이 역할의 노드를 실제로 띄우겠다'는 명시 의사다 —
+                   // 보유자가 빈 좌석(agent 없는 셸)이면 승계를 요청한다. 데몬이 그 좌석이 정말
+                   // 비었는지 결정론으로 재판정하므로(seat_claimable), 이 플래그는 '요청'일 뿐
+                   // 강제가 아니다. agent 가 붙은 정당한 보유자는 종전대로 claim_denied 로 보호된다.
+                   "takeover_empty_seat": true,
                    // (W1) restore 원값 전달(부재=신규는 데몬이 자기 env로 결정론 해소·기록).
                    "claude_config_dir": config_dir_override}),
         )?;
@@ -4798,6 +5088,11 @@ fn statusline_to_report_params(v: &Value) -> Value {
     if let Some(w) = ctx_window {
         params["ctx_window"] = json!(w);
     }
+    // CC v2 WS-A: statusline stdin의 transcript_path → session_file(기존 usage.report 파라미터).
+    // 데몬이 프로필 dir→계정(accountUuid) 귀속에 쓴다. 부재 시 생략(하위호환·필드 없는 구버전 무해).
+    if let Some(t) = v.get("transcript_path").and_then(|x| x.as_str()) {
+        params["session_file"] = json!(t);
+    }
     params
 }
 
@@ -4951,6 +5246,603 @@ fn request_on(socket: &std::path::Path, method: &str, params: Value) -> Result<V
     let stream = open_pipe_busy_retry(socket)
         .map_err(|e| format!("open {}: {e}", socket.display()))?;
     rpc_over(stream, method, params)
+}
+
+/// request_on의 타임아웃판 — connect 후 read/write 타임아웃을 강제한다. drain --verify fan-out은
+/// hung 소켓(데몬이 accept 후 무응답)에서 request_on의 무타임아웃 read가 영구 정지[A1-F2]하므로 필수.
+#[cfg(unix)]
+fn request_on_timeout(
+    socket: &std::path::Path,
+    method: &str,
+    params: Value,
+    timeout: std::time::Duration,
+) -> Result<Value, String> {
+    let stream = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    rpc_over(stream, method, params)
+}
+#[cfg(windows)]
+fn request_on_timeout(
+    socket: &std::path::Path,
+    method: &str,
+    params: Value,
+    _timeout: std::time::Duration,
+) -> Result<Value, String> {
+    // Windows named pipe read 타임아웃은 별도 API(SetCommTimeouts/OVERLAPPED)라 현 1차 플랫폼(darwin/unix)
+    // 밖. busy-retry 경로(request_on)로 위임한다 — hung 방어는 unix에서 완전(범위 한정).
+    request_on(socket, method, params)
+}
+
+// ============================ drain --verify (기능 1) ============================
+// 재시작 전 전 노드의 증류 체크포인트(SESSION_STATE)를 nonce 마커로 결정론 확인한다. 무인자 plain drain은
+// best-effort 저장 신호(거동 불변)이고, --verify만 이 경로로 분기해 노드별 결과 JSON+exit code를 낸다.
+// ★설계 v3: 소켓별 병렬 fan-out + connect/read 타임아웃 + 전역 하드캡(=timeout+마진), nonce 마커
+// (HTML 주석형 — 체크박스/denylist 토큰 회피), 복원 중 가드, live_cwd canonical 경로(무음 폴백 금지).
+
+/// 체크포인트 nonce 마커 한 줄 — HTML 주석형 전용. 체크박스 문법(`- [ ]`) 금지(javis_report.py 진행% 오염),
+/// session-start.sh denylist 토큰 회피. 신선도 판정은 mtime이 아니라 이 nonce 존재/일치로 한다[A1-F5]
+/// (마커 쓰기가 mtime 소비자에게 '실작업'으로 오인되는 드리프트 회피).
+fn checkpoint_marker(nonce: &str, ts: u64) -> String {
+    format!("<!-- cys-checkpoint: {nonce} {ts} -->")
+}
+
+/// 파일에 지정 nonce의 체크포인트 마커가 존재하는가(존재/일치 — mtime 아님).
+/// ★[F2] 이 검증은 '마커 기입'만 확인한다 — 노드가 마커 앞에서 SESSION_STATE 내용을 실제로 최신화했는지는
+/// 보증하지 못한다(형식적 순응 한계). Saved 결과·UI 라벨은 그래서 "저장 확인"이 아니라 "마커 확인"으로
+/// 표기한다. 내용 최신성은 노드(LLM) 협조 책임이며, 이 도구가 낼 수 있는 결정론 신호는 마커 존재까지다.
+fn file_has_checkpoint_nonce(path: &std::path::Path, nonce: &str) -> bool {
+    let needle = format!("cys-checkpoint: {nonce}");
+    std::fs::read_to_string(path)
+        .map(|s| s.contains(&needle))
+        .unwrap_or(false)
+}
+
+/// 노드 canonical 체크포인트 파일 = <live_cwd>/_round/SESSION_STATE.md (단일 복원 진실).
+fn canonical_checkpoint_file(live_cwd: &str) -> std::path::PathBuf {
+    std::path::Path::new(live_cwd)
+        .join("_round")
+        .join("SESSION_STATE.md")
+}
+
+/// [F1] 소켓 경로별 안정 구별자(FNV-1a) — nonce에 섞어 크로스소켓(같은 sid) 충돌을 막는다. 결정론(런타임
+/// 무관)이라 같은 소켓은 항상 같은 값·다른 소켓은 사실상 다른 값(충돌 확률 무시 가능). 단일 run 내
+/// 유일성만 필요하므로 짧은 64bit로 충분.
+fn socket_discriminator(socket: &std::path::Path) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in socket.to_string_lossy().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// 화면에서 '현재 입력창 영역'만 잘라낸다 — 마지막 입력 앵커(입력 박스 상단 '╭' 또는 줄 시작 '> ' 프롬프트)
+/// 이후 끝까지. 제출된 텍스트는 이 영역 **위**(스크롤백)에 렌더되고, 미제출 입력은 이 영역 **안**에 잔류한다.
+/// 앵커가 없으면(구/미지 TUI) 전체 화면을 반환한다(보수적 — 놓친 wedge=저장 유실이 과검출보다 위험).
+fn input_region(screen: &str) -> &str {
+    let box_top = screen.rfind('╭');
+    let prompt = if screen.starts_with("> ") {
+        Some(0)
+    } else {
+        screen.rfind("\n> ").map(|i| i + 1)
+    };
+    match box_top.into_iter().chain(prompt).max() {
+        Some(i) => &screen[i..],
+        None => screen,
+    }
+}
+
+/// 전달확정 게이트 판정 — 제출되면 주입 텍스트가 위로 스크롤되고 하단 입력창엔 스피너/빈 프롬프트만 남는다.
+/// Return 미발화(known bug)면 주입 텍스트가 입력창에 잔류하므로 sentinel이 입력창에 남는다.
+/// ★[F1] 실터미널은 긴 지시문을 물리적으로 줄바꿈(래핑)하고 입력창 하단에 테두리·단축키·토큰카운터 UI가
+///   따라붙어 sentinel이 최하단에서 밀리거나 물리 행 경계에서 쪼개진다 — 그래도 검출하려 공백·개행을
+///   제거하고 매치한다(구 tail-4행 스캔은 놓쳐 Return 재전송 미발화·저장 유실).
+/// ★[R2·R3 수리] 단 '화면 어디든'이 아니라 **입력창 영역(input_region)** 안에서만 매치한다 — 제출된
+///   스크롤백 에코(nonce 포함)를 wedge로 오검출하면 ①승인 프롬프트 대기 노드에 잉여 Return을 쏘아 의도외
+///   확정 위험(R2), ②delivery_failed↔timeout 라벨 변별 소실(R3). 미제출 입력은 입력창 영역에·제출 에코는
+///   그 위(스크롤백)에 있으므로 영역 한정 매치가 둘을 가른다. 앵커 부재 TUI는 전체 매치로 폴백(F1 보존).
+fn delivery_wedged(screen: &str, sentinel: &str) -> bool {
+    let region = input_region(screen);
+    let flat: String = region.chars().filter(|c| !c.is_whitespace()).collect();
+    let needle: String = sentinel.chars().filter(|c| !c.is_whitespace()).collect();
+    !needle.is_empty() && flat.contains(&needle)
+}
+
+/// 저장 지시문 생성 — ★[R1] 마커 기입을 '정지' 지시보다 **앞**(단계 ①)에 둔다. 지시문을 순서대로
+/// 리터럴 실행하는 노드가 '정지'를 먼저 만나면 이후 마커 기입을 건너뛰어 '저장했으나 timeout' 오판정이
+/// 났다(직전 F1 수리가 마커를 끝으로 옮기며 역전됨). F1의 wedge 검출은 위치 무관 전체 매치라 마커가
+/// 지시문 끝일 필요가 없으므로, 마커를 ①로 되돌려도 F1은 유지된다.
+/// ★[F4 위생] 기존 `<!-- cys-checkpoint:` 마커 라인은 지우고 새 1줄만 남기게 지시한다 — append-only면
+/// 재시작마다 죽은 마커가 무한 증식한다. 검증 로직은 무변경(새 nonce 존재 확인이라 옛 마커 잔존과 무관).
+fn drain_verify_instruction(marker: &str) -> String {
+    format!(
+        "[DRAIN-VERIFY] 재시작 전 체크포인트 검증. 지금 즉시 순서대로: ① _round/SESSION_STATE.md에 현재 작업 상태·미해결 게이트·다음 액션을 최신화해 저장하고, 그 파일에 이미 있는 `<!-- cys-checkpoint:` 로 시작하는 옛 마커 라인은 모두 삭제한 뒤, 맨 끝에 정확히 이 한 줄만 추가하라(문자 그대로·수정 금지): {marker} ② ①의 저장·기입을 모두 마친 뒤에 작업을 멈추고 재시작·복원을 기다려라(승인 프롬프트 대기 중이면 이 메시지는 무시하라)."
+    )
+}
+
+/// phoenix 복원이 이 소켓의 이 역할에 대해 진행 중인가 — 진행 중이면 Some(사유), 아니면 None.
+/// 저널 = <소켓 부모 디렉토리(realpath)>/phoenix/journal-*.json
+/// (phoenix.py state_dir_for=realpath(dirname(socket))[:389] 정합 — ★[F4] canonicalize 적용, 실패 시 원경로).
+/// 판정: 신선한(mtime 최근) 저널에서 대상 역할 stage가 기록됐고 g2_ack 미완료 → 복원 중(해당 role skip).
+/// ★[F2 수리] fail-CLOSED: 신선한 저널이 존재하는데 판독/파싱 실패, 또는 기대 스키마(roles 객체·해당
+///   role의 stages 객체) 부재면 '복원 중'으로 취급한다 — pack과 바이너리 릴리스 라인이 달라 저널 스키마
+///   스큐가 실재 위험이고, 각성 파손(디렉티브 재주입 × "작업 중단" 주입 교차)은 비가역이라 안전 방향=주입
+///   보류. 단 저널이 대상 role을 언급하지 않으면 이 role의 복원이 아니므로 다른 저널을 계속 본다(무관
+///   role over-skip 금지). 저널 파일 자체가 없으면(디렉토리 부재·비-저널) None(복원 아님 — 무해).
+/// ★[F3] EPOCH_GATE divergence: phoenix stage_done(javis_phoenix.py:1283-1296)은 완료 마킹의 epoch가
+///   현재 세대와 일치할 때만 done으로 인정한다(재부팅 넘긴 stale done 무효화). 이 가드는 phoenix 런타임
+///   epoch(_ACTIVE_EPOCH)를 알 수 없어 epoch 대조 없이 done 표기만 본다. 방향 차이: ①started&&!g2_ack
+///   분기는 over-skip(안전) ②g2_ack done 분기의 stale-epoch under-skip 위험은 mtime 신선도 창(≤RECENCY)이
+///   흡수한다 — stale-epoch done은 이전 세대(재부팅 전) 저널이라 대개 창 밖(무시)이므로 실질 발산 없음.
+fn restore_guard_reason(socket: &std::path::Path, role: &str) -> Option<String> {
+    const RESTORE_RECENCY_SECS: u64 = 300;
+    let dir = socket.parent()?;
+    // [F4] phoenix state_dir_for와 정렬 — 심링크 소켓 디렉토리 대응(실패 시 원경로 폴백).
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let phoenix = dir.join("phoenix");
+    let entries = std::fs::read_dir(&phoenix).ok()?; // 디렉토리 부재 = 저널 없음 = 복원 아님(None)
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("journal-") && name.ends_with(".json")) {
+            continue;
+        }
+        let fresh = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() <= RESTORE_RECENCY_SECS)
+            .unwrap_or(false);
+        if !fresh {
+            continue; // stale 저널(오래된 실패 복원)은 영구 차단 방지 위해 무시
+        }
+        // [F2] 신선한 저널 — 여기서부터 판독/파싱/스키마 실패는 fail-CLOSED(복원 중 취급).
+        // ★[R4 INFO] 판독·파싱 불능인 신선 저널은 그것이 '이 role'의 복원인지조차 알 수 없다 — 그래도
+        //   보수적으로 skip한다(무관 role까지 over-skip 가능). 근거: over-skip의 대가는 verify 1회 보류(그
+        //   노드는 이번 재시작 창에서 저장 미검증으로 표기)뿐이나, under-skip은 복원 중 노드에 "작업 중단"을
+        //   주입해 각성을 비가역 파손시킨다 — 비대칭 위험이라 안전 방향(skip)을 택한다. 코드 변경 불요.
+        let Ok(txt) = std::fs::read_to_string(e.path()) else {
+            return Some(format!("신선한 저널 판독 실패({name}) — fail-closed(복원 중 취급)"));
+        };
+        let Ok(j) = serde_json::from_str::<Value>(&txt) else {
+            return Some(format!(
+                "신선한 저널 파손(JSON 파싱 실패, {name}) — fail-closed(복원 중 취급)"
+            ));
+        };
+        if !j["roles"].is_object() {
+            return Some(format!(
+                "신선한 저널 스키마 이상(roles 비객체, {name}) — fail-closed(복원 중 취급)"
+            ));
+        }
+        let role_entry = &j["roles"][role];
+        if role_entry.is_null() {
+            continue; // 이 저널은 대상 role 무관 — over-skip 금지, 다음 저널 확인
+        }
+        let stages = &role_entry["stages"];
+        if !stages.is_object() {
+            return Some(format!(
+                "신선한 저널 role '{role}' stages 스키마 이상({name}) — fail-closed(복원 중 취급)"
+            ));
+        }
+        let done = |s: &str| stages[s]["done"].as_bool() == Some(true);
+        let started = ["spawn", "ready", "resume", "reinject"]
+            .iter()
+            .any(|s| done(s));
+        if started && !done("g2_ack") {
+            return Some(format!("phoenix 복원 진행 중(stage<g2_ack, {name})"));
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VerifyOutcome {
+    Saved,
+    Timeout,
+    DeliveryFailed,
+    Unverifiable,
+    SkippedRestoring,
+}
+impl VerifyOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            VerifyOutcome::Saved => "saved",
+            VerifyOutcome::Timeout => "timeout",
+            VerifyOutcome::DeliveryFailed => "delivery_failed",
+            VerifyOutcome::Unverifiable => "unverifiable",
+            VerifyOutcome::SkippedRestoring => "skipped_restoring",
+        }
+    }
+}
+
+/// verify 대상 1노드 — 소켓별 org.status에서 추출(surface_id는 데몬별 네임스페이스라 socket과 쌍으로 보유).
+#[derive(Clone)]
+struct VerifyTarget {
+    socket: std::path::PathBuf,
+    dept: String,
+    display: String,
+    surface_id: u64,
+    surface_ref: String,
+    role: String,
+    live_cwd: Option<String>,
+    pending_undelivered: u64,
+}
+
+/// drain --verify 소켓 I/O 추상화 — 프로덕션은 request_on_timeout, 테스트는 노드 상태(saved/no-save/
+/// wedge/hung)를 모사하는 fake로 주입한다(producer≠evaluator 검증 용이).
+trait VerifyIo {
+    fn inject(
+        &self,
+        socket: &std::path::Path,
+        sid: u64,
+        text: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String>;
+    fn read_screen(
+        &self,
+        socket: &std::path::Path,
+        sid: u64,
+        lines: u64,
+        timeout: std::time::Duration,
+    ) -> Result<String, String>;
+    fn send_return(
+        &self,
+        socket: &std::path::Path,
+        sid: u64,
+        timeout: std::time::Duration,
+    ) -> Result<(), String>;
+}
+
+/// 소켓 지정 주입(inject_text의 socket+timeout판): bracketed paste → 0.8s → Return. 기본 소켓 하드바인딩인
+/// inject_text와 달리 부서 소켓 대상[A1-F1] · request_on_timeout으로 hung 방어.
+fn inject_text_on(
+    socket: &std::path::Path,
+    sid: u64,
+    text: &str,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let wrapped = format!("\x1b[200~{text}\x1b[201~");
+    request_on_timeout(
+        socket,
+        "surface.send_text",
+        json!({"surface_id": sid, "text": wrapped, "quiet": true, "authoritative": true}),
+        timeout,
+    )?;
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    request_on_timeout(
+        socket,
+        "surface.send_key",
+        json!({"surface_id": sid, "key": "Return", "authoritative": true}),
+        timeout,
+    )?;
+    Ok(())
+}
+
+struct RealVerifyIo;
+impl VerifyIo for RealVerifyIo {
+    fn inject(
+        &self,
+        socket: &std::path::Path,
+        sid: u64,
+        text: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        inject_text_on(socket, sid, text, timeout)
+    }
+    fn read_screen(
+        &self,
+        socket: &std::path::Path,
+        sid: u64,
+        lines: u64,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        request_on_timeout(
+            socket,
+            "surface.read_text",
+            json!({"surface_id": sid, "lines": lines}),
+            timeout,
+        )
+        .map(|r| r["text"].as_str().unwrap_or("").to_string())
+    }
+    fn send_return(
+        &self,
+        socket: &std::path::Path,
+        sid: u64,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        request_on_timeout(
+            socket,
+            "surface.send_key",
+            json!({"surface_id": sid, "key": "Return", "authoritative": true}),
+            timeout,
+        )
+        .map(|_| ())
+    }
+}
+
+/// 1노드 검증: 복원 가드 → canonical 경로 → 저장 지시 주입 → 전달확정 게이트 → nonce 파일 폴링.
+/// 반환=(결과, 상세). 소켓 hung은 timeout(파일 폴링은 로컬 FS라 소켓 무관)·미제출 wedge는 delivery_failed로 구분.
+fn verify_one_node(
+    io: &dyn VerifyIo,
+    t: &VerifyTarget,
+    nonce_prefix: &str,
+    timeout: std::time::Duration,
+    now: u64,
+) -> (VerifyOutcome, String) {
+    use std::time::{Duration, Instant};
+    // 1) 복원 중 가드 — 각성 파손 방지(디렉티브 재주입과 "작업 중단"의 교차 차단). 사유를 JSON에 전달.
+    if let Some(reason) = restore_guard_reason(&t.socket, &t.role) {
+        return (VerifyOutcome::SkippedRestoring, reason);
+    }
+    // 2) canonical 경로 — live_cwd 미제공(구버전 부서 데몬)이면 검증불가(무음 cwd 폴백 금지)[A1-F6]
+    let Some(cwd) = t.live_cwd.as_deref() else {
+        return (
+            VerifyOutcome::Unverifiable,
+            "live_cwd 미제공(구버전 데몬) — 검증불가(무음 폴백 금지)".into(),
+        );
+    };
+    let file = canonical_checkpoint_file(cwd);
+    // ★[F1 수리] 크로스소켓 nonce 충돌 방지: surface_id는 데몬별 네임스페이스라 서로 다른 소켓의 두 노드가
+    // 같은 sid + 같은 live_cwd(전 부서 cwd 수렴 실측 있음)면 nonce·파일이 동일해져, 주입 안 한 노드가 타
+    // 노드 마커를 자기 것으로 오인해 Saved 위양성(→재시작 체크포인트 유실)이 났다. results가 idx 키잉으로
+    // sid 충돌을 이미 회피했는데 nonce만 sid에 남아 불일치였다. 소켓 안정 구별자를 nonce에 추가해 정합화.
+    let nonce = format!(
+        "{nonce_prefix}-{:x}-{}",
+        socket_discriminator(&t.socket),
+        t.surface_id
+    );
+    let marker = checkpoint_marker(&nonce, now);
+    // 이미 이 nonce가 있으면 즉시 통과(프로세스 내 재호출 idempotent)
+    if file_has_checkpoint_nonce(&file, &nonce) {
+        return (
+            VerifyOutcome::Saved,
+            format!("nonce 마커 확인: {}", file.display()),
+        );
+    }
+    // 3) 저장 지시 주입 — nonce 마커 기입 + 작업 중단.
+    let instr = drain_verify_instruction(&marker);
+    let io_to = std::cmp::min(timeout, Duration::from_secs(8));
+    if io.inject(&t.socket, t.surface_id, &instr, io_to).is_err() {
+        // 소켓 hung(RPC 타임아웃) — delivery_failed(노드 wedge)와 구분해 timeout으로 분류
+        return (
+            VerifyOutcome::Timeout,
+            "소켓 hung — 저장 지시 RPC 타임아웃(전역 캡 내)".into(),
+        );
+    }
+    // 4) 전달확정 게이트 — 빈 프롬프트+스피너 확인, wedge(하단 입력창 잔류)면 Return 재전송
+    std::thread::sleep(Duration::from_millis(600));
+    // ★[F1] 24행 읽기 — 래핑된 지시문 전체 + 하단 입력창 UI 행을 포괄(구 6행은 래핑 시 sentinel 유실).
+    let mut wedged = io
+        .read_screen(&t.socket, t.surface_id, 24, io_to)
+        .map(|s| delivery_wedged(&s, &nonce))
+        .unwrap_or(false);
+    if wedged {
+        let _ = io.send_return(&t.socket, t.surface_id, io_to);
+        std::thread::sleep(Duration::from_millis(800));
+        wedged = io
+            .read_screen(&t.socket, t.surface_id, 24, io_to)
+            .map(|s| delivery_wedged(&s, &nonce))
+            .unwrap_or(wedged);
+    }
+    // 5) nonce 파일 폴링(로컬 FS — 소켓 hung과 무관하게 저장 검출)
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if file_has_checkpoint_nonce(&file, &nonce) {
+            return (
+                VerifyOutcome::Saved,
+                format!("nonce 마커 확인: {}", file.display()),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    if wedged {
+        (
+            VerifyOutcome::DeliveryFailed,
+            "입력 미제출(wedge) — Return 재전송에도 저장 미검출".into(),
+        )
+    } else {
+        (
+            VerifyOutcome::Timeout,
+            format!(
+                "{}s 내 nonce 마커 미검출: {}",
+                timeout.as_secs(),
+                file.display()
+            ),
+        )
+    }
+}
+
+/// 소켓별 병렬 fan-out — 총 소요 ≈ 1×timeout(직렬 누적 아님). 노드별 detached 스레드로 verify를 스폰하고
+/// 전역 하드캡(=timeout+마진) 내 결과를 수집한다. 미도착 노드는 timeout으로 분류(캡 초과=hung 방어).
+fn drain_verify_fanout(
+    io: std::sync::Arc<dyn VerifyIo + Send + Sync>,
+    targets: Vec<VerifyTarget>,
+    timeout: std::time::Duration,
+    now: u64,
+) -> Value {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    let global_cap = timeout + Duration::from_secs(5);
+    let nonce_prefix = format!("{now}-{}", std::process::id());
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, VerifyOutcome, String)>();
+    let total = targets.len();
+    // surface_id는 데몬별 네임스페이스라 소켓 간 충돌 가능 → 인덱스로 키잉(nonce도 [F1] 소켓 구별자로 정합).
+    let mut meta: HashMap<usize, VerifyTarget> = HashMap::new();
+    for (idx, t) in targets.iter().enumerate() {
+        meta.insert(idx, t.clone());
+    }
+    for (idx, t) in targets.into_iter().enumerate() {
+        let tx = tx.clone();
+        let io = io.clone();
+        let np = nonce_prefix.clone();
+        std::thread::spawn(move || {
+            let (o, d) = verify_one_node(io.as_ref(), &t, &np, timeout, now);
+            let _ = tx.send((idx, o, d));
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now() + global_cap;
+    let mut results: HashMap<usize, (VerifyOutcome, String)> = HashMap::new();
+    while results.len() < total {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok((idx, o, d)) => {
+                results.insert(idx, (o, d));
+            }
+            Err(_) => break,
+        }
+    }
+    // 결과 JSON(원래 순서 안정) — 미도착 노드는 전역 캡 초과 timeout.
+    let mut nodes: Vec<Value> = Vec::new();
+    let mut pending_loss: Vec<Value> = Vec::new();
+    let (mut c_saved, mut c_timeout, mut c_deliv, mut c_unver, mut c_skip) = (0, 0, 0, 0, 0);
+    let mut all_saved = true;
+    for idx in 0..total {
+        let t = &meta[&idx];
+        let (outcome, detail) = results.get(&idx).cloned().unwrap_or((
+            VerifyOutcome::Timeout,
+            "전역 하드캡 초과 — 결과 미도착(timeout)".into(),
+        ));
+        match outcome {
+            VerifyOutcome::Saved => c_saved += 1,
+            VerifyOutcome::Timeout => c_timeout += 1,
+            VerifyOutcome::DeliveryFailed => c_deliv += 1,
+            VerifyOutcome::Unverifiable => c_unver += 1,
+            VerifyOutcome::SkippedRestoring => c_skip += 1,
+        }
+        if outcome != VerifyOutcome::Saved {
+            all_saved = false;
+        }
+        if t.pending_undelivered > 0 {
+            pending_loss.push(json!({
+                "role": t.role, "surface": t.surface_ref, "dept": t.dept,
+                "pending_undelivered": t.pending_undelivered,
+            }));
+        }
+        nodes.push(json!({
+            "dept": t.dept,
+            "department": t.display,
+            "role": t.role,
+            "surface": t.surface_ref,
+            "socket": t.socket.to_string_lossy(),
+            "live_cwd": t.live_cwd,
+            "checkpoint_file": t.live_cwd.as_deref().map(|c| canonical_checkpoint_file(c).to_string_lossy().into_owned()),
+            "outcome": outcome.as_str(),
+            "detail": detail,
+            "pending_undelivered": t.pending_undelivered,
+        }));
+    }
+    json!({
+        "mode": "drain-verify",
+        "timeout_secs": timeout.as_secs(),
+        "total": total,
+        "nodes": nodes,
+        "summary": {
+            "saved": c_saved, "timeout": c_timeout, "delivery_failed": c_deliv,
+            "unverifiable": c_unver, "skipped_restoring": c_skip,
+        },
+        // ★재시작 창 큐 보존[A3-F3]: 인메모리 pending_queue는 데몬 재시작에 소실된다(handlers.rs). 디스크
+        // flush는 데몬 RPC가 필요해(handlers 무접촉 목표) 대신 유실 예정분을 정직하게 가시화한다(무음 유실 금지).
+        "pending_loss_warning": pending_loss,
+        "all_saved": all_saved,
+    })
+}
+
+/// depts.json + 본부 소켓을 순회해 verify 대상(살아있는 AI 역할 노드)을 수집한다(run_fleet 소스 동형).
+/// 도달불가(다운) 부서·본부는 스킵(정상 정보). live_cwd는 org.status의 노드별 cd 추적값을 그대로 쓴다.
+fn drain_verify_targets() -> Vec<VerifyTarget> {
+    let home = cys::home_dir().to_string_lossy().into_owned();
+    let mut sockets: Vec<(std::path::PathBuf, String, String)> =
+        vec![(socket_path(), "main".to_string(), "본부 · CEO".to_string())];
+    let reg = std::env::var("CYS_DEPTS_JSON")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&home).join(".cys/depts.json"));
+    if let Ok(s) = std::fs::read_to_string(&reg) {
+        if let Ok(v) = serde_json::from_str::<Value>(&s) {
+            if let Some(depts) = v["depts"].as_object() {
+                for (name, meta) in depts {
+                    let sock = meta["socket"]
+                        .as_str()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| cys::dept_socket_path(name));
+                    let disp = meta["display_name"].as_str().unwrap_or(name).to_string();
+                    sockets.push((sock, name.clone(), disp));
+                }
+            }
+        }
+    }
+    let mut targets = Vec::new();
+    for (sock, dept, disp) in sockets {
+        let r = match request_on_timeout(
+            &sock,
+            "org.status",
+            json!({}),
+            std::time::Duration::from_secs(4),
+        ) {
+            Ok(r) => r,
+            Err(_) => continue, // 다운·전이 중 소켓 스킵(무해)
+        };
+        for s in r["surfaces"].as_array().cloned().unwrap_or_default() {
+            if s["exited"].as_bool() == Some(true) {
+                continue;
+            }
+            let Some(role) = s["role"].as_str() else {
+                continue;
+            };
+            if s["agent"].is_null() {
+                continue; // AI 노드만(agent 메타 존재)
+            }
+            let Some(sid) = s["surface_id"].as_u64() else {
+                continue;
+            };
+            targets.push(VerifyTarget {
+                socket: sock.clone(),
+                dept: dept.clone(),
+                display: disp.clone(),
+                surface_id: sid,
+                surface_ref: s["surface_ref"].as_str().unwrap_or("").to_string(),
+                role: role.to_string(),
+                live_cwd: s["live_cwd"].as_str().map(String::from),
+                pending_undelivered: s["queue_depth"].as_u64().unwrap_or(0),
+            });
+        }
+    }
+    targets
+}
+
+/// `cys drain --verify` 진입점 — 결정론 JSON을 stdout에, exit code로 전원 저장 여부를 반환한다
+/// (전원 saved=0, 아니면 1). 0-노드는 우아한 no-op(exit 0)[A3-F5].
+fn run_drain_verify(timeout: u64) -> i32 {
+    // 백스톱 하드 워치독 — 메인 로직이 어떤 이유로든 멈춰도 프로세스가 영구 정지하지 않게(plain drain 12s 패턴).
+    // fan-out은 timeout+5s 안에 반환하므로 정상 경로에선 절대 발화하지 않는다.
+    let cap = timeout + 10;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(cap));
+        std::process::exit(3);
+    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let targets = drain_verify_targets();
+    let io: std::sync::Arc<dyn VerifyIo + Send + Sync> = std::sync::Arc::new(RealVerifyIo);
+    let report = drain_verify_fanout(io, targets, std::time::Duration::from_secs(timeout), now);
+    let all_saved = report["all_saved"].as_bool() == Some(true);
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    if all_saved {
+        0
+    } else {
+        1
+    }
 }
 
 /// Tasks Control Center(CLI) — depts.json을 읽어 본부+각 부서 소켓에 org.status를 순회 집계한다.
@@ -5449,16 +6341,43 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
     }
 }
 
+/// ★W2 복원 디렉티브 분기: 워커·리뷰어는 master 지시를 기다리지만, master는 지시할 상위가 없다 —
+/// RECOVERY 프로토콜로 스스로 상태를 복원하고 미해결 게이트부터 자율 재개한다(콜드부트
+/// auto-restore가 master를 포함하는 경로).
+/// ★SEAT: fresh 기동과 **좌석 내 재연결(in-seat)** 두 경로가 같은 문구를 쓰도록 함수로 둔다 —
+/// 인라인 중복이면 한쪽만 고쳐지는 드리프트가 난다(복원 계약은 경로와 무관하게 하나다).
+fn restore_directive(role: &str) -> &'static str {
+    if role == "master" {
+        "[RESTORE] 조직 복원 절차다(master). _round/RECOVERY.md → SESSION_STATE.md → 자기 TODO → memory → git 순으로 읽고, 노드 재기동·surface 재매핑·directive 각성 후 미해결 게이트부터 자율 재개하라."
+    } else {
+        "[RESTORE] 조직 복원 절차다. _round/SESSION_STATE.md와 자기 TODO를 읽고 상태를 복원하라. ★작업 재개는 하지 말고 master의 지시를 기다려라."
+    }
+}
+
 /// T2-6 조직 복원: 토폴로지 스냅샷 기준으로 죽은 역할 일괄 재기동 (작업 재개는 master 판단)
 fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i32 {
     let result = (|| -> Result<(usize, usize), String> {
         let topo = request("system.topology", json!({}))?;
-        let live: std::collections::HashSet<String> = topo["live"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        // ★SEAT(2026-07-17 실사고 수리): '역할이 등록됨'과 '그 좌석에 누가 앉아 있음'을 구분한다.
+        // 종전 live 집합은 role 등록만 보고 skip 해서, role=master 를 쥔 **빈 셸**(agent 없는 좌석)이
+        // 있으면 master 를 영영 부활시키지 못했다(phoenix·▶부서장 버튼·부트가 동시에 잠김).
+        // 이제 live = "좌석이 실제 점유된 역할"만. 빈 좌석 역할은 아래 seats 맵으로 넘겨,
+        // **그 좌석에 직접 연결**(in-seat)하거나 승계 fresh 로 되살린다.
+        let live_entries = topo["live"].as_array().cloned().unwrap_or_default();
+        let live: std::collections::HashSet<String> = live_entries
             .iter()
+            .filter(|e| e["seat"].as_str() != Some("empty"))
             .filter_map(|e| e["role"].as_str().map(String::from))
+            .collect();
+        // 빈 좌석 인덱스: role → (surface_id, env_injected). 부활 대상이면서 좌석이 이미 존재하는 경우.
+        let empty_seats: std::collections::HashMap<String, (u64, bool)> = live_entries
+            .iter()
+            .filter(|e| e["seat"].as_str() == Some("empty"))
+            .filter_map(|e| {
+                let role = e["role"].as_str()?.to_string();
+                let sid = e["surface_id"].as_u64()?;
+                Some((role, (sid, e["env_injected"].as_bool().unwrap_or(false))))
+            })
             .collect();
         let saved = topo["saved"].as_array().cloned().unwrap_or_default();
         // ★W2a 심층방어: 의도적으로 닫힌(surface.close 경유) 역할의 묘비 — raw restore도 절대 재스폰하지
@@ -5494,17 +6413,73 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                 continue;
             }
             let Some(agent) = entry["agent"].as_str() else {
-                println!("· {role}: agent 미상 — 건너뜀 (claim-role로 등록된 pane)");
+                // 스냅샷에 agent 가 없으면 무엇을 띄울지 결정론으로 알 수 없다(claim-role 로만 등록된
+                // pane). 좌석 유무와 무관하게 여기서 멈추는 것이 옳다 — 임의 기본값(claude) 추정은
+                // 다른 에이전트를 쓰는 좌석에 엉뚱한 CLI 를 띄운다.
+                let hint = if empty_seats.contains_key(role) {
+                    " (좌석은 비어 있음 — 그 pane 에서 직접 agent 를 실행하면 등록된다)"
+                } else {
+                    ""
+                };
+                println!("· {role}: agent 미상 — 건너뜀 (claim-role로 등록된 pane){hint}");
                 continue;
             };
             let target_cwd = cwd
                 .clone()
                 .or_else(|| entry["cwd"].as_str().map(String::from));
-            println!("· {role}: {agent} 재기동…");
             // (4b) saved entry의 session_id를 꺼내 정확한 세션 재개(없으면 fallback)
             let sess = entry["session_id"].as_str().map(String::from);
             // (W1) topology에 기록된 원 계정 config_dir을 넘긴다(구 topology=None → 기존 템플릿 동작).
             let cfg = entry["claude_config_dir"].as_str().map(String::from);
+            // ★SEAT in-seat 연결(오너 의도: "최초로 만들어지는 surface에 클로드가 연결되고 마스터로
+            // 부활"): 그 역할의 좌석이 이미 있고 비어 있으면 **새 surface 를 만들지 않고 그 좌석에
+            // 직접** 에이전트를 기동한다. 좌석이 늘지 않고(796형 잔존 pane 0) 사용자가 보는 그 pane 이
+            // 그대로 부서장이 된다.
+            //
+            // ★계정격리 가드(E8): 빈 셸은 `cys new-surface` 산물이라 **pane env 가 비어 있다**.
+            // unix 는 boot_agent_on_surface 가 `KEY="val" cmd` 인라인으로 env 를 실어 안전하지만,
+            // Windows 는 순수 cmd 를 보내므로 CLAUDE_CONFIG_DIR 이 실리지 않아 **계정 격리가 깨진다**
+            // (node-recover 가 같은 이유로 fail-closed 하는 지점). 안전하지 않으면 in-seat 를 포기하고
+            // fresh 로 폴백한다 — 기능은 회복되고 격리는 보존된다(좌석이 하나 늘 뿐이며 승계가 정리한다).
+            let in_seat = empty_seats.get(role).and_then(|&(sid, env_injected)| {
+                let safe = cfg!(unix) || env_injected;
+                safe.then_some(sid)
+            });
+            if let Some(sid) = in_seat {
+                println!("· {role}: {agent} 좌석 내 재연결(surface:{sid})…");
+                let spec = match load_agent_spec(agent) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("· {role}: agent spec 해석 실패({e}) — 건너뜀");
+                        fail += 1;
+                        continue;
+                    }
+                };
+                let seat_cwd = target_cwd.clone();
+                match boot_agent_on_surface(
+                    sid,
+                    role,
+                    agent,
+                    &spec,
+                    !no_resume,
+                    sess.as_deref(),
+                    false,
+                    seat_cwd.as_deref(),
+                    cfg.as_deref(),
+                ) {
+                    Ok(()) => {
+                        ok += 1;
+                        let directive = restore_directive(role);
+                        let _ = inject_text(sid, directive);
+                        continue;
+                    }
+                    Err(e) => {
+                        // in-seat 실패는 치명이 아니다 — fresh 폴백이 가용성을 지킨다(정직히 알린다).
+                        println!("· {role}: 좌석 내 재연결 실패({e}) — fresh 기동으로 폴백");
+                    }
+                }
+            }
+            println!("· {role}: {agent} 재기동…");
             if run_launch_agent_opts(role, agent, target_cwd, !no_resume, sess, true, cfg) == 0 {
                 ok += 1;
                 if let Ok(r) = request("system.resolve_role", json!({"role": role})) {
@@ -5521,15 +6496,7 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                                 json!({"surface_id": sid, "pack_version": pv, "directive_hash": dh}),
                             );
                         }
-                        // ★W2 복원 디렉티브 분기: 워커·리뷰어는 master 지시를 기다리지만, master는
-                        // 지시할 상위가 없다 — RECOVERY 프로토콜로 스스로 상태를 복원하고 미해결
-                        // 게이트부터 자율 재개한다(콜드부트 auto-restore가 master를 포함하는 경로).
-                        let directive = if role == "master" {
-                            "[RESTORE] 조직 복원 절차다(master). _round/RECOVERY.md → SESSION_STATE.md → 자기 TODO → memory → git 순으로 읽고, 노드 재기동·surface 재매핑·directive 각성 후 미해결 게이트부터 자율 재개하라."
-                        } else {
-                            "[RESTORE] 조직 복원 절차다. _round/SESSION_STATE.md와 자기 TODO를 읽고 상태를 복원하라. ★작업 재개는 하지 말고 master의 지시를 기다려라."
-                        };
-                        let _ = inject_text(sid, directive);
+                        let _ = inject_text(sid, restore_directive(role));
                     }
                 }
             } else {
@@ -6182,9 +7149,14 @@ fn pack_update_from_dir(
         let res = with_apply_lock(lock_path, move || {
             let items: Vec<(&str, &str)> =
                 tree.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
-            cys::pack::apply_pack_transactional(&items, &pv, &new_state, || {
-                cys::packsig::record_accepted(&acc_path, &manifest_acc)
-            })
+            // W0-d: pack-update는 라이브 팩 쓰기 프로덕션 진입점 — 인가 부여.
+            cys::pack::apply_pack_transactional(
+                &items,
+                &pv,
+                &new_state,
+                Some(cys::pack::PackWriteAuth::production()),
+                || cys::packsig::record_accepted(&acc_path, &manifest_acc),
+            )
         })?;
         let (w, k, post_ok) = res?;
         written = w;
@@ -6301,7 +7273,8 @@ fn run_pack_downgrade_to_free(yes: bool, override_valid_license: bool) -> i32 {
         eprintln!("error: state 전환 실패 — {e}");
         return 1;
     }
-    match cys::pack::install(false) {
+    // W0-d: pack-downgrade는 라이브 팩 재설치 프로덕션 진입점 — 인가 부여.
+    match cys::pack::install(false, Some(cys::pack::PackWriteAuth::production())) {
         Ok((written, kept)) => {
             println!("[downgrade] free 전환 완료 — 내장 팩 재설치: {written} written, {kept} preserved.");
             0
@@ -6668,7 +7641,44 @@ fn run_pack_plan(force: bool) -> i32 {
         println!("※ 기존 병합 대기 {}건 — `cys pack-merge` 로 검토", pending.len());
     }
     println!("※ 사용자 전용 오버레이(~/.cys/local — 디렉티브 append·스킬 shadowing·훅 후행)는 업데이트가 절대 건드리지 않음");
+    report_overlay_skill_drift();
     0
+}
+
+/// ★W-D2(커스텀 생존 설계 2026-07-17): 오버레이 shadowing 스킬의 vendor 전진 감지(읽기 전용 —
+/// local 에는 절대 쓰지 않음·⑥층 불가침 유지). 오버레이는 업데이터가 존재를 모르는 영역이라
+/// "불가침의 대가 = 드리프트 무감지"였다 — --to-local 승격 시 기록한 `.vendor-base`(승격 당시
+/// vendor SKILL.md 해시)와 현 임베드 해시를 대조해, 사용자가 가리고 있는 vendor 스킬이 그 뒤
+/// 전진했으면 알린다. 기준 미기록(구 승격본·수동 생성)은 판정 불가로 정직하게 표시.
+fn report_overlay_skill_drift() {
+    let local_skills = cys::pack::local_dir().join("skills");
+    let Ok(entries) = std::fs::read_dir(&local_skills) else { return };
+    let mut lines: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !entry.path().join("SKILL.md").is_file() {
+            continue;
+        }
+        let rel = format!("skills/{name}/SKILL.md");
+        let Some(embed) = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c) else {
+            continue; // vendor 대응물 없는 순수 자작 스킬 — 드리프트 개념 없음
+        };
+        let embed_hash = cys::pack::content_hash_pub(embed);
+        match std::fs::read_to_string(entry.path().join(".vendor-base")) {
+            Ok(base) if base.trim() == embed_hash => {} // vendor 미전진 — 조용히 통과
+            Ok(_) => lines.push(format!(
+                "  {name}: vendor 전진 있음 — 내 오버레이본이 낡은 vendor 를 기준으로 함. \
+                 대조: `cys skill show {name}`(오버레이) vs 팩본 {rel}"
+            )),
+            Err(_) => lines.push(format!("  {name}: 승격 기준 미기록 — vendor 전진 여부 판정 불가(수동 대조 권장)")),
+        }
+    }
+    if !lines.is_empty() {
+        println!("\n⚠ 오버레이 shadowing 스킬의 vendor 드리프트 ({}건):", lines.len());
+        for l in lines {
+            println!("{l}");
+        }
+    }
 }
 
 /// ③ 커스터마이즈 병합: 병합 대기 원장 목록·해소. 해소 경로 4종 —
@@ -6682,6 +7692,7 @@ fn run_pack_merge(
     keep_mine: bool,
     ai: bool,
     to_local: bool,
+    propose: bool,
     yes: bool,
 ) -> i32 {
     let dir = cys::pack::pack_dir();
@@ -6699,10 +7710,10 @@ fn run_pack_merge(
             let ver = e.get("version").and_then(|v| v.as_str()).unwrap_or("?");
             match kind {
                 "new-pending" => println!(
-                    "  ⏸ {rel} — 내 수정본 유지 중, vendor {ver} 신버전이 {side} 에 대기\n     → cys pack-merge --file {rel} [--take-new|--keep-mine|--ai]"
+                    "  ⏸ {rel} — 내 수정본 유지 중, vendor {ver} 신버전이 {side} 에 대기\n     → cys pack-merge --file {rel} [--take-new|--keep-mine|--ai|--propose]"
                 ),
                 "healed" => println!(
-                    "  🛠 {rel} — vendor {ver} 로 치유됨, 내 수정본은 {side} 에 보존\n     → cys pack-merge --file {rel} [--to-local|--keep-mine(보존본 정리)]"
+                    "  🛠 {rel} — vendor {ver} 로 치유됨, 내 수정본은 {side} 에 보존\n     → cys pack-merge --file {rel} [--to-local|--propose|--keep-mine(보존본 정리)]"
                 ),
                 _ => println!("  ? {rel} ({kind})"),
             }
@@ -6720,9 +7731,19 @@ fn run_pack_merge(
         .iter()
         .find(|(r, _)| *r == rel.as_str())
         .map(|(_, c)| *c);
+    // ★W-F2: --propose 는 해소가 아니라 환류 — patch 파일 생성만 하고 원장은 건드리지 않는다.
+    if propose {
+        return run_pack_propose(&dir, &rel, kind, embed_now);
+    }
+    // ★W-D4: 헌법 파일(디렉티브·soul·CLAUDE)은 --yes 여도 대화형 확인 필수 — 자동 병합·자동
+    // 교체 금지(자율주행 denylist 정합). 비대화형(stdin EOF)에서는 빈 입력 → 거절되므로 안전측.
+    let is_const = cys::pack::is_constitution_file(&rel);
     let confirm = |prompt: &str| -> bool {
-        if yes {
+        if yes && !is_const {
             return true;
+        }
+        if yes && is_const {
+            println!("(헌법 파일 — --yes 무시, 확인 필수)");
         }
         print!("{prompt} [y/N] ");
         use std::io::Write;
@@ -6798,6 +7819,19 @@ fn run_pack_merge(
                     0
                 }
                 Some(m) => {
+                    // ★W-D3: 헌법 파일 병합은 안전핵 소실 결정론 검증을 통과해야 적용 가능
+                    // (fail-closed — AI 병합의 미묘한 왜곡·통째 소실로부터 안전핵을 지킨다).
+                    if is_const {
+                        if let Err(lost) = cys::overrides::verify_constitution_merge(&ours, &theirs, &m) {
+                            eprintln!(
+                                "⛔ 병합 거부(헌법 안전핵 소실 검출): {} — 병합본에서 안전핵 조항이 사라짐.\n\
+                                 \x20 수동 병합 후 --keep-mine 으로 해소하거나 --take-new(vendor 본)를 쓰세요.",
+                                lost.join(", ")
+                            );
+                            return 1;
+                        }
+                        println!("✔ 헌법 안전핵 검증 통과(소실 0)");
+                    }
                     println!("── 병합 제안 diff (내 수정본 → 병합본) ──");
                     print_unified_diff(&ours, &m);
                     if confirm(&format!("'{rel}' 에 병합본 적용?")) {
@@ -6847,6 +7881,15 @@ fn run_pack_merge(
                         if rel.starts_with("skills/") {
                             if let Some(skill_dir) = dest.parent() {
                                 skillscan_warn(skill_dir);
+                                // ★W-D2: 승격 당시 vendor 해시를 기록 — pack-plan 이 이후 vendor
+                                // 전진(shadowing 드리프트)을 결정론 감지하는 기준점. 사용자의 명시적
+                                // 승격 명령에 딸린 메타 기록이라 "업데이터의 local 불가침"과 무관.
+                                if let Some(embed) = embed_now {
+                                    let _ = cys::pack::write_atomic(
+                                        &skill_dir.join(".vendor-base"),
+                                        cys::pack::content_hash_pub(embed).as_bytes(),
+                                    );
+                                }
                             }
                         }
                         resolve(&mut pending, ".user");
@@ -6885,6 +7928,357 @@ fn run_pack_merge(
             1
         }
     }
+}
+
+/// ★W-F2(개선 환류 채널): 내 수정본과 vendor 본의 diff 를 제안 patch 파일로 생성.
+/// 배포 사용자의 system 커스텀에는 upstream 이 없다 — 가치 있는 개조가 제품으로 돌아올 유일한
+/// 길은 제안이다. **자동 전송 없음**(외부 발행은 항상 사용자 수동) — 파일 생성+안내까지만.
+/// 비밀 유출 가드: 홈 경로·키 패턴을 스캔해 검출 시 경고를 함께 출력(제출 전 사용자 확인 의무).
+fn run_pack_propose(dir: &std::path::Path, rel: &str, kind: &str, embed_now: Option<&str>) -> i32 {
+    // mine = 사용자 쪽 내용(healed → .user 보존본 / new-pending → 현재 디스크본).
+    let (mine_path, vendor): (std::path::PathBuf, String) = match kind {
+        "healed" => (
+            dir.join(format!("{rel}.user")),
+            match embed_now {
+                Some(c) => c.to_string(),
+                None => {
+                    eprintln!("'{rel}' 은 현 임베드에 없음(폐기된 파일) — 제안 대상 아님");
+                    return 1;
+                }
+            },
+        ),
+        "new-pending" => (
+            dir.join(rel),
+            match std::fs::read_to_string(dir.join(format!("{rel}.new"))) {
+                Ok(s) => s,
+                Err(_) => embed_now.map(str::to_string).unwrap_or_default(),
+            },
+        ),
+        other => {
+            eprintln!("알 수 없는 원장 kind '{other}' — 제안 생성 불가");
+            return 1;
+        }
+    };
+    let mine = match std::fs::read_to_string(&mine_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{} 읽기 실패: {e}", mine_path.display());
+            return 1;
+        }
+    };
+    // 비밀 스캔(안내용 WARN — 차단 아님: 제출은 어차피 사용자 수동이라 최종 책임 지점이 명확).
+    let mut secret_hits: Vec<String> = Vec::new();
+    for (i, line) in mine.lines().enumerate() {
+        let l = line.to_lowercase();
+        if l.contains("/users/") || l.contains("c:\\users\\") || l.contains("private key")
+            || l.contains("api_key") || l.contains("apikey") || l.contains("password")
+            || l.contains("secret")
+        {
+            secret_hits.push(format!("  {}행: {}", i + 1, line.trim()));
+        }
+    }
+    let out_dir = cys::pack::local_dir().join("proposals");
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("proposals 디렉터리 생성 실패: {e}");
+        return 1;
+    }
+    let ver = env!("CARGO_PKG_VERSION");
+    let fname = format!("{}-v{ver}.patch", rel.replace('/', "_"));
+    let out = out_dir.join(&fname);
+    // diff -u(맥·리눅스·git-bash 공통) 시도 — 부재 시 전문(全文) 제안으로 폴백(내용 손실 0).
+    let body = unified_diff_via_cmd(&vendor, &mine, rel).unwrap_or_else(|| {
+        format!(
+            "# unified diff 도구 부재 — 전문 제안(위=vendor {ver} 기준, 아래=내 수정 전문)\n\
+             # ── 내 수정 전문 ──\n{mine}"
+        )
+    });
+    let header = format!(
+        "# cys 개선 제안 patch\n# 대상: {rel} (vendor {ver} 기준)\n# 생성: cys pack-merge --file {rel} --propose\n\n"
+    );
+    if let Err(e) = cys::pack::write_atomic(&out, format!("{header}{body}").as_bytes()) {
+        eprintln!("patch 쓰기 실패: {e}");
+        return 1;
+    }
+    println!("✅ 제안 patch 생성: {}", out.display());
+    if !secret_hits.is_empty() {
+        println!(
+            "⚠ 비밀/개인정보 의심 {}건 — 제출 전 반드시 검토·마스킹하세요:\n{}",
+            secret_hits.len(),
+            secret_hits.join("\n")
+        );
+    }
+    println!("제출: 위 파일을 지원 채널(홈페이지 문의/저장소 이슈)에 첨부 — 자동 전송은 하지 않습니다.");
+    0
+}
+
+/// diff -u 외부 명령으로 unified diff 생성(결정론) — 도구 부재·실행 실패면 None(호출측 폴백).
+fn unified_diff_via_cmd(vendor: &str, mine: &str, rel: &str) -> Option<String> {
+    let tmp = std::env::temp_dir().join(format!("cys-propose-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).ok()?;
+    let a = tmp.join("vendor");
+    let b = tmp.join("mine");
+    std::fs::write(&a, vendor).ok()?;
+    std::fs::write(&b, mine).ok()?;
+    let out = std::process::Command::new("diff")
+        .arg("-u")
+        .arg("--label").arg(format!("vendor/{rel}"))
+        .arg("--label").arg(format!("mine/{rel}"))
+        .arg(&a)
+        .arg(&b)
+        .output();
+    let _ = std::fs::remove_dir_all(&tmp);
+    match out {
+        // diff 종료코드: 0=동일, 1=차이(정상), 2+=오류.
+        Ok(o) if o.status.code() == Some(0) || o.status.code() == Some(1) => {
+            Some(String::from_utf8_lossy(&o.stdout).into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// ★W-E1(신뢰의 결정론 증명): 직전 설치 보존본(<pack>.prev — atomic_swap 이 1세대 보존)에서
+/// **파일 단위** 복원. 전량 스왑 롤백은 업데이트 후 쌓인 런타임 상태(memory/·SESSION_STATE)까지
+/// 과거로 되돌리는 신규 소실 사고를 만들므로 v1 은 파일 단위만 지원한다(전량은 오너 결정 보류).
+/// seed-once 경로는 복원 대상에서 제외(상태 불가침 대칭). system 파일 복원은 다음 부트 스윕이
+/// 재치유함을 정직하게 고지 — 영속 경로(--to-local/--propose)로 안내한다.
+fn run_pack_rollback(file: Option<String>, yes: bool) -> i32 {
+    let dir = cys::pack::pack_dir();
+    let prev = cys::pack::pack_prev_dir(&dir);
+    if !prev.is_dir() {
+        eprintln!("보존본 없음({}) — .prev 는 설치·업데이트가 1회 이상 실행된 뒤 생깁니다.", prev.display());
+        return 1;
+    }
+    let prev_ver = std::fs::read_to_string(prev.join(".pack-version")).unwrap_or_else(|_| "?".into());
+    let cur_ver = std::fs::read_to_string(dir.join(".pack-version")).unwrap_or_else(|_| "?".into());
+    let Some(rel) = file else {
+        // 목록 모드: .prev 와 현재 팩에서 내용이 다른 파일(복원 후보)을 표시. 읽기 전용.
+        println!(
+            "보존본: {} (팩 {} → 현재 {})\n차이 파일(복원 후보):",
+            prev.display(), prev_ver.trim(), cur_ver.trim()
+        );
+        let mut count = 0usize;
+        let mut stack = vec![prev.clone()];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else { continue };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    // 내부 관리 디렉터리(.pristine)는 복원 대상 아님.
+                    if p.file_name().and_then(|n| n.to_str()) == Some(".pristine") {
+                        continue;
+                    }
+                    stack.push(p);
+                    continue;
+                }
+                let Ok(rel_path) = p.strip_prefix(&prev) else { continue };
+                let rel_s = rel_path.to_string_lossy().replace('\\', "/");
+                // 관리 파일·병치 파일은 후보에서 제외(사용자 멘탈모델 = 팩 본 파일).
+                if rel_s.starts_with('.') || rel_s.ends_with(".user") || rel_s.ends_with(".new") {
+                    continue;
+                }
+                let prev_bytes = std::fs::read(&p).unwrap_or_default();
+                let cur_bytes = std::fs::read(dir.join(rel_path)).unwrap_or_default();
+                if prev_bytes != cur_bytes {
+                    let own = cys::pack::ownership_name(&rel_s);
+                    println!("  [{own}] {rel_s}");
+                    count += 1;
+                    if count >= 200 {
+                        println!("  … (200건 초과 — 생략)");
+                        return 0;
+                    }
+                }
+            }
+        }
+        if count == 0 {
+            println!("  (없음 — 보존본과 현재 팩이 동일)");
+        } else {
+            println!("복원: cys pack-rollback --file <경로>");
+        }
+        return 0;
+    };
+    if rel.contains("..") || rel.starts_with('/') {
+        eprintln!("잘못된 경로: {rel}");
+        return 1;
+    }
+    let own = cys::pack::ownership_name(&rel);
+    if own == "seed-once" {
+        eprintln!(
+            "⛔ '{rel}' 은 런타임 상태(seed-once) — 롤백이 업데이트 후 쌓인 기억·상태를 지우는 \
+             역방향 소실을 만들므로 파일 단위 복원 대상에서 제외합니다."
+        );
+        return 1;
+    }
+    let src = prev.join(&rel);
+    let content = match std::fs::read(&src) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("보존본에 '{rel}' 없음({e}) — cys pack-rollback 으로 후보 목록 확인");
+            return 1;
+        }
+    };
+    let confirm = |prompt: &str| -> bool {
+        if yes {
+            return true;
+        }
+        print!("{prompt} [y/N] ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        matches!(line.trim(), "y" | "Y" | "yes")
+    };
+    if !confirm(&format!("'{rel}' 을 보존본(팩 {})으로 복원?", prev_ver.trim())) {
+        println!("취소됨");
+        return 0;
+    }
+    let dest = dir.join(&rel);
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = cys::pack::write_atomic(&dest, &content) {
+        eprintln!("복원 쓰기 실패: {e}");
+        return 1;
+    }
+    match own {
+        "user" => println!("✅ {rel} 복원(user 소유 — 업데이트가 덮지 않으므로 이대로 유지됩니다)"),
+        _ => println!(
+            "✅ {rel} 복원(system 소유 — 다음 부트 설치 스윕이 vendor 본으로 재치유하며, 그때 \
+             이 복원본은 {rel}.user 로 보존됩니다. 영속화: cys pack-merge --file {rel} --to-local(스킬) \
+             또는 --propose(개선 제안)"
+        ),
+    }
+    0
+}
+
+/// ★W-F3(표본 수집 도구): 이 기계의 커스터마이즈 실태를 로컬 리포트로 산출 — 병합 원장·보존본·
+/// 오버레이·자작 파일 통계. 배포 사용자가 "무엇을 만들다 잃는가"의 실분포 표본을 자발 제출할 수
+/// 있게 한다(자동 전송 없음 — 파일 생성+출력까지만. 개인 경로 등은 파일명 수준만 담는다).
+fn run_doctor_custom_report() -> i32 {
+    let dir = cys::pack::pack_dir();
+    let local = cys::pack::local_dir();
+    let mut md = String::new();
+    md.push_str(&format!(
+        "# cys 커스터마이즈 실태 리포트\n\n- 바이너리: {}\n- 팩: {}\n\n",
+        env!("CARGO_PKG_VERSION"),
+        std::fs::read_to_string(dir.join(".pack-version")).unwrap_or_else(|_| "?".into()).trim()
+    ));
+    // ① 병합 원장(무엇이 치유/병치됐나 — 소실 체감의 1차 표본).
+    let pending = cys::pack::load_merge_pending(&dir);
+    md.push_str(&format!("## 병합 대기 원장 ({}건)\n", pending.len()));
+    for (rel, e) in pending.iter() {
+        let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+        let ver = e.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+        md.push_str(&format!("- [{kind}] {rel} (vendor {ver})\n"));
+    }
+    // ② 보존본(.user)·병치본(.new) 잔존 — 원장 밖 잔존물 포함(파일명만).
+    let mut users: Vec<String> = Vec::new();
+    let mut news: Vec<String> = Vec::new();
+    let mut stack = vec![dir.clone()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if p.file_name().and_then(|n| n.to_str()) == Some(".pristine") {
+                    continue;
+                }
+                stack.push(p);
+                continue;
+            }
+            let rel = p.strip_prefix(&dir).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            if rel.ends_with(".user") {
+                users.push(rel);
+            } else if rel.ends_with(".new") {
+                news.push(rel);
+            }
+        }
+    }
+    users.sort();
+    news.sort();
+    md.push_str(&format!("\n## 보존본 .user ({}건)\n", users.len()));
+    for r in &users {
+        md.push_str(&format!("- {r}\n"));
+    }
+    md.push_str(&format!("\n## 병치본 .new ({}건)\n", news.len()));
+    for r in &news {
+        md.push_str(&format!("- {r}\n"));
+    }
+    // ③ 오버레이(~/.cys/local) 실사용 — 카테고리별 파일 수만(내용 비수집).
+    md.push_str("\n## 오버레이(~/.cys/local) 사용\n");
+    for cat in ["skills", "directives", "hooks", "bin", "notes", "proposals"] {
+        let n = walk_count(&local.join(cat));
+        if n > 0 {
+            md.push_str(&format!("- {cat}: {n}개 파일\n"));
+        }
+    }
+    // ④ 팩 안 비임베드 자작 파일(생존 보증 대상) — 임베드·관리 파일 제외.
+    let embedded: std::collections::HashSet<&str> =
+        cys::pack::PACK_ALL.iter().map(|(r, _)| *r).collect();
+    let mut customs: Vec<String> = Vec::new();
+    let mut stack2 = vec![dir.clone()];
+    while let Some(d) = stack2.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if p.file_name().and_then(|n| n.to_str()) == Some(".pristine") {
+                    continue;
+                }
+                stack2.push(p);
+                continue;
+            }
+            let rel = p.strip_prefix(&dir).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            if rel.starts_with('.') || rel.ends_with(".user") || rel.ends_with(".new")
+                || rel.starts_with("memory/") || rel.starts_with("round/")
+                || embedded.contains(rel.as_str())
+            {
+                continue;
+            }
+            customs.push(rel);
+        }
+    }
+    customs.sort();
+    md.push_str(&format!("\n## 팩 안 비임베드 자작 파일 ({}건 — 업데이트 불가침 보증 대상)\n", customs.len()));
+    for r in customs.iter().take(100) {
+        md.push_str(&format!("- {r}\n"));
+    }
+    if customs.len() > 100 {
+        md.push_str(&format!("- … 외 {}건\n", customs.len() - 100));
+    }
+    let out_dir = local.join("reports");
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("reports 디렉터리 생성 실패: {e}");
+        return 1;
+    }
+    let out = out_dir.join(format!(
+        "custom-report-{}.md",
+        chrono::Local::now().format("%Y%m%dT%H%M%S")
+    ));
+    if let Err(e) = cys::pack::write_atomic(&out, md.as_bytes()) {
+        eprintln!("리포트 쓰기 실패: {e}");
+        return 1;
+    }
+    print!("{md}");
+    println!("\n✅ 저장: {} — 개선에 도움이 됩니다: 지원 채널에 자발 제출(자동 전송 없음)", out.display());
+    0
+}
+
+/// 디렉터리 트리의 파일 수(재귀·읽기 전용) — custom-report 보조.
+fn walk_count(root: &std::path::Path) -> usize {
+    let mut n = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// diff3 -m 3-way 병합(결정론) — base 부재·diff3 부재·충돌이면 None(호출측이 대안 안내).
@@ -7363,6 +8757,61 @@ mod tests {
     fn sha256_of(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// ★W-B 보완 핀(성찰 2 산물): agents.json 을 user 승격하면 사용자 수정본이 동결돼 vendor
+    /// **신규 어댑터**가 영영 안 보이는 게 대가다(schedule.json 의 ensure_builtin_jobs 등가물이
+    /// agents.json 엔 없음). load_agent_spec 이 ①디스크 정의 우선(수정 보존) ②디스크에 없는
+    /// 키만 임베드 폴백(신기능 즉시 사용) ③둘 다 없으면 거부 — 합집합을 박제한다.
+    #[test]
+    fn load_agent_spec_disk_wins_and_embed_fills_missing() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-agentspec-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&td);
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
+
+        // 임베드에 실재하는 어댑터 키 2개를 사료로 삼는다(하드코딩 금지 — 팩 진실에서 취득).
+        let embed: serde_json::Value = cys::pack::PACK_ALL
+            .iter()
+            .find(|(r, _)| *r == "agents.json")
+            .map(|(_, c)| serde_json::from_str(c).expect("임베드 agents.json 파싱"))
+            .expect("임베드에 agents.json 존재");
+        let keys: Vec<String> = embed
+            .as_object()
+            .expect("객체")
+            .keys()
+            .filter(|k| !k.starts_with('_'))
+            .cloned()
+            .collect();
+        assert!(keys.len() >= 2, "어댑터 2개 이상 전제: {keys:?}");
+        let (mine_key, vendor_only_key) = (&keys[0], &keys[1]);
+
+        // 사용자본: 첫 어댑터만 보유 + 수정 흔적. 둘째 어댑터는 없음(구버전 파일 재현).
+        let mut mine = serde_json::Map::new();
+        let mut spec = embed[mine_key].clone();
+        spec["notes"] = serde_json::Value::String("MY-EDIT".into());
+        mine.insert(mine_key.clone(), spec);
+        std::fs::write(
+            td.join("agents.json"),
+            serde_json::to_string(&serde_json::Value::Object(mine)).unwrap(),
+        )
+        .unwrap();
+
+        // ① 디스크 정의 우선 — 사용자 수정이 임베드에 덮이지 않는다.
+        let got = load_agent_spec(mine_key).expect("디스크 어댑터 로드");
+        assert_eq!(got["notes"].as_str(), Some("MY-EDIT"), "디스크본이 이겨야(수정 보존)");
+        // ② 디스크에 없는 vendor 신규 어댑터 → 임베드 폴백(동결 해소).
+        let filled = load_agent_spec(vendor_only_key).expect("임베드 폴백으로 로드돼야");
+        assert_eq!(filled, embed[vendor_only_key], "폴백은 임베드 정의 그대로");
+        // ③ 양쪽 모두 없음 → 거부(무음 통과 금지).
+        assert!(load_agent_spec("nosuch-agent-xyz").is_err(), "미지 어댑터는 거부");
+
+        let _ = std::fs::remove_dir_all(&td);
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
     }
 
     /// minisign keypair 생성 → (pubkey_base64_rawline, sign_fn).
@@ -8561,6 +10010,21 @@ mod tests {
         assert_eq!(p["ctx_window"].as_u64(), Some(1000000));
         assert_eq!(p["rate"].as_array().unwrap().len(), 0);
         assert!(p.get("ctx_tokens").is_none(), "current_usage·total 없으면 ctx_tokens 생략");
+        assert!(p.get("session_file").is_none(), "transcript_path 없으면 session_file 생략");
+    }
+
+    /// CC v2 WS-A: transcript_path → session_file 동봉 — 데몬의 계정(accountUuid) 귀속 경로.
+    #[test]
+    fn statusline_params_transcript_path() {
+        let v = json!({
+            "transcript_path": "/Users/x/.claude/projects/-a/s.jsonl",
+            "context_window": {"used_percentage": 3.0}
+        });
+        let p = statusline_to_report_params(&v);
+        assert_eq!(
+            p["session_file"],
+            json!("/Users/x/.claude/projects/-a/s.jsonl")
+        );
     }
 
     /// 사람용 statusline 한 줄 포맷 — rate는 있을 때만, 모델명 부재 시 "claude" 폴백.
@@ -8967,6 +10431,11 @@ mod tests {
         }
     }
 
+    /// staging-residue 진단은 프로세스 전역 env `CYS_DOCTOR_STAGING_MIN_IDLE_SECS`(보호창)를 읽는다.
+    /// 이 값을 set/remove하는 doctor 테스트가 병렬로 겹치면 서로의 값을 읽어 오탐(사전 존재한 레이스)이
+    /// 나므로, 해당 env를 만지는 테스트를 이 락으로 직렬화한다(W0 테스트 격리 정신 — 전역 env 교대 창 제거).
+    static DOCTOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn doctor_pack_version_ok_and_skew() {
         let base = std::env::temp_dir().join(format!("cys-doc-ver-{}", std::process::id()));
@@ -9020,7 +10489,9 @@ mod tests {
     #[test]
     fn doctor_staging_residue_fix_keeps_prev() {
         // L5 보호 해제(방금 만든 staging이 <60s라 보호에 걸리지 않게) — 이 테스트는 삭제 동작 검증.
-        std::env::set_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "0");
+        // ★직렬화 + RAII 복원(사전 존재 레이스 봉인): 겹치는 doctor 테스트의 전역 env 교대 창 제거.
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = cys::pack::EnvGuard::set("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "0");
         let base = std::env::temp_dir().join(format!("cys-doc-stg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -9037,13 +10508,14 @@ mod tests {
         assert!(!base.join(".pack-staging").exists());
         assert!(base.join("pack.prev").exists(), ".prev 롤백 세대 보존(삭제 금지)");
         let _ = std::fs::remove_dir_all(&base);
-        std::env::remove_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS");
+        // _env drop → 이전 값 복원(remove_var 창 없음).
     }
 
     // L5: 진행중(최근 수정) staging은 doctor --fix가 삭제하지 않고 보호한다.
     #[test]
     fn doctor_staging_residue_protects_in_progress() {
-        std::env::set_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "3600"); // 1시간 보호창
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = cys::pack::EnvGuard::set("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "3600"); // 1시간 보호창
         let base = std::env::temp_dir().join(format!("cys-doc-stg-prot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -9056,7 +10528,7 @@ mod tests {
         assert!(base.join(".pack-staging").exists(), "진행중 staging은 삭제되지 않는다");
         assert!(d.action.contains("진행중 보호"), "보호 사유 보고: {}", d.action);
         let _ = std::fs::remove_dir_all(&base);
-        std::env::remove_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS");
+        // _env drop → 이전 값 복원.
     }
 
     #[test]
@@ -9104,7 +10576,8 @@ mod tests {
     #[test]
     fn doctor_fix_then_rediag_ok() {
         // L5 보호 해제 — 방금 만든 staging(<60s)이 진행중 보호에 걸려 정리 안 되는 것을 방지(정리 검증).
-        std::env::set_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "0");
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = cys::pack::EnvGuard::set("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "0");
         let base = std::env::temp_dir().join(format!("cys-doc-fix-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -9125,7 +10598,7 @@ mod tests {
         assert_eq!(by("staging-residue"), DiagStatus::Ok, "잔재 정리됨");
         assert_eq!(by("hook"), DiagStatus::Ok, "hook 재등록됨");
         let _ = std::fs::remove_dir_all(&base);
-        std::env::remove_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS");
+        // _env drop → 이전 값 복원.
     }
 
     // ───────────────────────── W1: 계정 dir 영속 + resume 재현 ─────────────────────────
@@ -9408,5 +10881,587 @@ mod tests {
         // agent 등록됐으나 아직 미관측(agent_alive=false) → skip.
         let unseen = json!({"agent": "claude", "exited": false, "agent_alive": false});
         assert!(reinject_check_should_skip_bare_shell(&unseen), "미관측 agent인데 진행");
+    }
+
+    // ============================ drain --verify (기능 1) 테스트 ============================
+
+    /// 노드 협조 상태를 모사하는 fake I/O. 협조 노드는 지시받은 마커를 파일에 기입하고, 미저장·wedge·
+    /// hung은 각각 거동을 흉내낸다(producer≠evaluator — negative fixture 검증).
+    #[derive(Clone, Copy, PartialEq)]
+    enum FakeScenario {
+        Cooperative,
+        /// [R1] 지시문을 순서대로 리터럴 실행하는 협조 노드 — '정지' 지시를 마커 기입보다 먼저 만나면
+        /// halt해 마커를 기입하지 못한다(구 지시문 순서면 '저장했으나 timeout' 오판정).
+        LiteralOrdered,
+        NonSaving,
+        Wedge,
+        Hung,
+    }
+
+    struct FakeVerifyIo {
+        nodes: std::sync::Mutex<std::collections::HashMap<u64, (FakeScenario, std::path::PathBuf)>>,
+        last_inject: std::sync::Mutex<std::collections::HashMap<u64, String>>,
+        // [R2] 노드별 send_return 호출 횟수 — 제출 완료 노드에 잉여 Return이 안 나가는지 검증.
+        returns: std::sync::Mutex<std::collections::HashMap<u64, u32>>,
+    }
+    impl FakeVerifyIo {
+        fn new() -> Self {
+            FakeVerifyIo {
+                nodes: std::sync::Mutex::new(std::collections::HashMap::new()),
+                last_inject: std::sync::Mutex::new(std::collections::HashMap::new()),
+                returns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+        fn add(&self, sid: u64, scen: FakeScenario, file: std::path::PathBuf) {
+            self.nodes.lock().unwrap().insert(sid, (scen, file));
+        }
+        fn return_count(&self, sid: u64) -> u32 {
+            *self.returns.lock().unwrap().get(&sid).unwrap_or(&0)
+        }
+    }
+    /// 주입 텍스트에서 마커 한 줄을 추출(협조 노드가 '지시대로 기입'하는 것을 모사).
+    fn extract_marker(text: &str) -> Option<String> {
+        let start = text.find("<!-- cys-checkpoint:")?;
+        let rest = &text[start..];
+        let end = rest.find("-->")? + 3;
+        Some(rest[..end].to_string())
+    }
+    /// [R1] 지시문을 순서대로 리터럴 실행하는 노드가 마커 기입에 '도달'하는가 — 마커 지시가 '정지'
+    /// 지시보다 앞에 있으면 도달(true), 정지를 먼저 만나면 halt해 미도달(false). 이 판정이 곧
+    /// drain_verify_instruction의 단계 순서 정확성을 규정한다(정지<마커면 저장 유실).
+    fn literal_reaches_marker(text: &str) -> bool {
+        let marker = text.find("<!-- cys-checkpoint:");
+        let stop = text.find("멈추").or_else(|| text.find("정지"));
+        match (marker, stop) {
+            (Some(m), Some(s)) => m < s,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+    /// 문자열을 cols 문자마다 물리 줄바꿈(실터미널 래핑 모사 — 멀티바이트 안전, char 단위).
+    fn wrap_cols(s: &str, cols: usize) -> String {
+        let mut out = String::new();
+        for (i, c) in s.chars().enumerate() {
+            if i > 0 && i % cols == 0 {
+                out.push('\n');
+            }
+            out.push(c);
+        }
+        out
+    }
+    fn fake_write_marker(text: &str, file: Option<std::path::PathBuf>) {
+        if let (Some(marker), Some(f)) = (extract_marker(text), file) {
+            let mut cur = std::fs::read_to_string(&f).unwrap_or_default();
+            cur.push_str(&marker);
+            cur.push('\n');
+            let _ = std::fs::write(&f, cur);
+        }
+    }
+    impl VerifyIo for FakeVerifyIo {
+        fn inject(
+            &self,
+            _socket: &std::path::Path,
+            sid: u64,
+            text: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<(), String> {
+            let scen = self.nodes.lock().unwrap().get(&sid).map(|(s, _)| *s);
+            let file = self.nodes.lock().unwrap().get(&sid).map(|(_, f)| f.clone());
+            self.last_inject
+                .lock()
+                .unwrap()
+                .insert(sid, text.to_string());
+            match scen {
+                Some(FakeScenario::Hung) => return Err("hung socket".into()),
+                Some(FakeScenario::Cooperative) => fake_write_marker(text, file),
+                // [R1] 순서대로 리터럴 실행 — 마커 지시에 도달할 때만 기입(정지가 먼저면 halt·미기입).
+                Some(FakeScenario::LiteralOrdered) => {
+                    if literal_reaches_marker(text) {
+                        fake_write_marker(text, file);
+                    }
+                }
+                _ => {} // NonSaving·Wedge: 기입 안 함
+            }
+            Ok(())
+        }
+        fn read_screen(
+            &self,
+            _socket: &std::path::Path,
+            sid: u64,
+            _lines: u64,
+            _timeout: std::time::Duration,
+        ) -> Result<String, String> {
+            let scen = self.nodes.lock().unwrap().get(&sid).map(|(s, _)| *s);
+            let raw = self
+                .last_inject
+                .lock()
+                .unwrap()
+                .get(&sid)
+                .cloned()
+                .unwrap_or_default();
+            match scen {
+                Some(FakeScenario::Hung) => Err("hung socket".into()),
+                Some(FakeScenario::Wedge) => {
+                    // ★미제출 wedge 모사(비-tautology): 주입 텍스트가 입력 박스 안에 40자 래핑으로 잔류하고
+                    // 하단에 박스 테두리·단축키·토큰카운터 UI가 붙는다(sentinel이 최하단에서 밀리고 경계에서
+                    // 쪼개짐). input_region은 박스 상단 '╭' 이후를 보므로 이 잔류 입력을 검출한다.
+                    Ok(format!(
+                        "...이전 대화...\n╭────────────────────╮\n│ (미제출)\n{}\n╰────────────────────╯\n  ⏵⏵ 6 lines · esc to clear\n  ? for shortcuts\n  ",
+                        wrap_cols(&raw, 40)
+                    ))
+                }
+                Some(FakeScenario::NonSaving) => {
+                    // ★[R2·R3 모사] 제출 완료 + 스크롤백 에코: 주입 텍스트(nonce 포함)가 스크롤백 상단에
+                    // 남고, 하단 입력창은 비어 있다(제출됨). input_region(마지막 '╭' 이후)엔 nonce가 없어야
+                    // wedge=false — 구 전체화면 매치면 에코의 nonce로 오검출(잉여 Return·라벨 오표기).
+                    Ok(format!(
+                        "...이전 대화...\n{}\n\n좋아, 확인했다. 재시작을 기다린다.\n╭────────────────────╮\n│ > \n╰────────────────────╯\n  ? for shortcuts\n  ",
+                        raw
+                    ))
+                }
+                // 협조·리터럴: 제출됨 — 하단은 스피너·빈 프롬프트(주입 텍스트 잔류 없음)
+                _ => Ok("...이전 대화...\n✻ Working… (esc to interrupt)\n> ".into()),
+            }
+        }
+        fn send_return(
+            &self,
+            _socket: &std::path::Path,
+            sid: u64,
+            _timeout: std::time::Duration,
+        ) -> Result<(), String> {
+            *self.returns.lock().unwrap().entry(sid).or_insert(0) += 1;
+            Ok(())
+        }
+    }
+
+    fn mk_target(sid: u64, socket: std::path::PathBuf, live_cwd: Option<String>) -> VerifyTarget {
+        VerifyTarget {
+            socket,
+            dept: "main".into(),
+            display: "본부".into(),
+            surface_id: sid,
+            surface_ref: format!("surface:{sid}"),
+            role: "worker".into(),
+            live_cwd,
+            pending_undelivered: 0,
+        }
+    }
+
+    /// 무회귀 증명: `cys drain`(기존 3 호출자 invocation)은 verify=false로 파싱돼 plain drain 경로로
+    /// 라우팅된다(거동 diff 0). `--verify`만 신규 경로로 분기.
+    #[test]
+    fn drain_flag_parsing_defaults_to_plain() {
+        use clap::Parser;
+        match Cli::parse_from(["cys", "drain"]).command {
+            Command::Drain { verify, timeout } => {
+                assert!(!verify, "무인자 drain은 plain(verify=false)이어야 함 — 회귀");
+                assert_eq!(timeout, 20);
+            }
+            _ => panic!("drain이 Drain으로 파싱되지 않음"),
+        }
+        match Cli::parse_from(["cys", "drain", "--verify", "--timeout", "7"]).command {
+            Command::Drain { verify, timeout } => {
+                assert!(verify);
+                assert_eq!(timeout, 7);
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// 마커 포맷 — HTML 주석형·체크박스 문법 금지·denylist 토큰 회피.
+    #[test]
+    fn drain_verify_marker_avoids_checkbox_and_denylist() {
+        let m = checkpoint_marker("run17-42", 1_700_000_000);
+        assert_eq!(m, "<!-- cys-checkpoint: run17-42 1700000000 -->");
+        assert!(!m.contains("- [ ]") && !m.contains("- [x]") && !m.contains("- [X]"));
+        for tok in [
+            "denylist", "recovery", "kill-switch", "soul.md", "autopilot", "자율주행", "안전핵",
+            "eval-driven", "헌법",
+        ] {
+            assert!(!m.contains(tok), "denylist 토큰 '{tok}' 포함");
+        }
+    }
+
+    /// wedge 판정 — 하단 잔류 텍스트만 wedge, 스피너·빈 프롬프트는 전달됨.
+    #[test]
+    fn drain_verify_delivery_wedged_detection() {
+        let sentinel = "run1-9";
+        assert!(delivery_wedged(
+            "위쪽\n[DRAIN-VERIFY] ... run1-9 ... 마커 <!-- cys-checkpoint: run1-9 1 -->",
+            sentinel
+        ));
+        assert!(!delivery_wedged(
+            "...이전 대화...\n✻ Working…\n> ",
+            sentinel
+        ));
+    }
+
+    /// ② 협조 노드 → saved (지시대로 마커 기입).
+    #[test]
+    fn drain_verify_saved_on_cooperative() {
+        let td = std::env::temp_dir().join(format!("cys-dv-coop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("SESSION_STATE.md"), "# 상태\n").unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(
+            7,
+            FakeScenario::Cooperative,
+            round.join("SESSION_STATE.md"),
+        );
+        let t = mk_target(7, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(2), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::Saved);
+    }
+
+    /// ②(변형) 이미 정확한 nonce 마커가 있으면 즉시 saved(idempotent 선통과).
+    #[test]
+    fn drain_verify_pass_when_already_marked() {
+        let td = std::env::temp_dir().join(format!("cys-dv-pre-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        let sock = td.join("cys.sock");
+        // verify_one_node의 nonce = "{prefix}-{socket_disc:x}-{sid}" ([F1] 소켓 구별자 포함).
+        let nonce = format!("run1-{:x}-7", socket_discriminator(&sock));
+        let marker = checkpoint_marker(&nonce, 100);
+        std::fs::write(round.join("SESSION_STATE.md"), format!("# 상태\n{marker}\n")).unwrap();
+        let io = FakeVerifyIo::new(); // 노드 미등록 — 주입해도 무동작(하지만 선통과라 무관)
+        let t = mk_target(7, sock, Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(2), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::Saved);
+    }
+
+    /// ① 저장 안 하는 노드 → timeout(FAIL).
+    #[test]
+    fn drain_verify_timeout_on_no_save() {
+        let td = std::env::temp_dir().join(format!("cys-dv-nosave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("SESSION_STATE.md"), "# 상태\n").unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(3, FakeScenario::NonSaving, round.join("SESSION_STATE.md"));
+        let t = mk_target(3, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::Timeout);
+    }
+
+    /// ③ 미제출 wedge → delivery_failed(timeout과 구분).
+    #[test]
+    fn drain_verify_delivery_failed_on_wedge() {
+        let td = std::env::temp_dir().join(format!("cys-dv-wedge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("SESSION_STATE.md"), "# 상태\n").unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(5, FakeScenario::Wedge, round.join("SESSION_STATE.md"));
+        let t = mk_target(5, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        let rc = io.return_count(5);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::DeliveryFailed);
+        assert!(rc >= 1, "실 wedge엔 Return 재전송이 발화해야 함(rc={rc})"); // [R2] 정상 경로
+    }
+
+    /// [R2·R3] 제출 완료 + 스크롤백 에코 노드 → wedge 오검출 없음: 잉여 Return 0(R2)·라벨 timeout 정확(R3).
+    /// 구 전체화면 매치면 에코의 nonce로 delivery_failed 오표기 + 승인대기 노드 잉여 Return 위험이었다.
+    #[test]
+    fn drain_verify_no_spurious_wedge_on_submitted_echo() {
+        let td = std::env::temp_dir().join(format!("cys-dv-echo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("SESSION_STATE.md"), "# 상태\n").unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(6, FakeScenario::NonSaving, round.join("SESSION_STATE.md")); // 제출 에코 모사(read_screen)
+        let t = mk_target(6, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        let rc = io.return_count(6);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::Timeout, "제출됐으나 미저장=timeout(delivery_failed 아님·R3)");
+        assert_eq!(rc, 0, "제출 완료 노드엔 잉여 Return 0이어야 함(R2·rc={rc})");
+    }
+
+    /// [R2·R3 단위] delivery_wedged가 입력창 영역만 본다 — 미제출 wedge(박스 안)=검출, 제출 에코(스크롤백)=비검출.
+    #[test]
+    fn drain_verify_delivery_wedged_input_region_only() {
+        let nonce = "run9-42";
+        // ① 미제출: 박스 안에 잔류(래핑) → 검출
+        let wedged = "...대화...\n╭────────╮\n│ (미제출)\n<!-- cys-check\npoint: run9-42 1 -->\n╰────────╯\n  ? shortcuts";
+        assert!(delivery_wedged(wedged, nonce), "입력 박스 내 미제출 텍스트는 wedge");
+        // ② 제출 에코: nonce가 스크롤백(박스 위)에만, 하단 박스는 빔 → 비검출
+        let echoed = "...대화...\n<!-- cys-checkpoint: run9-42 1 -->\n좋아, 확인.\n╭────────╮\n│ > \n╰────────╯\n  ? shortcuts";
+        assert!(!delivery_wedged(echoed, nonce), "제출된 스크롤백 에코는 wedge 아님");
+    }
+
+    /// [R1] 지시문 단계 순서 정확성 — 마커 기입이 '정지'보다 앞이라 리터럴 실행 노드가 저장한다.
+    /// ★비-tautology: 구 순서(정지<마커)면 리터럴 노드가 마커 미기입→timeout 오판정임을 명시 증명.
+    #[test]
+    fn drain_verify_literal_ordered_node_saves_and_old_order_would_fail() {
+        // 현 지시문: 마커가 '정지'보다 앞 → 리터럴 노드 도달(true)
+        let cur = drain_verify_instruction("<!-- cys-checkpoint: n-1 1 -->");
+        assert!(literal_reaches_marker(&cur), "현 지시문은 마커가 정지보다 앞이어야 함(R1)");
+        // 구 순서(①저장 ②정지 ③마커) 재구성 → 리터럴 노드가 정지를 먼저 만나 미도달(false)=저장 유실
+        let old = "① 저장하라. ② 작업을 멈추고 기다려라. ③ 마지막으로 <!-- cys-checkpoint: n-1 1 --> 추가";
+        assert!(!literal_reaches_marker(old), "구 순서면 리터럴 노드가 마커 미기입(FAIL 증명)");
+        // 통합: LiteralOrdered 노드가 현 지시문으로 실제 저장→saved
+        let td = std::env::temp_dir().join(format!("cys-dv-lit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("SESSION_STATE.md"), "# 상태\n").unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(4, FakeScenario::LiteralOrdered, round.join("SESSION_STATE.md"));
+        let t = mk_target(4, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(2), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::Saved, "리터럴 순서 노드가 현 지시문으로 저장→saved");
+    }
+
+    /// ④ hung 소켓(RPC 에러) → timeout(전역 캡 내 — 개별 스레드는 즉시 반환).
+    #[test]
+    fn drain_verify_timeout_on_hung() {
+        let td = std::env::temp_dir().join(format!("cys-dv-hung-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(9, FakeScenario::Hung, round.join("SESSION_STATE.md"));
+        let t = mk_target(9, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::Timeout);
+    }
+
+    /// [F1] 크로스소켓 nonce 충돌 위양성 — 같은 sid + 같은 live_cwd(부서 cwd 수렴)인 두 소켓에서, 한 노드가
+    /// 남긴 마커를 다른 소켓의 (주입 실패) 노드가 자기 것으로 오인해 Saved 위양성이 나던 결함.
+    /// ★비-tautology: 구 nonce("{prefix}-{sid}", 소켓 구별자 없음)면 매치=위양성임을 명시 증명, 신 로직은 Timeout.
+    #[test]
+    fn drain_verify_cross_socket_nonce_collision_false_positive() {
+        let td = std::env::temp_dir().join(format!("cys-dv-xsock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        let file = round.join("SESSION_STATE.md");
+        let cwd = td.to_string_lossy().into_owned();
+        let (prefix, sid) = ("runX", 7u64);
+        let sock_a = std::path::PathBuf::from("/x/cys-dept-a/cys.sock");
+        let sock_b = std::path::PathBuf::from("/x/cys-dept-b/cys.sock");
+        // 소켓 구별자는 결정론이고 서로 달라야 한다(같은 소켓은 안정, 다른 소켓은 상이).
+        assert_eq!(socket_discriminator(&sock_a), socket_discriminator(&sock_a));
+        assert_ne!(socket_discriminator(&sock_a), socket_discriminator(&sock_b));
+
+        // 구 로직 재현: A(sock_a)가 구 스킴 nonce("{prefix}-{sid}")로 공유 파일에 마커를 남겼다.
+        let a_old_nonce = format!("{prefix}-{sid}");
+        std::fs::write(
+            &file,
+            format!("# 상태\n{}\n", checkpoint_marker(&a_old_nonce, 100)),
+        )
+        .unwrap();
+        // 구 로직 B의 nonce도 sid만 쓰므로 A 마커를 자기 것으로 매치 → Saved 위양성(수정 전 FAIL 경로).
+        assert!(
+            file_has_checkpoint_nonce(&file, &a_old_nonce),
+            "구 로직: 같은 sid의 B가 A(타 소켓) 마커를 매치 → Saved 위양성"
+        );
+
+        // 신 로직: B(Hung=주입 전부 Err, sock_b)를 verify_one_node로 — 소켓 구별자로 nonce가 달라 파일의
+        // A 마커를 무시 → idempotent 미통과 → 주입(Hung Err) → Timeout(위양성 회피).
+        let io = FakeVerifyIo::new();
+        io.add(sid, FakeScenario::Hung, file.clone());
+        let tb = mk_target(sid, sock_b, Some(cwd));
+        let (ob, _d) = verify_one_node(&io, &tb, prefix, std::time::Duration::from_secs(1), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(
+            ob,
+            VerifyOutcome::Timeout,
+            "신 로직: 크로스소켓 nonce 충돌 위양성 회피 → Timeout"
+        );
+    }
+
+    /// ⑥(변형) live_cwd 미제공 → unverifiable(무음 폴백 금지).
+    #[test]
+    fn drain_verify_unverifiable_without_live_cwd() {
+        let io = FakeVerifyIo::new();
+        let t = mk_target(1, std::path::PathBuf::from("/nonexistent/cys.sock"), None);
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        assert_eq!(o, VerifyOutcome::Unverifiable);
+    }
+
+    /// ⑤ 복원 중(phoenix 저널 stage<g2_ack) → skipped_restoring.
+    #[test]
+    fn drain_verify_skipped_when_restoring() {
+        let td = std::env::temp_dir().join(format!("cys-dv-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let deptdir = td.join("cys-dept-x");
+        let phoenix = deptdir.join("phoenix");
+        std::fs::create_dir_all(&phoenix).unwrap();
+        // reinject 완료·g2_ack 미완료 = 복원 in-flight
+        let j = json!({"roles": {"worker": {"stages": {"reinject": {"done": true}}}}});
+        std::fs::write(
+            phoenix.join("journal-default.json"),
+            serde_json::to_string(&j).unwrap(),
+        )
+        .unwrap();
+        let socket = deptdir.join("cys.sock");
+        assert!(restore_guard_reason(&socket, "worker").is_some());
+        // g2_ack 완료면 복원 끝 → None
+        let j2 = json!({"roles": {"worker": {"stages": {"reinject": {"done": true}, "g2_ack": {"done": true}}}}});
+        std::fs::write(
+            phoenix.join("journal-default.json"),
+            serde_json::to_string(&j2).unwrap(),
+        )
+        .unwrap();
+        assert!(restore_guard_reason(&socket, "worker").is_none());
+        // 다른 역할은 무관 → None(over-skip 금지)
+        assert!(restore_guard_reason(&socket, "master").is_none());
+
+        // verify_one_node 통합: 복원 중이면 IO 이전에 skip
+        std::fs::write(
+            phoenix.join("journal-default.json"),
+            serde_json::to_string(&j).unwrap(),
+        )
+        .unwrap();
+        let io = FakeVerifyIo::new();
+        let t = mk_target(2, socket, Some(deptdir.to_string_lossy().into_owned()));
+        let (o, _d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::SkippedRestoring);
+    }
+
+    /// [F2] 신선한 저널이 파손 JSON이면 fail-CLOSED(복원 중 취급·skip) — 스키마 스큐/부분쓰기에 안전.
+    #[test]
+    fn drain_verify_restore_guard_fail_closed_on_corrupt_journal() {
+        let td = std::env::temp_dir().join(format!("cys-dv-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let deptdir = td.join("cys-dept-y");
+        let phoenix = deptdir.join("phoenix");
+        std::fs::create_dir_all(&phoenix).unwrap();
+        let socket = deptdir.join("cys.sock");
+        // ① 파손 JSON(신선 mtime) → Some(skip)
+        std::fs::write(phoenix.join("journal-default.json"), "{ this is not json ").unwrap();
+        assert!(
+            restore_guard_reason(&socket, "worker").is_some(),
+            "파손 신선 저널은 fail-closed여야 함"
+        );
+        // ② roles 비객체(신선) → Some(skip)
+        std::fs::write(
+            phoenix.join("journal-default.json"),
+            serde_json::to_string(&json!({"roles": "oops"})).unwrap(),
+        )
+        .unwrap();
+        assert!(restore_guard_reason(&socket, "worker").is_some());
+        // ③ role의 stages 스키마 이상(신선) → Some(skip)
+        std::fs::write(
+            phoenix.join("journal-default.json"),
+            serde_json::to_string(&json!({"roles": {"worker": {"stages": 5}}})).unwrap(),
+        )
+        .unwrap();
+        assert!(restore_guard_reason(&socket, "worker").is_some());
+        // ④ 저널 디렉토리 자체가 없으면 None(복원 아님 — 무해)
+        let empty = td.join("cys-dept-z").join("cys.sock");
+        assert!(restore_guard_reason(&empty, "worker").is_none());
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// [F1] 실터미널 래핑+하단 UI로 sentinel이 최하단에서 밀리고 경계에서 쪼개진 wedge를 검출한다.
+    /// ★비-tautology 증명: 동일 fixture를 구 로직(tail-4행 단일행 스캔)에 넣으면 놓친다(FAIL).
+    #[test]
+    fn drain_verify_wedge_survives_wrapping_and_trailing_ui() {
+        let nonce = "1700000000-88-7";
+        // 래핑으로 nonce가 물리 행 경계에서 쪼개지고("...1700000000-" / "88-7 ..."), 그 아래로 입력창
+        // 테두리·단축키·토큰카운터 UI 4행이 붙어 nonce가 하단에서 여러 행 위로 밀린다.
+        let screen = "\
+> [DRAIN-VERIFY] 재시작 전 체크포인트 검증. 지금 즉시\n\
+  ① _round/SESSION_STATE.md 저장 ② 작업 멈춤\n\
+  ③ 파일 끝에 이 한 줄: <!-- cys-checkpoint: 1700000000-\n\
+88-7 1700000000 -->\n\
+╰──────────────────────────────╯\n\
+  ⏵⏵ 5 lines · esc to clear\n\
+  ? for shortcuts                  (auto)\n\
+  context: 12k tokens\n\
+  ";
+        // 구 로직: 하단 4행에서 온전한 nonce 매치 → 놓침(FAIL). fixture가 tautology가 아님을 증명.
+        let old_tail4 = screen.lines().rev().take(4).any(|l| l.contains(nonce));
+        assert!(!old_tail4, "fixture가 구 tail-4 로직도 통과 — tautology");
+        // 신 로직: 전체 행·공백제거 매치 → 래핑·경계쪼갬·trailing UI에도 wedge 검출.
+        assert!(delivery_wedged(screen, nonce), "신 로직이 래핑된 wedge를 검출해야 함");
+    }
+
+    /// ⑥ 0-노드 → 우아한 no-op(all_saved=true, exit 0 대응).
+    #[test]
+    fn drain_verify_zero_nodes_noop() {
+        let io: std::sync::Arc<dyn VerifyIo + Send + Sync> = std::sync::Arc::new(FakeVerifyIo::new());
+        let report = drain_verify_fanout(io, vec![], std::time::Duration::from_secs(1), 100);
+        assert_eq!(report["total"], json!(0));
+        assert_eq!(report["all_saved"], json!(true));
+    }
+
+    /// 전 노드 verify 총 소요 ≤ 전역 캡(직렬 누적 금지) — N개 미저장 노드를 병렬로 돌려 직렬 시간보다
+    /// 뚜렷이 빠름을 확인한다(timeout=1s·4노드 → 직렬 ≥4s, 병렬 ~timeout).
+    #[test]
+    fn drain_verify_fanout_is_parallel_not_serial() {
+        let td = std::env::temp_dir().join(format!("cys-dv-par-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let fake = FakeVerifyIo::new();
+        let n = 4u64;
+        let mut targets = Vec::new();
+        for i in 0..n {
+            let round = td.join(format!("n{i}")).join("_round");
+            std::fs::create_dir_all(&round).unwrap();
+            std::fs::write(round.join("SESSION_STATE.md"), "# s\n").unwrap();
+            fake.add(i, FakeScenario::NonSaving, round.join("SESSION_STATE.md"));
+            targets.push(mk_target(
+                i,
+                td.join(format!("n{i}")).join("cys.sock"),
+                Some(td.join(format!("n{i}")).to_string_lossy().into_owned()),
+            ));
+        }
+        let io: std::sync::Arc<dyn VerifyIo + Send + Sync> = std::sync::Arc::new(fake);
+        let t0 = std::time::Instant::now();
+        let report = drain_verify_fanout(io, targets, std::time::Duration::from_secs(1), 100);
+        let elapsed = t0.elapsed();
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(report["summary"]["timeout"], json!(4));
+        assert_eq!(report["all_saved"], json!(false));
+        // 직렬이면 ≥ 4s. 병렬이면 ~1.x s. 3s 미만이면 병렬 확정.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "fan-out이 직렬로 보임: {elapsed:?}"
+        );
+    }
+
+    /// 집계·pending 유실 가시화 — 혼합 결과에서 summary·all_saved·pending_loss_warning 정합.
+    #[test]
+    fn drain_verify_aggregation_and_pending_visibility() {
+        let td = std::env::temp_dir().join(format!("cys-dv-agg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let fake = FakeVerifyIo::new();
+        // 노드0=협조(saved), 노드1=미저장(timeout, pending 2건)
+        let r0 = td.join("n0").join("_round");
+        let r1 = td.join("n1").join("_round");
+        std::fs::create_dir_all(&r0).unwrap();
+        std::fs::create_dir_all(&r1).unwrap();
+        std::fs::write(r0.join("SESSION_STATE.md"), "# s\n").unwrap();
+        std::fs::write(r1.join("SESSION_STATE.md"), "# s\n").unwrap();
+        fake.add(0, FakeScenario::Cooperative, r0.join("SESSION_STATE.md"));
+        fake.add(1, FakeScenario::NonSaving, r1.join("SESSION_STATE.md"));
+        let mut t0 = mk_target(0, td.join("n0").join("cys.sock"), Some(td.join("n0").to_string_lossy().into_owned()));
+        t0.role = "worker".into();
+        let mut t1 = mk_target(1, td.join("n1").join("cys.sock"), Some(td.join("n1").to_string_lossy().into_owned()));
+        t1.pending_undelivered = 2;
+        let io: std::sync::Arc<dyn VerifyIo + Send + Sync> = std::sync::Arc::new(fake);
+        let report = drain_verify_fanout(io, vec![t0, t1], std::time::Duration::from_secs(1), 100);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(report["summary"]["saved"], json!(1));
+        assert_eq!(report["summary"]["timeout"], json!(1));
+        assert_eq!(report["all_saved"], json!(false));
+        assert_eq!(report["pending_loss_warning"].as_array().unwrap().len(), 1);
+        assert_eq!(report["pending_loss_warning"][0]["pending_undelivered"], json!(2));
     }
 }

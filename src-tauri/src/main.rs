@@ -136,6 +136,22 @@ async fn rpc(method: &str, params: Value) -> Result<Value, String> {
 
 /// 소켓 지정 RPC — 풀의 소켓별 연결을 잠가 직렬화(다른 데몬 RPC를 막지 않음).
 async fn rpc_on(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
+    let resp = rpc_full(socket, method, params).await?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(resp["error"]["message"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string())
+    }
+}
+
+/// rpc_on의 전송·파싱 본체 — 데몬 응답 **전체**(ok/result/error.code)를 반환한다.
+/// ★GUI 오퍼레이터 승인(오너 2026-07-15): feed_reply가 error.code(self_approval_denied 등)로
+/// 재시도·UI 분류를 해야 하는데 rpc_on은 message만 올려 코드가 유실됐다 — 기존 호출부의 문자열
+/// 계약(message만)은 rpc_on 래퍼로 그대로 보존하고, 코드가 필요한 곳만 이 함수를 직접 쓴다.
+async fn rpc_full(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
     let req = json!({"id": 1, "method": method, "params": params});
     let mut line = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
     line.push(b'\n');
@@ -161,15 +177,7 @@ async fn rpc_on(socket: &std::path::Path, method: &str, params: Value) -> Result
             return Err(e);
         }
     };
-    let resp: Value = serde_json::from_str(resp_line.trim()).map_err(|e| e.to_string())?;
-    if resp["ok"].as_bool() == Some(true) {
-        Ok(resp["result"].clone())
-    } else {
-        Err(resp["error"]["message"]
-            .as_str()
-            .unwrap_or("unknown error")
-            .to_string())
-    }
+    serde_json::from_str(resp_line.trim()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -417,16 +425,37 @@ fn ime_debug_enabled() -> bool {
 }
 
 #[tauri::command]
-async fn send_input(socket: Option<String>, surface_id: u64, data: String) -> Result<(), String> {
+async fn send_input(
+    socket: Option<String>,
+    surface_id: u64,
+    data: String,
+    queued: Option<bool>,
+    clear_first: Option<bool>,
+) -> Result<(), String> {
     // human=true: T3-13 타이핑 가드의 신호 — UI 키 입력을 '사람'으로 표시해
-    // 원격 주입이 사람의 미완성 입력을 오염시키지 못하게 한다
+    // 원격 주입이 사람의 미완성 입력을 오염시키지 못하게 한다.
+    // queued=true(전출 복원 주입 등 후속 지시)는 사람 타이핑이 아니므로 human=false —
+    // human=true로 큐잉하면 last_human_input 갱신이 타이핑 가드를 3초 오염시킨다.
+    // clear_first=true는 데몬 T3-13 권위 전달(Ctrl-U 정리→paste→지연 CR 원자 제출) —
+    // raw "\r" 동봉은 Claude CLI가 paste로 삼켜 미제출된다(전출 e2e 실측). queued와 결합 불가.
+    // 전출 지시도 사람의 클릭에서 발화하므로 human 유지(타이핑 가드 결정론 통과).
+    let q = queued.unwrap_or(false);
+    let cf = clear_first.unwrap_or(false);
     rpc_on(
         &resolve_socket(&socket),
         "surface.send_text",
-        json!({"surface_id": surface_id, "text": data, "quiet": true, "human": true}),
+        json!({"surface_id": surface_id, "text": data, "quiet": true, "human": !q,
+               "queued": q, "clear_first": cf}),
     )
     .await
     .map(|_| ())
+}
+
+/// 전출(F6-2) 핸드오프 폴백 경로용 홈 디렉토리 — cwd가 루트류(/·C:\)인 pane은
+/// 프로젝트 상대 경로(_round/handoffs)가 성립하지 않아 ~/.cys/transfers 로 폴백한다.
+#[tauri::command]
+fn home_dir_path() -> String {
+    cys::home_dir().to_string_lossy().into_owned()
 }
 
 /// 클립보드 이미지 붙여넣기(F): base64 이미지를 임시 파일로 저장하고 절대경로를 반환한다.
@@ -475,10 +504,47 @@ fn list_dir(path: String) -> Result<Value, String> {
 }
 
 /// 파일을 시스템 기본 앱으로 연다 (macOS open / Windows start).
+/// 실행형 파일(유닉스 실행비트·Windows 실행 확장자)은 open이 곧 실행일 수 있어
+/// force 없이는 "executable_confirm" 에러로 거절한다 — UI가 확인 후 force로 재호출(fail-closed).
 #[tauri::command]
-fn open_path(path: String) -> Result<(), String> {
+fn open_path(path: String, force: Option<bool>) -> Result<(), String> {
     // 실재하는 로컬 경로만 허용 — URL 스킴·존재하지 않는 문자열이 OS 런처에 닿지 않게
-    std::fs::metadata(&path).map_err(|e| format!("not a local path: {e}"))?;
+    let meta = std::fs::metadata(&path).map_err(|e| format!("not a local path: {e}"))?;
+    if !force.unwrap_or(false) && meta.is_file() {
+        // 근본한계 명문화: '열기=실행'이 되는 타입의 완전 열거는 불가능하다(OS·설치 앱에 따라
+        // 확장). 게이트 = 실행비트(unix) + 위험 확장자 목록(문서-실행형 포함) — 목록 밖 신종
+        // 타입은 통과할 수 있으므로 신뢰 없는 파일은 Finder/탐색기에서 확인이 원칙이다.
+        fn ext_of(path: &str) -> String {
+            std::path::Path::new(path)
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default()
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 != 0 {
+                return Err("executable_confirm".into());
+            }
+        }
+        // macOS 문서-실행형: 실행비트 없이도 open이 설치·명령 실행으로 이어지는 타입
+        #[cfg(target_os = "macos")]
+        if ["pkg", "mpkg", "command", "terminal", "tool"].contains(&ext_of(&path).as_str()) {
+            return Err("executable_confirm".into());
+        }
+        // Windows: 실행비트가 없어 확장자 게이트 — 스크립트·핸들러 실행형 전반
+        #[cfg(windows)]
+        if [
+            "exe", "bat", "cmd", "com", "scr", "ps1", "msi", "vbs", "vbe", "js", "jse",
+            "wsf", "wsh", "hta", "lnk", "reg", "jar", "pif", "scf", "cpl", "msc",
+        ]
+        .contains(&ext_of(&path).as_str())
+        {
+            return Err("executable_confirm".into());
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let _ = ext_of; // linux 등에서 미사용 경고 억제(실행비트 게이트만 적용)
+    }
     #[cfg(target_os = "macos")]
     let r = std::process::Command::new("open").arg(&path).spawn();
     // explorer는 인자를 셸 파싱하지 않는다 — cmd /C start의 메타문자 주입 경로 제거
@@ -486,6 +552,107 @@ fn open_path(path: String) -> Result<(), String> {
     let r = std::process::Command::new("explorer").arg(&path).spawn();
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let r = std::process::Command::new("xdg-open").arg(&path).spawn();
+    r.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// 전출(F6-2) 핸드오프 내용 검증용 텍스트 헤드 읽기 — 파일 실존≠내용 유효이므로
+/// UI가 5필드(HANDOFF_CONTRACT)를 확인한다. 실재 파일만, 기본 64KB 캡(대파일 프리즈 방지).
+#[tauri::command]
+fn read_text_head(path: String, max_bytes: Option<u64>) -> Result<String, String> {
+    let meta = std::fs::metadata(&path).map_err(|e| format!("not a local path: {e}"))?;
+    if !meta.is_file() {
+        return Err("not a file".into());
+    }
+    let cap = max_bytes.unwrap_or(65536).min(1_048_576) as usize;
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let head = &bytes[..bytes.len().min(cap)];
+    Ok(String::from_utf8_lossy(head).into_owned())
+}
+
+/// ~/.cys/viewer/state.json 을 읽어 pid 생존이면 {port, token} 반환, 스테일/부재면 None.
+/// 사이드카(javis_view_bridge.py)가 {pid, port, token, ts} 를 원자 기록한다.
+fn read_live_view_state(path: &std::path::Path) -> Option<Value> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let pid = v.get("pid").and_then(|p| p.as_i64())?;
+    let port = v.get("port").and_then(|p| p.as_u64())?;
+    let token = v.get("token").and_then(|t| t.as_str())?.to_string();
+    // pid 생존 확인 — kill(pid, 0): 0=생존(권한 있음), ESRCH=사멸. (windows는 생존 가정 — 스테일이면 재기동 대기 타임아웃이 흡수)
+    #[cfg(unix)]
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return None;
+    }
+    let _ = pid;
+    Some(json!({"port": port, "token": token}))
+}
+
+/// ensure_view_bridge 임계구역 락 — 레이아웃 복원 시 web pane 2+개가 동시에 이 커맨드를
+/// invoke 하면 check-then-spawn 사이 갭에서 사이드카가 이중 spawn 되고, state.json 원자 기록의
+/// 패자가 고아로 영구 상주한다(view bridge는 유휴종료 없음). 이 프로세스 안의 동시 invoke를
+/// 직렬화해 첫 호출만 spawn하고 나머지는 락 획득 후 live state를 재확인해 즉시 반환하게 한다.
+/// ※한계: 프로세스 밖 동시성(앱 인스턴스 2개)은 이 락 범위 밖 — 별도 파일락이 필요하다(범위 외).
+static VIEW_BRIDGE_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+
+/// 뷰어 사이드카 확보(§8-1#13) — 살아있으면 {port, token} 즉시 반환, 아니면 detached spawn 후
+/// state.json(생존 pid) 을 최대 10초 대기해 반환. lazy 기동(부트체인 무접점)·읽기 전용 loopback.
+#[tauri::command]
+fn ensure_view_bridge() -> Result<Value, String> {
+    let state_path = cys::home_dir().join(".cys/viewer/state.json");
+    // 락 밖 빠른 경로 — 이미 살아있으면 직렬화 없이 즉시 반환.
+    if let Some(v) = read_live_view_state(&state_path) {
+        return Ok(v);
+    }
+    // 임계구역 진입: spawn 은 프로세스 내 한 번에 하나만.
+    let lock = VIEW_BRIDGE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner()); // poison 무시(임계구역 상태 무보유)
+    // 락 획득 후 재확인(double-checked) — 대기 중 다른 invoke가 이미 기동했으면 spawn 생략.
+    if let Some(v) = read_live_view_state(&state_path) {
+        return Ok(v);
+    }
+    let script = cys::pack::pack_dir().join("bin").join("javis_view_bridge.py");
+    if !script.exists() {
+        return Err(format!("view bridge 스크립트 없음: {}", script.display()));
+    }
+    let mut cmd = std::process::Command::new("python3");
+    inject_runtime_path(&mut cmd); // 동봉 runtime(python3) PATH 주입
+    cmd.arg(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    no_console(&mut cmd);
+    cmd.spawn().map_err(|e| format!("view bridge 기동 실패: {e}"))?;
+    // state 대기(0.2s 간격·최대 10s) — 사이드카가 0-bind 포트 확정 후 state.json 을 원자 기록한다.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if let Some(v) = read_live_view_state(&state_path) {
+            return Ok(v);
+        }
+    }
+    Err("view bridge state 대기 타임아웃(10s)".into())
+}
+
+/// 파일 관리자에서 해당 항목을 선택해 보여준다 (macOS Finder reveal / Windows explorer select).
+/// open_path와 동일한 실재 경로 게이트 — URL 스킴·비존재 문자열 차단.
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    std::fs::metadata(&path).map_err(|e| format!("not a local path: {e}"))?;
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("explorer")
+        .arg(format!("/select,{path}"))
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let r = {
+        // xdg에는 reveal 표준이 없다 — 부모 폴더 열기로 폴백
+        let parent = std::path::Path::new(&path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        std::process::Command::new("xdg-open").arg(parent).spawn()
+    };
     r.map(|_| ()).map_err(|e| e.to_string())
 }
 
@@ -594,12 +761,117 @@ fn classify_bundle_dir(macos_dir: &std::path::Path) -> BundleKind {
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
-            if parent == "/Applications" || parent.ends_with("/Applications") {
+            // ★/Volumes 가드: DMG·외장 마운트 안의 Applications 폴더/심링크(예: /Volumes/<dmg>/Applications/
+            // cys.app)는 ends_with("/Applications")를 만족해도 Canonical 이 아니다 — 언마운트·이젝트 시
+            // 죽은 경로가 되어 자기삭제·"손상됨" 결함이 재발한다(DMG 안 Applications 심링크 경유 실행 오판
+            // 차단). 정규 /Applications·~/Applications 만 Canonical(둘 다 /Volumes 하위가 아니므로 불변).
+            if !parent.starts_with("/Volumes/")
+                && (parent == "/Applications" || parent.ends_with("/Applications"))
+            {
                 return BundleKind::Canonical;
             }
         }
     }
     BundleKind::NonStandard
+}
+
+/// launchd 자기등록 가드(순수): **Canonical(/Applications·~/Applications)만 허용**한다. 무음
+/// autostart(GUI 시작 시 plist 무음 기록)는 명시 사용자설치(plan_cli_install: 사용자 액션+가시 경고)와
+/// 위험 프로파일이 다르다 — NonStandard(~/Downloads·/Volumes/USB 등 휘발/이동 경로)가 plist
+/// ProgramArguments 에 각인되면 언마운트·삭제 시 죽은 경로 데몬을 무한 스폰한다(Translocated·Backup 도
+/// 동류). 그래서 plan_cli_install 이 NonStandard 를 경고만 하고 허용하는 것과 **의도적으로 divergence**해,
+/// 자동등록은 Canonical 로 한정한다(비-Canonical 은 ensure_daemon 런타임 폴백=휘발성 데몬으로 안전).
+fn autoregister_allowed(kind: &BundleKind) -> bool {
+    matches!(kind, BundleKind::Canonical)
+}
+
+/// T2 부트 안전모드 판정 결과. autoregister 만 가리던 `autoregister_allowed` 보다 상위의 **부트 전면
+/// 게이트**로, 데몬 기동·launchd 등록·팩/hook 쓰기 등 자기경로 부수효과 전체를 조건화한다.
+#[derive(PartialEq, Debug, Clone, Copy)]
+enum BootPathVerdict {
+    Canonical,    // 정규 설치(/Applications·~/Applications) — 기존 부트 그대로 진행
+    Translocated, // Gatekeeper AppTranslocation 휘발 경로 — 안전모드
+    NonCanonical, // /Volumes(DMG 직실행)·Downloads·백업·개발 target/ 등 비정규 — 안전모드
+}
+
+/// 부트 경로 판정(순수): 실행 파일 경로와 escape env 플래그만으로 안전모드 진입 여부를 결정한다.
+///
+/// - `env_escape`(CYS_ALLOW_NONCANONICAL=1)이면 **무조건 Canonical** — 개발 빌드·CI·e2e 는 target/
+///   등 비정규 경로에서 실행되므로 이 탈출구가 없으면 테스트 하네스 자신이 안전모드에 갇힌다.
+/// - 그 외에는 `classify_bundle_dir` 4분류를 3분류로 접는다: Canonical→Canonical,
+///   Translocated→Translocated, Backup·NonStandard(=/Volumes·Downloads·개발 target/ 포함)→NonCanonical.
+///   판정 로직을 `classify_bundle_dir` 에 위임해 autoregister 가드와 divergence 하지 않게 한다
+///   (동일 경로 → 동일 안전성 판단·단일 SOT).
+///
+/// exe_path 는 `.../Contents/MacOS/cys-app`(current_exe) — 그 parent 가 classify_bundle_dir 입력이다.
+/// parent 가 없는 비정상 입력은 보수적으로 NonCanonical(정규 설치 근거 없음).
+fn boot_path_verdict(exe_path: &std::path::Path, env_escape: bool) -> BootPathVerdict {
+    if env_escape {
+        return BootPathVerdict::Canonical;
+    }
+    let macos_dir = match exe_path.parent() {
+        Some(d) => d,
+        None => return BootPathVerdict::NonCanonical,
+    };
+    match classify_bundle_dir(macos_dir) {
+        BundleKind::Canonical => BootPathVerdict::Canonical,
+        BundleKind::Translocated => BootPathVerdict::Translocated,
+        BundleKind::Backup | BundleKind::NonStandard => BootPathVerdict::NonCanonical,
+    }
+}
+
+/// 실행 중 프로세스의 부트 판정(비순수 래퍼) — current_exe + CYS_ALLOW_NONCANONICAL env 를 읽어
+/// `boot_path_verdict` 에 넘긴다. current_exe() 실패는 **fail-open(Canonical)**: 판정 근거가 전무할
+/// 때 정규 설치를 안전모드로 오무력화하지 않는다("오탐=앱 무력화" 회피). 이 fail-open 은
+/// maybe_autoregister_launchd 의 autoregister_allowed 가드(launchd 경로 독립 재검)로 방어심층이 유지된다.
+#[cfg(target_os = "macos")]
+fn current_boot_verdict() -> BootPathVerdict {
+    let env_escape = std::env::var("CYS_ALLOW_NONCANONICAL")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    match std::env::current_exe() {
+        Ok(p) => boot_path_verdict(&p, env_escape),
+        Err(_) => BootPathVerdict::Canonical,
+    }
+}
+
+/// 프론트 **pull 경로**(emit-before-listen 레이스 회피 · reviewer1 major). setup 의 안전모드
+/// `translocation-blocked` emit 은 프론트 listen 등록 전에 발화할 수 있고 Tauri v2 는 미등록 리스너에
+/// 버퍼링하지 않아 안내가 유실될 수 있다. start() 초기에 이 커맨드를 조회해 Some(안내문구)=안전모드면
+/// 즉시 표시한다(emit 은 벨트앤서스펜더로 유지). 데몬 무관 순수 조회라 daemon-ready 이전에도 응답한다.
+/// Canonical·비-macOS 는 None(정상 부트).
+#[tauri::command]
+fn boot_verdict() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let v = current_boot_verdict();
+        if v != BootPathVerdict::Canonical {
+            return Some(translocation_guidance(v));
+        }
+    }
+    None
+}
+
+/// 안전모드 사용자 안내 문구(순수). 자동 이동(자기 복사)은 오탐 시 파괴 위험이라 이번 범위에서
+/// 구현하지 않고, 복구 절차만 안내한다 — 설계 폴백 경로가 항상 성립. GUI 에서는
+/// `translocation-blocked` 이벤트로 stickyToast 에 실리고, 비-GUI(CI 등)에서는 stderr 로그로 나간다.
+#[cfg(target_os = "macos")]
+fn translocation_guidance(verdict: BootPathVerdict) -> String {
+    let cause = match verdict {
+        BootPathVerdict::Translocated => {
+            "Safari 등에서 내려받은 DMG 안의 앱을 곧바로 열어 macOS가 cys.app을 임시 위치에서 실행 중입니다."
+        }
+        _ => "cys.app이 정규 설치 위치(Applications) 밖에서 실행 중입니다.",
+    };
+    format!(
+        "{cause} 이 상태로는 백그라운드 서비스를 안전하게 등록할 수 없어 안전모드로 멈췄습니다.\n\n\
+         다음 순서로 설치해 주세요:\n\
+         1) Finder에서 cys.app을 응용 프로그램(Applications) 폴더로 드래그해 복사합니다.\n\
+         2) 이미 설치된 구버전 cys.app이 실행 중이면 먼저 종료한 뒤 새 버전으로 교체합니다.\n\
+         3) 그래도 '손상됨'으로 열리지 않으면 터미널에서 아래를 한 번 실행하세요:\n\
+         \u{2003}xattr -d com.apple.quarantine /Applications/cys.app\n\n\
+         설치 후 응용 프로그램 폴더의 cys.app을 다시 열면 정상 부팅됩니다."
+    )
 }
 
 /// `do shell script` 본문: target_dir 생성 + cys·cysd 심볼릭 멱등 생성(`ln -sf`).
@@ -1203,14 +1475,44 @@ fn read_profile_audience() -> String {
         .unwrap_or_else(|| "custom".to_string())
 }
 
+/// CC v2 WS-B: run_id 생성 — 산출물 dir·생애주기 추적의 결정론 키. ascii kebab만
+/// (skillrun.rs run_started 검증과 정합 — 경로 성분 금지).
+fn make_run_id(slug: Option<&str>, task: &str) -> String {
+    let base: String = slug
+        .unwrap_or(task)
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let base = if base.is_empty() { "skill".to_string() } else { base };
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{base}-{epoch}")
+}
+
 /// D5: 무계약 차단의 결정론 강제점 — task-prompt 티켓(성공기준·4규칙)을 생성한다(UI가 직접 워커에 명령 못 함).
 /// --no-survival-gate(B2): fresh 경로는 surface를 실행 시점에 만들므로 지금 워커 생존 확인 불요.
 /// D6: 청중 프로파일 audience를 scope에 주입 — 스킬이 Implications Domain 질문을 건너뛴다(custom=전체보기).
+/// CC v2 WS-B: 반환이 {ticket, run_id}로 확장 — 산출물 위치를 run_id dir로 핀(실행↔산출물 결정론 연결).
 #[tauri::command]
-fn make_ticket(task: String, scope: String, success: String, to: String) -> Result<String, String> {
+fn make_ticket(
+    task: String,
+    scope: String,
+    success: String,
+    to: String,
+    slug: Option<String>,
+) -> Result<Value, String> {
     let script = cys::pack::pack_dir().join("bin").join("javis_orchestra.py");
-    let out_fmt = "산출물을 ~/.cys/_round/skill-out/<작업slug>/ (절대경로) 아래에 저장하라(결정론 회수 위치·SB-6). \
-                   산출물에 '🔒 AI 보조 생성 · 오너 검수 전' 신뢰선 라벨을 부착하라(과대약속 금지).";
+    let run_id = make_run_id(slug.as_deref(), &task);
+    let out_fmt = format!(
+        "산출물을 ~/.cys/_round/skill-out/{run_id}/ (절대경로) 아래에 저장하라(결정론 회수 위치·SB-6). \
+         산출물에 '🔒 AI 보조 생성 · 오너 검수 전' 신뢰선 라벨을 부착하라(과대약속 금지)."
+    );
     let audience = read_profile_audience();
     let scope_full = if audience != "custom" {
         format!("{scope} · 청중 프로파일: {audience}(이 청중 맞춤으로 산출·Implications Domain 질문 생략)")
@@ -1224,7 +1526,7 @@ fn make_ticket(task: String, scope: String, success: String, to: String) -> Resu
         .arg("task-prompt")
         .args(["--task", &task, "--scope", &scope_full, "--success", &success, "--to", &to])
         .arg("--no-survival-gate")
-        .args(["--output-format", out_fmt]);
+        .args(["--output-format", &out_fmt]);
     no_console(&mut orch_cmd);
     let output = orch_cmd
         .output()
@@ -1232,12 +1534,19 @@ fn make_ticket(task: String, scope: String, success: String, to: String) -> Resu
     if !output.status.success() {
         return Err(format!("task-prompt 실패: {}", String::from_utf8_lossy(&output.stderr)));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(json!({"ticket": String::from_utf8_lossy(&output.stdout).to_string(), "run_id": run_id}))
 }
 
 /// D5/SB-2: 보이는 일회용 워커로 스킬 실행 — cys skill run(schedule --fresh) spawn(새 RPC 0·invisible -p 금지).
+/// CC v2 WS-B: run_id(make_ticket 발급)를 --run-id로 관통 — 데몬 run 생애주기 추적.
 #[tauri::command]
-fn run_skill(name: String, ticket: String, agent: Option<String>, close_after: Option<u64>) -> Result<Value, String> {
+fn run_skill(
+    name: String,
+    ticket: String,
+    agent: Option<String>,
+    close_after: Option<u64>,
+    run_id: Option<String>,
+) -> Result<Value, String> {
     if ticket.trim().is_empty() {
         return Err("ticket 비어 있음 — 무계약 실행 금지".into());
     }
@@ -1249,11 +1558,109 @@ fn run_skill(name: String, ticket: String, agent: Option<String>, close_after: O
     if let Some(ca) = close_after {
         cmd.args(["--close-after", &ca.to_string()]);
     }
+    if let Some(rid) = run_id.as_ref() {
+        cmd.args(["--run-id", rid]);
+    }
     cmd.stdin(std::process::Stdio::null());
     no_console(&mut cmd);
     cmd.spawn()
         .map_err(|e| format!("cys skill run 실행 실패 ({}): {e}", cys.display()))?;
-    Ok(json!({"ok": true, "name": name}))
+    Ok(json!({"ok": true, "name": name, "run_id": run_id}))
+}
+
+/// CC v2 WS-B: 최근 스킬 run 목록(생애주기 카드) — 로컬 데몬 skill.runs 위임.
+#[tauri::command]
+async fn skill_runs(limit: Option<u64>) -> Result<Value, String> {
+    rpc("skill.runs", json!({"limit": limit.unwrap_or(20)})).await
+}
+
+/// CC v2 WS-B(B5): 실행 전 자원 사전 게이트 — javis_resource_gate.py check --json.
+/// exit 0=allow 1=soft(경고 후 진행 가능) 2=hard(차단). 스크립트 부재·실행 실패는 allow
+/// (게이트가 보드를 죽이지 않는다 — fail-open, 게이트 자체는 사전 경고 장치).
+#[tauri::command]
+fn resource_gate_check() -> Result<Value, String> {
+    let script = cys::pack::pack_dir().join("bin").join("javis_resource_gate.py");
+    if !script.exists() {
+        return Ok(json!({"exit_code": 0, "report": Value::Null}));
+    }
+    let mut cmd = std::process::Command::new("python3");
+    inject_runtime_path(&mut cmd);
+    cmd.arg(&script).arg("check").arg("--json");
+    no_console(&mut cmd);
+    match cmd.output() {
+        Ok(out) => {
+            let code = out.status.code().unwrap_or(0);
+            let report =
+                serde_json::from_slice::<Value>(&out.stdout).unwrap_or(Value::Null);
+            Ok(json!({"exit_code": code, "report": report}))
+        }
+        Err(_) => Ok(json!({"exit_code": 0, "report": Value::Null})),
+    }
+}
+
+/// CC v2 WS-A: 계정 rate limit 전 조직 병합 뷰 — org_fleet 동형 fan-out(본부+부서, 2s 타임아웃).
+/// 병합 = (provider, account_id) 최신 updated_at 승자 · profiles 합집합. 부서 다운은 무시(로컬 우선).
+#[tauri::command]
+async fn usage_accounts_all() -> Result<Value, String> {
+    use std::time::Duration;
+    let mut targets: Vec<std::path::PathBuf> = vec![default_socket()];
+    if let Ok(reg) = list_depts() {
+        if let Some(depts) = reg.get("depts").and_then(|d| d.as_object()) {
+            for (name, meta) in depts {
+                let sock = meta
+                    .get("socket")
+                    .and_then(|s| s.as_str())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| dept_socket_path(name));
+                targets.push(sock);
+            }
+        }
+    }
+    let mut merged: std::collections::HashMap<(String, String), Value> =
+        std::collections::HashMap::new();
+    for sock in targets {
+        let call = tokio::time::timeout(
+            Duration::from_secs(2),
+            rpc_oneshot(&sock, "usage.accounts", json!({})),
+        )
+        .await;
+        let Ok(Ok(resp)) = call else { continue };
+        for a in resp["accounts"].as_array().into_iter().flatten() {
+            let key = (
+                a["provider"].as_str().unwrap_or("").to_string(),
+                a["account_id"].as_str().unwrap_or("").to_string(),
+            );
+            match merged.get_mut(&key) {
+                None => {
+                    merged.insert(key, a.clone());
+                }
+                Some(cur) => {
+                    let cur_ts = cur["updated_at"].as_f64().unwrap_or(0.0);
+                    let new_ts = a["updated_at"].as_f64().unwrap_or(0.0);
+                    // profiles 합집합은 승자와 무관하게 유지
+                    let mut profs: Vec<String> = cur["profiles"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .chain(a["profiles"].as_array().into_iter().flatten())
+                        .filter_map(|p| p.as_str().map(String::from))
+                        .collect();
+                    profs.sort();
+                    profs.dedup();
+                    if new_ts > cur_ts {
+                        *cur = a.clone();
+                    }
+                    cur["profiles"] = json!(profs);
+                }
+            }
+        }
+    }
+    let mut accounts: Vec<Value> = merged.into_values().collect();
+    accounts.sort_by(|x, y| {
+        (x["provider"].as_str().unwrap_or(""), x["label"].as_str().unwrap_or(""))
+            .cmp(&(y["provider"].as_str().unwrap_or(""), y["label"].as_str().unwrap_or("")))
+    });
+    Ok(json!({"accounts": accounts}))
 }
 
 /// RC(최초 자동연결): 기본 데몬(CEO)의 첫 화면에 master(claude)를 정석 자동기동한다.
@@ -1332,14 +1739,51 @@ async fn feed_list(status: Option<String>) -> Result<Value, String> {
     rpc("feed.list", json!({"status": status})).await
 }
 
+/// ★GUI 오퍼레이터 승인(오너 2026-07-15): 기본 데몬 state 디렉토리의 operator.token을 읽는다 —
+/// cysd state_dir(RC-13)의 기본 데몬 매핑과 동형(unix=기본 소켓의 부모 디렉토리,
+/// windows=%LOCALAPPDATA%\cys). feed_reply는 기본 데몬 전용(rpc 기본 소켓)이라 부서 pipe 슬러그
+/// 분기는 불필요. 매 호출 신선 재독(캐시 금지) — 데몬 재시작(churn)마다 토큰이 재발급되기 때문.
+/// 부재·빈 파일=None(구 데몬 호환 — 첨부 없이 기존대로 호출).
+fn read_operator_token() -> Option<String> {
+    #[cfg(windows)]
+    let dir = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").ok()?).join("cys");
+    #[cfg(not(windows))]
+    let dir = default_socket().parent()?.to_path_buf();
+    let tok = std::fs::read_to_string(dir.join("operator.token")).ok()?;
+    let tok = tok.trim().to_string();
+    (!tok.is_empty()).then_some(tok)
+}
+
 #[tauri::command]
 async fn feed_reply(request_id: String, decision: String) -> Result<(), String> {
-    rpc(
-        "feed.reply",
-        json!({"request_id": request_id, "decision": decision}),
-    )
-    .await
-    .map(|_| ())
+    // ★GUI 오퍼레이터 승인(오너 2026-07-15): operator.token을 첨부해 §3.2 자기승인 가드의 GUI 오탐
+    // (부서 생성 체인 pgid 각인 + surface 미귀속 fail-closed)을 면제한다. 첨부 지점은 이 Tauri 백엔드
+    // 단 한 곳 — 공용 cys CLI 무첨부는 워커의 **우발적** 면제만 차단한다(의도적 동일사용자
+    // 프로세스는 토큰 파일을 읽어 raw RPC로 우회 가능 — M11 수준·사고 방지용).
+    async fn call(request_id: &str, decision: &str) -> Result<Value, String> {
+        let mut params = json!({"request_id": request_id, "decision": decision});
+        if let Some(tok) = read_operator_token() {
+            params["operator_token"] = json!(tok);
+        }
+        rpc_full(&default_socket(), "feed.reply", params).await
+    }
+    let mut resp = call(&request_id, &decision).await?;
+    if resp["ok"].as_bool() != Some(true)
+        && resp["error"]["code"].as_str() == Some("self_approval_denied")
+    {
+        // 첫 호출의 파일 읽기와 데몬 재시작(토큰 회전)이 겹친 좁은 창 — 신선 재독으로 1회만 재시도.
+        resp = call(&request_id, &decision).await?;
+    }
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        // UI가 사유를 분류·표시할 수 있게 코드를 보존해 반환(에러 은폐 제거의 짝).
+        Err(format!(
+            "{}: {}",
+            resp["error"]["code"].as_str().unwrap_or("error"),
+            resp["error"]["message"].as_str().unwrap_or("unknown error")
+        ))
+    }
 }
 
 /// Attach: 부서 소켓의 surface PTY 출력을 base64 이벤트로 webview에 스트리밍.
@@ -1436,14 +1880,36 @@ async fn wait_for_connect(attempts: u32) -> bool {
 /// launchd-owned cysd의 socket-ready를 폴링해야 한다(중복 spawn·flock 경합 방지 — codex BLOCKER).
 #[cfg(target_os = "macos")]
 async fn maybe_autoregister_launchd() -> bool {
-    // 번들 동봉 cysd 절대경로(ensure_daemon과 동일 규칙) — 형제 cysd가 없으면 보류.
-    let daemon = match std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("cysd")))
-    {
-        Some(p) if p.exists() => p,
-        _ => return false,
+    // 번들 동봉 cysd 절대경로(ensure_daemon과 동일 규칙) — current_exe()=.../Contents/MacOS/cys-app,
+    // 그 parent 가 곧 <bundle>/Contents/MacOS(=classify_bundle_dir 입력)이자 형제 cysd 의 디렉터리다.
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return false,
     };
+    let macos_dir = match exe.parent() {
+        Some(d) => d,
+        None => return false,
+    };
+    // ★번들 위치 가드: plist 를 쓰기 **전에** 실행 번들 위치를 분류해 **Canonical(/Applications·
+    // ~/Applications)만** 자동등록한다. 무음 autostart 는 명시 사용자설치(plan_cli_install)와 위험
+    // 프로파일이 달라(GUI 시작 시 plist 무음 기록) 더 엄격하다: 휘발/이동 경로 — Translocated
+    // (/AppTranslocation/…)·Backup(cys.app.bak*/prev*)·NonStandard(~/Downloads·/Volumes/USB 등) — 가
+    // plist ProgramArguments 에 각인되면 언마운트·삭제·앱 이동 시 죽은 경로 데몬을 무한 스폰한다(사용자
+    // "손상됨"·앱 반복소실의 근본원인). 비-Canonical 은 자동등록만 skip 하고 ensure_daemon 런타임 폴백
+    // (휘발성 데몬)으로 안전하게 흐른다.
+    let kind = classify_bundle_dir(macos_dir);
+    if !autoregister_allowed(&kind) {
+        eprintln!(
+            "[cys-app] launchd autoregister skipped: 비정규 실행 위치({kind:?}) — \
+             Finder에서 cys.app을 Applications로 옮겨 다시 여세요"
+        );
+        return false;
+    }
+    // 형제 cysd가 없으면 보류(기존 동작 보존).
+    let daemon = macos_dir.join("cysd");
+    if !daemon.exists() {
+        return false;
+    }
     let running = connect().await.is_ok();
     match cys::launchd::register_if_absent(&daemon, running) {
         Ok(outcome) => {
@@ -1571,10 +2037,46 @@ async fn ensure_daemon() -> Result<(), String> {
         _ => std::path::PathBuf::from(daemon_name), // fall back to PATH
     };
     let mut command = std::process::Command::new(&program);
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    command.stdin(std::process::Stdio::null());
+    // ★W1-b: 앱-스폰 데몬의 stdout/stderr 를 기본 데몬 로그(launchd StandardErrorPath 와 동일 파일 규약)에
+    // O_APPEND 로 잇는다 — 과거 Stdio::null() 로 버려, 락 경쟁 패배·데드맨 판정 등 앱-스폰 데몬의 부트
+    // 진단이 통째로 증발했다(launchd-스폰 데몬만 로그가 남았다). open 실패 시 기존 null() 폴백 —
+    // 로그를 못 열어도 부트는 막지 않는다(fail-open).
+    #[cfg(target_os = "macos")]
+    {
+        let log = cys::launchd::log_path();
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+        {
+            Ok(f) => match f.try_clone() {
+                Ok(f2) => {
+                    command
+                        .stdout(std::process::Stdio::from(f))
+                        .stderr(std::process::Stdio::from(f2));
+                }
+                Err(_) => {
+                    command
+                        .stdout(std::process::Stdio::from(f))
+                        .stderr(std::process::Stdio::null());
+                }
+            },
+            Err(_) => {
+                command
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+            }
+        }
+    }
+    // launchd::log_path 는 mac 전용 경로 규약(#![cfg(target_os = "macos")])이라 그 외 OS(windows 포함)는
+    // 기존 null() 을 유지한다 — 별도 로그 파일 규약이 정해지면 그때 동등 배선한다.
+    #[cfg(not(target_os = "macos"))]
+    {
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    }
     no_console(&mut command);
     command
         .spawn()
@@ -1854,7 +2356,7 @@ async fn dept_tombstones() -> Result<Vec<String>, String> {
 /// 동일 메커니즘(앵커 준수: 시스템은 노드만 띄우고 지휘하지 않는다). CYS_SOCKET 제거로 항상
 /// base 데몬 대상(부서 오염 불가 — 소켓 격리와 동일 축). 생성된 surface는 GUI 자동입양이 수용.
 #[tauri::command]
-async fn start_master() -> Result<(), String> {
+async fn start_master(app: AppHandle) -> Result<(), String> {
     let cys = resolve_sidecar("cys");
     let out = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&cys);
@@ -1868,10 +2370,54 @@ async fn start_master() -> Result<(), String> {
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
     if out.status.success() {
+        spawn_orchestra_boot(app, None); // ★절대규칙: 마스터=4노드 팀 결정론 스폰(LLM 환각 무관)
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
+}
+
+/// ★절대규칙(오너 2026-07-15): 모든 마스터(본부·부서장)는 CSO·워커·리뷰어2 팀을 반드시 갖는다.
+/// 종전에는 이 팀 스폰이 마스터 LLM의 `cys boot`(디렉티브 §0 ④) 실행에 의존했는데, dept-master가
+/// "부서장 스코프=단독 대기"를 **환각**해 boot를 건너뛰는 치명 실사고가 발생했다(2026-07-15). 산문
+/// 의존을 제거하고 버튼 경로에서 `cys boot`를 코드 결정론으로 강제한다 — cys boot는 이미 가동 중인
+/// 역할을 건너뛰고(멱등·boot 락으로 동시 boot 직렬화) 마스터가 나중에 스스로 boot해도 중복 없음.
+/// ★관측성(적대검증 D-8): 종전 `let _ = status()`는 실패를 삼켜 claude 미설치 등으로 팀이 0개여도
+/// 사용자가 몰랐다(원 증상 재현·더 나쁨). exit≠0이거나 신규 기동 0이면 boot-warning 이벤트로 승격.
+/// fire-and-forget(최대 300s라 UI 무블록). socket=Some이면 그 부서 소켓 대상, None이면 본부.
+fn spawn_orchestra_boot(app: AppHandle, socket: Option<String>) {
+    let cys = resolve_sidecar("cys");
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&cys);
+        inject_runtime_path(&mut cmd);
+        match &socket {
+            Some(s) => {
+                cmd.env("CYS_SOCKET", s);
+            }
+            None => {
+                cmd.env_remove("CYS_SOCKET");
+            }
+        }
+        cmd.arg("boot");
+        no_console(&mut cmd);
+        match cmd.output() {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                // "boot 완료: 신규 기동 0" + "미설치" 힌트 = 팀이 안 떴다(claude 미설치 등) → 경고.
+                let launched_zero = stdout.contains("신규 기동 0");
+                let has_missing = stdout.contains("미설치");
+                if !o.status.success() || (launched_zero && has_missing) {
+                    let _ = app.emit(
+                        "boot-warning",
+                        "마스터는 시작됐으나 팀(CSO·워커·리뷰어) 기동에 실패했습니다 — claude CLI가 설치돼 있는지 확인하세요(설치: curl -fsSL https://claude.ai/install.sh | bash 후 재시도). 팀 없이도 마스터 단독 사용은 가능합니다.",
+                    );
+                }
+            }
+            Err(e) => {
+                let _ = app.emit("boot-warning", format!("팀 기동(cys boot) 실행 실패: {e}"));
+            }
+        }
+    });
 }
 
 /// ★R8(WP-2·적대검증 W2): CEO 승격 대기(PENDING) 여부 — cys-dept가 기록한 상태 파일 존재 검사.
@@ -1911,13 +2457,46 @@ async fn promote_pending_ceo() -> Result<String, String> {
     }
 }
 
+/// ★CEO 승격 Allow 결함 수리(오너 2026-07-15): 승격 요청은 cys-dept가 `feed push --wait`로 만드는
+/// 단명 프로세스인데, 오너가 Allow를 누를 무렵 그 대기자는 이미 timeout으로 죽어 있어 승격 행위가
+/// 실행되지 않았다(버튼이 먹통). 결정을 대기자에서 분리 — Allow 시 GUI가 이 커맨드로 승격을 **직접**
+/// 집행한다. `cys-dept promote-ceo`(오너 지명=consented 경로)는 feed 재질의 없이 directive를 교체한다.
+/// role-less(CYS_ROLE 제거)로 단일소유 가드 통과·base 소켓(CYS_SOCKET 제거) 대상.
+#[tauri::command]
+async fn approve_ceo_promotion() -> Result<String, String> {
+    let tool = dept_tool();
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("bash");
+        inject_runtime_path(&mut cmd);
+        cmd.env_remove("CYS_SOCKET");
+        cmd.env_remove("CYS_ROLE");
+        cmd.arg(&tool).arg("promote-ceo");
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    let txt = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() {
+        Ok(txt.trim().to_string())
+    } else {
+        Err(txt.trim().to_string())
+    }
+}
+
 /// ★조직 모델(오너 2026-07-15): 부서 탭의 "▶부서장" — 해당 부서 데몬에 master(부서장) 노드 기동.
 /// start_master(base=CEO 자리)와 대칭·동일 메커니즘(launch-agent). CYS_SOCKET=부서 소켓으로
 /// 그 부서 데몬이 pane을 spawn하므로 부서 팩 디렉티브(MASTER_DIRECTIVE)가 자동 주입되고,
 /// claim도 그 부서 레지스트리 대상(데몬당 살아있는 마스터 1명 규칙은 부서별 독립 적용).
 #[tauri::command]
-async fn start_dept_master(socket: String) -> Result<(), String> {
+async fn start_dept_master(app: AppHandle, socket: String) -> Result<(), String> {
     let cys = resolve_sidecar("cys");
+    let socket_boot = socket.clone(); // 아래 orchestra boot용(첫 클로저가 socket을 move)
     let out = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&cys);
         inject_runtime_path(&mut cmd);
@@ -1930,6 +2509,7 @@ async fn start_dept_master(socket: String) -> Result<(), String> {
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
     if out.status.success() {
+        spawn_orchestra_boot(app, Some(socket_boot)); // ★절대규칙: 부서장도 4노드 팀 결정론 스폰(환각 무관)
         Ok(())
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
@@ -1950,6 +2530,96 @@ async fn stop_dept_daemon_by_socket(socket: String) -> Result<(), String> {
     })
     .await;
     Ok(())
+}
+
+/// ★기능2(2026-07-15): 부서 완전 폐역(purge) — teardown을 넘어 대화기억(state·transcripts.db)까지
+/// 격리해 부활을 영구 차단한다. javis_org.py destroy 오케스트레이터에 일임(state·pack-dept
+/// 2디렉토리를 ~/.local/state/cys-trash/ 로 격리·묘비 영구 존치·재발견 glob 절단). CSO 전용 게이트라
+/// CYS_ROLE=cso 로 호출하고, base 레지스트리 대상이므로 CYS_SOCKET 은 제거한다(부서 소켓 오염 방지).
+/// 실패는 Err 로 GUI 에 정직 표기(무음 삼킴 금지). stop_dept_daemon_by_socket 과 socket→name 규약 공유.
+/// ★D2a(purge-safety 2026-07-16): --purge-workdir 는 GUI 에서 요청하지 않는다 — 실사고: 전 부서
+/// 레지스트리 cwd=$HOME(공유 에이전트 작업 디렉토리)라 홈 전체 스냅샷(TCC .Trash 에서 사망)·성공 시
+/// 홈 mv 파괴 경로였다. 백엔드 D1a 게이트(workdir_owned 선언제)가 이중 방어하나 GUI 계약도 정직하게
+/// "작업 폴더 보존"으로 고정한다(모달 고지문과 동일 커밋 — 변경 결합).
+#[tauri::command]
+async fn purge_dept_daemon_by_socket(socket: String) -> Result<String, String> {
+    let name = dept_name_from_socket(&socket)
+        .ok_or_else(|| format!("부서명 파생 실패(비표준 소켓): {socket}"))?;
+    let script = cys::pack::pack_dir().join("bin").join("javis_org.py");
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("python3");
+        inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(python3.exe) PATH 주입
+        cmd.env_remove("CYS_SOCKET"); // base 레지스트리 대상(부서 소켓 오염 방지)
+        cmd.env("CYS_ROLE", "cso"); // destroy 는 CSO 전용 게이트(require_cso)
+        cmd.arg(&script)
+            .arg("destroy")
+            .args(["--dept", &name])
+            .arg("--purge")
+            .arg("--purge-state");
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("javis_org destroy 실행 실패: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// ★기능2: 완전 삭제 확인 다이얼로그 프리뷰 — 격리될 state 디렉토리(대화기억)의 크기·최종 수정시각과
+/// "이 부서가 마지막인가(→CEO 강등)"를 반환한다. 사용자가 무엇을 삭제하는지 읽고 결정하도록 하는 근거.
+/// 읽기 전용(stat·registry 조회) — 부작용 없음.
+#[tauri::command]
+fn dept_purge_preview_by_socket(socket: String) -> Result<Value, String> {
+    let name = dept_name_from_socket(&socket)
+        .ok_or_else(|| format!("부서명 파생 실패(비표준 소켓): {socket}"))?;
+    // state 디렉토리 = 부서 소켓의 부모(dept_socket_path 규약과 동일).
+    let state_dir = dept_socket_path(&name)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| dept_socket_path(&name));
+    fn dir_size(p: &std::path::Path) -> u64 {
+        let mut total = 0u64;
+        if let Ok(rd) = std::fs::read_dir(p) {
+            for e in rd.flatten() {
+                match e.file_type() {
+                    Ok(ft) if ft.is_dir() => total += dir_size(&e.path()),
+                    Ok(_) => total += e.metadata().map(|m| m.len()).unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        total
+    }
+    let (size_bytes, mtime_secs, exists) = match std::fs::metadata(&state_dir) {
+        Ok(m) => {
+            let mt = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (dir_size(&state_dir), mt, true)
+        }
+        Err(_) => (0, 0, false),
+    };
+    // 부서 수(depts.json) — 1이면 이 삭제가 마지막 → CEO 강등 고지.
+    let dept_count = list_depts()
+        .ok()
+        .and_then(|r| r.get("depts").and_then(|d| d.as_object()).map(|o| o.len()))
+        .unwrap_or(0);
+    Ok(json!({
+        "name": name,
+        "state_dir": state_dir.to_string_lossy(),
+        "exists": exists,
+        "size_bytes": size_bytes,
+        "mtime_secs": mtime_secs,
+        "dept_count": dept_count,
+        "is_last": dept_count <= 1,
+    }))
 }
 
 /// A안(2026-07-11 오너 승인): 교대·설치 게이트가 세는 "지킬 세션" = **role 또는 agent 가 붙은
@@ -1984,7 +2654,7 @@ async fn dept_live_session_count(sock: &std::path::Path) -> Result<u64, String> 
 /// rotate_daemon 동형이되 대상이 부서 소켓이라 세션 카운트를 dept_live_session_count(부서소켓 surface.list)로
 /// 산출한다(live_session_count는 메인 전용이라 재사용 불가). 반환=새 데몬 identify(+rotate_log) — UI 스큐 해소 판정.
 #[tauri::command]
-async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool) -> Result<Value, String> {
+async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool, skip_drain: bool) -> Result<Value, String> {
     let sock = dept_socket_path(&name);
     // 세션 가드(rotate_daemon 동형). ★F1(리뷰): force=false는 카운트 실패를 0으로 접지 않고
     // Err("live_sessions:unknown")로 보류한다 — 세션 보유 부서를 무확인 교대할 위험 차단(UI가 held 분류·다음
@@ -1998,15 +2668,18 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool) -> Result
     }
     // drain(best-effort): 교대 전 부서 노드에 저장 신호. 부서 소켓 대상(CYS_SOCKET)으로 cys drain 실행
     // (메인 rotate_daemon의 drain 동형·spawn_blocking 패턴 일치). cys drain 자체 watchdog로 hang 시에도 종료.
-    let dsock = sock.to_string_lossy().into_owned();
-    let _ = tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
-        cmd.env(cys::ENV_SOCKET, &dsock);
-        cmd.arg("drain");
-        no_console(&mut cmd);
-        cmd.status()
-    })
-    .await;
+    // ★skip_drain: verified 재시작은 사전 `cys drain --verify`로 저장 확인됨 → 이중 drain 생략(회귀 0=false).
+    if !skip_drain {
+        let dsock = sock.to_string_lossy().into_owned();
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+            cmd.env(cys::ENV_SOCKET, &dsock);
+            cmd.arg("drain");
+            no_console(&mut cmd);
+            cmd.status()
+        })
+        .await;
+    }
     // cys-dept rotate <name> — 프로세스 정지→새 바이너리 재기동(reg_upsert 메타보존·묘비 불변).
     // launch_dept_daemon의 bash+inject_runtime_path+no_console+spawn_blocking 패턴 동형.
     let tool = dept_tool();
@@ -2253,7 +2926,7 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
 /// 만드는데 이 경로엔 재시작이 없어 영구 잔류한다. 진행 표시는 UI(checkVersionSkew/manualRotateSkewed) 토스트 담당.
 /// force=false: 살아있는 세션이 있으면 거부(UI가 확인 후 force=true로 재호출) — install_update 가드 동형.
 #[tauri::command]
-async fn rotate_daemon(app: AppHandle, force: bool) -> Result<(), String> {
+async fn rotate_daemon(app: AppHandle, force: bool, skip_drain: bool) -> Result<(), String> {
     // ★F1(리뷰): force=false는 UI checkVersionSkew(무손실 자동 교대)만 호출한다 — 세션 카운트 실패를 0으로
     // 접으면 세션 보유 노드를 무확인 교대할 위험 → Err("live_sessions:unknown")로 보류(UI가 "held" 분류·다음
     // tick 재시도). Ok(0)만 진행. force=true(사용자 확인 완료 수동 경로)는 카운트 자체를 건너뛴다(무영향).
@@ -2265,13 +2938,17 @@ async fn rotate_daemon(app: AppHandle, force: bool) -> Result<(), String> {
         }
     }
     // drain(best-effort): 교대 전 살아있는 노드에 저장 신호 + 유예 (install_update 3단계 동형).
-    let _ = tokio::task::spawn_blocking(|| {
-        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
-        cmd.arg("drain");
-        no_console(&mut cmd);
-        cmd.status()
-    })
-    .await;
+    // ★skip_drain: verified 재시작 경로는 사전에 `cys drain --verify`로 저장을 확인했으므로 여기서
+    // 이중 drain을 생략한다. 기존 무손실 자동교대·수동 '바로 재시작'은 skip_drain=false로 거동 불변(회귀 0).
+    if !skip_drain {
+        let _ = tokio::task::spawn_blocking(|| {
+            let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+            cmd.arg("drain");
+            no_console(&mut cmd);
+            cmd.status()
+        })
+        .await;
+    }
     let _ = std::fs::write(pending_restore_path(), "");
     stop_running_daemon().await;
     ensure_daemon().await?;
@@ -2279,6 +2956,60 @@ async fn rotate_daemon(app: AppHandle, force: bool) -> Result<(), String> {
     let app2 = app.clone();
     let _ = tokio::task::spawn_blocking(move || maybe_apply_pending_update(&app2)).await;
     Ok(())
+}
+
+/// [F5] drain --verify JSON 부재 시 실패 원인 분류 — ①구버전 미지원(clap unknown-flag) vs ②크래시/하드캡
+/// 백스톱을 구분해 UI가 정직한 문구를 고르게 한다(거동=plain drain 폴백은 양쪽 동일, 문구만 다름).
+/// 반환 Err 문자열 접두: "unsupported:"(①) / "verify_failed:"(②).
+/// - ① 판정: clap은 미지의 인자에 exit 2 + stderr에 "unexpected argument"/usage를 낸다(run_drain_verify는
+///   정상=0/1·백스톱=3만 내므로 exit 2는 clap 파싱 에러=미지원의 강신호).
+/// - ② 그 외(백스톱 exit 3·시그널 사망·부분 stdout 등): 실행은 됐으나 결과를 못 냄 = 검증 실패(원인 미상).
+fn classify_drain_verify_failure(exit_code: Option<i32>, stderr: &str) -> String {
+    let unsupported = exit_code == Some(2)
+        || stderr.contains("unexpected argument")
+        || stderr.contains("unrecognized")
+        || (stderr.contains("Usage:") && stderr.contains("--verify"));
+    if unsupported {
+        format!(
+            "unsupported: cys drain --verify 미지원(구버전 바이너리) (stderr: {})",
+            stderr.trim()
+        )
+    } else {
+        format!(
+            "verify_failed: drain --verify 실행 실패(exit={exit_code:?}, 크래시/하드캡 백스톱 가능) (stderr: {})",
+            stderr.trim()
+        )
+    }
+}
+
+/// GUI verified 재시작용 — `cys drain --verify`를 실행해 노드별 체크포인트(SESSION_STATE) 저장 검증
+/// 결과 JSON을 반환한다(all_saved·summary·nodes·pending_loss_warning). JSON 부재 시 [F5] 원인을 분류해
+/// Err("unsupported:…"=구버전 미지원 / "verify_failed:…"=크래시·하드캡)로 신호 → UI가 문구를 분기하고
+/// 양쪽 모두 plain drain 폴백(거동 동일). ★재시작하지 않는다(저장 검증만) — 재시작은 UI가 결과를 보고
+/// rotate_daemon(skip_drain=true)로 진행.
+#[tauri::command]
+async fn drain_verify(timeout: u64) -> Result<Value, String> {
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd =
+            std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+        cmd.arg("drain")
+            .arg("--verify")
+            .arg("--timeout")
+            .arg(timeout.to_string());
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    // 결과 JSON은 exit code(전원 saved=0/아니면 1)와 무관하게 stdout에 방출된다 — JSON 파싱 성공이 진실원천.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) {
+        return Ok(v);
+    }
+    // JSON 부재 = 구 바이너리 미지원(clap 에러) 또는 크래시/하드캡 → [F5] 원인 분류해 정직한 폴백 신호.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Err(classify_drain_verify_failure(out.status.code(), &stderr))
 }
 
 /// P5: 무중단 팩 업데이트 UI 브리지(DESIGN-noshutdown-pack-update §2-②·§7-③/④).
@@ -2460,6 +3191,7 @@ fn main() {
             start_dept_master,
             ceo_pending,
             promote_pending_ceo,
+            approve_ceo_promotion,
             daemon_status,
             list_surfaces,
             org_status,
@@ -2490,11 +3222,18 @@ fn main() {
             feed_reply,
             list_dir,
             open_path,
+            reveal_path,
+            read_text_head,
+            ensure_view_bridge,
+            home_dir_path,
             open_url,
             send_key,
             read_board_catalog,
             make_ticket,
             run_skill,
+            skill_runs,
+            resource_gate_check,
+            usage_accounts_all,
             skill_out_dir,
             check_update,
             check_pack_update,
@@ -2502,21 +3241,44 @@ fn main() {
             install_update,
             autotest_patch_install,
             rotate_daemon,
+            drain_verify,
             install_pack_update,
             launch_dept_daemon,
             allocate_dept_daemon,
             stop_dept_daemon,
             stop_dept_daemon_by_socket,
+            purge_dept_daemon_by_socket,
+            dept_purge_preview_by_socket,
             rotate_dept_daemon,
             list_depts,
             read_dept_catalog,
             install_cli_to_path,
             app_version,
             launch_master,
+            boot_verdict,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // ★T2 안전모드 게이트(translocation/비정규 경로 · 앱 자기삭제·"손상됨" 근본수리) —
+                // 데몬 기동·launchd 등록·팩/hook 쓰기 등 **자기경로 부수효과 전체보다 먼저** 실행 번들
+                // 위치를 판정한다. Canonical(정규 설치)이 아니면 부수효과를 전부 skip 하고 안내만 표시한
+                // 뒤 조기 반환한다(자동 이동 없음 — 오탐 시 파괴 위험 회피, 안내 폴백이 항상 성립).
+                // Canonical 이면 아래 기존 부트 흐름을 그대로 통과한다(정상 부트 무영향). 기존 설치본이
+                // 실행 중이면 single-instance 플러그인이 새 인스턴스를 접고, 그와 별개로 이 게이트가
+                // 비정규 인스턴스의 데몬 스폰 자체를 막는다(방어심층).
+                #[cfg(target_os = "macos")]
+                {
+                    let verdict = current_boot_verdict();
+                    if verdict != BootPathVerdict::Canonical {
+                        let msg = translocation_guidance(verdict);
+                        eprintln!(
+                            "[cys-app] 안전모드: 비정규 실행 위치({verdict:?}) — 데몬·launchd·팩 등록 skip\n{msg}"
+                        );
+                        let _ = handle.emit("translocation-blocked", msg);
+                        return;
+                    }
+                }
                 // ★온보딩 게이트(v4) — GUI 전용 완료 마커(.gui-onboarded) 기준. 팩 마커(.pack-version)
                 // 기준이던 v3는 CLI autostart·잔존 schtasks 등으로 cysd가 GUI보다 먼저 돈 머신에서
                 // 게이트가 선점돼 ~/.claude hook이 영구 미설치됐다(0.12.52 cys-neo 실사고 — "너는
@@ -2608,6 +3370,49 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [F1] open_path 실행형 게이트 — 실행비트 파일은 force 없이 executable_confirm으로 거절(fail-closed),
+    /// 비존재 경로는 metadata 게이트에서 거절(스폰 없음). force 경로는 실제 스폰이라 여기서 검사하지 않는다.
+    #[test]
+    fn open_path_gates_executable_and_missing() {
+        let r = open_path("/definitely/not/a/real/path-xyz".into(), None);
+        assert!(r.is_err() && !r.unwrap_err().contains("executable_confirm"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join("cys-openpath-test");
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("run.sh");
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let r = open_path(p.to_string_lossy().into_owned(), None);
+            assert_eq!(r, Err("executable_confirm".to_string()));
+        }
+    }
+
+    /// [F5] drain --verify 실패 분류 — 구버전 미지원(clap unknown-flag)과 크래시/하드캡을 구분한다.
+    /// UI 문구 정직성: ①→"미지원" ②→"검증 실패(원인 미상)". 거동(plain drain 폴백)은 양쪽 동일.
+    #[test]
+    fn drain_verify_failure_classification() {
+        // ① 구버전: clap exit 2 + unexpected argument → unsupported
+        let e1 = classify_drain_verify_failure(
+            Some(2),
+            "error: unexpected argument '--verify' found\n\nUsage: cys drain [OPTIONS]",
+        );
+        assert!(e1.starts_with("unsupported:"), "구버전 미지원은 unsupported: {e1}");
+        // ① exit 코드 미상이어도 stderr usage+--verify 패턴이면 unsupported
+        let e1b = classify_drain_verify_failure(None, "Usage: cys drain --verify ...");
+        assert!(e1b.starts_with("unsupported:"), "usage+--verify는 unsupported: {e1b}");
+        // ② 하드캡 백스톱(exit 3) → verify_failed
+        let e2 = classify_drain_verify_failure(Some(3), "");
+        assert!(e2.starts_with("verify_failed:"), "exit3 백스톱은 verify_failed: {e2}");
+        // ② 시그널 사망(code=None)·usage 무관 stderr → verify_failed
+        let e2b = classify_drain_verify_failure(None, "thread 'main' panicked at ...");
+        assert!(e2b.starts_with("verify_failed:"), "크래시는 verify_failed: {e2b}");
+        // 정상 exit 1(부분 실패)은 JSON 경로라 여기 안 오지만, 분류가 오면 verify_failed(안전)
+        let e2c = classify_drain_verify_failure(Some(1), "");
+        assert!(e2c.starts_with("verify_failed:"), "exit1 무JSON은 verify_failed: {e2c}");
+    }
 
     /// A안 회귀 박제(2026-07-11 오너 승인): 교대 게이트는 role/agent 붙은 세션만 지킨다.
     /// 맨 셸 pane(role·agent 없음)이 다시 게이트에 잡히면 기본 pane 1개만으로 자동 교대가
@@ -2866,6 +3671,42 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
     }
 
     #[test]
+    fn classify_bundle_dir_volumes_applications_is_not_canonical() {
+        use std::path::Path;
+        // ★/Volumes 가드(reviewer1): DMG·외장 마운트 안의 Applications 폴더/심링크 경유 실행은
+        // ends_with("/Applications")를 만족해도 Canonical 이 아니다(언마운트 시 죽은 경로 → 자기삭제 재발).
+        assert_ne!(
+            classify_bundle_dir(Path::new("/Volumes/cys 0.12.91/Applications/cys.app/Contents/MacOS")),
+            BundleKind::Canonical,
+            "/Volumes 하위 Applications 는 Canonical 오판 금지",
+        );
+        assert_eq!(
+            classify_bundle_dir(Path::new("/Volumes/cys 0.12.91/Applications/cys.app/Contents/MacOS")),
+            BundleKind::NonStandard,
+        );
+        // 정규 경로 불변(회귀 핀).
+        assert_eq!(
+            classify_bundle_dir(Path::new("/Applications/cys.app/Contents/MacOS")),
+            BundleKind::Canonical,
+            "/Applications 는 Canonical 불변",
+        );
+        assert_eq!(
+            classify_bundle_dir(Path::new("/Users/x/Applications/cys.app/Contents/MacOS")),
+            BundleKind::Canonical,
+            "~/Applications 는 Canonical 불변",
+        );
+        // boot_path_verdict 도 델리게이션 결과로 안전모드 진입(비-Canonical=NonCanonical).
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Volumes/cys 0.12.91/Applications/cys.app/Contents/MacOS/cys-app"),
+                false,
+            ),
+            BootPathVerdict::NonCanonical,
+            "/Volumes 하위 Applications 는 부트 안전모드 진입",
+        );
+    }
+
+    #[test]
     fn parse_which_a_returns_precedence_ordered_paths() {
         let out = "/Users/x/.local/bin/cys\n/opt/homebrew/bin/cys\n\n/usr/local/bin/cys\n";
         assert_eq!(
@@ -2890,6 +3731,129 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
             std::path::Path::new("/Applications/cys.app.bak-044/Contents/MacOS"),
             "/usr/local/bin"
         ).is_err());
+    }
+
+    #[test]
+    fn autoregister_allowed_only_canonical() {
+        // 무음 launchd 자동등록은 plan_cli_install 보다 엄격하다(의도적 divergence): Canonical 만 허용.
+        // NonStandard(~/Downloads·/Volumes 등)도 거부 — 휘발/이동 경로가 plist 에 각인되면 언마운트·삭제
+        // 시 죽은 경로 데몬 무한 스폰(리뷰어1 F1). 비-Canonical 은 ensure_daemon 런타임 폴백으로 안전.
+        assert!(autoregister_allowed(&BundleKind::Canonical), "정규 번들(/Applications·~/Applications)만 자동등록 허용");
+        assert!(!autoregister_allowed(&BundleKind::Translocated), "임시 경로는 자동등록 거부");
+        assert!(!autoregister_allowed(&BundleKind::Backup), "백업 번들은 자동등록 거부");
+        assert!(!autoregister_allowed(&BundleKind::NonStandard), "비표준(Downloads·USB 등)도 자동등록 거부");
+    }
+
+    // ── T4: 부트 안전모드 감지 게이트 ─────────────────────────────────────
+    #[test]
+    fn boot_path_verdict_positive_and_negative_cases() {
+        use std::path::Path;
+        // 양성 3케이스(비-Canonical=안전모드 진입) — escape env 없음(false).
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/private/var/folders/ab/AppTranslocation/CD12/d/cys.app/Contents/MacOS/cys-app"),
+                false,
+            ),
+            BootPathVerdict::Translocated,
+            "AppTranslocation 임시 경로 = Translocated",
+        );
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Volumes/cys 0.12.91/cys.app/Contents/MacOS/cys-app"),
+                false,
+            ),
+            BootPathVerdict::NonCanonical,
+            "DMG(/Volumes) 직실행 = NonCanonical",
+        );
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Users/x/Downloads/cys.app/Contents/MacOS/cys-app"),
+                false,
+            ),
+            BootPathVerdict::NonCanonical,
+            "임의(Downloads) 경로 = NonCanonical",
+        );
+        // 음성 2케이스(Canonical=정상 부트 그대로).
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Applications/cys.app/Contents/MacOS/cys-app"),
+                false,
+            ),
+            BootPathVerdict::Canonical,
+            "/Applications 정규 설치 = Canonical",
+        );
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Users/x/dev/cys/target/release/cys-app"),
+                true,
+            ),
+            BootPathVerdict::Canonical,
+            "CYS_ALLOW_NONCANONICAL=1(escape env) = 무조건 Canonical(개발·CI 자기감금 방지)",
+        );
+    }
+
+    #[test]
+    fn boot_path_verdict_escape_overrides_and_user_applications() {
+        use std::path::Path;
+        // ~/Applications 도 Canonical(정규 allowlist).
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Users/x/Applications/cys.app/Contents/MacOS/cys-app"),
+                false,
+            ),
+            BootPathVerdict::Canonical,
+        );
+        // escape env 는 translocation 경로마저 Canonical 로 덮는다(무조건 = 최우선 단락).
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/private/var/folders/ab/AppTranslocation/x/cys.app/Contents/MacOS/cys-app"),
+                true,
+            ),
+            BootPathVerdict::Canonical,
+        );
+        // escape 없는 개발 target/ 는 NonCanonical(하네스가 env 로 스스로 풀어야 함).
+        assert_eq!(
+            boot_path_verdict(
+                Path::new("/Users/x/dev/cys/target/debug/cys-app"),
+                false,
+            ),
+            BootPathVerdict::NonCanonical,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translocation_guidance_carries_recovery_steps() {
+        // 안내는 ①Applications 드래그 ②구버전 종료·교체 ③xattr quarantine 제거를 모두 담아야 한다.
+        let g = translocation_guidance(BootPathVerdict::Translocated);
+        assert!(g.contains("Applications"), "① Applications 드래그 설치 안내 포함");
+        assert!(g.contains("구버전") && g.contains("종료"), "② 구버전 종료·교체 안내 포함");
+        assert!(
+            g.contains("xattr -d com.apple.quarantine /Applications/cys.app"),
+            "③ quarantine 제거 명령 포함",
+        );
+        // NonCanonical 도 동일 복구 절차를 안내한다(원인 문구만 일반화).
+        let n = translocation_guidance(BootPathVerdict::NonCanonical);
+        assert!(n.contains("xattr -d com.apple.quarantine /Applications/cys.app"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn boot_verdict_command_feeds_pull_path() {
+        // 프론트 pull 경로(emit-before-listen 회피)의 백엔드 반쪽을 커맨드 레벨로 검증한다: start()가
+        // invoke("boot_verdict")로 받는 값이 안전모드면 Some(안내)·정상이면 None 이어야 안내 표시가 성립.
+        // 테스트 프로세스 exe(target/…/deps/cys_app-*)는 비정규 경로 → escape env 없으면 Some.
+        // CYS_ALLOW_NONCANONICAL 은 이 커맨드 외 어떤 테스트도 읽지 않아 병렬 간섭 없음.
+        std::env::remove_var("CYS_ALLOW_NONCANONICAL");
+        let g = boot_verdict();
+        assert!(g.is_some(), "비정규 실행(test 하네스 경로)에서 pull 은 안내 문구를 반환");
+        assert!(
+            g.unwrap().contains("xattr -d com.apple.quarantine /Applications/cys.app"),
+            "pull 이 반환한 안내에 복구 명령 포함(프론트 stickyToast 본문)",
+        );
+        std::env::set_var("CYS_ALLOW_NONCANONICAL", "1");
+        assert!(boot_verdict().is_none(), "escape env 에서는 None(정상 부트 — 안내 미표시)");
+        std::env::remove_var("CYS_ALLOW_NONCANONICAL");
     }
 
     #[test]
@@ -2988,5 +3952,23 @@ ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
             plan_path_add("", r"C:\Users\x\AppData\Local\cys"),
             Some(r"C:\Users\x\AppData\Local\cys".to_string())
         );
+    }
+
+    /// ★D2a(purge-safety 2026-07-16) 회귀 트립와이어: GUI purge 는 --purge-workdir 를 절대
+    /// 되살리지 않는다 — 전 부서 cwd=$HOME 현실에서 홈 스냅샷·격리(파괴) 경로였다(실사고).
+    /// 재도입하려면 백엔드 D1a 게이트(workdir_owned)와 모달 고지문("작업 폴더 보존")을 함께 바꿔야
+    /// 하며, 그 전에 이 테스트가 막는다.
+    #[test]
+    fn purge_dept_cmd_never_requests_workdir_purge() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("async fn purge_dept_daemon_by_socket")
+            .expect("purge_dept_daemon_by_socket 정의 소실 — 트립와이어 재배선 필요");
+        let seg = &src[start..start + src[start..].find("\n#[tauri::command]").unwrap_or(src.len() - start)];
+        assert!(
+            !seg.contains("--purge-workdir"),
+            "GUI purge 가 --purge-workdir 를 다시 요청함 — 홈 파괴 경로 재개방(실사고 2026-07-16 재발)"
+        );
+        assert!(seg.contains("--purge-state"), "purge 명령 골격 변형 — 트립와이어 재검토 필요");
     }
 }

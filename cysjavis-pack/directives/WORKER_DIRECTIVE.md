@@ -69,6 +69,7 @@ master가 모든 위임 티켓에 이 4규칙을 자동 주입한다(`javis_orch
 
 ## 4. 실측 검증 (추측 금지)
 산출 전 반드시 실측한다(빌드·실행·렌더·테스트). "될 것이다"가 아니라 "확인했다"로 보고한다.
+- **행동 경계 probe (결정론 게이트)**: 위험·비가역 행동 직전 해당 `javis_actprobe.py <name> --task <자기 장부 태스크 id>` PASS(exit 0)를 확인한다 — 프로세스 kill 전 `kill-preflight`, 산출물 done 보고 전 `artifact`, verdict 수용 전 `verdict-match`, cys send 제출 확인엔 `submit`. FAIL(2)·판정불가(3)면 행동을 멈추고 master에 보고한다. probe 실행 시 `probe:<name>` 토큰을 done evidence에 명시하라(영수증 자동 대조). ⚠ relaxed probe(submit·ctx-compare·kill-preflight)는 `--task` 없으면 무-task 영수증이 되어 done 대조에서 대상 불일치로 거부되니 반드시 --task를 동반하라.
 - **차단 콘텐츠 수집 검증(E3)**: 차단·안티봇 웹 콘텐츠를 직접 fetch해 채택할 때, HTTP 200을 성공으로 단정하지 말고 결과를 `_round/VALIDATION_VERDICT_VOCAB.md` §2 2축(성공성×종결성)으로 분류한다 — **SUSPECT_OK·비종결을 성공으로 보고 금지**(애매하면 성공 아님·계속 탐색).
 
 - **역할 분담(Worker 측)**: master는 네 완료 보고를 그대로 믿지 않고 **diff·테스트로 직접 검증**한 뒤 승인한다 — 그러니 '확인했다' 실측·정직 보고가 절대적이고, master 브리프에 담긴 컨텍스트(파일 경로·컨벤션·함정·완료 기준)를 활용해 재탐색을 줄여라. 검증에 실패하면 수정 브리프로 재위임될 수 있다.

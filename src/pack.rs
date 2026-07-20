@@ -51,21 +51,145 @@ pub fn embedded_pack_hash() -> String {
     format!("{:x}", h.finalize())
 }
 
-/// 설치 위치: $CYS_PACK_DIR (구 JAVIS_PACK_DIR·AITERM_JARVIS_DIR 폴백) 또는 ~/.cys/pack
-pub fn pack_dir() -> PathBuf {
+/// pack_dir 해석의 순수 env 층(W0-a): CYS_PACK_DIR(구 JAVIS_/AITERM_ 폴백) → 명시 경로,
+/// 아무 override도 없으면 `None`(= 홈 기본 폴백 대상). panic·부수효과 없음 — 폴백-불변식
+/// 회귀 테스트(pack_dir_env_precedence_and_legacy_fallbacks)가 이 순수함수를 직접 호출한다.
+fn pack_dir_from_env() -> Option<PathBuf> {
     if let Some(d) = crate::env_compat(ENV_PACK_DIR) {
-        return PathBuf::from(d);
+        return Some(PathBuf::from(d));
     }
     for legacy in ["JAVIS_PACK_DIR", "AITERM_JARVIS_DIR"] {
         if let Ok(d) = std::env::var(legacy) {
             if !d.is_empty() {
-                return PathBuf::from(d);
+                return Some(PathBuf::from(d));
             }
         }
     }
+    None
+}
+
+/// 홈 기반 라이브 기본 pack 경로(~/.cys/pack) — env override를 **의도적으로 무시**하는 원천 경로.
+/// pack_dir()의 최종 폴백이자 W0-d 인가 게이트가 보호하는 대상(테스트가 이 경로를 가리키면 인가 필요).
+fn home_default_pack_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".cys/pack")
+}
+
+/// 설치 위치: $CYS_PACK_DIR (구 JAVIS_PACK_DIR·AITERM_JARVIS_DIR 폴백) 또는 ~/.cys/pack.
+/// ★W0-a fail-closed: **테스트 빌드(cfg!(test))** 에서 어떤 pack env도 설정돼 있지 않으면 panic한다.
+/// 테스트가 CYS_PACK_DIR 격리를 잃은 채(teardown 창 등) 라이브 `~/.cys/pack`을 만지는 재오염 벡터를
+/// 조용한 폴백이 아니라 큰 소리 실패로 봉인한다. panic은 pack_dir() **본체가 아니라 이 진입점**에만
+/// 있으므로, 폴백 4단 자체를 검증하는 회귀 테스트는 순수함수(pack_dir_from_env·home_default_pack_dir)를
+/// 직접 호출해 영향을 받지 않는다. 프로덕션(cfg!(test) 아님)은 종전대로 홈 기본으로 폴백한다.
+pub fn pack_dir() -> PathBuf {
+    if let Some(p) = pack_dir_from_env() {
+        return p;
+    }
+    #[cfg(test)]
+    {
+        panic!(
+            "W0-a 테스트 격리 봉인 위반 — CYS_PACK_DIR 미설정 상태에서 pack_dir() 호출. \
+             테스트는 반드시 CYS_PACK_DIR을 temp 샌드박스로 설정하고(권장: EnvGuard) 라이브 \
+             ~/.cys/pack 을 만지지 않아야 한다."
+        );
+    }
+    #[cfg(not(test))]
+    {
+        home_default_pack_dir()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W0-d 양성 인가 게이트 — 팩 쓰기 경로는 대상이 **라이브 기본 경로**(~/.cys/pack)일 때
+// 양성 인가(PackWriteAuth) 없이는 하드 거부(Err)한다. 인가는 프로덕션 진입점(cys init-pack
+// CLI 핸들러·pack-update·pack-downgrade·cysd 부팅 자동설치)만 `PackWriteAuth::production()`으로
+// 부여한다(스코프 토큰 타입 — env 아님). 비라이브 대상(테스트 샌드박스·CYS_PACK_DIR temp) 쓰기는
+// 인가가 필요 없다. 원칙: 부정 감지(테스트 감지)가 아니라 양성 인가(프로덕션만 라이브 쓰기 허가).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 팩 쓰기 인가 증표(W0-d) — 라이브 기본 pack_dir에 쓰기를 허가하는 스코프 토큰.
+/// 필드가 private이라 crate 외부는 `production()`으로만 생성할 수 있고, crate 내부 테스트는
+/// `for_test()`로 명시 인가를 만든다. **env가 아니라 값**으로 흐르므로 teardown 창·잔류 env에
+/// 영향받지 않는다. Copy라 여러 쓰기 단계로 부담 없이 전달된다.
+#[derive(Clone, Copy)]
+pub struct PackWriteAuth {
+    _seal: (),
+}
+
+impl PackWriteAuth {
+    /// 프로덕션 진입점 전용 라이브 쓰기 인가. 호출처 = cys init-pack·pack-update·pack-downgrade
+    /// CLI 핸들러 + cysd 부팅 자동설치. (테스트에서 라이브를 실제로 쓰려 이걸 부르면 안 된다 —
+    /// 테스트는 temp 대상이라 인가 자체가 불필요하다.)
+    ///
+    /// 실경계 고지: `pub`은 바이너리 crate(cys·cysd)가 접근해야 하는 구조적 필요이며, 언어
+    /// 차원에서 "프로덕션 4곳만 생성 가능"을 강제하지는 못한다. 실효 방어는 W0-a(cfg-test
+    /// fail-closed)+W0-c(.cargo env 샌드박스)+W0-d(라이브 경로 인가 게이트)의 조합이고,
+    /// 테스트 코드가 이 토큰을 의도적으로 위조해 라이브 경로를 직접 겨냥하는 벡터까지는
+    /// 막지 않는다 — 그 벡터는 코드리뷰 게이트 소관이다.
+    pub fn production() -> Self {
+        PackWriteAuth { _seal: () }
+    }
+
+    /// crate 내부 테스트 전용 명시 인가(라이브 경로 대상 쓰기 로직을 의도적으로 검증할 때만).
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        PackWriteAuth { _seal: () }
+    }
+}
+
+/// 경로를 비교 가능한 정규형으로 해소: 존재하는 최장 접두를 canonicalize(심링크·`..`·상대경로
+/// 해소)하고 남은 **미존재 꼬리**를 그대로 이어 붙인다. macOS `/tmp`→`/private/tmp` 심링크와
+/// 아직 생성되지 않은 pack 디렉터리(rename 대상)를 둘 다 정확히 비교하기 위함.
+fn resolve_for_compare(p: &Path) -> PathBuf {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(p)
+    };
+    let mut existing = abs.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(&existing) {
+            let mut out = c;
+            for comp in tail.iter().rev() {
+                out.push(comp);
+            }
+            return out;
+        }
+        match existing.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                match existing.parent() {
+                    Some(par) => existing = par.to_path_buf(),
+                    None => return abs,
+                }
+            }
+            None => return abs,
+        }
+    }
+}
+
+/// dir이 (심링크·상대경로 해소 후) 라이브 기본 pack 경로(~/.cys/pack)를 가리키는가.
+/// env override와 무관하게 홈 기반 원천 경로만 본다 — 보호 대상은 실제 라이브 팩이다.
+fn targets_live_default(dir: &Path) -> bool {
+    resolve_for_compare(dir) == resolve_for_compare(&home_default_pack_dir())
+}
+
+/// W0-d 게이트: 라이브 기본 경로 대상 쓰기인데 인가 토큰이 없으면 하드 거부(Err).
+/// 비라이브 대상이거나 인가가 있으면 Ok — 아무 부수효과도 없는 순수 검사(쓰기 전에 선차단).
+fn authorize_pack_write(dir: &Path, auth: Option<PackWriteAuth>) -> Result<(), String> {
+    if auth.is_none() && targets_live_default(dir) {
+        return Err(format!(
+            "W0-d 인가 없는 라이브 팩 쓰기 거부 — 대상 {} 은 라이브 기본 경로(~/.cys/pack)이며 \
+             PackWriteAuth(프로덕션 진입점 전용) 없이는 쓸 수 없다. 테스트는 CYS_PACK_DIR temp \
+             대상으로 쓰거나 명시 인가를 부여하라.",
+            dir.display()
+        ));
+    }
+    Ok(())
 }
 
 /// SessionStart hook 등록 명령을 OS별로 조립하는 **공용 함수**(RC-2 · 순수 함수·회귀 핀).
@@ -84,6 +208,19 @@ pub fn session_start_hook_command(pack_dir: &Path) -> String {
         // ★역슬래시→정슬래시 정규화(RC-3): git-bash가 C:\ 역슬래시를 escape/미해석해 경로를 파괴하는
         // 것(C:\Users\...→C:Users...→No such file) 방지. javis_preflight._cys_hook_cmd 의 Windows 형태와
         // **동일 문자열**을 방출 → 두 writer 간 중복 등록 0(matcher 일치).
+        format!("bash \"{}\"", script.display().to_string().replace('\\', "/"))
+    } else {
+        format!("sh {}", script.display())
+    }
+}
+
+/// UserPromptSubmit hook(role-bootstrap.sh) 등록 명령 — session_start_hook_command 와 동일 OS 규약
+/// (unix `sh <abs>` / win `bash "<정슬래시>"`). ★javis_preflight._cys_hook_cmd("role-bootstrap.sh")
+/// 와 **byte-identical** 이어야 한다 — 격리 config 초기 시드(이 함수)와 preflight C28 재등록이 같은
+/// 문자열을 방출해야 중복 append 0(_prune_stale_hook_entries·_event_hook_registered matcher 일치·RC1).
+pub fn role_bootstrap_hook_command(pack_dir: &Path) -> String {
+    let script = pack_dir.join("hooks/role-bootstrap.sh");
+    if cfg!(windows) {
         format!("bash \"{}\"", script.display().to_string().replace('\\', "/"))
     } else {
         format!("sh {}", script.display())
@@ -119,14 +256,24 @@ fn setup_isolated_config_dir() {
             let _ = std::fs::write(&claude_md, tmpl);
         }
     }
-    // hook: <cfg>/settings.json 에 SessionStart → session-start.sh (없을 때만)
+    // hook: <cfg>/settings.json 에 SessionStart → session-start.sh + UserPromptSubmit →
+    // role-bootstrap.sh (없을 때만)
     let settings = cfg.join("settings.json");
     if !settings.exists() {
         // RC-2: OS-aware 공용 함수 사용 — Windows는 bash(Git Bash가 bash.exe만 보장·cmd/PowerShell은
         // .sh를 인터프리터 없이 못 실행). 구 `sh` 하드코딩 제거(격리 config dir·init-pack 경로 일치).
-        let hook = session_start_hook_command(&pack_dir());
+        let ss_hook = session_start_hook_command(&pack_dir());
+        // ★RC1(증분2): "너는 마스터다" 선언 시 결정론 부트스트랩을 발화하는 UserPromptSubmit 훅을
+        // 초기 시드에 함께 등록한다. 종전엔 preflight C28(SELFCORR_HOOKS)이 첫 --fix 때 비로소 등록해,
+        // 초기 세션(preflight 실행 전) 마스터 선언은 훅 미등록으로 발화되지 않는 창이 있었다.
+        // 부서 config의 결정론 등록 SOT는 preflight C28(role-bootstrap.sh→UserPromptSubmit, 이미 배선)
+        // 이며, 이 시드는 base 격리 config의 초기 창을 닫는 belt-and-suspenders다(양자 동일 문자열).
+        let ups_hook = role_bootstrap_hook_command(&pack_dir());
         let json = serde_json::json!({
-            "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": hook } ] } ] }
+            "hooks": {
+                "SessionStart": [ { "hooks": [ { "type": "command", "command": ss_hook } ] } ],
+                "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": ups_hook } ] } ]
+            }
         });
         if let Ok(s) = serde_json::to_string_pretty(&json) {
             let _ = std::fs::write(&settings, s);
@@ -358,6 +505,17 @@ pub(crate) enum Ownership {
     SeedOnce,
 }
 
+/// 헌법 파일(디렉티브·soul·CLAUDE) 판정 — ownership() User 등급의 부분집합이며, 병합 시
+/// 추가 안전 게이트(안전핵 존재 검증·자동 병합 금지)가 붙는 대상. ownership() 이 이 함수를
+/// 호출해 패턴을 한 곳에 유지한다(SOT 분산 금지 — 술어 조건 직접 중복 금지 규칙과 동일 취지).
+pub fn is_constitution_file(rel: &str) -> bool {
+    rel.ends_with("_DIRECTIVE.md")
+        || rel == "soul.md"
+        || rel.ends_with("/soul.md")
+        || rel == "CLAUDE.md"
+        || rel.ends_with("/CLAUDE.md")
+}
+
 /// 소유권 분류 단일 SOT. 우선순위 **SeedOnce > User > System** — 상태 경로 밑에 user 패턴
 /// 이름이 오는 가상 케이스(예: memory/CLAUDE.md)에서 '상태 보존(불가침)'이 '병합 병치(.new)'보다
 /// 안전측이며, decide_file_action 의 기존 검사 순서(seed-once 조기 반환)와 동형이다.
@@ -368,19 +526,31 @@ pub(crate) fn ownership(rel: &str) -> Ownership {
     {
         return Ownership::SeedOnce;
     }
-    if rel.ends_with("_DIRECTIVE.md")
-        || rel == "soul.md"
-        || rel.ends_with("/soul.md")
-        || rel == "CLAUDE.md"
-        || rel.ends_with("/CLAUDE.md")
+    if is_constitution_file(rel)
         // ★B2-1(W3): schedule.json 은 사용자가 `cys schedule add` 로 편집하는 혼합 파일 — 팩 강제갱신이 덮으면
         // 사용자 잡이 소실(비가역 데이터 손실)된다. user 소유로 보존하고, built-in 잡(phoenix-*)은 데몬 부트 시
         // 코드가 idempotent ensure 한다(cysd schedule::ensure_builtin_jobs). 기본 잡 드리프트(복구 가능) < 사용자 잡 소실.
         || rel == "schedule.json"
+        // ★W-B(커스텀 생존 설계 2026-07-17): agents.json 은 파일 자신의 _doc 이 "사용자 환경에 맞게
+        // 수정 가능"이라 선언하는 혼합 설정인데 system 등급이라 매 스윕 치유돼 사용자 어댑터 수정이
+        // 소실됐다(실측: 병합 원장 healed 0.12.64). schedule.json 전례를 따라 user 승격 — vendor 신
+        // 어댑터는 .new 병치+병합으로 전달되고, 소비자(launch-agent·cysd)는 어댑터 결손 시 해당
+        // 어댑터만 비활성(전체 파손 아님)이라 동결 리스크 < 사용자 수정 소실.
+        || rel == "agents.json"
     {
         return Ownership::User;
     }
     Ownership::System
+}
+
+/// 소유권 분류의 CLI 노출용 이름(외부 crate 인 bin/cys.rs 는 pub(crate) ownership() 을 못 본다).
+/// pack-guard hook·pack-ownership 서브커맨드가 소비 — 분류 자체는 위 단일 SOT 를 그대로 통과.
+pub fn ownership_name(rel: &str) -> &'static str {
+    match ownership(rel) {
+        Ownership::System => "system",
+        Ownership::User => "user",
+        Ownership::SeedOnce => "seed-once",
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -698,14 +868,16 @@ fn ensure_pristine(dir: &Path, rel: &str, content: &str) {
 /// force=false: 사용자 수정 파일 불가침 + **비수정 파일은 임베드 신버전으로 자동 갱신**
 /// (설치 매니페스트의 설치-당시 해시와 현재 파일 해시가 일치 = 비수정). 매니페스트가
 /// 없는 구설치본 파일은 종전대로 보존한다(안전측). 반환: (written, kept).
-pub fn install(force: bool) -> Result<(usize, usize), String> {
+pub fn install(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize), String> {
     // 얇은 래퍼: embed PACK_ALL(git-추적 전체 트리)를 입력원으로 install_from_iter에 위임한다.
     // ★외부 동작(반환값·디스크 결과·부수효과)은 완전 불변 — C/D/E 호출처 무영향(§3 하위호환).
+    // auth는 라이브 대상 쓰기 인가(W0-d) — install_from_iter가 pack_dir()에 쓰므로 그대로 전달한다.
     install_from_iter(
         PACK_ALL.iter().map(|(r, c)| (*r, *c)),
         force,
         env!("CARGO_PKG_VERSION"),
         false, // embed/cysd 경로(비트랜잭션): .pack-version 직접 기록 + 매니페스트 best-effort(외부 동작 불변).
+        auth,
     )
 }
 
@@ -732,7 +904,11 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     target_version: &str,
     transactional: bool,
     setup_config: bool,
+    auth: Option<PackWriteAuth>,
 ) -> Result<(usize, usize), String> {
+    // ★W0-d 양성 인가 게이트(최후 방어) — 어떤 부수효과보다 먼저. 대상이 라이브 기본 경로면
+    // 인가 없이는 하드 거부한다(테스트 재오염 벡터 구조적 봉인). 비라이브·인가 보유는 통과.
+    authorize_pack_write(&dir, auth)?;
     // items를 한 번 Vec로 고정 — 쓰기 루프·prune embedded-set·exec bit 루프 세 곳이 같은 집합을 본다.
     let items: Vec<(&str, &str)> = items.into_iter().collect();
     // ★채널 가드(v6 §5 — 내장/비트랜잭션 경로만): state=pro·손상이면 쓰기+prune **전체 생략**
@@ -872,9 +1048,15 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         save_merge_pending(&dir, &pending);
     }
     if !pending.is_empty() {
+        // ★W-E2: 사용자 언어 요약 — "지워진 게 아니라 보존됐다"를 등급별 수치로 즉시 증명.
+        let healed_n = pending.values()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("healed"))
+            .count();
+        let new_n = pending.len() - healed_n;
         println!(
-            "[init-pack] 커스터마이즈 병합 대기 {}건 — `cys pack-merge` 로 검토 (신버전 .new 병치 / 치유 전 사용자본 .user 보존)",
-            pending.len()
+            "[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 {}건 (내 수정본 .user 보존 {}건 · vendor 신버전 .new 병치 {}건)\n\
+             \x20 검토·병합: `cys pack-merge` · 직전 상태 파일 복원: `cys pack-rollback`",
+            pending.len(), healed_n, new_n
         );
     }
     // prune: 임베드에서 사라진 옛 파일(폐기 스킬·디렉티브)을 제거해 '기능 제거 배포'를 가능케 한다.
@@ -1000,8 +1182,9 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     force: bool,
     target_version: &str,
     transactional: bool,
+    auth: Option<PackWriteAuth>,
 ) -> Result<(usize, usize), String> {
-    install_into(pack_dir(), items, force, target_version, transactional, true)
+    install_into(pack_dir(), items, force, target_version, transactional, true, auth)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1112,8 +1295,11 @@ pub fn verify_staging(staging: &Path, items: &[(&str, &str)]) -> Result<(), Stri
 /// 원자 교체 기반 init-pack 설치(§3.1). 현재 pack_dir을 staging에 전량 복사→install_into로 임베드
 /// 반영(preserve-gate·prune·.pack-version)→검증→원자 rename 교체→실 pack_dir에 config 격리 셋업.
 /// 중단(카피·반영·검증 중 abort)은 기존 pack_dir을 건드리지 않는다(원자성). 반환: (written, kept).
-pub fn install_staged(force: bool) -> Result<(usize, usize), String> {
+pub fn install_staged(force: bool, auth: Option<PackWriteAuth>) -> Result<(usize, usize), String> {
     let dir = pack_dir();
+    // ★W0-d: 최종 commit/rename(atomic_swap)이 라이브 기본 경로를 원자 교체하므로, 어떤 staging
+    // 작업보다 먼저 인가를 검사한다(비라이브 대상·인가 보유는 통과 — 테스트는 temp 대상이라 무영향).
+    authorize_pack_write(&dir, auth)?;
     let staging = init_staging_dir(&dir);
     // 잔여 staging(같은 pid 재사용·직전 실패) 선정리.
     let _ = std::fs::remove_dir_all(&staging);
@@ -1134,6 +1320,7 @@ pub fn install_staged(force: bool) -> Result<(usize, usize), String> {
         env!("CARGO_PKG_VERSION"),
         false,
         false,
+        None, // staging은 비라이브 형제 경로 — 여기 쓰기는 인가 불요(라이브 인가는 위 swap 게이트가 담당).
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -1323,6 +1510,7 @@ pub fn apply_pack_transactional<F>(
     items: &[(&str, &str)],
     target_version: &str,
     state: &PackState,
+    auth: Option<PackWriteAuth>,
     post_commit: F,
 ) -> Result<(usize, usize, bool), String>
 where
@@ -1331,6 +1519,8 @@ where
     // ⓪ 직전 crash로 남은 orphan 저널 자가치유(새 트랜잭션 전 pre-state 확정).
     recover_pack_journal()?;
     let dir = pack_dir();
+    // ★W0-d: 저널·파일 반영 어떤 부수효과보다 먼저 라이브 인가 검사(비라이브·인가 보유는 통과).
+    authorize_pack_write(&dir, auth)?;
     // ① backup set = 새 manifest.files(=items) ∪ 현재 install-manifest 키(prune·overwrite 대상)
     //    ∪ .install-manifest.json ∪ .pack-state.json(v4 — rollback이 state도 pre-state로 복원).
     let mut backup_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -1366,7 +1556,7 @@ where
     // ② 파일 반영(transactional=true) — .pack-version은 여기서 쓰지 않고(④에서 commit marker로),
     //    .install-manifest.json write 실패는 fail-closed로 Err가 되어 아래 rollback을 탄다.
     let (written, kept) =
-        match install_from_iter(items.iter().copied(), false, target_version, true) {
+        match install_from_iter(items.iter().copied(), false, target_version, true, auth) {
             Ok(v) => v,
             Err(e) => {
                 let _ = rollback_journal();
@@ -1411,6 +1601,47 @@ pub fn role_directive_path(role: &str) -> Option<PathBuf> {
     Some(pack_dir().join("directives").join(file))
 }
 
+/// ★W0-b RAII EnvGuard(테스트 지원) — 환경변수를 **이전 값 복원형**으로 임시 설정/제거한다.
+/// drop 시(정상 종료·**패닉 언와인딩 포함**) 이전 값으로 되돌리므로, 구 teardown(`remove_var`)이
+/// 남기던 "env가 비는 창"(다음 테스트가 라이브 pack_dir을 오판·오염하던 벡터)을 구조적으로 없앤다.
+/// 프로덕션 코드는 이걸 쓰지 않는다(테스트 전용). lib·bin 테스트가 공유하도록 `pub`이다.
+#[doc(hidden)]
+pub struct EnvGuard {
+    key: String,
+    prev: Option<String>,
+}
+
+impl EnvGuard {
+    /// key를 val로 설정하고 이전 값을 기억한다(drop 시 복원).
+    pub fn set(key: &str, val: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, val);
+        EnvGuard { key: key.to_string(), prev }
+    }
+    /// key를 제거하고 이전 값을 기억한다(drop 시 복원).
+    pub fn remove(key: &str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::remove_var(key);
+        EnvGuard { key: key.to_string(), prev }
+    }
+    /// Option<String>(예: 다른 곳에서 캡처한 이전 값)으로 설정/제거한다.
+    pub fn set_opt(key: &str, val: Option<impl AsRef<std::ffi::OsStr>>) -> Self {
+        match val {
+            Some(v) => EnvGuard::set(key, v),
+            None => EnvGuard::remove(key),
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(&self.key, v),
+            None => std::env::remove_var(&self.key),
+        }
+    }
+}
+
 /// pack_dir()이 읽는 전역 env 키(ENV_PACK_DIR)의 set/remove 윈도를 직렬화하는 테스트 락.
 /// pack.rs·overrides.rs 테스트가 같은 lib 테스트 바이너리에서 ENV_PACK_DIR을 공유하므로
 /// 한 락으로 직렬화해야 프로세스 전역 env 경합(flaky)을 막는다 (R4 패턴의 모듈 간 공유).
@@ -1429,7 +1660,10 @@ mod tests {
 
     #[test]
     fn role_directive_exact_master() {
-        // master는 정확 일치만 — 'masterful' 같은 변형은 매핑 없음
+        // master는 정확 일치만 — 'masterful' 같은 변형은 매핑 없음.
+        // ★W0-a: dir_file("master")는 pack_dir()을 경유하므로, env를 전역 제거하는 테스트
+        // (pack_dir_env_precedence·w0a panic)와 직렬화해 미설정 창에서의 오탐 panic을 막는다.
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
         assert_eq!(dir_file("master").as_deref(), Some("MASTER_DIRECTIVE.md"));
         assert_eq!(dir_file("masterful"), None);
     }
@@ -1503,9 +1737,31 @@ mod tests {
     }
 
     #[test]
+    fn role_bootstrap_hook_command_is_os_aware_shared() {
+        // R2-LOW-B 회귀 핀(session_start 동형): 격리 config 시드와 preflight C28(_cys_hook_cmd)이
+        // 공유하는 문자열 — byte-identical이 깨지면 매 기동 중복 append(RC1 matcher 불일치)가 재발한다.
+        let cmd = role_bootstrap_hook_command(Path::new("/pack"));
+        assert!(
+            cmd.contains("hooks/role-bootstrap.sh") || cmd.contains("hooks\\role-bootstrap.sh"),
+            "must target bundled hook: {cmd:?}"
+        );
+        let interp = cmd.split_whitespace().next().unwrap_or("");
+        assert!(interp == "sh" || interp == "bash", "shell interpreter only: {interp:?}");
+        #[cfg(unix)]
+        assert_eq!(cmd, "sh /pack/hooks/role-bootstrap.sh", "unix byte-pin(제로 회귀)");
+        #[cfg(windows)]
+        {
+            assert!(cmd.starts_with("bash \""), "windows must use quoted bash: {cmd:?}");
+            assert!(!cmd.contains('\\'), "windows 경로 정슬래시 정규화: {cmd:?}");
+        }
+    }
+
+    #[test]
     fn role_directive_prefix_variants_map_to_standard() {
         // 접두 일치: 변형 역할(worker-2·reviewer-gemini·cso-1)도 표준 지침을 받는다
         // — 디렉티브 주입(각성)이 변형 역할에서 누락되지 않게 하는 핵심 불변식.
+        // ★W0-a: dir_file는 pack_dir() 경유 — env 전역 제거 테스트와 직렬화(미설정 창 오탐 panic 방지).
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
         for (role, file) in [
             ("worker", "WORKER_DIRECTIVE.md"),
             ("worker-2", "WORKER_DIRECTIVE.md"),
@@ -1533,6 +1789,8 @@ mod tests {
     #[test]
     fn role_directive_path_is_under_directives_dir() {
         // 경로 구조: <pack_dir>/directives/<FILE> — 부모 디렉터리가 'directives'
+        // ★W0-a: pack_dir() 경유 — env 전역 제거 테스트와 직렬화(미설정 창 오탐 panic 방지).
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
         let p = role_directive_path("master").unwrap();
         assert_eq!(
             p.parent().and_then(|d| d.file_name()).map(|f| f.to_string_lossy().into_owned()),
@@ -1628,22 +1886,11 @@ mod tests {
     #[test]
     fn install_writes_core_and_skills_to_fresh_dir() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let td = std::env::temp_dir().join(format!("cys-pack-install-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         let cfgdir = td.join("cysclaude"); // 격리 config dir(테스트 밀폐 — td와 함께 정리)
-        std::env::set_var(ENV_PACK_DIR, &td);
-        std::env::set_var(ENV_CONFIG_DIR, &cfgdir);
-        let result = install(false);
-        match saved {
-            Some(v) => std::env::set_var(ENV_PACK_DIR, v),
-            None => std::env::remove_var(ENV_PACK_DIR),
-        }
-        match saved_cfg {
-            Some(v) => std::env::set_var(ENV_CONFIG_DIR, v),
-            None => std::env::remove_var(ENV_CONFIG_DIR),
-        }
+        let _env = set_pack_env(&td, &cfgdir);
+        let result = install(false, None);
         let (written, kept) = result.expect("install 실패");
         assert_eq!(kept, 0, "빈 디렉터리인데 kept>0");
         assert_eq!(written, PACK_ALL.len(), "임베드 전수 설치 아님");
@@ -1655,6 +1902,10 @@ mod tests {
         let cfg_settings = std::fs::read_to_string(cfgdir.join("settings.json")).expect("격리 settings.json 미설치");
         assert!(cfg_settings.contains("SessionStart") && cfg_settings.contains("session-start.sh"),
                 "격리 settings.json에 SessionStart hook 부재");
+        // ★RC1(증분2): 초기 시드에 UserPromptSubmit→role-bootstrap.sh 등록(마스터 선언 결정론 발화의
+        // preflight-전 초기 창을 닫음). preflight _cys_hook_cmd 와 동일 문자열이라 재등록 시 중복 0.
+        assert!(cfg_settings.contains("UserPromptSubmit") && cfg_settings.contains("role-bootstrap.sh"),
+                "격리 settings.json에 UserPromptSubmit(role-bootstrap.sh) hook 부재");
         for probe in [
             "skills/korean-humanizer/SKILL.md",
             "skills/kosis-stats/scripts/run_kosis_stats.py",
@@ -1711,35 +1962,24 @@ mod tests {
     #[test]
     fn install_blocks_downgrade_when_disk_version_newer() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let td = std::env::temp_dir().join(format!("cys-pack-downgrade-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
-        std::env::set_var(ENV_PACK_DIR, &td);
-        std::env::set_var(ENV_CONFIG_DIR, td.join("cysclaude"));
+        let _env = set_pack_env(&td, td.join("cysclaude"));
 
         let embed = env!("CARGO_PKG_VERSION");
         // 1) 정상 설치 → .pack-version = embed 기록
-        install(false).expect("최초 install 실패");
+        install(false, None).expect("최초 install 실패");
         let disk_v1 = std::fs::read_to_string(td.join(PACK_VERSION_FILE)).unwrap();
         // 2) 디스크 .pack-version을 더 새 버전으로 위조(구버전 cys 롤백/오설치 시뮬)
         std::fs::write(td.join(PACK_VERSION_FILE), "99.0.0").unwrap();
         // 3) install(false) → 다운그레이드 차단 → (0,0), .pack-version 유지(embed로 안 덮음)
-        let blocked = install(false).expect("install 실패");
+        let blocked = install(false, None).expect("install 실패");
         let disk_after = std::fs::read_to_string(td.join(PACK_VERSION_FILE)).unwrap();
         // 4) force는 우회 → 갱신
-        install(true).expect("force install 실패");
+        install(true, None).expect("force install 실패");
         let disk_forced = std::fs::read_to_string(td.join(PACK_VERSION_FILE)).unwrap();
 
         // env 복원(assert 전 — 패닉해도 전역 env 누수 없게)
-        match saved {
-            Some(v) => std::env::set_var(ENV_PACK_DIR, v),
-            None => std::env::remove_var(ENV_PACK_DIR),
-        }
-        match saved_cfg {
-            Some(v) => std::env::set_var(ENV_CONFIG_DIR, v),
-            None => std::env::remove_var(ENV_CONFIG_DIR),
-        }
         let _ = std::fs::remove_dir_all(&td);
 
         assert_eq!(disk_v1.trim(), embed, "최초 install이 .pack-version을 embed로 기록");
@@ -1795,12 +2035,9 @@ mod tests {
     #[test]
     fn install_threeway_sides_pristine_and_pending_lifecycle() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let td = std::env::temp_dir().join(format!("cys-pack-threeway-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
-        std::env::set_var(ENV_PACK_DIR, &td);
-        std::env::set_var(ENV_CONFIG_DIR, td.join("cysclaude"));
+        let _env = set_pack_env(&td, td.join("cysclaude"));
 
         let get = |rel: &str| PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c)
             .unwrap_or_else(|| panic!("팩에 {rel} 부재"));
@@ -1818,7 +2055,7 @@ mod tests {
         });
         std::fs::write(td.join(INSTALL_MANIFEST), manifest.to_string()).unwrap();
 
-        install(false).expect("install 실패");
+        install(false, None).expect("install 실패");
         let read = |rel: &str| std::fs::read_to_string(td.join(rel)).unwrap();
 
         // ① user-owned: 보존 + 신버전 .new 병치 + 원장 new-pending.
@@ -1835,30 +2072,25 @@ mod tests {
         assert_eq!(read(&format!("{PRISTINE_DIR}/{sys_c}")), get(sys_c));
         assert!(!td.join(PRISTINE_DIR).join(user_b).exists(), "동결 파일 조상은 미갱신");
         // ④ 멱등: 재실행해도 상태 동일(원장 중복 기록·불필요 rewrite 없음).
-        install(false).expect("재실행 실패");
+        install(false, None).expect("재실행 실패");
         assert_eq!(read(user_b), "USER-SOUL");
         assert_eq!(load_merge_pending(&td).len(), 2);
         // ⑤ 해소: 사용자가 vendor 본 채택(디스크=임베드) → .new·원장 항목 자동 청소.
         std::fs::write(td.join(user_b), get(user_b)).unwrap();
-        install(false).expect("3차 실행 실패");
+        install(false, None).expect("3차 실행 실패");
         assert!(!td.join("soul.md.new").exists(), "채택 후 .new 청소");
         assert!(load_merge_pending(&td).get(user_b).is_none(), "채택 후 원장 소거");
 
         let _ = std::fs::remove_dir_all(&td);
-        match saved { Some(v) => std::env::set_var(ENV_PACK_DIR, v), None => std::env::remove_var(ENV_PACK_DIR) }
-        match saved_cfg { Some(v) => std::env::set_var(ENV_CONFIG_DIR, v), None => std::env::remove_var(ENV_CONFIG_DIR) }
     }
 
     /// ★플랜=실제 무드리프트(④): plan_install 분류가 같은 픽스처의 install 실행 결과와 일치.
     #[test]
     fn plan_install_matches_actual_install_actions() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let td = std::env::temp_dir().join(format!("cys-pack-plan-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
-        std::env::set_var(ENV_PACK_DIR, &td);
-        std::env::set_var(ENV_CONFIG_DIR, td.join("cysclaude"));
+        let _env = set_pack_env(&td, td.join("cysclaude"));
 
         std::fs::create_dir_all(&td).unwrap();
         std::fs::write(td.join("README.md"), "OLD-INSTALLED").unwrap();
@@ -1877,26 +2109,21 @@ mod tests {
         assert!(plan.merge_new.iter().any(|r| r == "soul.md"), "user-owned+전진 → merge_new");
         assert!(plan.heal.iter().any(|r| r == "acl.json"), "system 수정 → heal");
         // 실제 install 이 플랜과 같은 행동을 하는지 대조.
-        install(false).expect("install 실패");
+        install(false, None).expect("install 실패");
         let read = |rel: &str| std::fs::read_to_string(td.join(rel)).unwrap();
         assert_eq!(read("soul.md"), "USER-SOUL");
         assert!(td.join("soul.md.new").exists());
         assert!(td.join("acl.json.user").exists());
 
         let _ = std::fs::remove_dir_all(&td);
-        match saved { Some(v) => std::env::set_var(ENV_PACK_DIR, v), None => std::env::remove_var(ENV_PACK_DIR) }
-        match saved_cfg { Some(v) => std::env::set_var(ENV_CONFIG_DIR, v), None => std::env::remove_var(ENV_CONFIG_DIR) }
     }
 
     #[test]
     fn install_ownership_system_forced_user_preserved() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let td = std::env::temp_dir().join(format!("cys-pack-ownership-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
-        std::env::set_var(ENV_PACK_DIR, &td);
-        std::env::set_var(ENV_CONFIG_DIR, td.join("cysclaude")); // 격리(밀폐)
+        let _env = set_pack_env(&td, td.join("cysclaude")); // 격리(밀폐)
 
         let get = |rel: &str| PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c)
             .unwrap_or_else(|| panic!("팩에 {rel} 부재"));
@@ -1922,7 +2149,7 @@ mod tests {
         let manifest = serde_json::json!({ sys_a: content_hash("OLD-INSTALLED") });
         std::fs::write(td.join(INSTALL_MANIFEST), manifest.to_string()).unwrap();
 
-        install(false).expect("install 실패");
+        install(false, None).expect("install 실패");
         let read = |rel: &str| std::fs::read_to_string(td.join(rel)).unwrap();
 
         assert_eq!(read(sys_a), sys_a_c, "①system 비수정 → 임베드로 갱신");
@@ -1934,15 +2161,7 @@ mod tests {
         let m: std::collections::BTreeMap<String, String> =
             serde_json::from_str(&read(INSTALL_MANIFEST)).unwrap();
         assert_eq!(m.get(sys_a), Some(&content_hash(sys_a_c)), "갱신 후 매니페스트 미반영");
-        let (w2, _) = install(false).unwrap();
-        match saved {
-            Some(v) => std::env::set_var(ENV_PACK_DIR, v),
-            None => std::env::remove_var(ENV_PACK_DIR),
-        }
-        match saved_cfg {
-            Some(v) => std::env::set_var(ENV_CONFIG_DIR, v),
-            None => std::env::remove_var(ENV_CONFIG_DIR),
-        }
+        let (w2, _) = install(false, None).unwrap();
         assert_eq!(w2, 0, "멱등 위반: 재실행이 {w2}개를 다시 씀");
         assert_eq!(std::fs::read_to_string(td.join(user_b)).unwrap(), "USER-MODIFIED");
         let _ = std::fs::remove_dir_all(&td);
@@ -1953,12 +2172,9 @@ mod tests {
     #[test]
     fn install_force_preserves_user_schedule_jobs() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let td = std::env::temp_dir().join(format!("cys-sched-owner-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
-        std::env::set_var(ENV_PACK_DIR, &td);
-        std::env::set_var(ENV_CONFIG_DIR, td.join("cysclaude"));
+        let _env = set_pack_env(&td, td.join("cysclaude"));
         std::fs::create_dir_all(&td).unwrap();
 
         // 사용자가 `cys schedule add` 로 넣은 잡이 담긴 schedule.json(임베드와 상이).
@@ -1966,17 +2182,9 @@ mod tests {
         std::fs::write(td.join("schedule.json"), user_schedule).unwrap();
 
         // force=true 강제갱신 — user-owned schedule.json 은 보존돼야 한다.
-        install(true).expect("install(force) 실패");
+        install(true, None).expect("install(force) 실패");
         let after = std::fs::read_to_string(td.join("schedule.json")).unwrap();
 
-        match saved {
-            Some(v) => std::env::set_var(ENV_PACK_DIR, v),
-            None => std::env::remove_var(ENV_PACK_DIR),
-        }
-        match saved_cfg {
-            Some(v) => std::env::set_var(ENV_CONFIG_DIR, v),
-            None => std::env::remove_var(ENV_CONFIG_DIR),
-        }
         assert!(
             after.contains("my-daily-brief") && after.contains("USER JOB"),
             "강제갱신이 사용자 schedule.json 잡을 소실시켰다 — B2-1 위반. after={after}"
@@ -1984,16 +2192,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&td);
     }
 
-    /// ★B2 분류 순수 함수: user 화이트리스트(디렉티브·헌법·CLAUDE.md)만 preserve, 나머지=system.
+    /// ★B2 분류 순수 함수: user 화이트리스트(디렉티브·헌법·CLAUDE.md·혼합 설정)만 preserve, 나머지=system.
     #[test]
     fn is_user_owned_classification() {
+        // agents.json: ★W-B 승격 핀 — _doc 이 "사용자 환경에 맞게 수정 가능"이라 선언하는 혼합
+        // 설정(schedule.json 동형). system 으로 되돌리면 사용자 어댑터 수정이 매 스윕 소실된다.
         for u in ["soul.md", "directives/MASTER_DIRECTIVE.md", "CLAUDE.md",
-                  "sub/dir/CSO_DIRECTIVE.md", "some/soul.md", "schedule.json"] {
+                  "sub/dir/CSO_DIRECTIVE.md", "some/soul.md", "schedule.json", "agents.json"] {
             assert!(is_user_owned(u), "user 여야: {u}");
         }
         for s in ["bin/javis_phoenix.py", "hooks/session_start.sh", "README.md",
                   "acl.json", "CLAUDE.md.template", "skills/x/SKILL.md",
-                  "directives/CEO_TEMPLATE.md", "sub/schedule.json"] {
+                  "directives/CEO_TEMPLATE.md", "sub/schedule.json", "sub/agents.json"] {
             assert!(!is_user_owned(s), "system 여야: {s}");
         }
     }
@@ -2057,50 +2267,137 @@ mod tests {
         //      만들지 AITERM_JARVIS_DIR가 아니므로 '오직 이 루프'로만 도달 가능)
         //   4) ~/.cys/pack (기본)
         // 마이그레이션 경로라 순서가 뒤집히면 구 설치본을 조용히 못 찾는다.
-        let _g = PACK_ENV_LOCK.lock().unwrap();
-        let keys = [
-            "CYS_PACK_DIR",
-            "JAVIS_PACK_DIR",
-            "AITERM_PACK_DIR",
-            "AITERM_JARVIS_DIR",
-        ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in keys {
-            std::env::remove_var(k);
-        }
+        // ★W0-a: pack_dir()은 테스트 빌드에서 전 override 미설정 시 panic(격리 봉인)하므로, 4단 폴백
+        // 자체를 검증하는 이 테스트는 순수함수(pack_dir_from_env·home_default_pack_dir)를 직접 호출한다
+        // (설계 W0 명시 예외). EnvGuard로 각 키를 이전 값 복원형으로 격리한다(패닉 시에도 복원).
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
+        let _g_cys = EnvGuard::remove("CYS_PACK_DIR");
+        let _g_javis = EnvGuard::remove("JAVIS_PACK_DIR");
+        let _g_aiterm_pack = EnvGuard::remove("AITERM_PACK_DIR");
+        let _g_aiterm_jarvis = EnvGuard::remove("AITERM_JARVIS_DIR");
 
-        // 셋 다 없으면 기본 ~/.cys/pack (홈 끝 2요소가 .cys/pack)
-        let def = pack_dir();
+        // 셋 다 없으면 순수 해석은 None(= 홈 기본 폴백 대상), 홈 기본 경로 끝 2요소가 .cys/pack
+        assert!(pack_dir_from_env().is_none(), "override 부재 = None(홈 기본 폴백)");
         assert!(
-            def.ends_with(".cys/pack"),
-            "기본 경로는 .cys/pack: {def:?}"
+            home_default_pack_dir().ends_with(".cys/pack"),
+            "기본 경로는 .cys/pack: {:?}",
+            home_default_pack_dir()
         );
 
         // AITERM_JARVIS_DIR만 → 3순위로 도달 (env_compat이 못 만드는 키, 루프 전용 경로)
         std::env::set_var("AITERM_JARVIS_DIR", "/legacy/aiterm");
-        assert_eq!(pack_dir(), PathBuf::from("/legacy/aiterm"));
+        assert_eq!(pack_dir_from_env(), Some(PathBuf::from("/legacy/aiterm")));
 
         // JAVIS_PACK_DIR 추가 → AITERM_JARVIS_DIR보다 우선 (2순위)
         std::env::set_var("JAVIS_PACK_DIR", "/legacy/javis");
-        assert_eq!(pack_dir(), PathBuf::from("/legacy/javis"));
+        assert_eq!(pack_dir_from_env(), Some(PathBuf::from("/legacy/javis")));
 
         // CYS_PACK_DIR 추가(env_compat primary) → 최우선 (1순위)
         std::env::set_var("CYS_PACK_DIR", "/modern/cys");
-        assert_eq!(pack_dir(), PathBuf::from("/modern/cys"));
+        assert_eq!(pack_dir_from_env(), Some(PathBuf::from("/modern/cys")));
 
         // env_compat 폴백: CYS_PACK_DIR 비우면 JAVIS_PACK_DIR로(=2순위와 동일 키지만
         // env_compat 경로) — 빈 문자열은 미설정 취급이라 다음 후보로 넘어간다
         std::env::set_var("CYS_PACK_DIR", "");
-        assert_eq!(pack_dir(), PathBuf::from("/legacy/javis"));
+        assert_eq!(pack_dir_from_env(), Some(PathBuf::from("/legacy/javis")));
+        // guards drop → 각 키 원값 복원(중간 set_var는 덮어써짐)
+    }
 
-        // 복원
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
+    // ─────────────────────────────────────────────────────────────────────────
+    // ★W0 부정 케이스 3종(설계 합격 판정) — verifier를 부정 케이스로 검증한다.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// 부정①(W0-a): CYS_PACK_DIR(및 레거시) 미설정 상태에서 pack_dir() 호출은 **panic**한다.
+    /// catch_unwind로 패닉을 잡아 PACK_ENV_LOCK 오염(다른 테스트의 .lock().unwrap() 연쇄 실패)을 막고,
+    /// EnvGuard로 각 키를 복원한다(패닉 언와인딩에도 drop 보장).
+    #[test]
+    fn w0a_pack_dir_panics_when_all_env_unset_in_test_build() {
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
+        let _g_cys = EnvGuard::remove("CYS_PACK_DIR");
+        let _g_javis = EnvGuard::remove("JAVIS_PACK_DIR");
+        let _g_aiterm_pack = EnvGuard::remove("AITERM_PACK_DIR");
+        let _g_aiterm_jarvis = EnvGuard::remove("AITERM_JARVIS_DIR");
+        // 패닉 메시지 소음을 잠시 죽인다(테스트 stderr 노이즈 방지).
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(pack_dir);
+        std::panic::set_hook(prev_hook);
+        assert!(
+            result.is_err(),
+            "W0-a: 전 pack env 미설정 시 pack_dir()은 panic해야 한다(라이브 재오염 봉인)"
+        );
+    }
+
+    /// 부정②(W0-d): 인가 토큰 없이 **라이브 기본 경로** 대상 쓰기는 하드 거부(Err)된다.
+    /// HOME을 가짜 temp로 override해 home_default_pack_dir()가 실 라이브를 가리키지 않게 한다
+    /// (테스트가 실제 ~/.cys/pack을 만질 위험 0). CYS_PACK_DIR 샌드박스는 유지(W0-a panic 회피 —
+    /// 게이트는 target env가 아니라 dir 인자로 판정한다). 대조로 명시 인가 시 동일 쓰기가 성공한다.
+    #[test]
+    fn w0d_rejects_unauthorized_write_to_live_default_path() {
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("cys-w0d-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let _gh = EnvGuard::set("HOME", &base);
+        let live = home_default_pack_dir(); // = <fake_home>/.cys/pack
+        assert!(
+            targets_live_default(&live),
+            "설정 오류: fake HOME 기준 live 경로가 라이브 기본으로 판정돼야 한다"
+        );
+        let items = vec![("probe.txt", "hello")];
+
+        // 인가(None) 없이 라이브 기본 경로 쓰기 → Err, 아무것도 쓰이지 않음.
+        let res = install_into(live.clone(), items.iter().copied(), false, "2.0.0", false, false, None);
+        assert!(res.is_err(), "인가 없는 라이브 쓰기는 Err여야 한다: {res:?}");
+        assert!(!live.join("probe.txt").exists(), "거부 후 파일이 쓰이면 안 된다");
+
+        // 대조: 명시 인가(for_test) 부여 시 동일 대상 쓰기는 성공(게이트가 인가를 존중).
+        let ok = install_into(
+            live.clone(),
+            items.iter().copied(),
+            false,
+            "2.0.0",
+            false,
+            false,
+            Some(PackWriteAuth::for_test()),
+        );
+        assert!(ok.is_ok(), "인가 부여 시 라이브 쓰기는 성공해야 한다: {ok:?}");
+        assert!(live.join("probe.txt").exists(), "인가 쓰기 후 파일이 존재해야 한다");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 부정③(W0-d): **심링크**를 경유해 라이브 기본 경로를 가리키는 쓰기도 canonicalize 비교로 거부된다.
+    /// fake HOME 아래 실제 라이브 경로를 만들고, 별도 위치의 심링크가 그 부모를 가리키게 한 뒤
+    /// 심링크 경유 경로로 인가 없이 쓰기를 시도한다 → Err.
+    #[cfg(unix)]
+    #[test]
+    fn w0d_rejects_symlinked_path_to_live_default() {
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("cys-w0d-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let _gh = EnvGuard::set("HOME", &base);
+        // 라이브 기본 경로의 부모(<fake_home>/.cys)를 실재화.
+        let live = home_default_pack_dir();
+        let live_parent = live.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&live_parent).unwrap();
+        // 별도 위치의 심링크가 <fake_home>/.cys 를 가리킨다 → link/pack == 라이브 기본 경로.
+        let link = base.join("cys-link");
+        std::os::unix::fs::symlink(&live_parent, &link).unwrap();
+        let via_symlink = link.join("pack"); // canonicalize 시 <fake_home>/.cys/pack 로 해소
+        assert!(
+            targets_live_default(&via_symlink),
+            "심링크 경유 경로가 canonicalize 후 라이브 기본으로 판정돼야 한다"
+        );
+
+        let items = vec![("probe.txt", "hello")];
+        let res =
+            install_into(via_symlink.clone(), items.iter().copied(), false, "2.0.0", false, false, None);
+        assert!(res.is_err(), "심링크 경유 라이브 쓰기는 거부돼야 한다: {res:?}");
+        assert!(!live.join("probe.txt").exists(), "거부 후 라이브에 파일이 쓰이면 안 된다");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 빈 임시 dir에서 디스크 산출물을 핑거프린트(rel → sha256)로 채집한다 —
@@ -2130,8 +2427,6 @@ mod tests {
     #[test]
     fn install_from_iter_equivalent_to_install() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let base =
             std::env::temp_dir().join(format!("cys-pack-equiv-test-{}", std::process::id()));
         let td_a = base.join("a"); // install(false)
@@ -2142,30 +2437,21 @@ mod tests {
         // (hooks/session-start.sh)를 박으므로 td 안에 두면 td_a≠td_b 경로 차이가 핑거프린트를
         // 오염시킨다. pack dir 콘텐츠 자체는 경로 무관 결정론이라 이 분리로 순수 등가 비교가 된다.
         // A: 기존 래퍼
-        std::env::set_var(ENV_PACK_DIR, &td_a);
-        std::env::set_var(ENV_CONFIG_DIR, base.join("cfg-a"));
-        let res_a = install(false);
+        let _env_a = set_pack_env(&td_a, base.join("cfg-a"));
+        let res_a = install(false, None);
         let fp_a = fingerprint_dir(&td_a);
 
         // B: 추출 코어 직접 호출(동일 입력원·동일 버전)
-        std::env::set_var(ENV_PACK_DIR, &td_b);
-        std::env::set_var(ENV_CONFIG_DIR, base.join("cfg-b"));
+        let _env_b = set_pack_env(&td_b, base.join("cfg-b"));
         let res_b = install_from_iter(
             PACK_ALL.iter().map(|(r, c)| (*r, *c)),
             false,
             env!("CARGO_PKG_VERSION"),
             false,
+            None,
         );
         let fp_b = fingerprint_dir(&td_b);
 
-        match saved {
-            Some(v) => std::env::set_var(ENV_PACK_DIR, v),
-            None => std::env::remove_var(ENV_PACK_DIR),
-        }
-        match saved_cfg {
-            Some(v) => std::env::set_var(ENV_CONFIG_DIR, v),
-            None => std::env::remove_var(ENV_CONFIG_DIR),
-        }
         let _ = std::fs::remove_dir_all(&base);
 
         let (wa, ka) = res_a.expect("install 실패");
@@ -2257,13 +2543,25 @@ mod tests {
         }
     }
 
-    fn txn_prestate(tag: &str, files: &[(&str, &str)], version: &str) -> (PathBuf, PathBuf) {
+    /// ★W0-b: 테스트 env 격리 헬퍼 — ENV_PACK_DIR·ENV_CONFIG_DIR을 RAII 가드로 설정한다(이전 값
+    /// 복원형). 반환 가드가 drop될 때(정상·**패닉 언와인딩 포함**) 복원되므로 수동 teardown이 불필요하고
+    /// "env가 비는 창"이 생기지 않는다. PACK_ENV_LOCK 하에서 호출하는 것을 전제로 한다.
+    #[must_use]
+    fn set_pack_env(pack: impl AsRef<std::ffi::OsStr>, cfg: impl AsRef<std::ffi::OsStr>) -> (EnvGuard, EnvGuard) {
+        (EnvGuard::set(ENV_PACK_DIR, pack), EnvGuard::set(ENV_CONFIG_DIR, cfg))
+    }
+
+    fn txn_prestate(
+        tag: &str,
+        files: &[(&str, &str)],
+        version: &str,
+    ) -> (PathBuf, PathBuf, (EnvGuard, EnvGuard)) {
         let base = std::env::temp_dir().join(format!("cys-journal-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let pd = base.join("pack");
         std::fs::create_dir_all(&pd).unwrap();
-        std::env::set_var(ENV_PACK_DIR, &pd);
-        std::env::set_var(ENV_CONFIG_DIR, base.join("cfg"));
+        // ★W0-b: env 격리 가드 — 호출 테스트가 이 가드를 보유해 스코프 종료(패닉 포함) 시 복원.
+        let env_guards = set_pack_env(&pd, base.join("cfg"));
         std::fs::write(pd.join(PACK_VERSION_FILE), version).unwrap();
         let mut manifest = serde_json::Map::new();
         for (rel, content) in files {
@@ -2277,18 +2575,7 @@ mod tests {
             serde_json::Value::Object(manifest).to_string(),
         )
         .unwrap();
-        (base, pd)
-    }
-
-    fn restore_env(saved: Option<String>, saved_cfg: Option<String>) {
-        match saved {
-            Some(v) => std::env::set_var(ENV_PACK_DIR, v),
-            None => std::env::remove_var(ENV_PACK_DIR),
-        }
-        match saved_cfg {
-            Some(v) => std::env::set_var(ENV_CONFIG_DIR, v),
-            None => std::env::remove_var(ENV_CONFIG_DIR),
-        }
+        (base, pd, env_guards)
     }
 
     /// 정상 경로: 파일 반영·prune·record_accepted(closure)·.pack-version commit marker 기록 후
@@ -2296,9 +2583,7 @@ mod tests {
     #[test]
     fn apply_transactional_commit_then_journal_removed() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let (base, pd) = txn_prestate(
+        let (base, pd, _env) = txn_prestate(
             "commit",
             &[("README.md", "OLD-SOUL"), ("stale.txt", "STALE")],
             "1.0.0",
@@ -2307,7 +2592,7 @@ mod tests {
         // README.md 갱신 + new.txt 추가, stale.txt는 items 부재 → prune.
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
         let committed = std::cell::Cell::new(false);
-        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || {
+        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), None, || {
             committed.set(true);
             Ok(())
         });
@@ -2317,7 +2602,6 @@ mod tests {
         let newf = std::fs::read_to_string(pd.join("new.txt")).unwrap();
         let stale_exists = pd.join("stale.txt").exists();
         let journal_exists = pack_journal_dir().exists();
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         let (w, _k, post_ok) = res.expect("commit 실패");
@@ -2337,21 +2621,18 @@ mod tests {
     #[test]
     fn mid_apply_fault_rolls_back_to_prestate() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let (base, pd) = txn_prestate("fault", &[("README.md", "OLD-SOUL")], "1.0.0");
+        let (base, pd, _env) = txn_prestate("fault", &[("README.md", "OLD-SOUL")], "1.0.0");
         let pre_fp = fingerprint_dir(&pd);
 
         // README.md 갱신(1번째 성공) → collide 파일(2번째 성공) → collide/child(3번째: 부모가
         // 파일이라 create_dir_all 실패) = mid-apply fault.
         let items: Vec<(&str, &str)> =
             vec![("README.md", "NEW"), ("collide", "X"), ("collide/child", "Y")];
-        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || Ok(()));
+        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), None, || Ok(()));
 
         let post_fp = fingerprint_dir(&pd);
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
         let journal_exists = pack_journal_dir().exists();
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         assert!(res.is_err(), "mid-apply fault인데 성공 반환");
@@ -2367,9 +2648,7 @@ mod tests {
     #[test]
     fn post_commit_failure_keeps_commit_and_reports() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let (base, pd) = txn_prestate(
+        let (base, pd, _env) = txn_prestate(
             "recordfail",
             &[("README.md", "OLD-SOUL"), ("stale.txt", "STALE")],
             "1.0.0",
@@ -2377,7 +2656,7 @@ mod tests {
 
         // 파일 반영·prune·커밋은 성공, post-commit record_accepted만 실패.
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
-        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || {
+        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), None, || {
             Err("record_accepted boom".into())
         });
 
@@ -2385,7 +2664,6 @@ mod tests {
         let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let stale_exists = pd.join("stale.txt").exists();
         let journal_exists = pack_journal_dir().exists();
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         let (_w, _k, post_ok) = res.expect("post-commit 실패가 Err로 승격되면 안됨(커밋은 유효)");
@@ -2401,10 +2679,8 @@ mod tests {
     #[test]
     fn orphan_journal_recovery_rolls_back() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         // crash 후 디스크: .pack-version 옛 1.0.0(미커밋) + README.md 부분반영 + new.txt 신규생성.
-        let (base, pd) = txn_prestate("orphan-rb", &[("README.md", "PARTIAL-NEW")], "1.0.0");
+        let (base, pd, _env) = txn_prestate("orphan-rb", &[("README.md", "PARTIAL-NEW")], "1.0.0");
         std::fs::write(pd.join("new.txt"), "ORPHAN-NEW").unwrap();
         // 저널 수작업 조립: target 2.0.0, README.md(existed) backup=OLD-SOUL, new.txt(신규) existed=false.
         let jdir = pack_journal_dir();
@@ -2426,7 +2702,6 @@ mod tests {
         let new_exists = pd.join("new.txt").exists();
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
         let journal_exists = pack_journal_dir().exists();
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         assert_eq!(recovered.expect("recover 실패"), true, "orphan 미발견");
@@ -2441,10 +2716,8 @@ mod tests {
     #[test]
     fn orphan_journal_committed_only_cleaned() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         // 커밋 성공: .pack-version=2.0.0, README.md=NEW-SOUL(새 내용).
-        let (base, pd) = txn_prestate("orphan-commit", &[("README.md", "NEW-SOUL")], "2.0.0");
+        let (base, pd, _env) = txn_prestate("orphan-commit", &[("README.md", "NEW-SOUL")], "2.0.0");
         let jdir = pack_journal_dir();
         let files_dir = jdir.join("files");
         std::fs::create_dir_all(&files_dir).unwrap();
@@ -2459,7 +2732,6 @@ mod tests {
 
         let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let journal_exists = pack_journal_dir().exists();
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         assert_eq!(recovered.expect("recover 실패"), true, "orphan 미발견");
@@ -2474,9 +2746,7 @@ mod tests {
     #[test]
     fn manifest_write_failure_transactional_rolls_back() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let (base, pd) = txn_prestate("manifest-fail", &[("README.md", "OLD-SOUL")], "1.0.0");
+        let (base, pd, _env) = txn_prestate("manifest-fail", &[("README.md", "OLD-SOUL")], "1.0.0");
         // .install-manifest.json을 디렉터리로 치환 → write_atomic(rename) 실패 유발(IO fault 주입).
         let mp = pd.join(INSTALL_MANIFEST);
         std::fs::remove_file(&mp).unwrap();
@@ -2484,7 +2754,7 @@ mod tests {
 
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
         let committed = std::cell::Cell::new(false);
-        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || {
+        let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), None, || {
             committed.set(true);
             Ok(())
         });
@@ -2493,7 +2763,6 @@ mod tests {
         let new_exists = pd.join("new.txt").exists();
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
         let journal_exists = pack_journal_dir().exists();
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         assert!(res.is_err(), "매니페스트 write 실패인데 성공 반환(best-effort 흡수)");
@@ -2510,9 +2779,7 @@ mod tests {
     #[test]
     fn manifest_write_failure_embed_best_effort_proceeds() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let (base, pd) = txn_prestate("manifest-embed", &[("README.md", "OLD-SOUL")], "1.0.0");
+        let (base, pd, _env) = txn_prestate("manifest-embed", &[("README.md", "OLD-SOUL")], "1.0.0");
         let mp = pd.join(INSTALL_MANIFEST);
         std::fs::remove_file(&mp).unwrap();
         std::fs::create_dir_all(mp.join("child")).unwrap();
@@ -2521,11 +2788,10 @@ mod tests {
         // preserve-gate가 안전측 보존(OLD 유지) — 이는 manifest 손상의 정상 부작용이며 embed
         // best-effort 분기와 무관하다. 핵심: 매니페스트 write 실패에도 Err 없이 진행 + 버전 마커 기록.
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
-        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false, None);
 
         let new_exists = pd.join("new.txt").exists();
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         assert!(res.is_ok(), "embed 경로(best-effort)인데 매니페스트 실패로 Err 반환");
@@ -2577,9 +2843,7 @@ mod tests {
     #[test]
     fn embed_guard_pro_state_preserves_pro_files() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let (base, pd) = txn_prestate(
+        let (base, pd, _env) = txn_prestate(
             "proguard",
             &[("README.md", "OLD-SOUL"), ("pro-only/skill.md", "PRO-SKILL")],
             "1.0.0",
@@ -2592,13 +2856,12 @@ mod tests {
 
         // 내장 install 시뮬레이션: 신버전 2.0.0, items에 pro-only 파일 부재(=구현 전이라면 prune 대상).
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL")];
-        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false, None);
 
         let pro_file = std::fs::read_to_string(pd.join("pro-only/skill.md")).unwrap_or_default();
         let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
         let st_after = read_pack_state(&pd);
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         let (w, k) = res.expect("가드 경로는 Ok((0,0))이어야 함");
@@ -2616,16 +2879,13 @@ mod tests {
     #[test]
     fn embed_guard_corrupt_state_preserves() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let (base, pd) = txn_prestate("corruptguard", &[("README.md", "OLD")], "1.0.0");
+        let (base, pd, _env) = txn_prestate("corruptguard", &[("README.md", "OLD")], "1.0.0");
         std::fs::write(pd.join(PACK_STATE_FILE), b"{not json").unwrap();
 
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW")];
-        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false, None);
 
         let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         assert_eq!(res.expect("가드 경로 Ok"), (0, 0));
@@ -2636,18 +2896,15 @@ mod tests {
     #[test]
     fn embed_free_mismatch_heals_without_evidence() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         // install-manifest 키는 임베드 트리에 실재하는 rel만(README.md) — pro 파일 증거 없음.
-        let (base, pd) = txn_prestate("healok", &[("README.md", "OLD")], "1.0.0");
+        let (base, pd, _env) = txn_prestate("healok", &[("README.md", "OLD")], "1.0.0");
         write_pack_state(&pd, &test_free_state("0.9.0")).unwrap(); // base 불일치(0.9.0 ≠ 1.0.0)
 
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW")];
-        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false, None);
 
         let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let st_after = read_pack_state(&pd);
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         let (w, _k) = res.expect("자가치유 후 install 진행돼야 함");
@@ -2665,9 +2922,7 @@ mod tests {
     #[test]
     fn embed_free_mismatch_with_accepted_pro_preserved() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let (base, pd) = txn_prestate(
+        let (base, pd, _env) = txn_prestate(
             "falsefree",
             &[("README.md", "OLD"), ("pro-only/skill.md", "PRO")],
             "1.0.0",
@@ -2681,11 +2936,10 @@ mod tests {
         .unwrap();
 
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW")];
-        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false, None);
 
         let pro_file = std::fs::read_to_string(pd.join("pro-only/skill.md")).unwrap_or_default();
         let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         assert_eq!(res.expect("보존 경로 Ok"), (0, 0), "거짓 free인데 install 진행됨");
@@ -2697,10 +2951,8 @@ mod tests {
     #[test]
     fn embed_free_mismatch_with_pro_file_evidence_preserved() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         // install-manifest에 임베드 트리 밖 rel(pro-only/skill.md) = pro 파일 증거.
-        let (base, pd) = txn_prestate(
+        let (base, pd, _env) = txn_prestate(
             "proevidence",
             &[("README.md", "OLD"), ("pro-only/skill.md", "PRO")],
             "1.0.0",
@@ -2708,10 +2960,9 @@ mod tests {
         write_pack_state(&pd, &test_free_state("0.9.0")).unwrap();
 
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW")];
-        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false, None);
 
         let pro_file = std::fs::read_to_string(pd.join("pro-only/skill.md")).unwrap_or_default();
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         assert_eq!(res.expect("보존 경로 Ok"), (0, 0));
@@ -2723,23 +2974,19 @@ mod tests {
     #[test]
     fn embed_version_write_failure_creates_no_state_mismatch() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let base = std::env::temp_dir().join(format!("cys-vfault-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let pd = base.join("pack");
         std::fs::create_dir_all(&pd).unwrap();
-        std::env::set_var(ENV_PACK_DIR, &pd);
-        std::env::set_var(ENV_CONFIG_DIR, base.join("cfg"));
+        let _env = set_pack_env(&pd, base.join("cfg"));
         // .pack-version 경로를 디렉터리로 만들어 write_atomic(rename) 실패 주입.
         std::fs::create_dir_all(pd.join(PACK_VERSION_FILE).join("child")).unwrap();
 
         let items: Vec<(&str, &str)> = vec![("README.md", "NEW")];
-        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false, None);
 
         let state_exists = pd.join(PACK_STATE_FILE).exists();
         let soul_exists = pd.join("README.md").exists();
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
         assert!(res.is_ok(), "version 쓰기 실패는 loud 경고일 뿐 Err 아님(기존 외부 동작)");
@@ -2828,28 +3075,24 @@ mod tests {
     #[test]
     fn install_staged_fresh_then_idempotent_with_prev() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let base = std::env::temp_dir().join(format!("cys-staged-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let pd = base.join("pack");
-        std::env::set_var(ENV_PACK_DIR, &pd);
-        std::env::set_var(ENV_CONFIG_DIR, base.join("claude"));
+        let _env = set_pack_env(&pd, base.join("claude"));
 
         let (rel0, _) = PACK_ALL[0];
 
-        let (w1, _k1) = install_staged(false).unwrap();
+        let (w1, _k1) = install_staged(false, None).unwrap();
         assert!(w1 > 0, "신설은 written>0");
         assert!(pd.join(".pack-version").is_file(), ".pack-version 기록");
         assert!(pd.join(rel0).is_file(), "임베드 파일 반영");
         assert!(!pack_prev_dir(&pd).exists(), "첫 설치는 .prev 없음");
 
-        let (w2, _k2) = install_staged(false).unwrap();
+        let (w2, _k2) = install_staged(false, None).unwrap();
         assert_eq!(w2, 0, "멱등 재설치 written=0");
         assert!(pack_prev_dir(&pd).exists(), "재설치는 .prev 1세대 보존");
         assert!(pd.join(rel0).is_file(), "재설치 후 임베드 온전");
 
-        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2857,15 +3100,12 @@ mod tests {
     #[test]
     fn install_staged_preserves_user_edit() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(ENV_PACK_DIR).ok();
-        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let base = std::env::temp_dir().join(format!("cys-staged-pres-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let pd = base.join("pack");
-        std::env::set_var(ENV_PACK_DIR, &pd);
-        std::env::set_var(ENV_CONFIG_DIR, base.join("claude"));
+        let _env = set_pack_env(&pd, base.join("claude"));
 
-        install_staged(false).unwrap();
+        install_staged(false, None).unwrap();
         // ★B2: user 소유 파일(soul.md 등 — 디렉티브 제외)의 편집은 보존, system 파일 편집은 강제 갱신.
         let user_target = PACK_ALL
             .iter()
@@ -2880,7 +3120,7 @@ mod tests {
         std::fs::write(pd.join(user_target), "USER-EDIT-XYZ").unwrap();
         std::fs::write(pd.join(sys_target), "SYS-EDIT-XYZ").unwrap();
 
-        install_staged(false).unwrap();
+        install_staged(false, None).unwrap();
         assert_eq!(
             std::fs::read_to_string(pd.join(user_target)).unwrap(),
             "USER-EDIT-XYZ",
@@ -2892,7 +3132,59 @@ mod tests {
             "★B2: system 파일 편집은 임베드로 강제 갱신(스큐 동결 금지)"
         );
 
-        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★W-A1(커스텀 생존 계약 2026-07-17): 비임베드 신규 파일(사용자 자작 도구·스킬 등 출하물이
+    /// 아닌 파일)은 재설치 스윕·원자 교체·prune 어디서도 소실되지 않는다 — "자작 신규 파일은
+    /// 절대 안전"을 제품 약속으로 박제하는 회귀 핀. 대조군으로 진짜 prune 대상(매니페스트에
+    /// 등재됐지만 임베드에서 사라진 stale vendor 파일)은 정리됨을 함께 증명해, 이 보증이
+    /// "prune 이 아예 안 도는" 우연이 아니라 판정(매니페스트 등재 여부)에 의한 것임을 고정한다.
+    #[test]
+    fn user_created_noembed_files_survive_install_and_prune() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let base = std::env::temp_dir().join(format!("cys-staged-noembed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        let _env = set_pack_env(&pd, base.join("claude"));
+
+        install_staged(false, None).unwrap();
+
+        // 자작 파일 3종(루트·bin·중첩 스킬) — 임베드·매니페스트 어디에도 없다.
+        let customs = [
+            ("USER-NOTES-ROOT.md", "내 메모"),
+            ("bin/my_custom_tool.py", "#!/usr/bin/env python3\nprint('mine')\n"),
+            ("skills/my-jarvis-skill/SKILL.md", "---\nname: my-jarvis-skill\n---\n"),
+        ];
+        for (rel, content) in customs {
+            let p = pd.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+        }
+        // 대조군: 임베드에서 제거된 stale vendor 파일(매니페스트 등재 + 해시 일치 → prune 대상).
+        let stale_rel = "bin/legacy_gone_tool.py";
+        std::fs::write(pd.join(stale_rel), "OLD-VENDOR").unwrap();
+        let mpath = pd.join(INSTALL_MANIFEST);
+        let mut manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+        manifest.insert(stale_rel.to_string(), content_hash("OLD-VENDOR"));
+        std::fs::write(&mpath, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        // force 재설치(가장 공격적인 스윕) + 원자 교체 경로 통과.
+        install_staged(true, None).unwrap();
+
+        for (rel, content) in customs {
+            assert_eq!(
+                std::fs::read_to_string(pd.join(rel)).unwrap(),
+                content,
+                "★생존 계약: 비임베드 자작 파일은 force 스윕·prune·원자 교체에서 불가침 — {rel}"
+            );
+        }
+        assert!(
+            !pd.join(stale_rel).exists(),
+            "대조군: 매니페스트 등재 stale vendor 파일은 prune 됨(판정이 살아있음의 증명)"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 }

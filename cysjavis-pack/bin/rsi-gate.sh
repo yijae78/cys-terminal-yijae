@@ -41,6 +41,10 @@ import sys
 #   "human_signed": bool,                  # 인간(오너) 서명 유무
 #   "producer_model_family": "claude",
 #   "snapshot": {"path": "...", "sha256_expected": "..."},   # 원문 스냅샷 무결성
+#   "evaluator_hash": "<64hex>",           # C5 계보 — 선언 시 형식 검증(fail-CLOSED)
+#   "maturity": {"first_seen": "...", "adoption_evidence": "...",   # C7 성숙도 3필드
+#                "known_failures": [{"source_url","snapshot_sha256","summary"}, ...]},
+#   "pattern": {...},                      # C8 — v2 필드 선언 시 3필드 전부 검증(fail-CLOSED)
 #   "dimensions": {
 #       "source":     {"fetch_log": bool, "canonical": bool, "distinct_sources": int},
 #       "fact_check": {"cross_checked": bool},
@@ -84,6 +88,37 @@ def _match_any(paths, needles):
     return hits
 
 
+def _is_sha256(s):
+    return isinstance(s, str) and len(s) == 64 and all(c in "0123456789abcdefABCDEF" for c in s)
+
+
+def _maturity_errors(mat, label):
+    """C7 성숙도 3필드 검증 — known_failures 각 항목 source_url+snapshot_sha256+summary
+    (해시 없는 비판=지어낸 비판 봉쇄). 반환: 오류 목록(빈=통과)."""
+    if not isinstance(mat, dict):
+        return [f"[{label}] maturity가 dict 아님 — fail-CLOSED"]
+    errs = []
+    for k in ("first_seen", "adoption_evidence"):
+        if not str(mat.get(k, "")).strip():
+            errs.append(f"[{label}] maturity.{k} 누락/빈 — fail-CLOSED")
+    kf = mat.get("known_failures")
+    if not isinstance(kf, list):
+        errs.append(f"[{label}] maturity.known_failures 배열 누락 — fail-CLOSED")
+    else:
+        for j, item in enumerate(kf):
+            if not isinstance(item, dict):
+                errs.append(f"[{label}] known_failures[{j}] 객체 아님")
+                continue
+            u = str(item.get("source_url", ""))
+            if not (u.startswith("http://") or u.startswith("https://")):
+                errs.append(f"[{label}] known_failures[{j}].source_url 누락/비URL")
+            if not _is_sha256(item.get("snapshot_sha256", "")):
+                errs.append(f"[{label}] known_failures[{j}].snapshot_sha256 누락/64hex 아님")
+            if not str(item.get("summary", "")).strip():
+                errs.append(f"[{label}] known_failures[{j}].summary 누락")
+    return errs
+
+
 def gate(inp):
     """봉쇄 집행(순수 판정) — 통과 시 None, 위반 시 deny 사유 문자열. short-circuit 순서."""
     paths = inp.get("target_paths") or []
@@ -119,8 +154,20 @@ def gate(inp):
     if not src.get("fetch_log"):
         return "[출처] fetch 실호출 로그 없음(학습지식 단독 금지·hard fail)"
     is_confirmed = inp.get("target_state") == "confirmed"
-    if is_confirmed and int(src.get("distinct_sources", 0)) < 2:
-        return "[출처] confirmed 승격에 독립 출처 2개+ 필요(단일 출처 confirmed 불가)"
+    # ★P1-3 자기신고 정수 → 실측 대체(레드팀 F6): confirmed는 source_urls 목록을 요구하고
+    #   게이트가 distinct 호스트 수를 실측한다(자기신고 distinct_sources 정수 인플레 차단).
+    if is_confirmed:
+        urls = src.get("source_urls")
+        if not (isinstance(urls, list) and urls):
+            return "[출처] confirmed 승격에 source_urls 목록 필수(자기신고 정수 금지 — 게이트 실측 대상)"
+        hosts = set()
+        for u in urls:
+            s = str(u)
+            if "://" in s:
+                s = s.split("://", 1)[1]
+            hosts.add(s.split("/", 1)[0].lower())
+        if len(hosts) < 2:
+            return f"[출처] confirmed 독립 출처 2개+ 실측 필요(distinct host={len(hosts)})"
     if is_confirmed and not src.get("canonical"):
         return "[출처] canonical 미충족 — whitelist 밖은 provisional만(confirmed 불가)"
 
@@ -215,6 +262,33 @@ def gate(inp):
         if ar is not True:
             return "[효율] accuracy_retained=False — 정확도 미보존 절감은 reward-hack(내용 삭제) 차단"
 
+    # ★C5 evaluator 계보 — 선언 시 64hex 형식 강제(부재=SKIP 하위호환·malformed=DENY).
+    eh = inp.get("evaluator_hash")
+    if eh is not None and not _is_sha256(eh):
+        return "[계보] evaluator_hash 형식 위반(sha256 64hex 아님) — fail-CLOSED"
+
+    # ★C7 성숙도 — 번들에 maturity 선언 시 3필드+known_failures 항목별 해시 강제(부재=SKIP).
+    mat = inp.get("maturity")
+    if mat is not None:
+        errs = _maturity_errors(mat, "성숙도")
+        if errs:
+            return errs[0] + (f" (외 {len(errs)-1}건)" if len(errs) > 1 else "")
+
+    # ★C8 pattern v2 — 번들에 pattern 선언 + v2 필드(behavioral_claim·falsifier·maturity)
+    #   하나라도 존재하면 3필드 전부 유효 강제. v1 pattern(무선언)=SKIP(후방 호환·강화만).
+    pt = inp.get("pattern")
+    if pt is not None:
+        if not isinstance(pt, dict):
+            return "[패턴] pattern이 dict 아님 — fail-CLOSED"
+        if any(k in pt for k in ("behavioral_claim", "falsifier", "maturity")):
+            if not str(pt.get("behavioral_claim", "")).strip():
+                return "[패턴v2] behavioral_claim 누락/빈(관찰 가능 행동 서술) — fail-CLOSED"
+            if not str(pt.get("falsifier", "")).strip():
+                return "[패턴v2] falsifier 누락/빈(반증 관측 조건) — fail-CLOSED"
+            errs = _maturity_errors(pt.get("maturity"), "패턴v2")
+            if errs:
+                return errs[0] + (f" (외 {len(errs)-1}건)" if len(errs) > 1 else "")
+
     # ⑤ 의미·논리 독립 모델 패밀리 verdict 확인(공통모드 차단) — 결정론 통과 후에만.
     producer = str(inp.get("producer_model_family", "")).lower()
     verdicts = inp.get("verdicts") or []
@@ -265,7 +339,8 @@ def self_test():
     def cbase(**_):
         d = copy.deepcopy(base)
         d["target_state"] = "confirmed"
-        d["dimensions"]["source"] = {"fetch_log": True, "canonical": True, "distinct_sources": 2}
+        d["dimensions"]["source"] = {"fetch_log": True, "canonical": True, "distinct_sources": 2,
+                                     "source_urls": ["https://w3.org/a", "https://mozilla.org/b"]}
         d["dimensions"]["fact_check"] = {"cross_checked": True}
         d["dimensions"]["evidence"] = {"quote": "q", "context_entailment": "support"}
         d["dimensions"]["logic"] = {"verdict_json": "{\"verdict\":\"PASS\"}"}
@@ -290,8 +365,14 @@ def self_test():
     d = copy.deepcopy(base); d["dimensions"]["source"]["fetch_log"] = False
     expect("출처 fetch_log 0 DENY", d, False)
 
-    d = copy.deepcopy(base); d["target_state"] = "confirmed"; d["dimensions"]["source"]["distinct_sources"] = 1
-    expect("confirmed 단일출처 DENY", d, False)
+    d = copy.deepcopy(base); d["target_state"] = "confirmed"
+    d["dimensions"]["source"]["distinct_sources"] = 1
+    d["dimensions"]["source"]["source_urls"] = ["https://only-one.example/a"]  # 1 host → 실측 DENY
+    expect("confirmed 단일출처 DENY(실측)", d, False)
+    # ★P1-3 자기신고 인플레 차단 — distinct_sources=9 자기신고여도 실측 host=1이면 DENY.
+    d = cbase(); d["dimensions"]["source"]["distinct_sources"] = 9
+    d["dimensions"]["source"]["source_urls"] = ["https://same.host/a", "https://same.host/b"]
+    expect("confirmed 자기신고 인플레 무효(실측 host=1) DENY", d, False)
 
     d = copy.deepcopy(base); d["dimensions"]["logic"]["verdict_json"] = "{not valid json"
     expect("논리 JSON 파싱실패=FAIL DENY", d, False)
@@ -345,6 +426,36 @@ def self_test():
     d = copy.deepcopy(base); d["dimensions"]["quality"]["eval_improved"] = False
     d["dimensions"]["efficiency"] = dict(eff_ok)
     expect("quality 미충족 + efficiency present DENY(정확도-우선 순서)", d, False)
+
+    # ★C5 evaluator_hash (선언 시 형식 강제·부재=SKIP)
+    d = copy.deepcopy(base); d["evaluator_hash"] = "a" * 64
+    expect("evaluator_hash 유효 allow", d, True)
+    d = copy.deepcopy(base); d["evaluator_hash"] = "short"
+    expect("evaluator_hash malformed DENY(fail-CLOSED)", d, False)
+
+    # ★C7 maturity (선언 시 3필드+known_failures 해시 강제·부재=SKIP)
+    kf_ok = [{"source_url": "https://x.example/postmortem", "snapshot_sha256": "b" * 64, "summary": "s"}]
+    mat_ok = {"first_seen": "2026-01-01", "adoption_evidence": "3 orgs", "known_failures": kf_ok}
+    d = copy.deepcopy(base); d["maturity"] = dict(mat_ok)
+    expect("maturity 유효 allow", d, True)
+    d = copy.deepcopy(base); d["maturity"] = dict(mat_ok, known_failures=[{"source_url": "https://x.example/p", "summary": "s"}])
+    expect("maturity known_failures 해시 누락 DENY", d, False)
+    d = copy.deepcopy(base); d["maturity"] = dict(mat_ok); d["maturity"].pop("first_seen")
+    expect("maturity first_seen 누락 DENY", d, False)
+    d = copy.deepcopy(base); d["maturity"] = "not-a-dict"
+    expect("maturity 비dict DENY(fail-CLOSED)", d, False)
+
+    # ★C8 pattern v2 (v2 선언 시 3필드 강제·v1=SKIP 후방 호환)
+    pat_v1 = {"domain": "d", "condition": "c", "action": "a", "rationale": "r", "evidence_ref": "https://e"}
+    d = copy.deepcopy(base); d["pattern"] = dict(pat_v1)
+    expect("pattern v1(무선언) allow(후방 호환)", d, True)
+    pat_v2 = dict(pat_v1, behavioral_claim="관찰 행동", falsifier="반증 조건", maturity=dict(mat_ok))
+    d = copy.deepcopy(base); d["pattern"] = dict(pat_v2)
+    expect("pattern v2 유효 allow", d, True)
+    d = copy.deepcopy(base); d["pattern"] = dict(pat_v2); d["pattern"].pop("falsifier")
+    expect("pattern v2 falsifier 누락 DENY", d, False)
+    d = copy.deepcopy(base); d["pattern"] = dict(pat_v2, maturity={"first_seen": "2026"})
+    expect("pattern v2 maturity 불완전 DENY", d, False)
 
     return 1 if fails else 0
 

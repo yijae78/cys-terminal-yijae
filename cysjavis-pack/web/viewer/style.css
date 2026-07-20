@@ -1,0 +1,141 @@
+/* 자비스 뷰어 — 기본 다크. 터미널 테마 postMessage 로 CSS 변수 덮어씀(§14). */
+:root {
+  --bg: #14171c;
+  --fg: #d8dee9;
+  --muted: #7a8494;
+  --border: #2a2f38;
+  --panel: #1a1e24;
+  --accent: #6ea8fe;
+  --code-bg: #0f1216;
+  --add: #2ea04326;
+  --add-fg: #3fb950;
+  --del: #f8514926;
+  --del-fg: #f85149;
+  --hunk: #6ea8fe22;
+}
+body[data-theme="light"] {
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --muted: #656d76;
+  --border: #d0d7de;
+  --panel: #f6f8fa;
+  --accent: #0969da;
+  --code-bg: #f6f8fa;
+  --add: #2ea04322;
+  --add-fg: #1a7f37;
+  --del: #f8514922;
+  --del-fg: #cf222e;
+  --hunk: #0969da18;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.6 -apple-system, "SF Pro Text", "Apple SD Gothic Neo",
+        "Segoe UI", sans-serif;
+}
+#layout { display: flex; height: 100vh; }
+
+#sidebar {
+  width: 240px; flex: 0 0 240px;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.side-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 12px; border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+.side-head button {
+  background: none; border: 1px solid var(--border); color: var(--fg);
+  border-radius: 5px; cursor: pointer; padding: 1px 7px; font-size: 13px;
+}
+.side-head button:hover { border-color: var(--accent); color: var(--accent); }
+#side-path {
+  padding: 6px 12px; font-size: 11px; color: var(--muted);
+  word-break: break-all; border-bottom: 1px solid var(--border);
+}
+#file-list { list-style: none; margin: 0; padding: 4px 0; overflow-y: auto; }
+#file-list li {
+  padding: 4px 12px; cursor: pointer; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+#file-list li:hover { background: var(--hunk); }
+#file-list li.dir { color: var(--accent); }
+#file-list li .ic { display: inline-block; width: 16px; opacity: .8; }
+
+#main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+#topbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+#doc-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.badge {
+  font-size: 11px; padding: 1px 7px; border-radius: 10px;
+  background: var(--add); color: var(--add-fg); font-weight: 700;
+}
+.status { margin-left: auto; font-size: 12px; color: var(--muted); }
+
+#content { flex: 1; overflow: auto; padding: 24px 32px; }
+.empty { color: var(--muted); text-align: center; margin-top: 12vh; }
+.empty .hint { font-size: 12px; }
+.empty code, .hint code {
+  background: var(--code-bg); padding: 1px 5px; border-radius: 4px;
+}
+
+/* markdown 렌더 */
+.md { max-width: 900px; margin: 0 auto; }
+.md h1, .md h2 { border-bottom: 1px solid var(--border); padding-bottom: .3em; }
+.md h1, .md h2, .md h3, .md h4 { margin-top: 1.4em; }
+.md code {
+  background: var(--code-bg); padding: .15em .4em; border-radius: 4px;
+  font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: .9em;
+}
+.md pre {
+  background: var(--code-bg); padding: 14px 16px; border-radius: 8px;
+  overflow-x: auto; border: 1px solid var(--border);
+}
+.md pre code { background: none; padding: 0; }
+.md table { border-collapse: collapse; margin: 1em 0; display: block;
+  overflow-x: auto; }
+.md th, .md td { border: 1px solid var(--border); padding: 6px 12px; }
+.md th { background: var(--panel); }
+.md blockquote {
+  border-left: 3px solid var(--border); margin: 1em 0; padding: 0 1em;
+  color: var(--muted);
+}
+.md img { max-width: 100%; }
+.md a { color: var(--accent); }
+.mermaid { text-align: center; margin: 1em 0; }
+
+/* diff 뷰 */
+.diff { max-width: 1100px; margin: 0 auto; font-family: "SF Mono",
+  ui-monospace, Menlo, monospace; font-size: 12.5px; }
+.diff .file-head {
+  margin: 18px 0 0; padding: 8px 12px; background: var(--panel);
+  border: 1px solid var(--border); border-bottom: none;
+  border-radius: 8px 8px 0 0; font-weight: 600;
+}
+.diff table { border-collapse: collapse; width: 100%;
+  border: 1px solid var(--border); border-radius: 0 0 8px 8px; overflow: hidden; }
+.diff td { padding: 0 8px; white-space: pre-wrap; word-break: break-all;
+  vertical-align: top; }
+.diff td.ln { text-align: right; color: var(--muted); user-select: none;
+  width: 1%; white-space: nowrap; padding: 0 8px; opacity: .7; }
+.diff tr.add td { background: var(--add); }
+.diff tr.add td.code { color: var(--add-fg); }
+.diff tr.del td { background: var(--del); }
+.diff tr.del td.code { color: var(--del-fg); }
+.diff tr.hunk td { background: var(--hunk); color: var(--accent); }
+
+.errbox {
+  max-width: 900px; margin: 2em auto; padding: 14px 18px;
+  border: 1px solid var(--del-fg); border-radius: 8px;
+  background: var(--del); color: var(--fg);
+}

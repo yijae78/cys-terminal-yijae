@@ -2,19 +2,10 @@
   "_doc": "Heartbeat 스케줄. cys schedule add 로 추가하거나 직접 편집(데몬이 30초 내 핫 리로드). time(HH:MM 반복)·in(원샷)·every_minutes(주기) 중 하나. 예: {\"id\":\"daily-env-scan\",\"time\":\"07:00\",\"days\":[],\"action\":\"push\",\"to\":\"master\",\"text\":\"[heartbeat] 일일 환경스캐닝을 시작하라\",\"if_absent\":\"launch\",\"launch\":{\"role\":\"master\",\"agent\":\"claude\",\"cwd\":null}}. 24/365 가동 전제: Mac 전원/잠자기 설정(caffeinate 등)은 사용자가 보장해야 한다.",
   "jobs": [
     {
-      "action": "push",
-      "every_minutes": 15,
-      "id": "owner-progress-report-15min",
-      "if_absent": "skip",
-      "text_command": "printf '[heartbeat] 15분 보고 — 아래 진행%%는 결정론 산출값이다. 그대로(수치 불변) 주인님에게 보고하고, idle·feed·context 경고가 있으면 능동 조치하라.\\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report.py\"",
-      "to": "master"
-    },
-    {
-      "id": "owner-progress-report-5min",
+      "id": "owner-progress-gate-5min",
       "every_minutes": 5,
-      "action": "push",
-      "to": "master",
-      "text_command": "printf '[heartbeat] 5분 보고 — 아래 진행%%는 결정론 산출값이다. 그대로(수치 불변) 주인님에게 보고하라.\\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report.py\"",
+      "action": "command",
+      "command": "CYS_REPORT_GATE_DIR=\"$HOME/.cys/state/report_gate\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report_gate.py\" run",
       "if_absent": "skip"
     },
     {
@@ -32,6 +23,26 @@
       "to": "master",
       "text_command": "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_channel_watch.py\" --no-push",
       "if_absent": "skip"
+    },
+    {
+      "id": "learn-ttl-audit",
+      "every_minutes": 1440,
+      "action": "push",
+      "to": "master",
+      "if_absent": "skip",
+      "text_command": "printf '[heartbeat] RSI 학습 TTL 감사(일 1회·G1) — 만기 tombstone·재검 wakeup·lapse 강등·refs 대조의 결정론 산출이다. hard-fail 항목은 능동 조치하라.\\n'; CYS_ROUND_DIR=\"${CYS_ROUND_DIR:-$HOME/.cys/state}\" JAVIS_ROOT=\"${JAVIS_ROOT:-$HOME/.cys/state}\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_learn.py\" audit --json",
+      "_builtin": "learn",
+      "_builtin_version": 1
+    },
+    {
+      "id": "fleet-digest",
+      "every_minutes": 10080,
+      "action": "push",
+      "to": "master",
+      "if_absent": "skip",
+      "text_command": "printf '[heartbeat] 주간 fleet digest(G5) — 채택 학습물·사후 효과(ROI)·게이트 지출의 결정론 read-only 집계다. 수치 불변으로 보고하라. 추천 0건 지속=게이트 비용 재조정 검토 트리거.\\n'; CYS_ROUND_DIR=\"${CYS_ROUND_DIR:-$HOME/.cys/state}\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_fleet_report.py\" --days 7 2>&1 | tail -40",
+      "_builtin": "learn",
+      "_builtin_version": 1
     }
   ]
 }

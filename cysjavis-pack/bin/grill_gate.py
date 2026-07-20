@@ -216,8 +216,12 @@ def decide_floor(request_text):
     return floor, signals
 
 
-def cmd_begin(request_text):
+def cmd_begin(request_text, floor_override=0):
     floor, signals = decide_floor(request_text)
+    # ★--floor 상향 전용 오버라이드(v2): 오너/티켓의 "복잡" 선언 반영. 하향은 구조적 불가.
+    if floor_override and _int(floor_override, 0) > floor:
+        floor = _int(floor_override, 0)
+        signals = signals + ["owner-floor:%d" % floor]
     has_override = bool(os.environ.get("GRILL_MARKER", "").strip())
     sid = _surface_id()
     # ★격리 불가 시 fail-open: 마커를 만들지 않아 cross-node 마비를 원천 차단.
@@ -226,6 +230,23 @@ def cmd_begin(request_text):
                           "reason": "CYS_SURFACE_ID 부재 — surface 격리 불가, "
                                     "cross-node 마비 방지 위해 미발동(fail-open)",
                           "floor": floor, "signals": signals}, ensure_ascii=False))
+        return 0
+    # ★v2 상향 시맨틱: collecting(미만료) 마커가 있으면 덮어쓰기 금지 — floor 상향만 병합.
+    #   axes·raw_count는 어떤 경로로도 리셋되지 않는다(자동무장 후 모델의 원문 begin이
+    #   복잡도를 30으로 정밀 교정하는 경로를 열되, 진행 소실·하향 게이밍은 봉쇄).
+    old = _load_marker()
+    if old and old.get("status") == "collecting" and not _expired(old):
+        old_floor = _int(old.get("floor"), DEFAULT_FLOOR_SIMPLE)
+        merged = max(old_floor, floor)
+        if merged != old_floor:
+            old["floor"] = merged
+            old["complexity"] = ("complex" if merged >= DEFAULT_FLOOR_COMPLEX
+                                 else "simple")
+            old["complexity_signals"] = list(old.get("complexity_signals") or []) + signals
+            _save_marker(old)
+        print(json.dumps({"session_id": old.get("session_id"), "merged": True,
+                          "floor": merged, "distinct": len(old.get("axes", [])),
+                          "signals": signals}, ensure_ascii=False))
         return 0
     m = {
         "session_id": _axis_hash(str(time.time()) + (request_text or "")),
@@ -540,6 +561,28 @@ def self_test():
         if f5 != 20:
             fails.append("⑭b COMPLEX 오탐: 'migration' 단독이 floor %d(20 기대)" % f5)
 
+        # ⑯ ★v2 begin 상향 시맨틱: collecting 마커에 재begin — 진행 보존·상향만
+        fresh(20)
+        _save_marker(dict(_load_marker(), axes=["a1", "a2"], raw_count=2))
+        cmd_begin("멀티 서브시스템 아키텍처 재설계 전수조사")   # 복잡 → 30 상향
+        m16 = _load_marker()
+        if _int(m16.get("floor"), 0) != 30:
+            fails.append("⑯재begin 상향 실패 floor=%s(30 기대)" % m16.get("floor"))
+        if len(m16.get("axes", [])) != 2 or m16.get("raw_count") != 2:
+            fails.append("⑯재begin이 진행(axes/raw)을 리셋함")
+        cmd_begin("오타 수정")   # 단순 → 하향 시도: 30 유지되어야
+        if _int(_load_marker().get("floor"), 0) != 30:
+            fails.append("⑯하향 게이밍 차단 실패(30→%s)" % _load_marker().get("floor"))
+        # ⑯b --floor 상향 전용 오버라이드
+        fresh(20)
+        cmd_begin("간단 작업", floor_override=30)
+        if _int(_load_marker().get("floor"), 0) != 30:
+            fails.append("⑯b --floor 상향 미반영")
+        fresh(30)
+        cmd_begin("간단 작업", floor_override=20)   # 하향 시도
+        if _int(_load_marker().get("floor"), 0) != 30:
+            fails.append("⑯b --floor 하향이 먹힘(게이밍 경로)")
+
         # ⑮ ★surface 부재 시 begin fail-open(마커 미생성)
         os.environ.pop("GRILL_MARKER", None)
         os.environ.pop("CYS_SURFACE_ID", None)
@@ -559,10 +602,12 @@ def self_test():
         sys.stderr.write("\n".join(fails) + "\n")
         sys.stderr.write("grill_gate self-test: %d 실패\n" % len(fails))
         return 1
-    print(json.dumps({"self_test": "ok", "cases": 15,
+    print(json.dumps({"self_test": "ok", "cases": 17,
                       "covers": "fail-open·차단·충족·배치우회·쪼개기·무의미·한글축·"
                                 "취소·무응답·end거부/force·done·만료·floor-null·"
-                                "floor20/30/복잡토큰·surface부재"}, ensure_ascii=False))
+                                "floor20/30/복잡토큰·surface부재·"
+                                "v2상향병합/진행보존/하향거부/floor오버라이드"},
+                     ensure_ascii=False))
     return 0
 
 
@@ -571,6 +616,8 @@ def main():
     ap.add_argument("cmd", nargs="?",
                     choices=["begin", "count", "check", "end", "status"])
     ap.add_argument("--request", default="", help="begin: 원 작업 지시(복잡도 판정용)")
+    ap.add_argument("--floor", type=int, default=0,
+                    help="begin: 상향 전용 floor 오버라이드(오너/티켓 '복잡' 선언 — 하향 불가)")
     ap.add_argument("--force", action="store_true",
                     help="end: 오너 조기중단(미충족이어도 종료·abandoned 기록)")
     ap.add_argument("--self-test", action="store_true")
@@ -579,7 +626,7 @@ def main():
     if args.self_test:
         sys.exit(self_test())
     if args.cmd == "begin":
-        sys.exit(cmd_begin(args.request))
+        sys.exit(cmd_begin(args.request, floor_override=args.floor))
     if args.cmd == "count":
         sys.exit(cmd_count(sys.stdin.read()))
     if args.cmd == "check":

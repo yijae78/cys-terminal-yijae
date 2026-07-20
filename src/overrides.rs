@@ -92,6 +92,22 @@ pub fn sanitize_local_directive(raw: &str) -> (String, Vec<String>) {
     sanitize_with_cap(raw, LOCAL_DIRECTIVE_MAX_LEN, "local-directive")
 }
 
+/// ★W-D3(커스텀 생존 설계 2026-07-17): 헌법 파일(디렉티브·soul·CLAUDE) 3-way/AI 병합 결과의
+/// 안전핵 소실 결정론 검증. 규칙 — SAFETY_KEYWORDS 각 키워드에 대해 **내 수정본(ours)과 vendor
+/// 신버전(theirs) 양쪽에 존재**하는 키워드(=양측이 합의한 안전핵 조항)가 병합본(merged)에서
+/// 사라지면 위반. 한쪽에만 있는 키워드는 정당한 진화(추가·개편)일 수 있어 요구하지 않는다 —
+/// 존재 검사라 재문구화(rewording)는 통과시키되 통째 소실은 차단하는, 오탐 낮은 안전측 핀.
+/// 반환 Err = 소실 키워드 목록(병합 적용을 거부해야 함 — fail-closed).
+pub fn verify_constitution_merge(ours: &str, theirs: &str, merged: &str) -> Result<(), Vec<String>> {
+    let (lo, lt, lm) = (ours.to_lowercase(), theirs.to_lowercase(), merged.to_lowercase());
+    let lost: Vec<String> = SAFETY_KEYWORDS
+        .iter()
+        .filter(|kw| lo.contains(*kw) && lt.contains(*kw) && !lm.contains(*kw))
+        .map(|kw| kw.to_string())
+        .collect();
+    if lost.is_empty() { Ok(()) } else { Err(lost) }
+}
+
 fn sanitize_with_cap(raw: &str, cap: usize, label: &str) -> (String, Vec<String>) {
     let mut warnings = Vec::new();
     let kept: Vec<&str> = raw
@@ -250,13 +266,9 @@ mod tests {
         if let Some((name, body)) = write_json {
             std::fs::write(td.join("overrides").join(name), body).unwrap();
         }
-        let saved = std::env::var(crate::pack::ENV_PACK_DIR).ok();
-        std::env::set_var(crate::pack::ENV_PACK_DIR, &td);
+        // ★W0-b: EnvGuard로 이전 값 복원형 격리 — f()가 패닉해도 drop이 복원(미설정 창 제거).
+        let _g_pack = crate::pack::EnvGuard::set(crate::pack::ENV_PACK_DIR, &td);
         let out = f();
-        match saved {
-            Some(v) => std::env::set_var(crate::pack::ENV_PACK_DIR, v),
-            None => std::env::remove_var(crate::pack::ENV_PACK_DIR),
-        }
         let _ = std::fs::remove_dir_all(&td);
         out
     }
@@ -315,5 +327,30 @@ mod tests {
         let (capped, w2) = sanitize_local_directive(&long);
         assert_eq!(capped.chars().count(), LOCAL_DIRECTIVE_MAX_LEN);
         assert!(w2.iter().any(|w| w.contains("초과")));
+    }
+
+    /// ★W-D3 헌법 병합 안전핵 소실 핀: 양측 합의 키워드 소실=거부, 재문구화·일방 키워드=통과.
+    #[test]
+    fn constitution_merge_detects_safety_core_loss() {
+        let ours = "## 지침\n- autopilot denylist 준수\n- kill-switch: 주인 입력 즉시 정지\n- 내 커스텀 조항";
+        let theirs = "## 지침 v2\n- autopilot denylist 준수(강화)\n- kill-switch 불변\n- vendor 신규 조항";
+        // ① 정상 병합(안전핵 보존) → Ok.
+        let good = "## 지침 v2\n- autopilot denylist 준수(강화)\n- kill-switch 불변\n- 내 커스텀 조항\n- vendor 신규 조항";
+        assert!(verify_constitution_merge(ours, theirs, good).is_ok());
+        // ② 병합이 안전핵 조항(denylist·kill-switch)을 소실 → Err 에 키워드 적시(fail-closed).
+        let bad = "## 지침 v2\n- 내 커스텀 조항\n- vendor 신규 조항";
+        let lost = verify_constitution_merge(ours, theirs, bad).unwrap_err();
+        assert!(lost.iter().any(|k| k == "denylist"), "denylist 소실 검출: {lost:?}");
+        assert!(lost.iter().any(|k| k.contains("kill")), "kill-switch 소실 검출: {lost:?}");
+        // ③ 재문구화(키워드는 잔존)는 통과 — 존재 검사라 문장 개편을 막지 않는다.
+        //    (양측 공통 키워드 autopilot·denylist·kill-switch 가 전부 잔존해야 통과 — 하나라도
+        //     빠지면 ②처럼 거부되는 것이 이 핀의 사양이다.)
+        let reworded = "## v3\n- denylist(autopilot 정지 경계) 완전 준수\n- kill-switch 재선언";
+        assert!(verify_constitution_merge(ours, theirs, reworded).is_ok());
+        // ④ 일방(ours 에만) 키워드는 요구하지 않음 — vendor 가 제거한 조항의 정당한 진화 허용.
+        let ours_only = "- eval-driven 원칙\n- autopilot denylist";
+        let theirs_v2 = "- autopilot denylist"; // vendor 가 eval-driven 조항 제거
+        let merged_v2 = "- autopilot denylist";
+        assert!(verify_constitution_merge(ours_only, theirs_v2, merged_v2).is_ok());
     }
 }

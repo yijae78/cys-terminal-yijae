@@ -44,6 +44,22 @@
     color:#6d93b5;font-size:14px;padding:2px 6px}
   #panel .status{font-size:15px;margin-top:7px;min-height:14px;color:#8ccdf0}
   #panel .status.ok{color:#35e0c0} #panel .status.err{color:#ff8080}
+  /* 카페·상점 선물 패널 (D6) */
+  #shop{position:fixed;left:16px;bottom:70px;width:420px;z-index:21;display:none;
+    background:rgba(14,10,7,.95);border:1px solid rgba(255,183,90,.55);border-radius:8px;
+    padding:14px;box-shadow:0 0 24px rgba(220,150,40,.25)}
+  #shop h2{margin:0 0 6px;font-size:19px;color:#ffd88a}
+  #shop .meta{font-size:15px;color:#e2c79a;line-height:1.6;margin-bottom:8px}
+  #shop button{background:#3a2c10;color:#ffd88a;border:1px solid rgba(255,183,90,.6);
+    border-radius:5px;padding:6px 12px;font:600 15px 'SF Mono',Menlo,monospace;cursor:pointer;margin:3px 4px 0 0}
+  #shop button:hover{background:#55420f} #shop button:disabled{opacity:.35;cursor:default}
+  #shop #shop-close{background:transparent;border:none;position:absolute;top:8px;right:8px;color:#b58a55;font-size:14px}
+  #shop #shop-targets{margin-top:8px;max-height:150px;overflow-y:auto}
+  #shop .status{font-size:14px;margin-top:8px;min-height:14px;color:#e2c79a}
+  #shop .status.ok{color:#35e0c0} #shop .status.err{color:#ff8080}
+  .embed #shop{width:min(80vw,360px);bottom:52px;padding:10px}
+  .embed #shop h2{font-size:14px} .embed #shop .meta{font-size:11px}
+  .embed #shop button{font-size:12px;padding:5px 9px}
   /* 근접 대화 팝업 (#talk — 주인이 아바타에 다가가면 자동) */
   #talk{position:fixed;z-index:18;width:360px;display:none;
     background:rgba(10,18,32,.94);border:1.5px solid rgba(255,209,102,.75);border-radius:9px;
@@ -145,6 +161,7 @@ if (window.self !== window.top) document.documentElement.classList.add("embed");
   </div>
 </div>
 <div id="btnbar">
+  <button id="b-shuffle" title="부서 자리배치를 세션 랜덤으로 다시 섞기 (타임머신 중 비활성)">🔀 배치 섞기</button>
   <button id="b-director" title="중요 이벤트 자동 줌인 — 기본 꺼짐(주인 이동 줌인과 혼동 방지)">🎥 디렉터</button>
   <button id="b-voice" title="실패·승인·경보 한국어 안내방송">🔇 방송</button>
   <button id="b-theme" title="메타버스 테마 전환 (저장됨)">🎨 테마</button>
@@ -167,6 +184,14 @@ if (window.self !== window.top) document.documentElement.classList.add("embed");
   </div>
   <div class="note">전송 = cys send + Return (해당 pane에 즉시 타이핑됨). 배달은
     surface.input_injected 이벤트로 이 화면에 되돌아와 확인된다(동시성 루프).</div>
+</div>
+<div id="shop">
+  <button id="shop-close">✕</button>
+  <h2 id="shop-title">—</h2>
+  <div class="meta" id="shop-desc">—</div>
+  <button id="shop-gift">🎁 선물하기</button>
+  <div id="shop-targets"></div>
+  <div class="status" id="shop-status"></div>
 </div>
 
 <script type="module">
@@ -665,15 +690,100 @@ function disposeGroup(g){
   });
   scene.remove(g);
 }
-function slotPositions(n){
-  const cols = Math.max(3, Math.ceil(Math.sqrt(n*1.6)));
-  const rows = Math.ceil(n/cols), out=[];
-  for (let i=0;i<n;i++){
-    const cx = i%cols, rz = Math.floor(i/cols);
-    out.push([ -1.3 + (cx-(cols-1)/2)*(SLAB_W-6.6)/Math.max(cols-1,1),
-               (rz-(rows-1)/2)*(SLAB_D-4.2)/Math.max(rows-1,1) || 0 ]);
-  }
+// ── D1. FloorPlan SOT ── 층 배치 단일 기술자. 각 가구 함수의 좌표 소유권을 여기로 회수한다.
+//   템플릿 5종(격자·클러스터·창가열·미러·중앙광장) × seed 미세변주. seed 기본=부서 라벨 해시(결정론).
+const floorPlans = new Map();        // deptId → plan (buildWorld가 채움)
+let shuffleSeed = null;              // null=부서 해시(결정론) · 숫자=세션 랜덤("배치 섞기")
+function hashStr(s){ let h = 2166136261; const t = String(s);
+  for (let i=0;i<t.length;i++){ h ^= t.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function rngOf(seed){ let a = seed >>> 0;
+  return ()=>{ a = a + 0x6D2B79F5 | 0; let x = Math.imul(a ^ a>>>15, 1|a);
+    x = x + Math.imul(x ^ x>>>7, 61|x) ^ x; return ((x ^ x>>>14) >>> 0) / 4294967296; }; }
+// 데스크 배치기 — region 안·비겹침(인접 간격 최소 1.50 실측 · footprint 1.62×1.24), 좌표 리터럴 대신 파생값. rot=set.grp.rotation.y.
+function fillGrid(n, x0, x1, z0, z1, rot){
+  const out=[]; if (n<=0) return out;
+  const cols = Math.max(1, Math.min(n, Math.round(Math.sqrt(n*(x1-x0)/Math.max(0.4, z1-z0)))));
+  const rows = Math.ceil(n/cols);
+  for (let i=0;i<n;i++){ const c=i%cols, r=Math.floor(i/cols);
+    out.push([ cols>1 ? x0+(x1-x0)*c/(cols-1) : (x0+x1)/2,
+               rows>1 ? z0+(z1-z0)*r/(rows-1) : (z0+z1)/2, rot ]); }
   return out;
+}
+function fillPods(n, x0, x1, z0, z1){        // 4인 클러스터 — 2×2 포드가 서로 마주봄
+  const out=[]; if (n<=0) return out;
+  const pods = Math.ceil(n/4);
+  const pcols = Math.max(1, Math.min(pods, Math.round(Math.sqrt(pods*(x1-x0)/Math.max(0.4, z1-z0)))));
+  const prows = Math.ceil(pods/pcols);
+  const off = [[-0.85,-0.95,0],[0.85,-0.95,0],[-0.85,0.95,Math.PI],[0.85,0.95,Math.PI]];
+  let placed=0;
+  for (let p=0;p<pods && placed<n;p++){ const pc=p%pcols, pr=Math.floor(p/pcols);
+    const px = pcols>1 ? x0+(x1-x0)*pc/(pcols-1) : (x0+x1)/2;
+    const pz = prows>1 ? z0+(z1-z0)*pr/(prows-1) : (z0+z1)/2;
+    for (let k=0;k<4 && placed<n;k++){ out.push([px+off[k][0], pz+off[k][1], off[k][2]]); placed++; } }
+  return out;
+}
+function fillRow(n, x0, x1, zRow, rowGap, rot, zMin){   // 창가 일렬 — 넘치면 뒷줄, zMin에서 행 수 고정(회의실 진입 방지)
+  const out=[]; if (n<=0) return out;
+  const perCap = Math.max(1, Math.floor((x1-x0)/1.9)+1);
+  const rowsMax = (zMin != null) ? Math.max(1, Math.floor((zRow-zMin)/rowGap)+1) : Infinity;
+  const rows = Math.min(rowsMax, Math.ceil(n/perCap));   // 뒷줄이 zMin(회의실 AABB) 넘기 전 클램프
+  const per = Math.ceil(n/rows);                          // 초과분은 열 압축(행 수 고정 — z는 항상 안전)
+  for (let i=0;i<n;i++){ const c=i%per, r=Math.floor(i/per);
+    const cnt = Math.min(per, n - r*per);
+    out.push([ cnt>1 ? x0+(x1-x0)*c/(cnt-1) : (x0+x1)/2, zRow - r*rowGap, rot ]); }
+  return out;
+}
+// 템플릿 뱅크 5종 → plan. 좌표는 SLAB(x∈±6.5·z∈±4.3) 안, 가구·데스크·순찰 비겹침을 수제 보장.
+function floorPlanOf(deptKey, seed, nodeCount){
+  const es = (seed==null ? hashStr(deptKey) : (seed ^ hashStr(deptKey))) >>> 0;
+  const rng = rngOf(es);
+  const tpl = es % 5;
+  const n = Math.max(0, nodeCount|0);
+  const jz = (rng()-0.5)*0.5;                       // 미세 변주(오프셋)
+  const acc = Math.floor(rng()*ACCENTS.length);
+  let plan;
+  if (tpl === 0){            // 격자형 — 회의실 우후 · 라운지 우전 · 데스크 좌측 격자
+    plan = { meeting:{x:4.4,z:-2.2,w:3.6,d:2.9}, lounge:{x:4.6,z:2.4},
+      kanban:{x:-3.2}, amenity:'plants', amenityPos:{x:-2.0,z:3.9},
+      desks: fillGrid(n, -4.6, 1.5, -3.2+jz, 2.3+jz, 0),
+      patrol: [[-4.2,3.6],[0,3.6],[2.5,0],[2.5,-3.0]] };
+  } else if (tpl === 1){     // 4인 클러스터형 — 데스크가 포드로 묶여 마주봄
+    plan = { meeting:{x:4.4,z:-2.2,w:3.6,d:2.9}, lounge:{x:4.6,z:2.4},
+      kanban:{x:-3.2}, amenity:'pingpong', amenityPos:{x:5.5,z:0.4},
+      desks: fillPods(n, -4.2, 0.8, -2.4, 1.9),
+      patrol: [[-4.2,3.6],[0,3.6],[2.5,0],[2.5,-3.0]] };
+  } else if (tpl === 2){     // 창가 일렬형 — 회의실 후중앙 · 데스크 앞창가(창 바라봄)
+    plan = { meeting:{x:-0.2,z:-2.6,w:3.4,d:2.6}, lounge:{x:4.5,z:-1.4},
+      kanban:{x:3.4}, amenity:'plants', amenityPos:{x:5.4,z:3.2},
+      desks: fillRow(n, -4.6, 1.7, 3.3, 1.5, Math.PI, -0.5),   // zMin -0.5: 뒷줄이 회의실 z(-1.3~) 진입 금지
+      patrol: [[-4.0,-3.6],[4.0,-3.6],[5.5,1.5],[-5.2,-0.5]] };
+  } else if (tpl === 3){     // 미러 반전형 — 회의실 좌후 · 라운지 좌전 · 데스크 우측 격자
+    plan = { meeting:{x:-4.4,z:-2.2,w:3.6,d:2.9}, lounge:{x:-4.6,z:2.4},
+      kanban:{x:3.2}, amenity:'plants', amenityPos:{x:2.0,z:3.9},
+      desks: fillGrid(n, -1.5, 4.6, -3.2+jz, 2.3+jz, 0),
+      patrol: [[4.2,3.6],[0,3.6],[-2.5,0],[-2.5,-3.0]] };
+  } else {                   // 중앙 광장형 — 라운지 전중앙(광장) · 데스크 압축 격자
+    plan = { meeting:{x:4.4,z:-2.2,w:3.6,d:2.9}, lounge:{x:0.2,z:3.4},
+      kanban:{x:-3.4}, amenity:'plants', amenityPos:{x:5.5,z:2.0},
+      desks: fillGrid(n, -4.6, 1.5, -3.2, 0.7, 0),
+      patrol: [[-4.2,-3.9],[-1.0,-3.9],[2.5,0],[2.5,-3.2]] };   // z-3.9: 앞줄 데스크 footprint(zmin -3.69) 아래·슬랩 내부
+  }
+  plan.gather = { x: plan.meeting.x, z: plan.meeting.z };
+  plan.accent = ACCENTS[acc];
+  return plan;
+}
+function makeAmenity(y, plan){
+  const p = plan.amenityPos;
+  if (plan.amenity === 'pingpong') return makePingPong(y, p.x, p.z);
+  if (plan.amenity === 'popup') return makePopupStore(y, p.x, p.z);
+  if (plan.amenity === 'plants'){
+    const g = new THREE.Group();
+    for (let i=0;i<3;i++){ const dx=(i-1)*0.4;
+      g.add(mesh(G.pot, M.potM, p.x+dx, y+0.08, p.z));
+      g.add(mesh(G.leaves, M.leafM, p.x+dx, y+0.26, p.z)); }
+    return g;
+  }
+  return new THREE.Group();
 }
 function makeFloor(y, deptTint, hot){
   const g = new THREE.Group();
@@ -703,9 +813,9 @@ function makeFloor(y, deptTint, hot){
   return g;
 }
 // ---------- 어메니티 (빅테크 오피스 감성 — 회의실·라운지·카페·탁구·옥상) ----------
-function makeMeetingRoom(y, accent){
+function makeMeetingRoom(y, accent, m){
   const g = new THREE.Group();
-  const cx = 4.4, cz = -2.2, w = 3.6, d = 2.9, h = 1.5;
+  const cx = m.x, cz = m.z, w = m.w, d = m.d, h = 1.5;
   // 유리벽 3면 (+z 면은 입구)
   g.add(mesh(new THREE.BoxGeometry(w, h, 0.04), M.meetGlass, cx, y+h/2, cz-d/2, false));
   g.add(mesh(new THREE.BoxGeometry(0.04, h, d), M.meetGlass, cx-w/2, y+h/2, cz, false));
@@ -725,9 +835,9 @@ function makeMeetingRoom(y, accent){
   lbl.position.set(cx, y+2.1, cz); g.add(lbl);
   return g;
 }
-function makeLounge(y, accent){
+function makeLounge(y, accent, pos){
   const g = new THREE.Group();
-  const cx = 4.5, cz = 2.5;
+  const cx = pos.x, cz = pos.z;
   const accMat = new THREE.MeshStandardMaterial({ color: accent, roughness: 0.85 });
   const rug = new THREE.Mesh(new THREE.CircleGeometry(1.75, 28),
     new THREE.MeshStandardMaterial({ color: accent, roughness: 0.95,
@@ -764,12 +874,61 @@ function makeCafe(y){
   for (let i=0;i<3;i++)
     g.add(mesh(new THREE.CylinderGeometry(0.16, 0.13, 0.55, 10), M.chair, cx-0.8+i*0.8, y+0.28, cz+0.85, false));
   const sign = textSprite('☕ CAFE', { size:20, color:'#ffd77a' });
-  sign.position.set(cx, y+1.7, cz); g.add(sign);
+  sign.position.set(cx, y+1.9, cz); g.add(sign);
+  // D6 메뉴판 (CanvasTexture — 오늘의 원두=부서별 토큰 잔량 + 라떼 가격표, ≥2s 스로틀)
+  cafeMenuCanvas = document.createElement('canvas'); cafeMenuCanvas.width = 512; cafeMenuCanvas.height = 256;
+  cafeMenuTex = new THREE.CanvasTexture(cafeMenuCanvas); cafeMenuTex.colorSpace = THREE.SRGBColorSpace;
+  lastCafeMenu = 0;
+  const menu = new THREE.Mesh(new THREE.PlaneGeometry(2.0, 1.0),
+    new THREE.MeshBasicMaterial({ map:cafeMenuTex, transparent:true }));
+  menu.position.set(cx, y+1.55, cz-0.36); g.add(menu);   // 카운터 뒤(+z 향함=손님 쪽)
+  g.add(mesh(new THREE.BoxGeometry(2.2, 1.2, 0.05), M.dark, cx, y+1.55, cz-0.4, false));
+  drawCafeMenu(true);
+  // D6 클릭 상품: 토큰 라떼 (선물하기 트리거) — 카운터 위 컵
+  const latte = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.075, 0.16, 12),
+    new THREE.MeshStandardMaterial({ color:0xf2ead6, roughness:0.5, emissive:0x6a4a20, emissiveIntensity:0.2 }));
+  latte.position.set(cx+1.0, y+0.99, cz+0.1);
+  latte.userData.shopItem = { kind:'latte', name:'토큰 라떼',
+    desc:'주인이 직원에게 보내는 격려의 토큰 라떼 한 잔. 알림만 전달됩니다(회신 불요).' };
+  g.add(latte);
+  const ltag = textSprite('토큰 라떼', { size:13, color:'#ffd88a', bg:'rgba(30,20,6,.8)' });
+  ltag.position.set(cx+1.0, y+1.25, cz+0.1); g.add(ltag);
   return g;
 }
-function makePingPong(y){
+// 카페 메뉴판 렌더 — 부서별 5h/7d 토큰 잔량("오늘의 원두") + 라떼 가격표(≥2s 스로틀).
+let cafeMenuCanvas = null, cafeMenuTex = null, lastCafeMenu = 0;
+function drawCafeMenu(force){
+  if (!cafeMenuCanvas) return;
+  const now = performance.now();
+  if (!force && now - lastCafeMenu < 2000) return;
+  lastCafeMenu = now;
+  const g = cafeMenuCanvas.getContext('2d');
+  g.clearRect(0,0,512,256);
+  g.fillStyle = 'rgba(18,12,6,0.96)'; g.fillRect(0,0,512,256);
+  g.strokeStyle = '#c98a3a'; g.lineWidth = 3; g.strokeRect(4,4,504,248);
+  g.fillStyle = '#ffd88a'; g.font = '600 24px Menlo,monospace';
+  g.fillText('☕ 오늘의 원두 (토큰 잔량)', 18, 36);
+  const deps = (lastWorld && lastWorld.departments) || [];
+  let ry = 72; g.font = '17px Menlo,monospace';
+  deps.slice(0,4).forEach(d=>{
+    const roast = (lbl)=>{
+      let s=0, nn=0; (d.nodes||[]).forEach(n=>{ const r=(n.rate||[]).find(x=>x.label===lbl);
+        const u = r && (r.used_pct ?? r.pct); if (u!=null){ s+=Math.max(0,100-u); nn++; } });
+      return nn ? Math.round(s/nn) : null; };
+    const h5 = roast('5h'), d7 = roast('7d');
+    g.fillStyle = '#e2c79a'; g.fillText(String(d.id).slice(0,8), 18, ry);
+    g.fillStyle = h5==null?'#667':(h5<15?'#ff8a8a':'#6ee1be');
+    g.fillText('5h '+(h5==null?'—':h5+'%'), 190, ry);
+    g.fillStyle = d7==null?'#667':(d7<15?'#ff8a8a':'#8cc3eb');
+    g.fillText('7d '+(d7==null?'—':d7+'%'), 340, ry);
+    ry += 30;
+  });
+  g.fillStyle = '#ffd88a'; g.font = '600 18px Menlo,monospace';
+  g.fillText('라떼 ☕ 격려 1잔 · 스킬 🎁 추천 (팝업스토어)', 18, 240);
+  cafeMenuTex.needsUpdate = true;
+}
+function makePingPong(y, cx=2.6, cz=1.6){
   const g = new THREE.Group();
-  const cx = 2.6, cz = 1.6;
   g.add(mesh(new THREE.BoxGeometry(1.8, 0.05, 1.0),
     new THREE.MeshStandardMaterial({ color:0x1f6e46, roughness:0.7 }), cx, y+0.5, cz));
   g.add(mesh(new THREE.BoxGeometry(1.82, 0.09, 0.02), M.white, cx, y+0.56, cz, false));
@@ -795,10 +954,9 @@ function makeBrickTexture(){
 }
 const brickMat = new THREE.MeshStandardMaterial({ map: makeBrickTexture(), roughness: 0.95 });
 
-function makePopupStore(y){
+function makePopupStore(y, cx=-4.6, cz=0.8){
   // 성수동 팝업 스토어 — 벽돌 부스 + 스트라이프 어닝 + 네온 + 신상 진열(실데이터 버전)
   const g = new THREE.Group();
-  const cx = -4.6, cz = 0.8;
   const back = mesh(new THREE.BoxGeometry(2.6, 1.9, 0.12), brickMat, cx, y+0.95, cz-0.75);
   const side = mesh(new THREE.BoxGeometry(0.12, 1.3, 1.5), brickMat, cx-1.25, y+0.65, cz);
   g.add(back); g.add(side);
@@ -808,19 +966,38 @@ function makePopupStore(y){
   g.add(awn);
   g.add(mesh(new THREE.BoxGeometry(2.2, 0.5, 0.6), M.woodDark, cx, y+0.25, cz+0.15));
   g.add(mesh(new THREE.BoxGeometry(2.2, 0.05, 0.6), M.wood, cx, y+0.53, cz+0.15));
-  for (let i=0;i<3;i++){
-    const item = new THREE.Mesh(new THREE.BoxGeometry(0.22,0.22,0.22),
-      new THREE.MeshStandardMaterial({ color:0x101820, roughness:0.4,
-        emissive: ACCENTS[i], emissiveIntensity: 0.6 }));
-    item.position.set(cx-0.7+i*0.7, y+0.67, cz+0.15); item.castShadow = true;
-    g.add(item);
-  }
+  const shelfSign = textSprite('🎁 스킬 상점', { size:16, color:'#ffd88a' });
+  shelfSign.position.set(cx, y+1.15, cz+0.35); g.add(shelfSign);
+  populateShopSkills(g, y, cx, cz);          // GET /skills → 진열(비동기·실패 시 빈 선반 우아 강등)
+  // 하네스 코너 (표시 전용 — 클릭 상품 아님, shopItem 미부여)
+  const hx = cx + 1.55;
+  g.add(mesh(new THREE.BoxGeometry(0.7, 0.5, 0.5), M.woodDark, hx, y+0.25, cz+0.15));
+  g.add(mesh(new THREE.BoxGeometry(0.7, 0.05, 0.5), M.wood, hx, y+0.53, cz+0.15));
+  [0,1].forEach(i=> g.add(mesh(new THREE.BoxGeometry(0.2,0.2,0.2), M.metal, hx-0.18+i*0.36, y+0.67, cz+0.15, false)));
+  const htag = textSprite('🔧 하네스', { size:13, color:'#9fd8ff', bg:'rgba(8,20,36,.8)' });
+  htag.position.set(hx, y+1.0, cz+0.15); g.add(htag);
   const neon = textSprite('✦ POP-UP ✦', { size:24, color:'#ff8fb8' });
   neon.position.set(cx, y+2.35, cz-0.6); g.add(neon);
   const ver = textSprite('신상: cys v' + (lastWorld?.daemon?.version || '—'),
     { size:16, color:'#ffd77a' });
-  ver.position.set(cx, y+1.05, cz+0.35); g.add(ver);
+  ver.position.set(cx-0.9, y+1.05, cz+0.35); g.add(ver);
   return g;
+}
+async function populateShopSkills(g, y, cx, cz){
+  let skills = [];
+  try { const j = await (await fetch('/skills')).json(); skills = (j && j.skills) || []; }
+  catch(e){ skills = []; }                    // 실패 = 빈 선반 우아 강등
+  if (!g.parent) return;                       // 그 사이 재빌드됐으면 폐기(stale 그룹 오염 방지)
+  skills.slice(0, 6).forEach((sk, i)=>{
+    const item = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.2, 0.2),
+      new THREE.MeshStandardMaterial({ color:0x101820, roughness:0.4,
+        emissive: ACCENTS[i%ACCENTS.length], emissiveIntensity:0.6 }));
+    item.position.set(cx-0.7 + (i%3)*0.7, y+0.67 - Math.floor(i/3)*0.0, cz+0.15 - Math.floor(i/3)*0.32);
+    item.castShadow = true;
+    item.userData.shopItem = { kind:'skill', name: sk.name || '스킬',
+      desc: (sk.description || '설명 없음'), accounts: sk.accounts || [] };
+    g.add(item);
+  });
 }
 function makePipes(y){
   // 성수동 인더스트리얼 — 천장 노출 배관
@@ -836,29 +1013,100 @@ function makePipes(y){
   return g;
 }
 function makeChairmanOffice(roofY){
-  // 루프탑 회장실 (주인 전용 펜트하우스)
+  // 루프탑 회장실 (주인 전용 펜트하우스) — w 5.0→7.0 확장·고급화. 왕좌·책상은 THRONE SOT 기준 상대.
   const g = new THREE.Group();
-  const cx = 0.5, cz = -2.5, w = 5.0, d = 3.0, h = 1.7;
-  g.add(mesh(new THREE.BoxGeometry(w, h, 0.05), M.meetGlass, cx, roofY+h/2, cz-d/2, false));
+  const cx = 0.5, cz = -2.5, w = 7.0, d = 3.0, h = 1.7;
+  const backZ = cz - d/2;                              // 뒷벽(-z) = -4.0
+  g.add(mesh(new THREE.BoxGeometry(w, h, 0.05), M.meetGlass, cx, roofY+h/2, backZ, false));
   g.add(mesh(new THREE.BoxGeometry(0.05, h, d), M.meetGlass, cx-w/2, roofY+h/2, cz, false));
   g.add(mesh(new THREE.BoxGeometry(0.05, h, d), M.meetGlass, cx+w/2, roofY+h/2, cz, false));
-  const rug = new THREE.Mesh(new THREE.CircleGeometry(1.9, 30),
-    new THREE.MeshStandardMaterial({ color:0x8a2f2f, roughness:0.95, transparent:true, opacity:0.5 }));
-  rug.rotation.x = -Math.PI/2; rug.position.set(cx, roofY+0.08, cz); rug.receiveShadow = true;
-  g.add(rug);
+  const gold = new THREE.MeshStandardMaterial({ color:0xc9a24a, roughness:0.32, metalness:0.72 });
   const goldWood = new THREE.MeshStandardMaterial({ color:0x9a7440, roughness:0.5, metalness:0.25 });
-  g.add(mesh(new THREE.BoxGeometry(2.2, 0.08, 0.95), goldWood, cx, roofY+0.78, cz-0.3));
-  g.add(mesh(new THREE.BoxGeometry(0.09, 0.74, 0.85), M.woodDark, cx-1.0, roofY+0.38, cz-0.3));
-  g.add(mesh(new THREE.BoxGeometry(0.09, 0.74, 0.85), M.woodDark, cx+1.0, roofY+0.38, cz-0.3));
+  // 카펫 확대(1.9→2.6) + 골드 트림 링
+  const rug = new THREE.Mesh(new THREE.CircleGeometry(2.6, 32),
+    new THREE.MeshStandardMaterial({ color:0x8a2f2f, roughness:0.95, transparent:true, opacity:0.5 }));
+  rug.rotation.x = -Math.PI/2; rug.position.set(cx, roofY+0.08, cz); rug.receiveShadow = true; g.add(rug);
+  const trim = new THREE.Mesh(new THREE.RingGeometry(2.55, 2.75, 40), gold);
+  trim.rotation.x = -Math.PI/2; trim.position.set(cx, roofY+0.09, cz); g.add(trim);
+  // 회장 책상(THRONE 기준 상대) — 골드 상판 + 골드 네임플레이트
+  g.add(mesh(new THREE.BoxGeometry(2.4, 0.08, 0.95), goldWood, THRONE.x, roofY+0.78, THRONE.z+0.85));
+  g.add(mesh(new THREE.BoxGeometry(0.09, 0.74, 0.85), M.woodDark, THRONE.x-1.1, roofY+0.38, THRONE.z+0.85));
+  g.add(mesh(new THREE.BoxGeometry(0.09, 0.74, 0.85), M.woodDark, THRONE.x+1.1, roofY+0.38, THRONE.z+0.85));
+  g.add(mesh(new THREE.BoxGeometry(0.5, 0.04, 0.12), gold, THRONE.x, roofY+0.83, THRONE.z+1.2, false));
+  // 왕좌(THRONE SOT 기준)
   const throne = new THREE.Group(); throne.position.set(THRONE.x, roofY, THRONE.z);
-  throne.rotation.y = Math.PI;   // 등받이를 유리벽(-z) 쪽으로 — 착석자가 책상·오피스를 본다(구: 뒤돌아 있음)
+  throne.rotation.y = Math.PI;   // 등받이를 유리벽(-z) 쪽으로 — 착석자가 책상·오피스를 본다
   throne.add(mesh(new THREE.BoxGeometry(0.6, 0.1, 0.55), goldWood, 0, 0.5, 0));
   throne.add(mesh(new THREE.BoxGeometry(0.58, 0.85, 0.09), goldWood, 0, 0.95, 0.26));
   throne.add(mesh(G.chairPost, M.metal, 0, 0.3, 0, false));
   g.add(throne);
+  // 게스트 체어 2 (책상 건너편, 회장을 바라봄 = -z)
+  [[-0.7],[0.7]].forEach(([dx])=>{ const c = makeChair();
+    c.position.set(THRONE.x+dx, roofY, THRONE.z+2.0); g.add(c); });
+  // 서측 책장 + 책 + 트로피
+  const shelfX = cx - w/2 + 0.45;
+  g.add(mesh(new THREE.BoxGeometry(0.3, 1.5, 1.6), M.woodDark, shelfX, roofY+0.75, cz-0.2, false));
+  for (let i=0;i<5;i++){ const bh = 0.28 + (i%2)*0.06;
+    const book = new THREE.Mesh(new THREE.BoxGeometry(0.18, bh, 0.22),
+      new THREE.MeshStandardMaterial({ color: ACCENTS[i%ACCENTS.length], roughness:0.8 }));
+    book.position.set(shelfX+0.02, roofY+0.55+ (i>2?0.5:0), cz-0.7+ (i%3)*0.32); g.add(book); }
+  const trophy = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.11, 0.16, 10), gold);
+  trophy.position.set(shelfX+0.02, roofY+1.5, cz+0.3); g.add(trophy);
+  g.add(mesh(new THREE.BoxGeometry(0.16, 0.05, 0.16), goldWood, shelfX+0.02, roofY+1.4, cz+0.3, false));
+  // 뒷벽 회장 대시보드(CanvasTexture — 부서별 진행%·비용·토큰잔량, ≥2s 스로틀)
+  chairDashCanvas = document.createElement('canvas'); chairDashCanvas.width = 512; chairDashCanvas.height = 256;
+  chairDashTex = new THREE.CanvasTexture(chairDashCanvas); chairDashTex.colorSpace = THREE.SRGBColorSpace;
+  lastChairDash = 0;
+  const dash = new THREE.Mesh(new THREE.PlaneGeometry(3.2, 1.5),
+    new THREE.MeshBasicMaterial({ map:chairDashTex, transparent:true }));
+  dash.position.set(cx, roofY+1.25, backZ+0.06); g.add(dash);   // 뒷벽 안쪽면(+z 향함)
+  g.add(mesh(new THREE.BoxGeometry(3.4, 1.7, 0.05), M.dark, cx, roofY+1.25, backZ+0.02, false));
+  drawChairDash(true);
   const lbl = textSprite('회 장 실', { size:26, color:'#ffd166' });
   lbl.position.set(cx, roofY+2.4, cz); g.add(lbl);
   return g;
+}
+// 회장 대시보드 렌더 — 전광판 drawBillboard 패턴 재사용(≥2s 스로틀).
+let chairDashCanvas = null, chairDashTex = null, lastChairDash = 0;
+function drawChairDash(force){
+  if (!chairDashCanvas) return;
+  const now = performance.now();
+  if (!force && now - lastChairDash < 2000) return;
+  lastChairDash = now;
+  const g = chairDashCanvas.getContext('2d');
+  g.clearRect(0,0,512,256);
+  g.fillStyle = 'rgba(10,14,26,0.96)'; g.fillRect(0,0,512,256);
+  g.strokeStyle = '#c9a24a'; g.lineWidth = 3; g.strokeRect(4,4,504,248);   // 골드 트림
+  g.fillStyle = '#ffd88a'; g.font = '600 26px Menlo,monospace';
+  g.fillText('👑 회장 대시보드', 20, 40);
+  const deps = (lastWorld && lastWorld.departments) || [];
+  let ry = 80; g.font = '18px Menlo,monospace';
+  deps.slice(0,5).forEach(d=>{
+    const ns = d.nodes || [];
+    let pSum=0, pN=0, tSum=0, tN=0;
+    ns.forEach(n=>{
+      if (n.progress && n.progress.pct != null){ pSum += n.progress.pct; pN++; }
+      const r = (n.rate||[]).find(x=>x.label==='5h') || (n.rate||[])[0];
+      const used = r && (r.used_pct ?? r.pct);
+      if (used != null){ tSum += Math.max(0, 100-used); tN++; }
+    });
+    const pct = pN ? Math.round(pSum/pN) : 0;
+    const tok = tN ? Math.round(tSum/tN) : null;
+    g.fillStyle = '#bfe6ff'; g.font = '18px Menlo,monospace'; g.fillText(String(d.id).slice(0,10), 20, ry);
+    g.fillStyle = '#132033'; g.fillRect(178, ry-15, 170, 16);
+    g.fillStyle = pct>=90 ? '#6ee1be' : '#3fa8e0'; g.fillRect(178, ry-15, 170*Math.min(pct,100)/100, 16);
+    g.fillStyle = '#cfeeff'; g.font = '15px Menlo,monospace'; g.fillText(pct+'%', 354, ry);
+    g.fillStyle = tok==null ? '#667788' : (tok<15 ? '#ff8a8a' : '#ffd88a');
+    g.fillText(tok==null ? '토큰 —' : ('토큰 '+tok+'%'), 400, ry);
+    ry += 32;
+  });
+  const cost = lastWorld && lastWorld.board && lastWorld.board.cost_today;
+  if (cost){ let t = '오늘 비용';
+    if (cost.usd != null) t += ` $${cost.usd.toFixed(2)}`;
+    if (cost.tokens != null) t += ` · ${Math.round(cost.tokens/10000)}만 tok`;
+    g.fillStyle = '#ffd88a'; g.font = '600 20px Menlo,monospace'; g.fillText(t, 20, 244);
+  }
+  chairDashTex.needsUpdate = true;
 }
 function makeRooftop(roofY){
   const g = new THREE.Group();
@@ -867,7 +1115,7 @@ function makeRooftop(roofY){
     transparent:true, opacity:0.5, depthWrite:false });   // 데크도 반투명 — 본부 층 가림 금지
   const deck = mesh(new THREE.BoxGeometry(SLAB_W-1, 0.12, SLAB_D-1), deckT, 0, roofY, 0, false);
   deck.receiveShadow = true; deck.userData.floorY = roofY; g.add(deck);
-  [[-4.2,1.6],[3.4,1.2]].forEach(([dx,dz],i)=>{
+  [[-4.9,1.6],[4.9,2.6]].forEach(([dx,dz],i)=>{   // 회장실 w 7.0 확장 충돌 해소 이동(라운지체어 동반)
     g.add(mesh(new THREE.CylinderGeometry(0.04, 0.04, 1.9, 8), M.metal, dx, roofY+0.95, dz, false));
     const top = new THREE.Mesh(new THREE.ConeGeometry(1.15, 0.5, 10),
       new THREE.MeshStandardMaterial({ color: ACCENTS[i], roughness:0.85 }));
@@ -879,8 +1127,7 @@ function makeRooftop(roofY){
       ch.rotation.x = -0.25; ch.position.set(dx+ox, roofY+0.3, dz+oz);
       ch.castShadow = true; g.add(ch); });
   });
-  const neon = textSprite('C Y S J A V I S', { size:34, color:'#5fe0ff' });
-  neon.position.set(0, roofY+2.9, 0); neon.scale.multiplyScalar(1.6); g.add(neon);
+  // R2: 옥상 네온 회사명 로고 스프라이트 삭제 (좌상단 h1만 남김). '회 장 실' 라벨은 회장실에 유지.
   return g;
 }
 
@@ -934,12 +1181,12 @@ function drawBillboard(){
 
 // #9 칸반 벽면 — 부서 층 뒷벽 3열 보드(CanvasTexture, ≥2s 스로틀·patch_top 즉시).
 //  전 보드에 동일 칸반(공유 백로그)을 그린다 — owner→부서 매핑 없이 결정론·게이트 친화.
-function makeKanbanBoard(y){
+function makeKanbanBoard(y, kx){
   const canvas = document.createElement('canvas'); canvas.width = 512; canvas.height = 256;
   const tex = new THREE.CanvasTexture(canvas); tex.colorSpace = THREE.SRGBColorSpace;
   const pane = new THREE.Mesh(new THREE.PlaneGeometry(4.2, 2.1),
     new THREE.MeshBasicMaterial({ map:tex, transparent:true }));
-  pane.position.set(-3.2, y+1.7, -SLAB_D/2+0.12);       // 좌측 뒷벽(회의실 +x와 겹침 회피)
+  pane.position.set(kx, y+1.7, -SLAB_D/2+0.12);         // 뒷벽 부착(plan.kanban.x — 회의실 AABB 비겹침)
   const grp = new THREE.Group(); grp.add(pane);
   return { grp, canvas, tex, lastDraw:0 };
 }
@@ -1093,7 +1340,7 @@ function buildWorld(w){
   worldGroup = new THREE.Group();
   nodes.clear(); racks.clear();
   links.clear(); ghosts.clear(); meeting = null;    // 재구축 시 파생물 초기화
-  kanbanBoards = []; blockedLines = []; reviewGather = null;
+  kanbanBoards = []; blockedLines = []; reviewGather = null; floorPlans.clear();
   document.getElementById('b-dismiss').hidden = true;
   lastWorld = w;
   const deps = w.departments || [];
@@ -1105,15 +1352,18 @@ function buildWorld(w){
     const fg = makeFloor(y, tints[i%tints.length], hot);
     const lbl = textSprite(d.id, { size:26, color:'#9fd8ff' });
     lbl.position.set(-SLAB_W/2-2.0, y+1.3, -SLAB_D/2-0.5); fg.add(lbl);
-    const accent = ACCENTS[i % ACCENTS.length];
-    fg.add(makeMeetingRoom(y, accent));    // 부서 회의실 (직원간·부서간·주인 소집용)
-    fg.add(makeLounge(y, accent));         // 휴게 라운지 (소파·빈백·플로어램프)
+    const plan = floorPlanOf(d.id, shuffleSeed, (d.nodes||[]).length);   // D1 배치 SOT
+    floorPlans.set(d.id, plan);
+    const accent = plan.accent;
+    fg.add(makeMeetingRoom(y, accent, plan.meeting));   // 부서 회의실 (직원간·부서간·주인 소집용)
+    if (plan.lounge) fg.add(makeLounge(y, accent, plan.lounge));   // 휴게 라운지
     fg.add(makePipes(y));                  // 성수동 인더스트리얼 노출 배관
-    const kb = makeKanbanBoard(y); fg.add(kb.grp); kanbanBoards.push(kb);   // #9
+    if (plan.amenity) fg.add(makeAmenity(y, plan));      // 층 개성 어메니티(탁구·화분·팝업)
+    const kb = makeKanbanBoard(y, plan.kanban.x); fg.add(kb.grp); kanbanBoards.push(kb);   // #9
     worldGroup.add(fg);
-    const slots = slotPositions((d.nodes||[]).length);
+    const slots = plan.desks;
     (d.nodes||[]).forEach((n,j)=>{
-      addNode(n, d.id, new THREE.Vector3(slots[j][0], y, slots[j][1]), seedc++);
+      addNode(n, d.id, new THREE.Vector3(slots[j][0], y, slots[j][1]), seedc++, slots[j][2]);
       total++;
     });
   }
@@ -1129,6 +1379,8 @@ function buildWorld(w){
   worldGroup.add(makePopupStore(0));       // 성수동 팝업 스토어 (신상=실데몬 버전)
   worldGroup.add(makePipes(0));
   lobbyAnchor.set(SLAB_W/2-2.2, 1.6, -SLAB_D/2+0.5);
+  floorPlans.set('로비', { meeting:{x:0,z:0.4,w:3.0,d:2.4}, gather:{x:0,z:0.4}, lounge:null,
+    kanban:{x:0}, amenity:null, desks:[], patrol:[[0,3.4],[3.6,0.4],[-3.6,0.4]], accent:ACCENTS[0] });
   (w.lobby?.unassigned||[]).forEach((n,i)=>{
     addNode(n, '로비', new THREE.Vector3(-2.2+i*2.0, 0, SLAB_D/2-2.0), seedc++);
     total++;
@@ -1156,9 +1408,10 @@ function buildWorld(w){
   FLOOR_NAMES.set(0, '로비');
   deps.forEach(d=>FLOOR_NAMES.set(Math.round(d.floor*FLOOR_H*10)/10, d.id));
   FLOOR_NAMES.set(Math.round(roofY*10)/10, '옥상 · 회장실');
-  worldGroup.add(makeRooftop(roofY));      // 루프탑 데크 (파라솔·라운지체어·네온)
+  worldGroup.add(makeRooftop(roofY));      // 루프탑 데크 (파라솔·라운지체어)
   worldGroup.add(makeChairmanOffice(roofY)); // 회장실 (주인 전용)
   buildOwner(roofY);                        // 👑 주인 아바타 + 엘리베이터
+  buildDog();                               // 🐶 watchdog 강아지 (로비 리셋 · 순찰 시작)
   scene.add(worldGroup);
   baseTy = roofY / 2 + 1.2;
   worldMeta = { seq:w.seq, daemonv:w.daemon?.version||'', deps:deps.length, total };
@@ -1168,9 +1421,10 @@ function buildWorld(w){
   if (selected && !nodes.has(selected)) closePanel();
 }
 
-function addNode(n, deptId, pos, seed){
+function addNode(n, deptId, pos, seed, rot=0){
   const set = makeDeskSet(n, seed);
   set.grp.position.copy(pos);
+  set.grp.rotation.y = rot;          // D1 데스크 방향(템플릿 창가열·클러스터 변주)
   const bat = batterySprite(n.ctx?.pct);
   bat.position.set(0, 1.95, 0); set.grp.add(bat);
   const label = textSprite(n.role, { size:20, color:'#d8ecfa' });
@@ -1475,8 +1729,10 @@ function handleVerdict(f){
 }
 function gatherReview(members){
   members.forEach((e,i)=>{ if (e.data.presence==='dead' || e.override || e.walkAnim) return;
+    const plan = floorPlans.get(e.deptId); if (!plan) return;   // 각자 소속 부서 회의실로(plan SOT)
     const ang = (i/members.length)*Math.PI*2;
-    entWalkTo(e, 4.4 + Math.cos(ang)*1.4, -2.2 + Math.sin(ang)*0.9, 'stand'); });
+    const rx = plan.meeting.w/2 - 0.5, rz = plan.meeting.d/2 - 0.5;
+    entWalkTo(e, plan.gather.x + Math.cos(ang)*rx, plan.gather.z + Math.sin(ang)*rz, 'stand'); });
   reviewGather = { members, until: performance.now() + 8000 };   // 8초 후 자동 복귀
 }
 
@@ -1526,25 +1782,44 @@ function addChat(cls, name, text){
 
 // ---------- 주인(오너) 아바타 · 엘리베이터 · 강림 (#2) ----------
 const ELEV = { x: -SLAB_W/2+0.9, z: SLAB_D/2-0.8 };
+const SERVER_Y = -2.6;                      // 지하 서버룸 슬랩 y (buildWorld sy와 동일값)
 let owner = null, elevCar = null, ownerHome = new THREE.Vector3();
+let dog = null, dogRoute = [];              // D4 watchdog 강아지 · 순찰 루트(로비→각층→지하)
 // 👑 왕좌 근접 자동 착석 — 주인이 옥상 왕좌 반경 안에서 멈추면 앉고, 이동을 시작하면 일어선다.
 let ownerSeated = false;
-function updateThroneSeat(){
+// 자리 존 AABB — 책상+왕좌를 포함. 존 안에서 정지(idle)하면 왕좌로 스냅 걷기 후 착석.
+const SEAT_ZONE = { x0:-0.7, x1:1.7, z0:-3.9, z1:-2.2 };
+function updateThroneSeat(dt){
+  if (ownerSeated) return;
+  if (keys.up || keys.down || keys.left || keys.right) return;   // 활성 입력 중=미정지 → 스냅 보류(존 진입+정지 시만 착석)
   const g = owner.pr.grp;
   const roofY = FLOORS.length ? FLOORS[FLOORS.length-1] : 0;
-  const near = Math.abs(g.position.y - (roofY + 0.74)) < 0.45 &&
-               Math.hypot(g.position.x - THRONE.x, g.position.z - THRONE.z) < THRONE.nearR;
-  if (near && !ownerSeated){
-    ownerSeated = true;
-    g.position.set(THRONE.x, roofY + THRONE.seatY, THRONE.z);
-    g.rotation.y = Math.PI;            // ㄴ자 다리(-z)가 책상(+z)으로 — 직원 착석과 동일 패턴
-    owner.pr.setStanding(false);       // 착석 포즈
+  const onRoof = Math.abs(g.position.y - (roofY + 0.74)) < 0.45;
+  const inZone = onRoof && g.position.x > SEAT_ZONE.x0 && g.position.x < SEAT_ZONE.x1
+                        && g.position.z > SEAT_ZONE.z0 && g.position.z < SEAT_ZONE.z1;
+  if (!inZone) return;
+  const dx = THRONE.x - g.position.x, dz = THRONE.z - g.position.z;
+  const dist = Math.hypot(dx, dz);
+  if (dist > 0.06){                    // 왕좌 핀포인트로 짧은 스냅 걷기(다음 프레임 계속)
+    const step = Math.min(WALK_SPEED*(dt||0.016), dist);
+    g.position.x += dx/dist*step; g.position.z += dz/dist*step;
+    g.rotation.y = Math.atan2(dx, dz);
+    owner.walkPh += (dt||0.016)*9; owner.pr.swing(owner.walkPh);
+    return;
   }
+  ownerSeated = true;                  // 도착 → 착석
+  g.position.set(THRONE.x, roofY + THRONE.seatY, THRONE.z);
+  g.rotation.y = Math.PI;              // ㄴ자 다리(-z)가 책상(+z)으로 — 직원 착석과 동일 패턴
+  owner.pr.setStanding(false);         // 착석 포즈
+  owner.pr.swing(0);
 }
 function standFromThrone(){
   if (!ownerSeated) return;
   ownerSeated = false;
-  owner.pr.setStanding(true);          // 기립 — 방향·높이는 walk 스텝이 자연 복귀
+  owner.pr.setStanding(true);          // 기립 포즈
+  const roofY = FLOORS.length ? FLOORS[FLOORS.length-1] : 0;
+  owner.pr.grp.position.y = roofY + 0.74;   // 좌면고(seatY)→층 보행고 복원(침하 보행 결함 수리)
+  owner.pr.swing(0);
 }
 function buildOwner(roofY){
   const pr = makePerson('owner', 0);
@@ -1555,7 +1830,7 @@ function buildOwner(roofY){
   crown.position.set(0, 0.24, 0); pr.headG.add(crown);
   const lbl = textSprite('👑 주인', { size:22, color:'#ffd166' });
   lbl.position.set(0, 1.15, 0); pr.grp.add(lbl);
-  ownerHome.set(1.7, roofY+0.74, -2.6);   // 회장실 데스크 옆 (옥좌 존)
+  ownerHome.set(THRONE.x, roofY+0.74, THRONE.z+0.65);   // 자리 존 안(THRONE 파생) — idle 착석 트리거
   pr.grp.position.copy(ownerHome);
   worldGroup.add(pr.grp);
   elevCar = new THREE.Mesh(new THREE.BoxGeometry(1.15, 1.95, 1.05),
@@ -1591,7 +1866,7 @@ function ownerDeliver(key, text, opts={}){
 }
 function advanceOwner(dt, t){
   if (!owner || !owner.plan.length){
-    if (owner){ owner.busy = false; updateThroneSeat(); }   // 정지 상태 — 왕좌 근접이면 착석
+    if (owner){ owner.busy = false; updateThroneSeat(dt); }   // 정지 상태 — 자리 존이면 스냅 착석
     return;
   }
   standFromThrone();                                        // 이동 계획 생김 — 앉아 있었다면 기립
@@ -1694,6 +1969,7 @@ function ownerManualTick(dt){
     return;
   }
   if (ax === 0 && az === 0) return;
+  standFromThrone();                                        // 키보드 이동도 기립 트리거(스케이팅 결함 수리)
   if (owner.manual && owner.plan.length){
     if (owner.plan[0].t === 'ride' || owner.plan[0].t === 'arrive') return; // 승강 중 보행 불가
     owner.plan = [];                                        // 키 입력이 클릭 이동을 대체
@@ -1712,6 +1988,138 @@ function ownerManualTick(dt){
   owner.manual = false; owner.busy = false;
 }
 
+// ---------- D4. watchdog 강아지 (저폴리 · 순찰 · kill/alert 반응) ----------
+//  메시에 nodeKey·floorY userData 비부여(클릭 오염 방지). 층간 이동=승강 코어 페이드(elevCar 미사용).
+function makeDog(){
+  const g = new THREE.Group();
+  const fur  = new THREE.MeshStandardMaterial({ color:0xb98a52, roughness:0.85, transparent:true });
+  const furD = new THREE.MeshStandardMaterial({ color:0x8a5f34, roughness:0.85, transparent:true });
+  g.add(mesh(new THREE.BoxGeometry(0.26, 0.28, 0.5), fur, 0, 0.34, 0));          // 몸(전후=z, 머리 +z)
+  g.add(mesh(new THREE.BoxGeometry(0.24, 0.24, 0.22), fur, 0, 0.46, 0.34));      // 머리
+  g.add(mesh(new THREE.BoxGeometry(0.12, 0.1, 0.12), furD, 0, 0.42, 0.47, false));   // 주둥이
+  g.add(mesh(new THREE.BoxGeometry(0.06, 0.12, 0.05), furD,  0.09, 0.60, 0.30, false));  // 귀
+  g.add(mesh(new THREE.BoxGeometry(0.06, 0.12, 0.05), furD, -0.09, 0.60, 0.30, false));
+  const legG = new THREE.BoxGeometry(0.07, 0.22, 0.07);
+  [[0.10,0.18],[-0.10,0.18],[0.10,-0.18],[-0.10,-0.18]].forEach(([lx,lz])=>
+    g.add(mesh(legG, furD, lx, 0.11, lz, false)));
+  const tail = new THREE.Group(); tail.position.set(0, 0.44, -0.25);             // 꼬리(-z 후방)
+  tail.add(mesh(new THREE.BoxGeometry(0.05, 0.05, 0.22), fur, 0, 0.06, -0.10, false));
+  g.add(tail);
+  g.scale.setScalar(0.95);
+  return { grp:g, tail };
+}
+function buildDog(){
+  const d = makeDog();
+  worldGroup.add(d.grp);                     // userData 미부여 — 클릭/층 판정 오염 없음
+  dogRoute = [];
+  const lob = floorPlans.get('로비');
+  dogRoute.push({ y:0, patrol: (lob && lob.patrol) || [[0,3.4],[3.6,0],[-3.6,0]] });
+  (lastWorld.departments||[]).forEach(dep=>{
+    const pl = floorPlans.get(dep.id);
+    if (pl && pl.patrol) dogRoute.push({ y: dep.floor*FLOOR_H, patrol: pl.patrol });
+  });
+  dogRoute.push({ y: SERVER_Y, patrol: [[-2,1.6],[2,1.6],[0,-1.2]] });   // 지하 서버룸
+  dog = { grp:d.grp, tail:d.tail, wag:0, state:'patrol', ri:0, wi:0, op:1,
+    trY:0, trPhase:'out', trThen:'patrol', killPid:null, killPopped:false,
+    barks:0, barkTimer:0, holdMs:0 };
+  const p0 = dogRoute[0].patrol[0];
+  d.grp.position.set(p0[0], 0, p0[1]);       // 로비 리셋(재빌드 규약)
+}
+const DOG_SPEED = 2.2;
+function dogSetOpacity(o){ dog.grp.traverse(m=>{ if (m.material) m.material.opacity = o; }); }
+function dogStepTo(g, x, y, z, dt, speed=DOG_SPEED){
+  g.position.y = y;
+  const dx = x - g.position.x, dz = z - g.position.z, dist = Math.hypot(dx, dz);
+  if (dist < 0.08) return true;
+  const s = Math.min(speed*dt, dist);
+  g.position.x += dx/dist*s; g.position.z += dz/dist*s;
+  g.rotation.y = Math.atan2(dx, dz);         // 머리 +z 전방 — 직원 규약과 동일
+  return false;
+}
+function dogPop(txt, color){
+  const s = textSprite(txt, { size:19, color, bg:'rgba(8,26,46,.92)' });
+  s.position.copy(dog.grp.position).add(new THREE.Vector3(0, 1.15, 0));
+  worldGroup.add(s); pops.push({ s, life:1.6 });
+}
+function flashRack(pid){                      // pid가 racks에 등록됐을 때만 — 통상 miss가 정상(fallback 기본)
+  const led = racks.get(pid); if (!led) return;
+  const orig = led.material.color.getHex(); let n = 0;
+  const iv = setInterval(()=>{ if (!led.material){ clearInterval(iv); return; }
+    led.material.color.setHex(n%2 ? 0xff3030 : 0x330808); n++;
+    if (n > 12){ clearInterval(iv); led.material.color.setHex(orig); } }, 250);   // 3s
+}
+function dogEnter(state){
+  if (state === 'kill_run') dog.killPopped = false;
+  else if (state === 'alert_bark'){ dog.barks = 2; dog.barkTimer = 0; }
+}
+function dogTransitTo(targetY, thenState){    // 승강 코어 페이드 전환(elevCar 미사용)
+  if (Math.abs(dog.grp.position.y - targetY) < 0.2){ dog.state = thenState; dogEnter(thenState); return; }
+  dog.trY = targetY; dog.trThen = thenState; dog.trPhase = 'out'; dog.state = 'transit';
+}
+function dogResume(){
+  const y = dog.grp.position.y;
+  const ri = dogRoute.findIndex(r=>Math.abs(r.y - y) < 0.3);
+  dog.ri = ri >= 0 ? ri : 0; dog.wi = 0; dog.op = 1; dogSetOpacity(1); dog.state = 'patrol';
+}
+function dogTick(dt){
+  if (!dog || !dogRoute.length) return;
+  dog.wag += dt*10; dog.tail.rotation.y = Math.sin(dog.wag)*0.5;   // 꼬리 흔들기
+  const g = dog.grp;
+  if (dog.state === 'transit'){
+    if (dog.trPhase === 'out'){
+      const arr = dogStepTo(g, ELEV.x, g.position.y, ELEV.z, dt);
+      dog.op = Math.max(0, dog.op - dt*2.4); dogSetOpacity(dog.op);
+      if (arr && dog.op <= 0.05){ g.position.set(ELEV.x, dog.trY, ELEV.z); dog.trPhase = 'in'; }
+    } else {
+      dog.op = Math.min(1, dog.op + dt*2.4); dogSetOpacity(dog.op);
+      if (dog.op >= 1){ dog.state = dog.trThen; dogEnter(dog.trThen); }
+    }
+    return;
+  }
+  if (dog.state === 'patrol'){
+    const route = dogRoute[dog.ri]; const wp = route.patrol[dog.wi] || [0,0];
+    if (dogStepTo(g, wp[0], route.y, wp[1], dt)){
+      dog.wi++;
+      if (dog.wi >= route.patrol.length){
+        dog.ri = (dog.ri + 1) % dogRoute.length; dog.wi = 0;
+        dogTransitTo(dogRoute[dog.ri].y, 'patrol');
+      }
+    }
+    return;
+  }
+  if (dog.state === 'kill_run'){
+    if (dogStepTo(g, 0, SERVER_Y, 0, dt, 3.4)){                    // 서버룸 중앙 질주(기본 타깃)
+      if (!dog.killPopped){ dog.killPopped = true; dogPop('💢', '#ff6a6a');
+        if (dog.killPid != null) flashRack(dog.killPid); dog.holdMs = performance.now() + 1600; }
+      if (performance.now() > dog.holdMs) dogResume();
+    }
+    return;
+  }
+  if (dog.state === 'alert_bark'){
+    dog.barkTimer -= dt;
+    if (dog.barks > 0 && dog.barkTimer <= 0){ dog.barks--; dog.barkTimer = 0.6; dogPop('🐶 멍!', '#ffd166'); }
+    if (dog.barks <= 0 && dog.barkTimer <= 0.15) dogResume();
+    return;
+  }
+}
+function fxDog(f){                             // {t:'dog', kind:'kill'|'alert', pid?/sid?, count?}
+  if (!dog) return;
+  if (dog.state === 'transit') return;         // 이동 중엔 신규 반응 무시(코얼레싱은 브리지가 담당)
+  if (f.kind === 'kill'){
+    dog.killPid = f.pid;
+    addTick(`🐶 watchdog: 중복 프로세스 감지 — 강아지 출동${f.pid!=null?' (pid '+f.pid+')':''}`, 1);
+    dogTransitTo(SERVER_Y, 'kill_run');
+  } else if (f.kind === 'alert'){
+    addTick(`🐶 watchdog 경보: 프로세스 과다${f.count?' ('+f.count+')':''}`, 1);
+    let ty = dog.grp.position.y;               // sid → 노드 층(있으면), 없으면 현재 층에서 짖기
+    if (f.sid != null){
+      for (const e of nodes.values()){ if (String(e.data.key).includes(String(f.sid))){ ty = e.group.position.y; break; } }
+    }
+    if (Math.abs(ty - dog.grp.position.y) < 0.3){ dog.state = 'alert_bark'; dogEnter('alert_bark'); }
+    else dogTransitTo(ty, 'alert_bark');
+  }
+}
+
 async function postCommand(key, text, meeting){
   try {
     const r = await fetch('/command', { method:'POST',
@@ -1727,15 +2135,19 @@ async function postCommand(key, text, meeting){
 const raycaster = new THREE.Raycaster();
 const panel = document.getElementById('panel');
 let pendingCmd = null;
-canvas.addEventListener('click', e=>{
-  if (dragMoved) return;                                // 드래그는 회전
-  const m = new THREE.Vector2((e.clientX/innerWidth)*2-1, -(e.clientY/innerHeight)*2+1);
+function handleCanvasClick(clientX, clientY){    // 클릭 판정 코어 (리스너·DEBUG 훅 공용)
+  const m = new THREE.Vector2((clientX/innerWidth)*2-1, -(clientY/innerHeight)*2+1);
   raycaster.setFromCamera(m, camera);
   const hits = raycaster.intersectObjects(worldGroup ? worldGroup.children : [], true);
   for (const h of hits){
     let o = h.object;
     while (o && !o.userData.nodeKey) o = o.parent;
     if (o && o.userData.nodeKey){ openPanel(o.userData.nodeKey); return; }
+  }
+  for (const h of hits){                                  // D6 상점 상품 (nodeKey > shopItem > floorY)
+    let o = h.object;
+    while (o && !o.userData.shopItem) o = o.parent;
+    if (o && o.userData.shopItem){ openShop(o.userData.shopItem); return; }
   }
   for (const h of hits){                                  // 바닥 클릭 → 주인 이동 (MMORPG)
     if (h.object.userData.floorY !== undefined){
@@ -1744,6 +2156,10 @@ canvas.addEventListener('click', e=>{
     }
   }
   closePanel();
+}
+canvas.addEventListener('click', e=>{
+  if (dragMoved) return;                                // 드래그는 회전
+  handleCanvasClick(e.clientX, e.clientY);
 });
 // ---------- task 전문 말풍선 (hover/선택 · #4) ----------
 let taskTipKey = null, lastHover = 0;
@@ -1822,6 +2238,71 @@ if (dbg){
     return { ctx: e.data.ctx?.pct ?? null, presence: e.data.presence,
              ringVisible: !!(e.set.progRing && e.set.progRing.visible) };
   };
+  // e2e 게이트 배선 (master 규약 · DEBUG일 때만 · 프로덕션 무영향)
+  dbg.floorPlans = floorPlans;          // D1: deptId→plan 라이브 맵(재빌드=clear+set, 참조 유지)
+  dbg.floorPlan = (deptId)=> floorPlans.get(deptId) || null;   // D1: 부서별 plan 접근자
+  dbg.floorPlanOf = floorPlanOf;        // D1: 템플릿·불변식 직접 산출
+  dbg.furnitureAabbs = (plan)=>{        // D8-2 게이트: 실 렌더 가구 footprint (make* 상수와 드리프트 0)
+    const box = (cx,cz,w,d)=>({ cx, cz, w, d });
+    const amW = { pingpong:1.9, plants:1.2, popup:2.8 };   // amenity별 footprint
+    const amD = { pingpong:1.1, plants:0.5, popup:1.8 };
+    const dW = 1.62, dFront = 0.75, dBack = 0.49;    // 데스크: 파티션 폭 ↔ 의자/사람(앞)·뒷패널(뒤)
+    return {
+      meeting: box(plan.meeting.x, plan.meeting.z, plan.meeting.w, plan.meeting.d),
+      lounge: plan.lounge ? box(plan.lounge.x+0.08, plan.lounge.z+0.22, 3.7, 2.3) : null,
+      kanban: box(plan.kanban.x, -SLAB_D/2+0.12, 4.2, 0.3),   // 뒷벽 부착 벽면 보드
+      amenity: plan.amenity ? box(plan.amenityPos.x, plan.amenityPos.z,
+        amW[plan.amenity]||1.2, amD[plan.amenity]||0.5) : null,
+      desks: plan.desks.map(d=>{
+        const rot = d[2] || 0;
+        if (Math.abs(Math.sin(rot)) < 0.01)          // rot∈{0,π}: z축 정렬 유지, 중심만 앞뒤 이동
+          return box(d[0], d[1] + ((dFront-dBack)/2)*Math.cos(rot), dW, dFront+dBack);
+        return box(d[0], d[1], Math.max(dW, dFront+dBack), Math.max(dW, dFront+dBack));  // 그 외=보수 정사각
+      }),
+    };
+  };
+  Object.defineProperty(dbg, 'ownerSeated', { configurable:true, get:()=> ownerSeated });   // D2 착석 상태
+  dbg.ownerPos = ()=> owner ? { x:owner.pr.grp.position.x, y:owner.pr.grp.position.y,
+    z:owner.pr.grp.position.z, planLen:owner.plan.length } : null;
+  dbg.ownerState = ()=> owner ? {       // D2 착석 상태기계 4단언(seated·좌표·manual·busy·planLen)
+    seated: ownerSeated, x:owner.pr.grp.position.x, y:owner.pr.grp.position.y, z:owner.pr.grp.position.z,
+    manual: !!owner.manual, busy: !!owner.busy, planLen: owner.plan.length } : null;
+  dbg.teleportOwner = (x, z, floorY)=>{ // D2 착석 시뮬 — 해당 층 보행고로 즉시 이동(기립 트리거 경유)
+    if (!owner) return null;
+    standFromThrone();                  // 착석 중이면 기립(y 보행고 복원)
+    const fy = (floorY != null ? floorY : curFloorY());
+    owner.plan = []; owner.manual = false; owner.busy = false;   // 진행 플랜 취소
+    owner.pr.grp.position.set(x, fy + 0.74, z);
+    return { x, y: fy + 0.74, z }; };
+  Object.defineProperty(dbg, 'dogState', { configurable:true, get:()=> dog ? {   // D4 강아지 상태
+    mode: dog.state, floorY: dog.grp.position.y,
+    target: dog.state==='transit' ? ('floor@'+dog.trY)
+          : dog.state==='kill_run' ? 'server-center'
+          : dog.state==='patrol' ? ('wp'+dog.wi) : dog.state } : null });
+  dbg.shopItems = ()=>{ let n=0; if (worldGroup) worldGroup.traverse(o=>{   // D6 진열 상품 수
+    if (o.userData && o.userData.shopItem) n++; }); return n; };
+  dbg.setKey = (k, v)=>{ keys[k] = !!v; };   // D2: 헤드리스 키 입력 시뮬(스냅 입력 게이트 단언용)
+  dbg.projectToScreen = (x, y, z)=>{          // 게이트 6b: 월드→화면 픽셀(실클릭 시뮬 — camera.project 래핑)
+    const v = new THREE.Vector3(x, y, z).project(camera);
+    return { x: (v.x*0.5 + 0.5)*innerWidth, y: (-v.y*0.5 + 0.5)*innerHeight,
+      visible: v.z < 1 && Math.abs(v.x) <= 1 && Math.abs(v.y) <= 1 };
+  };
+  dbg.clickFirstShopItem = ()=>{              // 게이트 6b: 첫 상품을 실 raycast 클릭 경로로 눌러 owner 이동 미유발 단언
+    let target = null;
+    if (worldGroup) worldGroup.traverse(o=>{ if (!target && o.userData && o.userData.shopItem) target = o; });
+    if (!target) return { found:false };
+    const before = owner ? owner.plan.length : 0;
+    const shopWasHidden = document.getElementById('shop').style.display !== 'block';
+    const v = new THREE.Vector3(); target.getWorldPosition(v); v.project(camera);
+    const sx = (v.x*0.5 + 0.5)*innerWidth, sy = (-v.y*0.5 + 0.5)*innerHeight;
+    dragMoved = false;                        // 드래그 아님 보장(리스너 우회·핸들러 직접 구동)
+    handleCanvasClick(sx, sy);                // 캔버스 클릭 핸들러와 동일 raycast 경로
+    return { found:true, ownerPlanBefore:before,
+      ownerPlanAfter: owner ? owner.plan.length : 0,
+      ownerMoved: owner ? (owner.plan.length > before || owner.busy) : false,
+      opened: document.getElementById('shop').style.display === 'block',
+      shopWasHidden };
+  };
 }
 document.getElementById('p-close').onclick = closePanel;
 function setPanelStatus(msg, cls){
@@ -1848,6 +2329,62 @@ document.getElementById('p-send').onclick = async ()=>{
   } catch(e){ setPanelStatus('전송 실패: ' + e.message, 'err'); }
   btn.disabled = false;
 };
+
+// ---------- D6 카페·상점 선물 흐름 (Phase B — 알림 텍스트만 발송) ----------
+const shopEl = document.getElementById('shop');
+let shopItem = null;
+function setShopStatus(msg, cls){ const el = document.getElementById('shop-status');
+  el.textContent = msg; el.className = 'status ' + (cls||''); }
+function openShop(item){
+  shopItem = item;
+  document.getElementById('shop-title').textContent = (item.kind==='latte'?'☕ ':'🎁 ') + item.name;
+  const acc = (item.accounts && item.accounts.length)
+    ? `<br><span style="color:#b58a55">가용 계정: ${item.accounts.join(', ')}</span>` : '';
+  document.getElementById('shop-desc').innerHTML = item.desc + acc;
+  document.getElementById('shop-targets').innerHTML = '';
+  setShopStatus('', '');
+  const gift = document.getElementById('shop-gift'); gift.style.display = '';
+  shopEl.style.display = 'block';
+}
+function closeShop(){ shopEl.style.display = 'none'; shopItem = null; }
+document.getElementById('shop-close').onclick = closeShop;
+document.getElementById('shop-gift').onclick = ()=>{
+  if (!shopItem) return;
+  if (HUD_TOKEN.startsWith('__')){ setShopStatus('조작 비활성 — 브리지 경유 접속 필요', 'err'); return; }
+  const wrap = document.getElementById('shop-targets'); wrap.innerHTML = '';
+  const hint = document.createElement('div'); hint.className = 'meta';
+  hint.textContent = '받을 직원 선택 (대기/꾸벅만 활성):'; wrap.appendChild(hint);
+  let any = false;
+  nodes.forEach(ent=>{
+    const p = ent.data.presence, eligible = (p==='waiting' || p==='drowsy');
+    const b = document.createElement('button');
+    b.textContent = labelOf(ent.data.key); b.disabled = !eligible;
+    if (eligible){ any = true; b.onclick = ()=> giftTo(ent.data.key); }
+    else { b.style.opacity = '0.4'; b.title = `상태 ${PRESENCE_KO[p]||p} — 작업 중/불가`; }
+    wrap.appendChild(b);
+  });
+  if (!any){ const d = document.createElement('div'); d.className = 'meta';
+    d.textContent = '지금 선물 가능한(대기/꾸벅) 직원이 없습니다.'; wrap.appendChild(d); }
+  document.getElementById('shop-gift').style.display = 'none';
+};
+async function giftTo(key){
+  if (!shopItem) return;
+  const text = shopItem.kind==='latte'
+    ? '[카페 알림] ☕ 주인이 토큰라떼를 보냈습니다 — 회신 불요'
+    : `[카페 알림] 🎁 스킬 '${shopItem.name}' 추천 — 필요 시 사용`;
+  setShopStatus('전송 중…', '');
+  const ok = await postCommand(key, text, false);       // 알림 텍스트만 (실명령 아님 — Phase C 제외)
+  if (ok){ setShopStatus(`✅ ${labelOf(key)}에게 전달됨 — cys-terminal 반영 대기`, 'ok');
+    addTick(`${shopItem.kind==='latte'?'☕':'🎁'} 카페 선물 → ${labelOf(key)}`, 0);
+    showGiftMug(key); }
+  else setShopStatus('게이트 거부 또는 브리지 오류', 'err');
+}
+function showGiftMug(key){
+  const ent = nodes.get(key); if (!ent) return;
+  ent.set.mug.visible = true;                           // 기존 rate-limit 머그 재사용 (60s)
+  clearTimeout(ent.giftMugTimer);
+  ent.giftMugTimer = setTimeout(()=>{ if (!ent.anim.rateLimited) ent.set.mug.visible = false; }, 60000);
+}
 
 // ---------- 협업 광섬유 아크 (#5) ----------
 const links = new Map(); let lastLinkT = 0;
@@ -2021,9 +2558,12 @@ function convene(){
   const topic = document.getElementById('chat-input').value.trim() || '부서 회의';
   document.getElementById('chat-input').value = '';
   members.forEach(e=> postCommand(e.data.key, `[회의 소집 · 주인] ${topic} — 회의실 집합`, false));
+  const plan = floorPlans.get(deptId) || floorPlanOf(deptId, shuffleSeed, members.length);
+  const gx = plan.gather.x, gz = plan.gather.z;              // 집합점 = 회의실 중심(plan SOT)
+  const rx = plan.meeting.w/2 - 0.4, rz = plan.meeting.d/2 - 0.4;   // 링 = 회의실 AABB 내부(상수 금지)
   members.forEach((e,i)=>{
     const ang = (i/members.length)*Math.PI*2;
-    entWalkTo(e, 4.4 + Math.cos(ang)*1.5, -2.2 + Math.sin(ang)*1.0, 'stand');
+    entWalkTo(e, gx + Math.cos(ang)*rx, gz + Math.sin(ang)*rz, 'stand');
   });
   meeting = { deptId, until: performance.now() + 180000 };
   document.getElementById('b-dismiss').hidden = false;
@@ -2035,7 +2575,7 @@ function convene(){
       { t:'walk', to:new THREE.Vector3(ELEV.x, owner.pr.grp.position.y, ELEV.z) },
       { t:'ride', y: fy+0.74 },
       { t:'focus', y: fy },
-      { t:'walk', to:new THREE.Vector3(4.4, fy+0.74, -0.6) },
+      { t:'walk', to:new THREE.Vector3(gx, fy+0.74, gz + plan.meeting.d/2 + 0.9) },
       { t:'say', text: `[회의] ${topic}` },
       { t:'wait', s: 6 },
     ];
@@ -2087,7 +2627,9 @@ function exitReplay(){ replay.mode = false; tlSlider.value = 1000; tlLabel.textC
 function replayTick(dt){
   replay.simT += dt*90;   // 90배속
   while (replay.idx < replay.events.length && replay.events[replay.idx].ts <= replay.simT){
-    handleFx(replay.events[replay.idx].fx); replay.idx++;
+    const ev = replay.events[replay.idx].fx;
+    if (ev && ev.t === 'dog') fxDog(ev); else handleFx(ev);   // 강아지 fx는 t로 분리 라우팅
+    replay.idx++;
   }
   tlLabel.textContent = '⏪ ' + new Date(replay.simT*1000).toLocaleTimeString('ko-KR',{hour12:false});
   tlSlider.value = Math.min(1000, Math.round((replay.simT - replay.t0)/(replay.t1 - replay.t0)*1000));
@@ -2210,6 +2752,13 @@ async function peekSelected(){
 document.getElementById('chat-peek').onclick = peekSelected;
 document.getElementById('chat-meet').onclick = convene;
 document.getElementById('b-dismiss').onclick = dismissMeeting;
+document.getElementById('b-shuffle').onclick = ()=>{
+  if (replay.mode){ addChat('sy','시스템','타임머신 재생 중에는 배치를 섞을 수 없습니다'); return; }
+  if (!lastWorld) return;
+  shuffleSeed = Math.floor(Math.random()*0x7fffffff) >>> 0;   // 세션 랜덤 seed 재추첨
+  buildWorld(lastWorld);
+  addChat('sy','시스템','부서 자리배치를 새로 섞었습니다 (세션 랜덤 · 새로고침 시 초기화)');
+};
 document.getElementById('b-director').onclick = (e)=>{
   directorOn = !directorOn; e.target.classList.toggle('on', directorOn); };
 document.getElementById('b-voice').onclick = (e)=>{
@@ -2233,6 +2782,7 @@ function connect(){
       case 'patch': patchNode(f.key, f.node); break;
       case 'patch_top': handlePatchTop(f); break;   // #8 #9 #10 #12 상단 필드 갱신
       case 'fx': if (!replay.mode){ handleFx(f); worldMeta.seq++; refreshStats(); } break;
+      case 'dog': if (!replay.mode) fxDog(f); break;   // D4 강아지 fx (kind='alert'가 handleFx rate-limit와 충돌 → t로 분리)
       case 'resync': fetchWorld(); break;
     }
   };
@@ -2291,6 +2841,7 @@ function frame(now){
     pts.needsUpdate = true; }
   advanceOwner(dt, t);
   ownerManualTick(dt);
+  dogTick(dt);
   proxT += dt;
   if (proxT > 0.2){ proxT = 0; proximityTick(); }
   if (talkKey) positionTalk();
@@ -2318,7 +2869,7 @@ function frame(now){
       entWalkTo(e, e.group.position.x, e.group.position.z + 0.52, 'seat'); });
     reviewGather = null;
   }
-  if (nowMs - lastLinkT > 1000){ lastLinkT = nowMs; updateLinks(nowMs); }
+  if (nowMs - lastLinkT > 1000){ lastLinkT = nowMs; updateLinks(nowMs); drawChairDash(); drawCafeMenu(); }   // 대시보드·메뉴판 ≥2s 스로틀 내장
   weatherTick(dt);
   dayNightTick(dt);
   if (replay.mode) replayTick(dt);

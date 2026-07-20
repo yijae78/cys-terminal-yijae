@@ -74,6 +74,7 @@
             </div>
           </div>
           <div class="cc-kpi" id="cc-kpi"></div>
+          <div class="cc-section"><div class="cc-h">계정 Rate Limit <button id="btn-cc-acct-redact" title="계정 라벨(이메일) 가림 — 스크린샷 공유용">🔒</button></div><div id="cc-accounts"></div></div>
           <div class="cc-section"><div class="cc-h">플릿 현황</div><div id="cc-fleet"></div></div>
           <div class="cc-section"><div class="cc-h">토큰 · 비용</div>
             <div id="cc-token-bars"></div>
@@ -127,6 +128,7 @@
         </div>
         <div id="cc-view-learn" hidden>
           <div class="cc-kpi" id="cc-learn-kpi"></div>
+          <div class="cc-section"><div class="cc-h">📚 자산 성장</div><div id="cc-learn-assets"></div></div>
           <div class="cc-section"><div class="cc-h">🔬 학습 라운드 타임라인</div><div id="cc-learn-timeline"></div></div>
           <div class="cc-section"><div class="cc-h">♻️ 채택 · 롤백 (retention)</div><div id="cc-learn-retention"></div></div>
           <div class="cc-section"><div class="cc-h">🧭 발견 누적 (Discovery)</div><div id="cc-learn-discovery"></div></div>
@@ -134,7 +136,8 @@
         </div>
         <div id="cc-view-board" hidden>
           <div class="cc-board-note">클릭 = 보이는 일회용 워커가 task-prompt 티켓(성공기준·4규칙) 경유로 실행합니다. 산출물은 "AI 보조 생성 · 오너 검수 전"입니다.</div>
-          <div class="cc-section"><div class="cc-h">스킬 보드 (클릭 = 일회용 워커 실행)</div><div id="cc-board-domains"></div></div>
+          <div class="cc-section"><div class="cc-h">최근 실행</div><div id="cc-board-runs"></div></div>
+          <div class="cc-section"><div class="cc-h">스킬 보드 (클릭 = 일회용 워커 실행)</div><input id="cc-board-search" placeholder="스킬 검색(카탈로그)" /><div id="cc-board-domains"></div></div>
           <div class="cc-section"><div class="cc-h">산출물 회수 (~/.cys/_round/skill-out)</div><div id="cc-board-out"></div></div>
         </div>
         <div id="cc-view-tasks" hidden>

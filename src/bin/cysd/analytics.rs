@@ -62,10 +62,198 @@ pub fn open(socket_path: &Path) -> Option<Connection> {
             payload       TEXT NOT NULL,        -- IR(JSON 등) — 형식 버전드
             attest_hash   TEXT NOT NULL,        -- prev∥payload 해시체인(recall hash_step 동형)
             ts            REAL NOT NULL);
-         CREATE INDEX IF NOT EXISTS ix_cl_scope_revn ON change_log(scope, revn);",
+         CREATE INDEX IF NOT EXISTS ix_cl_scope_revn ON change_log(scope, revn);
+         -- CC v2 WS-A: 계정 rate limit 시계열(추세·소진예측·부트 예열). ADDITIVE — 구버전 무시.
+         CREATE TABLE IF NOT EXISTS rate_snapshots(
+            ts REAL, provider TEXT, account TEXT, label TEXT,
+            win TEXT, used_pct REAL, resets_at REAL);
+         CREATE INDEX IF NOT EXISTS ix_rate_snap ON rate_snapshots(provider, account, win, ts);
+         -- CC v2 WS-B: 스킬보드 실행 생애주기(산출물+데드라인 결정론 — skillrun.rs 헤더).
+         -- exit_note: timeout_no_artifact|daemon_restart 등 판정 사유.
+         CREATE TABLE IF NOT EXISTS skill_runs(
+            run_id TEXT PRIMARY KEY, name TEXT, label TEXT, started_at REAL,
+            deadline REAL, status TEXT,
+            exit_note TEXT, artifact_dir TEXT, ended_at REAL);
+         CREATE INDEX IF NOT EXISTS ix_skill_runs_started ON skill_runs(started_at);",
     )
     .ok()?;
     Some(conn)
+}
+
+// ── CC v2 WS-A: rate_snapshots ──
+
+/// 계정 rate 스냅샷 1행 적재 — 스로틀·prune 판단은 호출부(accounts.rs). 실패 무해.
+pub fn record_rate_snapshot(
+    conn: &Connection,
+    ts: f64,
+    provider: &str,
+    account: &str,
+    label: &str,
+    win: &str,
+    used_pct: f64,
+    resets_at: Option<f64>,
+) {
+    let _ = conn.execute(
+        "INSERT INTO rate_snapshots(ts, provider, account, label, win, used_pct, resets_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        rusqlite::params![ts, provider, account, label, win, used_pct, resets_at],
+    );
+}
+
+/// 보존 창 밖 스냅샷 prune.
+pub fn prune_rate_snapshots(conn: &Connection, before_ts: f64) {
+    let _ = conn.execute("DELETE FROM rate_snapshots WHERE ts < ?1", [before_ts]);
+}
+
+/// (provider,account,win)별 **최신** 스냅샷 — 부트 예열용. since 이후만.
+/// 반환: (ts, provider, account, label, win, used_pct, resets_at)
+pub fn last_rate_snapshots(
+    conn: &Connection,
+    since: f64,
+) -> Vec<(f64, String, String, String, String, f64, Option<f64>)> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT ts, provider, account, label, win, used_pct, resets_at FROM rate_snapshots
+         WHERE ts >= ?1 GROUP BY provider, account, win HAVING ts = MAX(ts)",
+    ) else {
+        return out;
+    };
+    let rows = stmt.query_map([since], |r| {
+        Ok((
+            r.get::<_, f64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, f64>(5)?,
+            r.get::<_, Option<f64>>(6)?,
+        ))
+    });
+    if let Ok(rows) = rows {
+        for r in rows.flatten() {
+            out.push(r);
+        }
+    }
+    out
+}
+
+/// 계정×창 최근 시계열(소진 예측용) — ts 오름차순 (ts, used_pct).
+pub fn rate_series(
+    conn: &Connection,
+    provider: &str,
+    account: &str,
+    win: &str,
+    since: f64,
+) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT ts, used_pct FROM rate_snapshots
+         WHERE provider=?1 AND account=?2 AND win=?3 AND ts>=?4 ORDER BY ts",
+    ) else {
+        return out;
+    };
+    let rows = stmt.query_map(rusqlite::params![provider, account, win, since], |r| {
+        Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?))
+    });
+    if let Ok(rows) = rows {
+        for r in rows.flatten() {
+            out.push(r);
+        }
+    }
+    out
+}
+
+// ── CC v2 WS-B: skill_runs ──
+
+pub fn skill_run_insert(
+    conn: &Connection,
+    run_id: &str,
+    name: &str,
+    label: &str,
+    now: f64,
+    deadline: f64,
+) {
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO skill_runs(run_id, name, label, started_at, deadline, status)
+         VALUES(?1,?2,?3,?4,?5,'launched')",
+        rusqlite::params![run_id, name, label, now, deadline],
+    );
+}
+
+pub fn skill_run_update(
+    conn: &Connection,
+    run_id: &str,
+    status: &str,
+    exit_note: Option<&str>,
+    artifact_dir: Option<&str>,
+    ended_at: Option<f64>,
+) {
+    let _ = conn.execute(
+        "UPDATE skill_runs SET status=?2,
+            exit_note=COALESCE(?3, exit_note),
+            artifact_dir=COALESCE(?4, artifact_dir),
+            ended_at=COALESCE(?5, ended_at)
+         WHERE run_id=?1",
+        rusqlite::params![run_id, status, exit_note, artifact_dir, ended_at],
+    );
+}
+
+/// 열린 run(launched) — 워처 전이 대상. (run_id, deadline)
+pub fn skill_runs_open(conn: &Connection) -> Vec<(String, f64)> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT run_id, deadline FROM skill_runs WHERE status='launched'",
+    ) else {
+        return out;
+    };
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+    });
+    if let Ok(rows) = rows {
+        for r in rows.flatten() {
+            out.push(r);
+        }
+    }
+    out
+}
+
+/// 부트 reconcile — 열린 run 일괄 failed(사유 기록). 일회용 pane은 데몬 재시작을 넘어 살지 않는다.
+pub fn skill_runs_fail_open(conn: &Connection, note: &str, now: f64) {
+    let _ = conn.execute(
+        "UPDATE skill_runs SET status='failed', exit_note=?1, ended_at=?2
+         WHERE status='launched'",
+        rusqlite::params![note, now],
+    );
+}
+
+/// 최근 run 목록(UI 카드) — started_at 내림차순.
+pub fn skill_runs_list(conn: &Connection, limit: u64) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT run_id, name, label, started_at, deadline, status, exit_note, artifact_dir, ended_at
+         FROM skill_runs ORDER BY started_at DESC LIMIT ?1",
+    ) else {
+        return out;
+    };
+    let rows = stmt.query_map([limit], |r| {
+        Ok(serde_json::json!({
+            "run_id": r.get::<_, String>(0)?,
+            "name": r.get::<_, String>(1)?,
+            "label": r.get::<_, String>(2)?,
+            "started_at": r.get::<_, f64>(3)?,
+            "deadline": r.get::<_, Option<f64>>(4)?,
+            "status": r.get::<_, String>(5)?,
+            "exit_note": r.get::<_, Option<String>>(6)?,
+            "artifact_dir": r.get::<_, Option<String>>(7)?,
+            "ended_at": r.get::<_, Option<f64>>(8)?,
+        }))
+    });
+    if let Ok(rows) = rows {
+        for r in rows.flatten() {
+            out.push(r);
+        }
+    }
+    out
 }
 
 // ── T2-3 append-only change-log + 단조 revn + 낙관적 동시성(restore-replay READER) ──
@@ -1768,5 +1956,56 @@ mod tests {
         assert_eq!(vern, 0);
         assert_eq!(replayed, 3, "revn>2 = p2,p3,p4");
         assert_eq!(payloads, vec!["p2".to_string(), "p3".to_string(), "p4".to_string()]);
+    }
+
+    // ── CC v2 WS-A: rate_snapshots ──
+
+    #[test]
+    fn rate_snapshots_record_last_and_prune() {
+        let (_socket, conn) = open_change_db("ratesnap");
+        // 같은 (계정,창)에 시계열 3점 + 다른 창 1점
+        record_rate_snapshot(&conn, 100.0, "claude", "u1", "a@b.c", "5h", 10.0, Some(500.0));
+        record_rate_snapshot(&conn, 200.0, "claude", "u1", "a@b.c", "5h", 20.0, Some(500.0));
+        record_rate_snapshot(&conn, 300.0, "claude", "u1", "a@b.c", "5h", 30.0, Some(500.0));
+        record_rate_snapshot(&conn, 250.0, "claude", "u1", "a@b.c", "7d", 5.0, None);
+        // last: (u1,5h)=ts300, (u1,7d)=ts250 — 창별 최신 1행씩
+        let last = last_rate_snapshots(&conn, 0.0);
+        assert_eq!(last.len(), 2);
+        let five = last.iter().find(|r| r.4 == "5h").unwrap();
+        assert_eq!((five.0, five.5), (300.0, 30.0));
+        // 시계열은 ts 오름차순
+        let series = rate_series(&conn, "claude", "u1", "5h", 0.0);
+        assert_eq!(series, vec![(100.0, 10.0), (200.0, 20.0), (300.0, 30.0)]);
+        // prune: ts<250 삭제 → 5h는 300 한 점, 7d 250 한 점
+        prune_rate_snapshots(&conn, 250.0);
+        assert_eq!(rate_series(&conn, "claude", "u1", "5h", 0.0), vec![(300.0, 30.0)]);
+    }
+
+    // ── CC v2 WS-B: skill_runs 상태 전이 ──
+
+    #[test]
+    fn skill_runs_lifecycle_and_boot_reconcile() {
+        let (_socket, conn) = open_change_db("skillruns");
+        skill_run_insert(&conn, "r1", "skill-a", "라벨A", 100.0, 820.0);
+        skill_run_insert(&conn, "r2", "skill-b", "라벨B", 110.0, 830.0);
+        // 열린 run 2건(deadline 동봉)
+        let open = skill_runs_open(&conn);
+        assert_eq!(open.len(), 2);
+        assert!(open.iter().any(|(id, d)| id == "r1" && *d == 820.0));
+        // r1 done + 산출물 경로
+        skill_run_update(&conn, "r1", "done", None, Some("/x/skill-out/r1"), Some(400.0));
+        let open = skill_runs_open(&conn);
+        assert_eq!(open.len(), 1, "done은 열린 run에서 제외");
+        // 부트 reconcile: 남은 launched(r2) → failed(daemon_restart)
+        skill_runs_fail_open(&conn, "daemon_restart", 500.0);
+        assert!(skill_runs_open(&conn).is_empty());
+        let runs = skill_runs_list(&conn, 10);
+        assert_eq!(runs.len(), 2);
+        let r2 = runs.iter().find(|r| r["run_id"] == "r2").unwrap();
+        assert_eq!(r2["status"], "failed");
+        assert_eq!(r2["exit_note"], "daemon_restart");
+        let r1 = runs.iter().find(|r| r["run_id"] == "r1").unwrap();
+        assert_eq!(r1["status"], "done");
+        assert_eq!(r1["artifact_dir"], "/x/skill-out/r1");
     }
 }

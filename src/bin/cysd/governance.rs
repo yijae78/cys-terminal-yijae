@@ -25,7 +25,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut queue_depth_alerted: HashMap<u64, f64> = HashMap::new();
         let mut deadman_last_alert: f64 = 0.0;
         let mut alert_fired: HashMap<String, f64> = HashMap::new();
-        let mut learn_stuck_debounce: HashMap<u64, f64> = HashMap::new();
+        // (learn gaps C12②) 재시작에도 디바운스 창 유지 — state 파일에서 복원.
+        let mut learn_stuck_debounce: HashMap<u64, f64> =
+            load_learn_stuck_debounce(&daemon.socket_path);
         let mut zombie_miss: HashMap<u64, u32> = HashMap::new();
         let mut launch_flag_warned: std::collections::HashSet<u64> =
             std::collections::HashSet::new();
@@ -40,6 +42,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
             // 자원 거버넌스가 데몬 수명 내내 조용히 사라지는 것을 막는다.
             let tick = std::panic::AssertUnwindSafe(|| {
                 sys.refresh_processes(ProcessesToUpdate::All, true);
+                // ★SEAT: 프로세스 표를 갓 refresh 한 이 지점이 좌석 판정의 유일한 write 시점이다.
+                // deliver_queued 보다 **먼저** 갱신해야 같은 틱의 배달이 최신 좌석 사실을 본다.
+                refresh_seat_cache(&daemon, &sys);
                 check_load(&daemon, &mut last_load_alert);
                 check_surfaces(&daemon, &sys, &mut last_dup_alert, &mut last_proc_alert);
                 check_idle(&daemon);
@@ -402,6 +407,42 @@ fn learn_stuck_candidates(
     out
 }
 
+/// (RSI 학습 자율추천 i·learn gaps C12②) stuck 디바운스 지속화 파일명 — 데몬 state
+/// 디렉터리(소켓 동거·부서별 격리) 하위. 직렬화: {"<surface_id>": <last_propose_epoch>}.
+const LEARN_STUCK_DEBOUNCE_FILE: &str = "learn_stuck_debounce.json";
+
+/// 디바운스 맵 로드 — 데몬 재시작 시 인메모리 디바운스 소실로 CYS_RSI_STUCK_DEBOUNCE_SECS
+/// (기본 3600) 창이 리셋돼 동일 노드 추천이 중복 발화하던 문제 수리: spawn_watchdog가 부트 시
+/// 1회 읽어 창을 이어간다. 부재/손상=빈 맵(fail-open — 최악은 추천 1회 중복일 뿐, 차단이 더 해롭다).
+fn load_learn_stuck_debounce(socket_path: &std::path::Path) -> HashMap<u64, f64> {
+    let path = crate::state::state_dir(socket_path).join(LEARN_STUCK_DEBOUNCE_FILE);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| Some((k.parse::<u64>().ok()?, v.as_f64()?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 디바운스 맵 저장(원자) — check_learn_stuck가 추천 발화로 타임스탬프를 갱신한 직후 호출.
+/// 죽은 surface 항목은 watchdog retain이 인메모리에서 솎아내고 다음 발화 시 파일에도 반영된다.
+fn save_learn_stuck_debounce(socket_path: &std::path::Path, debounce: &HashMap<u64, f64>) {
+    let obj: serde_json::Map<String, serde_json::Value> = debounce
+        .iter()
+        .map(|(k, v)| (k.to_string(), json!(v)))
+        .collect();
+    let dir = crate::state::state_dir(socket_path);
+    let _ = write_json_atomic(
+        &dir,
+        LEARN_STUCK_DEBOUNCE_FILE,
+        &serde_json::Value::Object(obj).to_string(),
+    );
+}
+
 /// (RSI 학습 자율추천 i) 막힘 트리거 — ★읽기 전용: watchdog의 기존 재시작 카운터(동일 노드
 /// N회 실패=막힘 신호)만 읽어 학습 추천 feed 항목을 만든다. autopilot(EFEC/AMI) 자율주행
 /// 로직은 무손상·자동응답 0 — 추천까지만 자율, 착수는 사람 승인(directive §4). 디바운스로 스팸 차단.
@@ -444,6 +485,8 @@ fn check_learn_stuck(
             Some(sid),
         );
     }
+    // (learn gaps C12②) 발화 직후 지속화 — 재시작이 디바운스 창을 리셋하지 않게.
+    save_learn_stuck_debounce(&daemon.socket_path, debounce);
 }
 
 /// T3-12 승인 aging 재알림: pending feed가 무음 적체되지 않게 N분마다 재push.
@@ -639,6 +682,41 @@ fn check_todo(daemon: &Arc<Daemon>) {
         .retain(|k, _| seen.contains(k));
 }
 
+/// ★W-B 보완(승인 미감지=워커 hang 방지 · 2026-07-17): agents.json 이 user 소유로 승격되면
+/// 사용자 수정본은 영구 보존되지만 **동결**된다 — vendor 가 새 CLI 프롬프트용 approval_patterns 를
+/// 추가해도 그 사용자에겐 영영 도달하지 않아 승인 격상이 조용히 멈추고 워커가 hang 한다(우리
+/// 지침이 최우선 방지 대상으로 명시한 '큐 적체'의 정확한 기전).
+///
+/// 해소 = **합집합**: 디스크(사용자) 패턴 + 임베드(vendor) 패턴을 name 기준 dedup 병합하고,
+/// 충돌 시 **디스크가 이긴다**(사용자 주권 불변). approval_patterns 는 *감지 전용*(자동 응답
+/// 절대 없음 — 판단은 master)이라 추가 패턴은 부작용이 없고 미감지만 위험하다 = 합집합이 안전측.
+/// 순수 함수로 분리해 테스트 가능하게 둔다.
+fn merged_approval_patterns(
+    disk: &serde_json::Value,
+    embed: &serde_json::Value,
+    agent: &str,
+) -> Vec<serde_json::Value> {
+    let get = |v: &serde_json::Value| -> Vec<serde_json::Value> {
+        v.get(agent)
+            .and_then(|a| a.get("approval_patterns"))
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut out = get(disk);
+    let have: std::collections::HashSet<String> = out
+        .iter()
+        .filter_map(|p| p["name"].as_str().map(String::from))
+        .collect();
+    for p in get(embed) {
+        match p["name"].as_str() {
+            Some(n) if !have.contains(n) => out.push(p), // vendor 신규 패턴만 보강
+            _ => {}                                      // 동명 = 사용자본 유지(디스크 우선)
+        }
+    }
+    out
+}
+
 /// T4-16 승인 격상 스캔: agents.json의 approval_patterns를 visible screen에 매칭.
 /// ★자동 응답 절대 금지 — 감지·격상(이벤트+feed 항목)만. 판단은 master의 몫.
 fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f64>) {
@@ -650,6 +728,12 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
             Some(v) => v,
             None => return,
         };
+    // 임베드 vendor 정의(동결 사용자본 보강용 — 파싱 실패 시 빈 객체로 무해 폴백).
+    let embed_agents: serde_json::Value = cys::pack::PACK_ALL
+        .iter()
+        .find(|(r, _)| *r == "agents.json")
+        .and_then(|(_, c)| serde_json::from_str(c).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
     let now = now_epoch();
     let surfaces: Vec<Arc<crate::state::Surface>> =
         daemon.surfaces.lock().unwrap().values().cloned().collect();
@@ -660,12 +744,11 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
         let Some((agent, _)) = s.agent_meta.lock().unwrap().clone() else {
             continue;
         };
-        let Some(patterns) = agents[&agent]["approval_patterns"].as_array() else {
-            continue;
-        };
+        let patterns = merged_approval_patterns(&agents, &embed_agents, &agent);
         if patterns.is_empty() {
             continue;
         }
+        let patterns = &patterns;
         let screen = s.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().contents();
         let mut any_match = false;
         for p in patterns {
@@ -1144,6 +1227,115 @@ fn check_load(daemon: &Daemon, last_alert: &mut f64) {
             json!({"load_1m": load.one, "load_5m": load.five, "threshold": daemon.config.load_high_threshold}),
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★SEAT: 좌석 점유(seat-occupancy) 판정 — 단일 SOT
+//
+// 왜 필요한가(2026-07-17 실사고): role=master 를 쥔 채 agent 가 없는 '빈 셸' 좌석이
+// ①phoenix 부활 ②▶부서장/▶CEO 버튼 ③디렉티브 재주입을 전부 잠그고, master 앞 큐 메시지를
+// zsh 프롬프트에 문자로 타이핑시켰다. 뿌리는 모든 생존 판정이 `exited` 만 보고 **좌석에 실제로
+// 누가 앉아 있는지**를 묻지 않은 것이다(cys.rs run_restore `live.contains(role)` ·
+// javis_phoenix `_alive()` · surface.create/claim_role 의 holder_live 전부 동형).
+//
+// 설계 원칙(3중 성찰 반영):
+//  - **커널 사실 1차**: "셸 이외의 자손 프로세스가 있는가" = 좌석이 쓰이는 중인가. hook·에이전트
+//    종류·config 와 무관하게 커널이 증언한다. 에이전트 계층 부산물(usage transcript 등록 등)을
+//    판정에 섞으면 hook 없는 환경에서 '영원히 Occupied → 부활 잠김'이라는 **고치려는 결함과 동형의
+//    반대편 결함**이 열린다 — 계층을 섞지 않는다.
+//  - **정책 2차는 승계에만**: agent_meta·최근 사람 입력은 좌석을 *지키는* 방향으로만 가산한다
+//    (seat_claimable). 큐 배달은 1차만 본다 — agent_meta 가 남은 죽은 노드의 셸에 배달하면 그것도
+//    zsh 타이핑이기 때문이다(같은 사고의 다른 얼굴).
+//  - **Unknown = 현행 동작 유지**: 프로브 미도달은 새 실패를 만들지 않는다(큐=배달·승계=거부).
+//
+// 한계(명시): 사용자가 좌석에서 잡을 백그라운드로 돌리면(`sleep 100 &`) 프롬프트가 비어도
+// Occupied 로 판정된다 — 보호(fail-closed) 방향이라 오탈취는 없고, 부활은 다음 틱에 재시도된다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeatState {
+    /// 판정 미도달(프로브 실패·첫 틱 이전) — 소비처는 **현행 동작**으로 강등한다.
+    Unknown = 0,
+    /// 자손 프로세스 존재 = 사람이든 에이전트든 이 좌석은 쓰이는 중.
+    Occupied = 1,
+    /// 셸 단독 = 빈 좌석.
+    Empty = 2,
+}
+
+impl SeatState {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => SeatState::Occupied,
+            2 => SeatState::Empty,
+            _ => SeatState::Unknown,
+        }
+    }
+    /// status/topology 노출용 — pack·CLI 는 이 문자열만 소비한다(판정 이원화 금지).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SeatState::Occupied => "occupied",
+            SeatState::Empty => "empty",
+            SeatState::Unknown => "unknown",
+        }
+    }
+}
+
+/// ★SEAT 1차(커널 사실): 이 좌석에 셸 이외의 자손 프로세스가 있는가.
+/// 종료된 surface 는 좌석 개념이 없으므로 Empty(무해 — 승계 게이트는 exited 를 이미 별도 처리).
+/// 셸 pid 가 프로세스 표에 아예 없으면(아직 미갱신·프로브 실패) Unknown → 소비처가 현행 동작 유지.
+pub fn seat_state(sys: &System, s: &crate::state::Surface) -> SeatState {
+    if s.exited.load(Ordering::Relaxed) {
+        return SeatState::Empty;
+    }
+    if sys.process(sysinfo::Pid::from_u32(s.pid)).is_none() {
+        return SeatState::Unknown;
+    }
+    if collect_descendants(sys, s.pid).is_empty() {
+        SeatState::Empty
+    } else {
+        SeatState::Occupied
+    }
+}
+
+/// ★SEAT 캐시 갱신 — **단일 writer**(watchdog 틱). 판정 재료(전 프로세스 표)를 이미 refresh 한
+/// 지점에서 한 번만 계산해 캐시에 싣는다. RPC 읽기 경로(surface.list·status·deliver_queued)는
+/// 재조회 없이 이 값을 소비한다(비용 중복 0).
+pub fn refresh_seat_cache(daemon: &Arc<Daemon>, sys: &System) {
+    let surfaces: Vec<Arc<crate::state::Surface>> =
+        daemon.surfaces.lock().unwrap().values().cloned().collect();
+    for s in surfaces {
+        s.seat_cache
+            .store(seat_state(sys, &s).as_u8(), Ordering::Relaxed);
+    }
+}
+
+/// ★SEAT 2차(승계 정책): 이 좌석의 특권 role 을 다른 surface 가 가져가도 되는가.
+/// 커널 사실이 Empty 이고 + agent_meta 부재(죽은 에이전트의 좌석은 node-recover 영역이지 탈취
+/// 대상이 아니다) + 최근 사람 입력 없음(사용자가 지금 claude 를 띄우려 타이핑 중일 수 있다)
+/// 셋을 **모두** 만족할 때만 true. Unknown 은 false(현행=거부 유지).
+pub fn seat_claimable(sys: &System, s: &crate::state::Surface) -> bool {
+    if seat_state(sys, s) != SeatState::Empty {
+        return false;
+    }
+    if s.agent_meta.lock().unwrap().is_some() {
+        return false;
+    }
+    let human_recent = s
+        .last_human_input
+        .lock()
+        .unwrap()
+        .map(|t| t.elapsed().as_secs() < queue_human_quiet_secs())
+        .unwrap_or(false);
+    !human_recent
+}
+
+/// 승계 게이트 전용 즉시 프로브 — 캐시(watchdog 틱 주기)는 role 재바인딩 판정에 쓰기엔 stale 하다.
+/// 드문 경로(부활·부트 선언)라 전 프로세스 refresh 비용을 그 시점에 지불한다.
+pub fn seat_claimable_now(s: &crate::state::Surface) -> bool {
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    seat_claimable(&sys, s)
 }
 
 /// Walk the process table and collect all descendants of `root`.
@@ -1788,6 +1980,11 @@ fn alert_queue_depth_if_high(
         "사람 입력이 식을 때까지 보류 중(CYS_QUEUE_HUMAN_QUIET_SECS)"
     } else if blocked_by.starts_with("queue_paused") {
         "헬스 조치(pause-queue) 해제가 대응 — 해당 surface 헬스 상태를 점검하라"
+    } else if blocked_by.starts_with("empty_seat") {
+        // ★SEAT: 이 사유는 '좌석에 에이전트가 없다'는 뜻이다 — 임계·quiet 노브로는 풀리지 않는다.
+        // 조치는 좌석에 에이전트를 앉히는 것(부활·수동 연결)이므로 그 손잡이를 가리킨다.
+        "좌석에 에이전트가 없다 — 그 pane 에서 직접 agent 를 실행하거나 `cys restore`(부활)로 \
+         좌석을 채우면 보류분이 순서대로 배달된다(메시지는 보존 중·유실 아님)"
     } else {
         "임계 조정은 CYS_QUEUE_QUIET_SECS"
     };
@@ -1894,6 +2091,29 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             alert_queue_depth_if_high(daemon, &s, depth_alerted, "human_typing(사람 입력 직후)");
             continue;
         }
+        // ★SEAT 게이트(2026-07-17 실사고 수리): **role 좌석**인데 좌석이 비었으면(에이전트 없음)
+        // 배달을 보류한다. 종전엔 quiet 이기만 하면 배달해, 빈 셸이 role 을 쥔 동안 리뷰어 verdict·
+        // 워커 보고가 zsh 프롬프트에 문자로 타이핑돼 **보고가 증발**했다(surface:112 실측).
+        //
+        // 판정 기준을 'role 유무'로 둔 이유: pending_queue 는 텍스트만 담아(anchor 미보존) 항목별
+        // role-앵커 여부를 구분할 수 없다. 그런데 role 좌석은 정의상 에이전트 자리이므로 'role 있는
+        // surface'가 role-앵커 메시지의 실질 대상이다. role 없는 맨 셸의 `--queued` 자동화는
+        // 종전 그대로 통과한다(무회귀).
+        //
+        // Unknown(프로브 미도달)은 **배달**한다 — 현행 동작 유지(판정 실패가 전 큐를 멈추는
+        // 새 장애를 만들지 않는다). 보류는 유실이 아니라 지연이며, 좌석에 에이전트가 앉으면
+        // 순서대로 배달된다. 적체는 아래 기존 알림이 사유와 함께 가시화한다(침묵 적체 금지).
+        if s.role.lock().unwrap().is_some()
+            && SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)) == SeatState::Empty
+        {
+            alert_queue_depth_if_high(
+                daemon,
+                &s,
+                depth_alerted,
+                "empty_seat(좌석에 에이전트 미연결)",
+            );
+            continue;
+        }
         // pop은 writer 채널 인계 성공 후에만 — 실패 시 메시지를 보존해 다음 틱에 재시도.
         // 블로킹 write·sleep은 surface 전용 writer 스레드가 수행하므로 watchdog은 멈추지 않는다.
         //
@@ -1946,8 +2166,8 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        learn_stuck_candidates, paste_settle_ms, plan_duplicate_kills, queue_head_starving,
-        should_confirm_retry,
+        learn_stuck_candidates, merged_approval_patterns, paste_settle_ms, plan_duplicate_kills,
+        queue_head_starving, should_confirm_retry,
     };
 
     /// codex 전송확정 유실 수리 불변식: paste 정착 지연은 길이 비례·상한 3000ms.
@@ -1997,6 +2217,61 @@ mod tests {
         let mut stale = Some(Instant::now() - Duration::from_secs(999));
         assert!(!queue_head_starving(true, &mut stale, 45));
         assert!(stale.is_none(), "큐 비면 시계 리셋");
+    }
+
+    /// ★W-B 보완 핀: agents.json user 동결이 vendor 신규 approval_patterns 를 못 받아 승인
+    /// 미감지→워커 hang 으로 가는 경로를 차단한다. 규칙 = 합집합(디스크 ∪ 임베드), 동명은 디스크 승.
+    #[test]
+    fn approval_patterns_union_disk_wins_vendor_fills() {
+        let disk = serde_json::json!({
+            "claude": { "approval_patterns": [
+                { "name": "tool-permission", "pattern": "MY-CUSTOM-REGEX" }
+            ]}
+        });
+        let embed = serde_json::json!({
+            "claude": { "approval_patterns": [
+                { "name": "tool-permission", "pattern": "VENDOR-OLD" },
+                { "name": "new-vendor-prompt", "pattern": "VENDOR-NEW" }
+            ]},
+            "codex": { "approval_patterns": [{ "name": "codex-approve", "pattern": "CX" }]}
+        });
+        let merged = merged_approval_patterns(&disk, &embed, "claude");
+        assert_eq!(merged.len(), 2, "동명 dedup + vendor 신규 1건 보강: {merged:?}");
+        let mine = merged.iter().find(|p| p["name"] == "tool-permission").unwrap();
+        assert_eq!(mine["pattern"], "MY-CUSTOM-REGEX", "동명 충돌은 디스크(사용자) 승");
+        assert!(merged.iter().any(|p| p["name"] == "new-vendor-prompt"), "vendor 신규 패턴 도달(hang 방지)");
+        // 디스크에 아예 없는 어댑터 → 임베드 전량 폴백(신규 CLI 지원 즉시 유효).
+        let cx = merged_approval_patterns(&disk, &embed, "codex");
+        assert_eq!(cx.len(), 1, "디스크 결손 어댑터는 임베드로 채움");
+        // 양쪽 모두 없음 → 빈 벡터(무해 — 호출측이 continue).
+        assert!(merged_approval_patterns(&disk, &embed, "nosuch").is_empty());
+    }
+
+    /// (learn gaps C12②) stuck 디바운스 지속화 — 저장→로드 왕복 + 부재/손상 fail-open 핀.
+    /// 데몬 재시작 후에도 CYS_RSI_STUCK_DEBOUNCE_SECS 창이 유지되는 토대(소실=추천 중복 발화).
+    #[test]
+    fn learn_stuck_debounce_persistence_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("cys_learn_debounce_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("cysd.sock");
+        // 실제 저장 위치는 state_dir 파생(unix=소켓 부모·Windows=LOCALAPPDATA 슬러그) —
+        // 플랫폼 중립으로 state_dir 경유로 정리·손상 주입한다.
+        let sfile = crate::state::state_dir(&sock).join(super::LEARN_STUCK_DEBOUNCE_FILE);
+        let _ = std::fs::create_dir_all(sfile.parent().unwrap());
+        let _ = std::fs::remove_file(&sfile);
+        // 부재 = 빈 맵(fail-open)
+        assert!(super::load_learn_stuck_debounce(&sock).is_empty());
+        let mut m = std::collections::HashMap::new();
+        m.insert(7u64, 1_700_000_000.5f64);
+        m.insert(12u64, 1_700_000_100.0f64);
+        super::save_learn_stuck_debounce(&sock, &m);
+        assert_eq!(super::load_learn_stuck_debounce(&sock), m, "저장→로드 왕복 보존");
+        // 손상 = 빈 맵(fail-open — 조용한 차단보다 추천 재발화가 안전측)
+        std::fs::write(&sfile, "{corrupt").unwrap();
+        assert!(super::load_learn_stuck_debounce(&sock).is_empty());
+        let _ = std::fs::remove_file(&sfile);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// L3 재발방지 핀(2026-07-07 feed 189 폭주): 데몬 감지 항목의 surface 단위

@@ -32,3 +32,9 @@ NO_GO면 원인 단계로 되돌린다(다듬기로 덮지 않는다).
 
 `verify-report.md` — 관문별 [판정·근거·문제 프레임] + 종합 판정. 4관문 전부 GO여야 상위
 `[[youtube-video-pipeline]]`가 종료·출고 승인. 미통과 시 종료 금지·원인 단계로 회송.
+
+**증거 규약 (영상/음성 매체 — NO_GO 근거 의무)**: 각 결함 근거는 필수 증거 3종을 갖춘다 —
+① 타임코드 구간 · ② 프레임 캡처 경로 · ③ 결함 서술. verdict evidence 로 낼 때 위치 ref 규약은
+`경로.mp4#t=MM:SS-MM:SS`(영상 경로 + 타임코드 구간 융합), 프레임 캡처는 별도 evidence 항목
+(`ref`=`frames/f_MMSS.png`). 결함을 지적하는 verdict(NO_GO→REVISE/BLOCK)는 실행가능한 `fix`를
+동반해야 한다(미동반 시 자동 강등). 상세·예시 JSON = `${CYS_PACK_DIR:-$HOME/.cys/pack}/round/EVIDENCE_CONVENTION.md`(§1 영상/음성).

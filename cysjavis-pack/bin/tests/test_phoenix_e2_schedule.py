@@ -28,7 +28,12 @@ def main():
     pack_ids = {j["id"] for j in d.get("jobs", [])}
     check("① 팩 schedule.json 에 phoenix-snapshot-6h 부재(코드 이전)", "phoenix-snapshot-6h" not in pack_ids)
     check("① 팩 schedule.json 에 phoenix-drill-weekly 부재(코드 이전)", "phoenix-drill-weekly" not in pack_ids)
-    check("① 하트비트 잡은 잔존(팩 배달 유지)", "owner-progress-report-5min" in pack_ids, str(sorted(pack_ids)))
+    # 하트비트 5분 잡은 잔존하되, 델타게이트 마이그레이션으로 owner-progress-report-5min(push) →
+    # owner-progress-gate-5min(command)로 형태가 바뀌었다(무의미 wake 제거 · DESIGN §C2).
+    check("① 하트비트 5분 잡 잔존(델타게이트로 마이그레이션)",
+          "owner-progress-gate-5min" in pack_ids, str(sorted(pack_ids)))
+    check("① 구 push 보고 잡은 제거됨(이중발화 방지)",
+          "owner-progress-report-5min" not in pack_ids and "owner-progress-report-15min" not in pack_ids)
 
     # ② schedule.rs builtin_jobs 가 두 잡을 올바른 주기·명령으로 정의.
     rs = open(SCHED_RS, encoding="utf-8").read()

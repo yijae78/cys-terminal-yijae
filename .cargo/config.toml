@@ -1,0 +1,12 @@
+# W0-c 테스트 격리 봉인 — 모든 `cargo test`/`cargo run` 에 CYS_PACK_DIR 을 리포 내 샌드박스로
+# 자동 주입한다(cargo가 빌드/테스트 프로세스 환경에 넣음). 직접 `cargo test` 타이핑(사고 벡터)도
+# 구조적으로 봉인돼 라이브 ~/.cys/pack 을 만지지 않는다. relative=true 는 이 config 파일 기준 상대
+# 경로(= 리포 루트/target/test-pack-sandbox)로 해석된다(target/ 은 .gitignore 대상).
+#
+# force=false: 이미 CYS_PACK_DIR 이 설정돼 있으면(예: `CYS_PACK_DIR=$(mktemp -d) cargo test`) 그것을
+# 존중하고 덮지 않는다 — 테스트가 자체 override 로 격리 가능.
+#
+# ⚠ 릴리스 바이너리 실행 시점엔 이 env 가 없다(cargo build 산출물의 런타임엔 무영향) — 프로덕션
+# pack_dir() 은 종전대로 CYS_PACK_DIR 미설정 시 ~/.cys/pack 으로 폴백한다.
+[env]
+CYS_PACK_DIR = { value = "target/test-pack-sandbox", relative = true, force = false }
