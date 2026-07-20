@@ -4735,6 +4735,29 @@ function restartResultToast(failedDepts: string[], deptRestoreFailed: boolean) {
 // → 3) green(all_saved)이면 자동 진행(skipDrain=true), 부분 실패면 노드별 리포트+[그래도 재시작/취소].
 // cys 코어가 --verify를 미지원하면(구버전) plain drain 폴백(skipDrain=false)+경고. '무손실' 표현 금지 —
 // 대화 원문은 트랜스크립트 복원, 이 기능은 증류 체크포인트(SESSION_STATE·TODO) 최신성만 보증한다.
+// 안전 전체 재시작(오너 2026-07-20): 데몬만이 아니라 앱 프로세스를 재기동해 새 UI까지 반영(버튼 단일화).
+// backend restart_app_full = drain 저장 → detached relauncher(현 PID 소멸 대기 후 새 앱 기동·single-instance
+// 레이스 회피) → app.exit. 노드·부서는 phoenix로 자동 복원.
+async function fullAppRestart() {
+  if (rotatingDaemon || purgingDept) {
+    toast("feed", "작업 진행 중", "데몬 교대 또는 부서 삭제가 진행 중입니다 — 잠시 후 다시 시도하세요.");
+    return;
+  }
+  const ok = await confirmModal(
+    "앱 재시작",
+    "앱을 안전하게 껐다 켭니다: 각 노드의 저장(drain)을 먼저 보낸 뒤 앱을 재기동하고, 부서·노드·대화 기억을 " +
+      "자동 복원합니다(피닉스). 화면이 잠깐 닫혔다 다시 열립니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 재시작하시겠습니까?",
+    "재시작",
+  );
+  if (!ok) return;
+  try {
+    await invoke("restart_app_full");
+    // 성공 시 백엔드가 app.exit → relauncher가 새 인스턴스 기동(후속 UI 처리 없음).
+  } catch (e) {
+    toast("health", "재시작 실패", String(e));
+  }
+}
+
 async function manualRestartAllDaemons() {
   if (rotatingDaemon || purgingDept) {
     // ★[F3] 부서 완전 폐역(purge) 진행 중이면 같은 부서 데몬 경합을 피해 재시작을 보류·안내.
@@ -6172,9 +6195,8 @@ document.getElementById("cc-board-search")!.addEventListener("input", (e) => {
   renderBoardDomains();
 });
 document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
-// 오너 지시(2026-07-20 정리): 두 버튼 역할 분리 — ↻=새로고침(가벼운 상태 갱신), 재시작=앱 재시작(붉은 경고).
-document.getElementById("btn-refresh")!.addEventListener("click", () => void manualRefresh());
-document.getElementById("btn-restart-daemon")!.addEventListener("click", () => void manualRestartAllDaemons());
+// 오너 지시(2026-07-20): 버튼 단일화 — 새로고침 버튼 제거, 재시작 버튼 하나가 '안전한 앱 전체 재시작'(UI 반영+복원).
+document.getElementById("btn-restart-daemon")!.addEventListener("click", () => void fullAppRestart());
 document.getElementById("btn-theme")!.addEventListener("click", (e) =>
   openThemePopover(e.currentTarget as HTMLElement),
 );

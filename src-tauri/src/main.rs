@@ -2958,6 +2958,51 @@ async fn rotate_daemon(app: AppHandle, force: bool, skip_drain: bool) -> Result<
     Ok(())
 }
 
+/// 안전 전체 재시작(오너 2026-07-20): 데몬 rotate가 아니라 **앱 프로세스 자체를 재기동**해 새 UI 빌드까지
+/// 반영한다(버튼 단일화 — X·새로고침·재시작 통합). app.restart()의 single-instance '미복귀' 위험을
+/// 피하려고, 현 프로세스가 **완전히 종료된 뒤** 새 cys-app.exe를 기동하는 detached relauncher(Wait-Process로
+/// PID 소멸 대기 → 레이스 제거)를 띄우고 자신은 exit한다. 노드·부서는 생존 데몬 재연결·phoenix로 복원.
+/// 안전핀: relaunch 대상 경로가 실재하지 않으면 exit하지 않고 에러 반환(앱 미복귀 원천 차단).
+#[tauri::command]
+async fn restart_app_full(app: AppHandle) -> Result<(), String> {
+    let app_exe = resolve_sidecar(if cfg!(windows) { "cys-app.exe" } else { "cys-app" });
+    if !app_exe.exists() {
+        return Err(format!("재기동 대상 없음: {}", app_exe.display()));
+    }
+    // 1) drain(best-effort): 재기동 전 살아있는 노드에 저장 신호.
+    let _ = tokio::task::spawn_blocking(|| {
+        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+        cmd.arg("drain");
+        no_console(&mut cmd);
+        let _ = cmd.status();
+    })
+    .await;
+    // 2) 안전 relauncher: 현 PID 완전 종료 뒤 새 앱 기동(single-instance 레이스 회피).
+    let pid = std::process::id();
+    #[cfg(windows)]
+    {
+        let target = app_exe.display().to_string().replace('\'', "''");
+        let ps = format!(
+            "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 400; Start-Process -FilePath '{target}'"
+        );
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps]);
+        no_console(&mut cmd);
+        cmd.spawn().map_err(|e| format!("relauncher 기동 실패(앱 유지): {e}"))?;
+    }
+    #[cfg(not(windows))]
+    {
+        let target = app_exe.display();
+        let sh = format!("while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; sleep 0.4; exec '{target}'");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &sh]);
+        cmd.spawn().map_err(|e| format!("relauncher 기동 실패(앱 유지): {e}"))?;
+    }
+    // 3) 현 앱 종료 — relauncher가 소멸 감지 후 새 인스턴스 기동.
+    app.exit(0);
+    Ok(())
+}
+
 /// [F5] drain --verify JSON 부재 시 실패 원인 분류 — ①구버전 미지원(clap unknown-flag) vs ②크래시/하드캡
 /// 백스톱을 구분해 UI가 정직한 문구를 고르게 한다(거동=plain drain 폴백은 양쪽 동일, 문구만 다름).
 /// 반환 Err 문자열 접두: "unsupported:"(①) / "verify_failed:"(②).
@@ -3241,6 +3286,7 @@ fn main() {
             install_update,
             autotest_patch_install,
             rotate_daemon,
+            restart_app_full,
             drain_verify,
             install_pack_update,
             launch_dept_daemon,
