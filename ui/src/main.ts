@@ -6136,7 +6136,10 @@ document.getElementById("cc-board-search")!.addEventListener("input", (e) => {
   renderBoardDomains();
 });
 document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
-document.getElementById("btn-refresh")!.addEventListener("click", () => void manualRefresh());
+// 오너 지시(2026-07-20): ↻ 버튼을 "앱 껐다 켜기"처럼 = 안전 전체 재시작으로.
+// manualRestartAllDaemons = 확인창 → 저장(drain) 검증 → 데몬(메인+부서) 재시작 → 부서·노드·대화기억
+// 자동 복원(피닉스). app.restart()의 single-instance 미복귀 위험을 피하는 검증된 경로(A안).
+document.getElementById("btn-refresh")!.addEventListener("click", () => void manualRestartAllDaemons());
 document.getElementById("btn-restart-daemon")!.addEventListener("click", () => void manualRestartAllDaemons());
 document.getElementById("btn-theme")!.addEventListener("click", (e) =>
   openThemePopover(e.currentTarget as HTMLElement),
