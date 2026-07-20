@@ -4687,6 +4687,41 @@ async function start() {
   // 사이드바 노드 신호(B3): 시작 1회 + 10s idle 폴백(이벤트 구동은 onDaemonEvent에서). CC 5s 폴링보다 가벼움.
   refreshSidebarStatus();
   setInterval(refreshSidebarStatus, 10000);
+  // 부서 탭 자동 정합(오너 2026-07-20): 백엔드(CLI)로 생성돼 탭이 없는 살아있는 부서를 자동 탭 부착.
+  void reconcileDeptTabs();
+}
+
+// 부서 탭 자동 정합 — 등록·생존했으나 탭 없는 부서(CLI/CSO 백엔드 생성)를 시작 시 자동으로 탭에 붙인다.
+// 탭 닫힘=데몬 teardown이므로 '생존+무탭'은 백엔드 생성 경로에서만 발생 → 의도적 닫힘의 재개방 없음(무해).
+// 실패는 조용히 무시(수동 +부서 폴백). addDeptWorkspace는 mission_key로 기존 부서를 재사용하므로 중복 0.
+async function reconcileDeptTabs() {
+  try {
+    const reg = (await invoke("list_depts").catch(() => ({ depts: {} }))) as {
+      depts?: Record<string, { socket?: string; mission_key?: string }>;
+    };
+    const cat = (await invoke("read_dept_catalog").catch(() => ({}))) as {
+      departments?: Record<string, { mission_key?: string }>;
+    };
+    const keyByMission = new Map<string, string>();
+    for (const [k, d] of Object.entries(cat.departments ?? {})) {
+      if (d.mission_key) keyByMission.set(d.mission_key, k);
+    }
+    const prevActive = activeWs;
+    for (const e of Object.values(reg.depts ?? {})) {
+      if (!e.socket || !e.mission_key) continue;
+      if (workspaces.some((w) => w.socket === e.socket)) continue; // 이미 탭 존재
+      const alive = await invoke("daemon_status", { socket: e.socket }).then(() => true).catch(() => false);
+      if (!alive) continue; // 죽은 등재 skip(유령 탭 방지)
+      const catKey = keyByMission.get(e.mission_key) ?? e.mission_key;
+      await addDeptWorkspace(catKey);
+    }
+    if (prevActive >= 0 && prevActive < workspaces.length) {
+      activeWs = prevActive; // 시작 포커스는 원래 워크스페이스 유지(부서 탭으로 튀지 않게)
+      render();
+    }
+  } catch {
+    /* 정합 실패 무해 — 수동 +부서로 폴백 */
+  }
 }
 
 // ---------- ui wiring ----------
