@@ -14,15 +14,22 @@ JARVIS_DIR="${CYS_PACK_DIR:-$HOME/.cys/pack}"
 # /clear·compact로 세션이 바뀌어도 SessionStart가 재발화해 자동 재등록된다. 실패 무해.
 # 인터프리터 해소 — Windows는 python3 명령이 없고 python/py만 있는 경우가 흔하다.
 CYS_PY="$(command -v python3 || command -v python || command -v py)"
-if [ ! -t 0 ] && command -v cys >/dev/null 2>&1 && [ -n "$CYS_PY" ]; then
-  # readline 한정 — stdin 전량 소비로 같은 stdin을 보는 후속 처리를 굶기지 않는다
-  # (hook 입력 JSON은 단일 라인)
-  TP=$("$CYS_PY" -c 'import sys,json
+HOOK_SRC=""
+if [ ! -t 0 ] && [ -n "$CYS_PY" ]; then
+  # stdin(hook 입력 JSON)을 1회 캡처 후 transcript_path·source 둘 다 파싱
+  # (source=startup/resume/clear/compact — restart-restore fix B 의 자동각성 게이트에 사용)
+  HOOK_JSON=$(cat 2>/dev/null)
+  TP=$(printf '%s' "$HOOK_JSON" | "$CYS_PY" -c 'import sys,json
 try:
-    print(json.loads(sys.stdin.readline()).get("transcript_path",""))
+    print(json.loads(sys.stdin.read()).get("transcript_path",""))
 except Exception:
     print("")' 2>/dev/null)
-  [ -n "$TP" ] && cys usage-register --transcript "$TP" >/dev/null 2>&1
+  HOOK_SRC=$(printf '%s' "$HOOK_JSON" | "$CYS_PY" -c 'import sys,json
+try:
+    print(json.loads(sys.stdin.read()).get("source",""))
+except Exception:
+    print("")' 2>/dev/null)
+  [ -n "$TP" ] && command -v cys >/dev/null 2>&1 && cys usage-register --transcript "$TP" >/dev/null 2>&1
 fi
 
 if [ -z "$CYS_ROLE" ]; then
@@ -62,10 +69,12 @@ esac
 case "$CYS_ROLE" in
   master|cso)
     if command -v cys >/dev/null 2>&1; then
+      # ★restart-restore fix B: --takeover-empty-seat — 죽은 선임(빈 좌석: agent 없음·자손 0)이면
+      # 승계하고, agent 붙은 정당한 live 보유자는 종전대로 거부(듀얼링 방지 불변). reap 레이스 해소.
       if command -v timeout >/dev/null 2>&1; then
-        CLAIM_OUT=$(timeout 2 cys claim-role "$CYS_ROLE" 2>&1); CLAIM_RC=$?
+        CLAIM_OUT=$(timeout 3 cys claim-role "$CYS_ROLE" --takeover-empty-seat 2>&1); CLAIM_RC=$?
       else
-        CLAIM_OUT=$(cys claim-role "$CYS_ROLE" 2>&1); CLAIM_RC=$?
+        CLAIM_OUT=$(cys claim-role "$CYS_ROLE" --takeover-empty-seat 2>&1); CLAIM_RC=$?
       fi
       if [ "$CLAIM_RC" -ne 0 ] && printf '%s' "$CLAIM_OUT" | grep -qi 'claim_denied\|privileged role held'; then
         echo "■ 역할 주소 상실 (CYS_ROLE=$CYS_ROLE — 레지스트리의 살아있는 보유자가 우위)"
@@ -79,6 +88,34 @@ case "$CYS_ROLE" in
     fi
     ;;
 esac
+# ── ★restart-restore fix B+C: master 재시작 자동각성(선언 없이) + 부서 데몬 자동기동 ──
+# 죽은 선임에서 --takeover-empty-seat 로 좌석을 승계한 신 surface가 source=startup 이면,
+# 오너가 "너는 마스터다"를 안 쳐도 부트 팀 기동 + 부서 데몬 복구를 자동 발화한다.
+# javis_bootstrap.py 는 idempotent(singleflight flock·팀 결손0=스폰없음·claim거부=exit7)라 재발화 안전.
+# clear/compact/resume 은 제외(이미 가동 중 — 재부팅 churn 방지). 전부 배경·graceful, hook 은 즉시 반환.
+if [ "$CYS_ROLE" = "master" ]; then
+  case "$HOOK_SRC" in
+    startup|"")
+      if [ -f "$JARVIS_DIR/bin/javis_bootstrap.py" ] && [ -n "$CYS_PY" ]; then
+        AST="$HOME/.cys/state"; mkdir -p "$AST" 2>/dev/null
+        ( if command -v setsid >/dev/null 2>&1; then setsid "$CYS_PY" "$JARVIS_DIR/bin/javis_bootstrap.py" >"$AST/auto-awaken.log" 2>&1
+          elif command -v nohup >/dev/null 2>&1; then nohup "$CYS_PY" "$JARVIS_DIR/bin/javis_bootstrap.py" >"$AST/auto-awaken.log" 2>&1
+          else "$CYS_PY" "$JARVIS_DIR/bin/javis_bootstrap.py" >"$AST/auto-awaken.log" 2>&1; fi ) &
+        # 부서 데몬 자동기동(데몬만 — 노드는 자원게이트로 수동). depts.json 의 부서 각각 cys ping 으로 기동.
+        if command -v cys-dept >/dev/null 2>&1 && [ -f "$HOME/.cys/depts.json" ]; then
+          ( for _d in $("$CYS_PY" -c 'import json,os
+try:
+    print(" ".join(json.load(open(os.path.expanduser("~/.cys/depts.json"))).get("depts",{}).keys()))
+except Exception:
+    pass' 2>/dev/null); do
+              cys-dept "$_d" -- cys ping >/dev/null 2>&1
+            done ) &
+        fi
+        echo "■ 자동각성 발화됨 (restart-restore B/C): javis_bootstrap.py 배경 실행(preflight→claim→boot→check) + 부서 데몬 자동기동. 완료 확인=cys list / ~/.cys/state/auto-awaken.log. 재실행 금지(idempotent 훅이 집행 중)."
+      fi
+      ;;
+  esac
+fi
 echo "■ CYSJavis 역할 각성 (CYS_ROLE=$CYS_ROLE)"
 cat "$D"
 # ★R13 부트 브리지(T2b 전 임시 — hook=system층이라 디렉티브(user-owned) 미개정 기계에도 전파):

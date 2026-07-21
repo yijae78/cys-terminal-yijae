@@ -62,7 +62,7 @@ if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -f "$SOUL" ];
 fi
 
 # ---------- ★부서 소켓 노드: pack-dept round 정본만 (dept-recovery §8③·R1/R2/R3) ----------
-DIR="$CWD"; STATE=""; STATE_DIR=""; PREV=""; DEPT_CTX=""; DEPT_NO_STATE=""; DEPT_ROUND=""
+DIR="$CWD"; STATE=""; STATE_DIR=""; PREV=""; DEPT_CTX=""; DEPT_NO_STATE=""; DEPT_ROUND=""; MASTER_CANON=""
 case "$CYS_PACK_DIR" in */pack-dept-dept-*) DEPT_CTX=1 ;; esac
 case "$CYS_SOCKET"   in */cys-dept-dept-*)  DEPT_CTX=1 ;; esac
 if [ -n "$DEPT_CTX" ]; then
@@ -76,12 +76,18 @@ if [ -n "$DEPT_CTX" ]; then
     DEPT_NO_STATE=1
   fi
 else
-  # ---------- L2: cwd 상향탐색 (메인/CEO 노드·회귀 0) ----------
-  while [ -n "$DIR" ] && [ "$DIR" != "/" ] && [ "$DIR" != "$PREV" ]; do
-    if [ -f "$DIR/_round/SESSION_STATE.md" ]; then STATE="$DIR/_round/SESSION_STATE.md"; STATE_DIR="$DIR"; break; fi
-    PREV="$DIR"
-    DIR=$(dirname "$DIR")
-  done
+  # ---------- L2: master(홈/CEO) 는 pack round 정본 우선 (restart-restore fix A) ----------
+  # 재시작 cwd 가 앱 설치폴더(공용 _round 스텁 shadowing)여도 master 는 자기 정본을 확실히 복원.
+  if [ "$CYS_ROLE" = "master" ] && [ -n "$CYS_PACK_DIR" ] && [ -f "$CYS_PACK_DIR/round/SESSION_STATE.md" ]; then
+    STATE="$CYS_PACK_DIR/round/SESSION_STATE.md"; STATE_DIR="$CYS_PACK_DIR/round"; MASTER_CANON=1
+  else
+    # cwd 상향탐색 (비-master 노드·프로젝트 작업·회귀 0)
+    while [ -n "$DIR" ] && [ "$DIR" != "/" ] && [ "$DIR" != "$PREV" ]; do
+      if [ -f "$DIR/_round/SESSION_STATE.md" ]; then STATE="$DIR/_round/SESSION_STATE.md"; STATE_DIR="$DIR"; break; fi
+      PREV="$DIR"
+      DIR=$(dirname "$DIR")
+    done
+  fi
 fi
 # fallback: 루트 ACTIVE_PROJECT 포인터
 USED_FALLBACK=""
@@ -101,7 +107,7 @@ if [ -n "$STATE" ]; then
   # ★멀티-워크스페이스 혼동 방어: 작업기억을 '현재 폴더'가 아닌 곳에서 가져왔으면 자동 경고
   if [ -n "$USED_FALLBACK" ]; then
     OUT="${OUT}⚠ 이 기억은 현재 폴더에서 못 찾아 ACTIVE_PROJECT fallback($(_esc "$STATE_DIR"))으로 가져왔다. 이 프로젝트 고유 기억이 아닐 수 있음 — 다른 프로젝트면 현재 폴더에 _round/SESSION_STATE.md를 먼저 만들 것.\n"
-  elif [ -n "$CWD" ] && [ -n "$STATE_DIR" ] && [ "$STATE_DIR" != "$CWD" ]; then
+  elif [ -z "$MASTER_CANON" ] && [ -n "$CWD" ] && [ -n "$STATE_DIR" ] && [ "$STATE_DIR" != "$CWD" ]; then
     OUT="${OUT}⚠ 이 기억은 현재 폴더($(_esc "$CWD"))가 아니라 상위($(_esc "$STATE_DIR"))에서 가져왔다. 이 프로젝트 고유 작업기억이 아닐 수 있음 — 다른 프로젝트면 현재 폴더에 _round/SESSION_STATE.md를 먼저 만들 것(멀티-워크스페이스 혼동 방지).\n"
   fi
   # ★⑤ 고정 헤더 발췌 주입(외부 메모리 아키텍처 접목): 작업기억이 비대하면 첫 화면을
