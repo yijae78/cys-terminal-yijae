@@ -28,6 +28,8 @@ STATE_PATH = BROWSER_ROOT / "state.json"
 AUDIT_PATH = BROWSER_ROOT / "audit.jsonl"
 BROWSERD_DIR = Path(__file__).resolve().parent.parent / "browserd"
 SERVER_TS = BROWSERD_DIR / "server.ts"
+PLAYWRIGHT_PACKAGE = BROWSERD_DIR / "node_modules" / "playwright-core" / "package.json"
+DEPS_LOCK_PATH = BROWSER_ROOT / "deps-install.lock"
 
 # 에러 코드 → exit 코드 매핑
 EXIT_BY_ERROR = {
@@ -99,7 +101,70 @@ def _chrome_available() -> bool:
     for n in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
         if _which(n):
             return True
+    if os.name == "nt":
+        roots = [
+            os.environ.get("PROGRAMFILES"),
+            os.environ.get("PROGRAMFILES(X86)"),
+            os.environ.get("LOCALAPPDATA"),
+        ]
+        rels = [
+            Path("Google/Chrome/Application/chrome.exe"),
+            Path("Microsoft/Edge/Application/msedge.exe"),
+        ]
+        if any((Path(root) / rel).exists() for root in roots if root for rel in rels):
+            return True
     return False
+
+
+def _ensure_browserd_deps(bun: str, timeout: float = 180.0):
+    """업데이트가 node_modules를 정리해도 첫 실행에 결정론적으로 복구한다."""
+    if PLAYWRIGHT_PACKAGE.exists():
+        return None
+    BROWSER_ROOT.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + timeout
+    lock_fd = None
+    while lock_fd is None:
+        try:
+            lock_fd = os.open(DEPS_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if PLAYWRIGHT_PACKAGE.exists():
+                return None
+            try:
+                if time.time() - DEPS_LOCK_PATH.stat().st_mtime > timeout:
+                    DEPS_LOCK_PATH.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.time() >= deadline:
+                return "browserd 의존성 설치 잠금 대기 타임아웃"
+            time.sleep(0.25)
+    try:
+        remaining = max(1.0, deadline - time.time())
+        result = subprocess.run(
+            [bun, "install", "--frozen-lockfile", "--production"],
+            cwd=str(BROWSERD_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=remaining,
+        )
+        if result.returncode != 0 or not PLAYWRIGHT_PACKAGE.exists():
+            tail = (result.stdout or "")[-2000:]
+            return f"browserd 의존성 자동복구 실패(exit {result.returncode})\n{tail}"
+        return None
+    except subprocess.TimeoutExpired:
+        return f"browserd 의존성 자동복구 타임아웃({timeout}s)"
+    except Exception as e:
+        return f"browserd 의존성 자동복구 실패: {e}"
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        try:
+            DEPS_LOCK_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def start_browserd(headless: bool, timeout: float = 20.0):
@@ -109,6 +174,9 @@ def start_browserd(headless: bool, timeout: float = 20.0):
         return None, "bun 미설치 — https://bun.sh"
     if not SERVER_TS.exists():
         return None, f"server.ts 없음: {SERVER_TS}"
+    dep_error = _ensure_browserd_deps(bun)
+    if dep_error:
+        return None, dep_error
     BROWSER_ROOT.mkdir(parents=True, exist_ok=True)
     args = [bun, "run", str(SERVER_TS)]
     if headless:
@@ -251,7 +319,7 @@ def cmd_doctor(a) -> int:
     checks.append(("lockfile 존재", lock, "bun.lock" if lock else "없음"))
 
     chrome = _chrome_available()
-    checks.append(("Chrome/chromium 가용", chrome, "found" if chrome else "미설치 (channel 폴백 시 `bunx playwright install chromium`)"))
+    checks.append(("Chrome/Edge/chromium 가용", chrome, "found" if chrome else "미설치 (channel 폴백 시 `bunx playwright install chromium`)"))
 
     server_ok = SERVER_TS.exists()
     checks.append(("server.ts 존재", server_ok, str(SERVER_TS)))
@@ -382,11 +450,11 @@ def main():
 
     # --- sot = observe --profile human notebooklm 축약 ---
     if a.cmd == "sot":
-        sys.exit(cmd_observe("sot", NOTEBOOKLM_URL, "human", None, headless))
+        sys.exit(cmd_observe("sot", NOTEBOOKLM_URL, "human", "human", None, headless))
 
     # --- observe (P2-a) ---
     if a.cmd == "observe":
-        sys.exit(cmd_observe("observe", a.url, a.profile, a.evidence_dir, headless))
+        sys.exit(cmd_observe("observe", a.url, a.profile, a.context, a.evidence_dir, headless))
 
     # --- pick (P4) ---
     if a.cmd == "pick":
@@ -422,10 +490,13 @@ def gate_human(verb: str, args: dict):
     return None
 
 
-def cmd_observe(verb_label: str, url: str, profile, evidence_dir, headless_flag: bool) -> int:
+def cmd_observe(verb_label: str, url: str, profile, context, evidence_dir, headless_flag: bool) -> int:
     """P2-a 관측 — headful로 열고 관측 상태 반환. human 프로필은 결재 경유.
     관측은 headful이 본질(사람이 창을 봄) → --headless 무시하고 headful 강제."""
-    args = {"url": url, "context": None}
+    # agent/human이 같은 default context를 재사용하면 로그인용 human 창 대신
+    # 비로그인 agent 창이 살아나는 결함을 막는다. human은 전용 context가 기본이다.
+    effective_context = context or ("human" if profile == "human" else None)
+    args = {"url": url, "context": effective_context}
     args = {k: v for k, v in args.items() if v is not None}
     if evidence_dir:
         args["evidence_dir"] = evidence_dir
